@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+ --> tests/trybuild/fail/tooltip_new_widget.rs:6:26
+  |
+6 |     let _ = Tooltip::new(widget);
+  |             ------------ ^^^^^^ expected `El<_>`, found `El<Row, WidgetElement<Button>>`
+  |             |
+  |             arguments to this function are incorrect
+  |
+  = note: expected struct `El<_, LayoutOnly>`
+             found struct `El<Row, WidgetElement<Button>>`
+note: associated function defined here
+ --> src/widgets/tooltip.rs
+  |
+  |     pub fn new<L>(root: El<L, LayoutOnly>) -> Self
+  |            ^^^

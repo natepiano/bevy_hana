@@ -1,0 +1,316 @@
+{
+  "platform": "windows",
+  "example_ron_path": "%APPDATA%\\hana_clerestory\\restore_window.ron",
+  "test_ron_dir": "tests/config/ron/windows",
+
+  "tests": [
+    {
+      "id": "same_monitor_restore_mon0",
+      "description": "Basic position/size persistence on Monitor 0",
+      "automation": "full",
+      "launch_monitor": 0,
+
+      "ron_file": "same_monitor_restore_mon0.ron",
+
+      "mutation": {
+        "target_monitor": "launch",
+        "position_offset": [400, 300],
+        "size": [1000, 700]
+      },
+
+      "windows": {
+        "primary": {
+          "validate": ["position", "size", "monitor_index", "mode"]
+        }
+      }
+    },
+
+    {
+      "id": "cross_high_to_low",
+      "description": "Window on low-DPI monitor restores correctly when launched from high-DPI monitor",
+      "automation": "full",
+      "launch_monitor_role": "high",
+      "launch_size": "640,480",
+      "requires": {"min_monitors": 2, "different_scales": true},
+
+      "ron_file": "cross_monitor_high_to_low.ron",
+
+      "windows": {
+        "primary": {
+          "validate": ["position", "size", "monitor_index", "mode"]
+        }
+      }
+    },
+
+    {
+      "id": "cross_low_to_high",
+      "description": "Window on high-DPI monitor restores correctly when launched from low-DPI monitor (CompensateSizeOnly low->high)",
+      "automation": "full",
+      "launch_monitor_role": "low",
+      "launch_size": "640,480",
+      "requires": {"min_monitors": 2, "different_scales": true},
+
+      "ron_file": "cross_monitor_low_to_high.ron",
+
+      "windows": {
+        "primary": {
+          "validate": ["position", "size", "monitor_index", "mode"]
+        }
+      }
+    },
+
+    {
+      "id": "borderless_mon0",
+      "description": "Borderless fullscreen restore on Monitor 0",
+      "automation": "full",
+      "launch_monitor": 0,
+
+      "ron_file": "fullscreen_borderless_mon0.ron",
+
+      "windows": {
+        "primary": {
+          "validate": ["monitor_index", "mode"]
+        }
+      }
+    },
+
+    {
+      "id": "multi_window_0_0",
+      "description": "Primary on Monitor 0, secondary on Monitor 0",
+      "automation": "full",
+      "launch_monitor": 0,
+      "ron_file": "multi_window_0_0.ron",
+
+      "windows": {
+        "primary": {
+          "validate": ["position", "size", "monitor_index", "mode"]
+        },
+        "window-1": {
+          "spawn_event": "restore_window::events::SpawnManagedWindow",
+          "validate": ["position", "size", "monitor_index", "mode"]
+        }
+      }
+    },
+
+    {
+      "id": "persistence_remember_all",
+      "description": "RememberAll mode preserves unspawned window entries in RON after shutdown",
+      "automation": "full",
+      "launch_monitor": 0,
+      "ron_file": "multi_window_0_0.ron",
+
+      "windows": {
+        "primary": {
+          "validate": ["position", "size", "monitor_index", "mode"]
+        }
+      },
+
+      "persistence_validation": {
+        "mode": "RememberAll",
+        "expected_ron_keys": ["primary", "window-1"]
+      }
+    },
+
+    {
+      "id": "persistence_active_only",
+      "description": "ActiveOnly mode prunes unspawned window entries from RON after shutdown",
+      "automation": "full",
+      "launch_monitor": 0,
+      "ron_file": "multi_window_0_0.ron",
+
+      "windows": {
+        "primary": {
+          "validate": ["position", "size", "monitor_index", "mode"]
+        }
+      },
+
+      "persistence_validation": {
+        "mode": "ActiveOnly",
+        "expected_ron_keys": ["primary"],
+        "unexpected_ron_keys": ["window-1"]
+      }
+    },
+
+    {
+      "id": "save_position_on_unmoved_window",
+      "description": "Window that was never moved saves a real position (not None) to the state file",
+      "automation": "full",
+      "launch_monitor": 0,
+
+      "ron_file": "no_position_same_monitor.ron",
+
+      "windows": {
+        "primary": {
+          "validate": ["size", "mode", "monitor_index"]
+        }
+      },
+
+      "persistence_validation": {
+        "expect_position_saved": ["primary"]
+      }
+    },
+
+    {
+      "id": "exclusive_mon0_W3",
+      "description": "Exclusive fullscreen with DX12 crash workaround on Monitor 0",
+      "automation": "full",
+      "launch_monitor": 0,
+      "workaround_keys": ["W3"],
+
+      "ron_file": "fullscreen_exclusive_mon0.ron",
+
+      "windows": {
+        "primary": {
+          "validate": ["exit_code"]
+        }
+      }
+    },
+
+    {
+      "id": "same_monitor_restore_mon1",
+      "description": "Basic position/size persistence on Monitor 1",
+      "automation": "full",
+      "launch_monitor": 1,
+
+      "ron_file": "same_monitor_restore_mon1.ron",
+
+      "mutation": {
+        "target_monitor": "launch",
+        "position_offset": [300, 200],
+        "size": [1100, 600]
+      },
+
+      "windows": {
+        "primary": {
+          "validate": ["position", "size", "monitor_index", "mode"]
+        }
+      }
+    },
+
+    {
+      "id": "borderless_mon1",
+      "description": "Borderless fullscreen restore on Monitor 1",
+      "automation": "full",
+      "launch_monitor": 1,
+
+      "ron_file": "fullscreen_borderless_mon1.ron",
+
+      "windows": {
+        "primary": {
+          "validate": ["monitor_index", "mode"]
+        }
+      }
+    },
+
+    {
+      "id": "multi_window_0_1",
+      "description": "Primary on Monitor 0, secondary on Monitor 1",
+      "automation": "full",
+      "launch_monitor": 0,
+      "requires": {"min_monitors": 2},
+      "ron_file": "multi_window_0_1.ron",
+
+      "windows": {
+        "primary": {
+          "validate": ["position", "size", "monitor_index", "mode"]
+        },
+        "window-1": {
+          "spawn_event": "restore_window::events::SpawnManagedWindow",
+          "validate": ["position", "size", "monitor_index", "mode"]
+        }
+      }
+    },
+
+    {
+      "id": "multi_window_1_0",
+      "description": "Primary on Monitor 1, secondary on Monitor 0",
+      "automation": "full",
+      "launch_monitor": 1,
+      "requires": {"min_monitors": 2},
+      "ron_file": "multi_window_1_0.ron",
+
+      "windows": {
+        "primary": {
+          "validate": ["position", "size", "monitor_index", "mode"]
+        },
+        "window-1": {
+          "spawn_event": "restore_window::events::SpawnManagedWindow",
+          "validate": ["position", "size", "monitor_index", "mode"]
+        }
+      }
+    },
+
+    {
+      "id": "multi_window_1_1",
+      "description": "Primary on Monitor 1, secondary on Monitor 1",
+      "automation": "full",
+      "launch_monitor": 1,
+      "requires": {"min_monitors": 2},
+      "ron_file": "multi_window_1_1.ron",
+
+      "windows": {
+        "primary": {
+          "validate": ["position", "size", "monitor_index", "mode"]
+        },
+        "window-1": {
+          "spawn_event": "restore_window::events::SpawnManagedWindow",
+          "validate": ["position", "size", "monitor_index", "mode"]
+        }
+      }
+    },
+
+    {
+      "id": "dpi_drag_W2",
+      "description": "DPI drag stability - window should move smoothly between monitors with different scales",
+      "automation": "human_assisted",
+      "launch_monitor": 0,
+      "requires": {"min_monitors": 2, "different_scales": true},
+      "workaround_keys": ["W2"],
+
+      "workaround_validation": {
+        "feature_flag": "workaround-winit-4341",
+        "build_without": "--no-default-features --features workaround-winit-3124,workaround-winit-4440",
+        "build_with": "",
+        "without_behavior": "Window bounces or resizes incorrectly when dragged between monitors",
+        "with_behavior": "Window moves smoothly and resizes correctly when dragged between monitors"
+      },
+
+      "ron_file": "dpi_drag_stability.ron",
+
+      "instructions_without_workaround": [
+        "## PHASE 1: Testing WITHOUT workaround (expect bug)",
+        "1. App built WITHOUT workaround-winit-4341",
+        "2. Window should appear on Monitor 1 (low-DPI)",
+        "3. Slowly drag the window to Monitor 0 (high-DPI)",
+        "4. **EXPECTED BUG**: Window bounces back or resizes incorrectly"
+      ],
+      "instructions_with_workaround": [
+        "## PHASE 2: Testing WITH workaround (expect fix)",
+        "1. App rebuilt WITH workaround-winit-4341",
+        "2. Window should appear on Monitor 1 (low-DPI)",
+        "3. Slowly drag the window to Monitor 0 (high-DPI)",
+        "4. **EXPECTED**: Window moves smoothly and scales correctly"
+      ],
+
+      "success_criteria_without": "Bug confirmed: Window bounces or resizes incorrectly during drag",
+      "success_criteria_with": "Fix confirmed: Window drags smoothly between monitors"
+    }
+  ],
+  "probe_cases": [
+    {
+      "id": "zero_owned_windows",
+      "description": "The process and HTTP probe remain alive after every owned window closes",
+      "interaction": "automated",
+      "evidence": "application"
+    }
+  ],
+  "reconnect_cases": [
+    {
+      "id": "windows_windowed_reconnect",
+      "description": "A window on the virtual display monitor returns to the same verified id after the monitor disconnects and reconnects",
+      "interaction": "automated",
+      "startup_mode": "windowed",
+      "cycles": 1
+    }
+  ]
+}

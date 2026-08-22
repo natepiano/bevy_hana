@@ -1,0 +1,13 @@
+error[E0407]: method `scan` is not a member of trait `DeviceReporter`
+ --> tests/compile_fail/device_reporter_scan_is_unavailable.rs:8:5
+  |
+8 |     fn scan(&mut self, _: &mut World) -> DeviceScan { DeviceScan::Complete(Vec::new()) }
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not a member of trait `DeviceReporter`
+
+error[E0046]: not all trait items implemented, missing: `discover`
+ --> tests/compile_fail/device_reporter_scan_is_unavailable.rs:7:1
+  |
+7 | impl DeviceReporter for Reporter {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `discover` in implementation
+  |
+  = help: implement the missing item: `fn discover(&mut self) -> DiscoveryWork { todo!() }`

@@ -1,0 +1,16 @@
+(
+    version: 3,
+    entries: [
+        (
+            key: Primary,
+            state: (
+                position: MonitorOffset((50, 50)),
+                logical_width: 400,
+                logical_height: 300,
+                monitor_index: 0,
+                mode: Windowed,
+                app_name: "restore_window",
+            )
+        ),
+    ],
+)

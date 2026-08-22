@@ -1,0 +1,33 @@
+{
+  "name": "macOS Dell monitor power",
+  "target_matcher": "DELL S3425DW",
+  "inventory_name_field": "_name",
+  "probe_monitor_matcher": {
+    "physical_size": [3440, 1440],
+    "refresh_rate_millihertz": 120000
+  },
+  "minimum_off_seconds": 1,
+  "minimum_on_seconds": 5,
+  "power_off": {
+    "executable": "/usr/bin/shortcuts",
+    "arguments": ["run", "dell monitor off"],
+    "timeout_seconds": 10,
+    "inherit_environment": ["HOME", "PATH", "TMPDIR", "USER"],
+    "accepted_exit_codes": [0]
+  },
+  "power_on": {
+    "executable": "/usr/bin/shortcuts",
+    "arguments": ["run", "dell monitor on"],
+    "timeout_seconds": 15,
+    "inherit_environment": ["HOME", "PATH", "TMPDIR", "USER"],
+    "accepted_exit_codes": [0]
+  },
+  "inventory": {
+    "executable": "/usr/sbin/system_profiler",
+    "arguments": ["SPDisplaysDataType", "-json"],
+    "timeout_seconds": 30,
+    "inherit_environment": ["HOME", "PATH", "TMPDIR", "USER"],
+    "accepted_exit_codes": [0],
+    "output_limit_bytes": 4000000
+  }
+}

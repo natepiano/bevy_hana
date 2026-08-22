@@ -1,0 +1,11 @@
+error[E0308]: mismatched types
+ --> tests/compile_fail/discovery_job_requires_owned_device_scan.rs:6:40
+  |
+6 |     let _ = DiscoveryJob::new(move |_| &device_scan);
+  |                                        ^^^^^^^^^^^^ expected `DeviceScan`, found `&DeviceScan`
+  |
+help: consider removing the borrow
+  |
+6 -     let _ = DiscoveryJob::new(move |_| &device_scan);
+6 +     let _ = DiscoveryJob::new(move |_| device_scan);
+  |

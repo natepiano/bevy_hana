@@ -1,0 +1,37 @@
+[package]
+authors.workspace = true
+categories        = ["config", "game-development"]
+description       = "JSONC keymap loading, command registration, diagnostics, and reload support for Bevy."
+edition.workspace = true
+homepage          = "https://github.com/natepiano/bevy_hana/tree/main/crates/hana_rubric"
+keywords          = ["bevy", "input", "keymap"]
+license.workspace = true
+name              = "hana_rubric"
+readme            = "README.md"
+repository        = "https://github.com/natepiano/bevy_hana"
+version           = "0.1.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+bevy = { workspace = true, features = [
+  "bevy_log",
+  "bevy_state",
+  "keyboard",
+  "std",
+] }
+bevy_enhanced_input.workspace = true
+bitflags.workspace = true
+dirs.workspace = true
+notify.workspace = true
+serde.workspace = true
+serde_json_lenient.workspace = true
+strum.workspace = true
+
+[dev-dependencies]
+jsonschema.workspace = true
+serde_json.workspace = true
+
+[[example]]
+name = "keymap_demo"

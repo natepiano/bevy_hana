@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+  --> tests/trybuild/fail/widget_state_appearance_forged_scope.rs:13:9
+   |
+12 |     <LayoutBuilder as AcceptsElement<WidgetElement<Button>>>::with_child_builder(
+   |     ---------------------------------------------------------------------------- arguments to this function are incorrect
+13 |         &mut panel,
+   |         ^^^^^^^^^^ expected `ChildScope<'_>`, found `&mut LayoutBuilder`
+   |
+note: associated function defined here
+  --> src/layout/builder.rs
+   |
+   |     fn with_child_builder<'a>(
+   |        ^^^^^^^^^^^^^^^^^^

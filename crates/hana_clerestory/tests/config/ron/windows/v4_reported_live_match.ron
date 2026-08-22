@@ -1,0 +1,16 @@
+(
+    version: 4,
+    entries: [
+        (
+            key: Primary,
+            state: (
+                position: MonitorOffset((48, 32)),
+                logical_width: 1_280,
+                logical_height: 720,
+                monitor_panel: Fingerprinted((6_343_271)),
+                mode: Windowed,
+                app_name: "phase-19-v4-reported",
+            ),
+        ),
+    ],
+)

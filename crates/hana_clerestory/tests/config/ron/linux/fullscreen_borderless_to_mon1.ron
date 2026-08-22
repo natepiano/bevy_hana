@@ -1,0 +1,17 @@
+(
+    version: 3,
+    entries: [
+        (
+            key: Primary,
+            state: (
+                // BorderlessFullscreen targeting Monitor 1 (HDMI, scale 1)
+                position: MonitorOffset((0, 0)),
+                logical_width: ${MONITOR_1_WIDTH},
+                logical_height: ${MONITOR_1_HEIGHT},
+                monitor_index: 1,
+                mode: BorderlessFullscreen,
+                app_name: "restore_window",
+            )
+        ),
+    ],
+)

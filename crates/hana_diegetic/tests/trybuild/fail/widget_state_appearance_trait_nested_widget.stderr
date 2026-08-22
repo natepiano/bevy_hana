@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/trybuild/fail/widget_state_appearance_trait_nested_widget.rs:12:22
+   |
+12 |         builder.with(El::new().button("inner"), |_| {});
+   |                 ---- ^^^^^^^^^^^^^^^^^^^^^^^^^ expected `El<_>`, found `El<Row, WidgetElement<Button>>`
+   |                 |
+   |                 arguments to this method are incorrect
+   |
+   = note: expected struct `El<_, LayoutOnly>`
+              found struct `El<Row, WidgetElement<Button>>`
+note: method defined here
+  --> src/layout/builder.rs
+   |
+   |     fn with<L, Role>(
+   |        ^^^^

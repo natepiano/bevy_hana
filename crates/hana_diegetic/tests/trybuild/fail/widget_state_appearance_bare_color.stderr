@@ -1,0 +1,21 @@
+error[E0277]: a bare `Color` does not say which property it sets
+ --> tests/trybuild/fail/widget_state_appearance_bare_color.rs:7:54
+  |
+7 |     let _button = El::new().button("button").hovered(RED);
+  |                                              ------- ^^^ wrap it: `BackgroundColor(Color)`, `TextColor(Color)`, `BorderColor(Color)`, `PathColor(Color)`, or `Tint(Color)`
+  |                                              |
+  |                                              required by a bound introduced by this call
+  |
+  = help: the trait `IntoAppearance` is not implemented for `Color`
+  = help: the following other types implement trait `IntoAppearance`:
+            Appearance
+            PathColor
+            Tint
+            hana_diegetic::BackgroundColor
+            hana_diegetic::BorderColor
+            hana_diegetic::TextColor
+note: required by a bound in `El::<L, WidgetElement<W>>::hovered`
+ --> src/layout/builder.rs
+  |
+  |     pub fn hovered(mut self, appearance: impl IntoAppearance) -> Self {
+  |                                               ^^^^^^^^^^^^^^ required by this bound in `El::<L, WidgetElement<W>>::hovered`

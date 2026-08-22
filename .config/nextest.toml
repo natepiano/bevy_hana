@@ -1,0 +1,14 @@
+# Nextest configuration for the hana workspace
+
+# The default profile skips the downstream compile-fail tests in
+# tool_id_boundary: each one shells out to a real `cargo check` against the
+# workspace target directory, so locally they serialize behind whatever else is
+# building and routinely take minutes. CI runs them via `--profile ci`. To run
+# them locally on demand:
+#   cargo nextest run --ignore-default-filter -E 'binary(tool_id_boundary)'
+
+[profile.default]
+default-filter = "not (binary(tool_id_boundary) and test(/^downstream_/))"
+
+[profile.ci]
+default-filter = "all()"

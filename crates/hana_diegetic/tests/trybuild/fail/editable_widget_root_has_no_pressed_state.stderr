@@ -1,0 +1,18 @@
+error[E0599]: the method `pressed` exists for struct `El<hana_diegetic::Row, WidgetElement<EditableField>>`, but its trait bounds were not satisfied
+  --> tests/trybuild/fail/editable_widget_root_has_no_pressed_state.rs:11:10
+   |
+ 9 |       let _field = El::new()
+   |  __________________-
+10 | |         .editable_field("editable", field)
+11 | |         .pressed(Appearance::new().background(Color::BLACK));
+   | |         -^^^^^^^ method cannot be called due to unsatisfied trait bounds
+   | |_________|
+   |
+   |
+  ::: src/layout/builder.rs
+   |
+   |   pub struct EditableField(());
+   |   ------------------------ doesn't satisfy `EditableField: Pressable`
+   |
+   = note: the following trait bounds were not satisfied:
+           `EditableField: Pressable`

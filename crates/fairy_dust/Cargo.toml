@@ -1,0 +1,53 @@
+[package]
+authors.workspace    = true
+categories           = ["development-tools", "game-development"]
+description          = "Workspace example helper — quiet logs and opt-in dev capabilities for bevy_hana examples"
+edition.workspace    = true
+keywords             = ["bevy", "dev", "examples"]
+license.workspace    = true
+name                 = "fairy_dust"
+publish              = false
+readme               = "README.md"
+repository.workspace = true
+version.workspace    = true
+
+[lints]
+workspace = true
+
+[[example]]
+name = "keymap_contexts"
+path = "examples/keymap_contexts.rs"
+test = true
+
+[dependencies]
+bevy = { workspace = true, features = [
+  "bevy_anti_alias",
+  "bevy_asset",
+  "bevy_core_pipeline",
+  "bevy_gizmos",
+  "bevy_image",
+  "bevy_log",
+  "bevy_pbr",
+  "bevy_picking",
+  "bevy_post_process",
+  "bevy_render",
+  "bevy_winit",
+  "default_font",
+  "ktx2",
+  "mesh_picking",
+  "multi_threaded",
+  "smaa_luts",
+  "tonemapping_luts",
+  "zstd_rust",
+] }
+bevy_brp_extras = { workspace = true }
+bevy_enhanced_input = { workspace = true }
+hana_clerestory = { workspace = true }
+hana_diegetic = { path = "../hana_diegetic" }
+hana_lagrange = { workspace = true }
+hana_rubric = { workspace = true }
+hana_valence = { workspace = true }
+
+[dev-dependencies]
+strum.workspace    = true
+trybuild.workspace = true

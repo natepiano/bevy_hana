@@ -1,0 +1,65 @@
+// One document governs every keymap layer in `keymap_contexts`.
+//
+// `context` is a conjunction over the named application-owned dimensions. The
+// protected Cmd/Ctrl+P palette recovery chord is intentionally absent: Fairy
+// Dust opens it directly through `KeymapPlugin::with_protected_command_binding`.
+{
+  "bindings": [
+    {
+      "bindings": {
+        "g": "example::show_global_route",
+        "t": "example::show_tombstoned_route",
+        "ctrl-shift-r": "fairy_dust::restart",
+        "ctrl-shift-l": "fairy_dust::toggle_screen_space_panels",
+        "ctrl-shift-a": "fairy_dust::toggle_home_aabb_gizmo",
+        "shift-slash": "fairy_dust::show_help",
+        "alt-i": "fairy_dust::toggle_free_cam_look_pitch",
+        "shift-c": "fairy_dust::cycle_camera_preset"
+      }
+    },
+    {
+      "context": { "application": "main_menu" },
+      "bindings": {
+        "a": "example::show_main_menu_route"
+      }
+    },
+    {
+      "context": { "application": "running" },
+      "bindings": {
+        "a": "example::show_running_route"
+      }
+    },
+    {
+      "context": { "interaction": "resting" },
+      "bindings": {
+        "i": "example::show_resting_route"
+      }
+    },
+    {
+      "context": { "interaction": "dimension_lock" },
+      "bindings": {
+        "i": "example::show_dimension_lock_route"
+      }
+    },
+    {
+      "context": {
+        "application": "running",
+        "interaction": "dimension_lock"
+      },
+      "bindings": {
+        "c": "example::show_combined_route",
+        "o": "example::show_combined_route_before_override",
+        "t": null
+      }
+    },
+    {
+      "context": {
+        "application": "running",
+        "interaction": "dimension_lock"
+      },
+      "bindings": {
+        "o": "example::show_combined_route_after_override"
+      }
+    }
+  ]
+}

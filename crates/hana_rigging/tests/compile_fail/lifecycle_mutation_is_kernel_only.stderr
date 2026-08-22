@@ -1,0 +1,19 @@
+error[E0624]: method `record_capture` is private
+ --> tests/compile_fail/lifecycle_mutation_is_kernel_only.rs:4:16
+  |
+4 |       ready_role.record_capture(unsafe { std::mem::MaybeUninit::uninit().assume_init() });
+  |                  ^^^^^^^^^^^^^^ private method
+  |
+ ::: src/binding.rs
+  |
+  | /     pub(crate) fn record_capture(
+  | |         &mut self,
+  | |         capture_outcome: CaptureOutcome<LastKnownGoodConfiguration>,
+  | |     ) {
+  | |_____- private method defined here
+
+error[E0599]: no method named `start_requested_apply` found for struct `ReadyRole<'a>` in the current scope
+ --> tests/compile_fail/lifecycle_mutation_is_kernel_only.rs:8:24
+  |
+8 |     let _ = ready_role.start_requested_apply(
+  |             -----------^^^^^^^^^^^^^^^^^^^^^ method not found in `ReadyRole<'_>`

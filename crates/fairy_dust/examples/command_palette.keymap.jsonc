@@ -1,0 +1,38 @@
+// Keymap document owned by the `command_palette` example.
+//
+// It replaces Fairy Dust's shipped document outright, so it binds every `fairy_dust::`
+// command as well as the two `example::` commands the example declares with `command!`.
+// Secondary+P is reserved by Fairy Dust's direct recovery path and therefore is not authored
+// here. Dropping a `fairy_dust::` line here would not fail the load —
+// it would silently kill that hotkey for this example.
+//
+// `example::home` takes `secondary-shift-h` rather than `secondary-h`, because on macOS
+// `secondary` is Cmd and Cmd+H is the system chord that hides the application — the
+// example would never see it.
+//
+// The second block deliberately misspells `context` as `contxt`. That is an authoring
+// mistake the keymap reports as an advisory rather than a failure, so the example opens
+// with one advisory row above its query field and still runs every binding — which is
+// what the palette's failure rows are there to show.
+{
+  "bindings": [
+    {
+      "bindings": {
+        "secondary-shift-h": "example::home",
+        "secondary-k": "example::swap_camera",
+        "ctrl-shift-r": "fairy_dust::restart",
+        "ctrl-shift-l": "fairy_dust::toggle_screen_space_panels",
+        "ctrl-shift-a": "fairy_dust::toggle_home_aabb_gizmo",
+        "shift-slash": "fairy_dust::show_help",
+        "alt-i": "fairy_dust::toggle_free_cam_look_pitch",
+        "shift-c": "fairy_dust::cycle_camera_preset"
+      }
+    },
+    {
+      "contxt": "global",
+      "bindings": {
+        "secondary-shift-k": "example::swap_camera"
+      }
+    }
+  ]
+}

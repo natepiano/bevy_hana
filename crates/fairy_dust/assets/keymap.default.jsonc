@@ -1,0 +1,30 @@
+// Fairy Dust's shipped default keymap.
+//
+// Every Fairy Dust app installs this document, whether or not it opens the command
+// palette, because these bindings are how Fairy Dust's own capabilities are reached.
+// A command listed here that no linked crate declares would be rejected — and the
+// keymap is rejected whole — so this file names exactly the ids `fairy_dust` declares
+// with `command!`.
+//
+// `secondary-` resolves per platform: Cmd on macOS, Ctrl everywhere else. Fairy Dust reserves
+// Secondary+P outside keymap routing for palette recovery, so this authored document deliberately
+// leaves it unbound. The bare keys Fairy Dust reserves (H home, P cube spin or fold play) are also
+// left alone, so nothing here shadows an example's own shortcut.
+//
+// An application that declares its own commands supplies its own document with
+// `with_command_palette_keymap`, which replaces this one — so that document repeats these
+// bindings alongside its own ids, or those capabilities go dark.
+{
+  "bindings": [
+    {
+      "bindings": {
+        "ctrl-shift-r": "fairy_dust::restart",
+        "ctrl-shift-l": "fairy_dust::toggle_screen_space_panels",
+        "ctrl-shift-a": "fairy_dust::toggle_home_aabb_gizmo",
+        "shift-slash": "fairy_dust::show_help",
+        "alt-i": "fairy_dust::toggle_free_cam_look_pitch",
+        "shift-c": "fairy_dust::cycle_camera_preset"
+      }
+    }
+  ]
+}

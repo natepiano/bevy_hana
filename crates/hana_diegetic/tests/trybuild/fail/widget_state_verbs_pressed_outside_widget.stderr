@@ -1,0 +1,16 @@
+error[E0599]: no method named `pressed` found for struct `El` in the current scope
+ --> tests/trybuild/fail/widget_state_verbs_pressed_outside_widget.rs:8:10
+  |
+6 |       let _ = El::new()
+  |  _____________-
+7 | |         .background(Color::WHITE)
+8 | |         .pressed(Appearance::new().background(Color::BLACK));
+  | |         -^^^^^^^ method not found in `El`
+  | |_________|
+  |
+  |
+  = note: the method was found for
+          - `El<L, PressedPart>`
+          - `El<L, WidgetChild>`
+          - `El<L, WidgetElement<W>>`
+          - `El<L, WidgetPart>`

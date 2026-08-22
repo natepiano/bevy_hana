@@ -1,0 +1,9 @@
+error[E0599]: no method named `text_color` found for struct `EditorStateColors` in the current scope
+  --> tests/trybuild/fail/editable_widget_editor_part_has_no_property.rs:12:14
+   |
+10 | /         EditorStateColors::new()
+11 | |             .focused(Color::BLACK)
+12 | |             .text_color(Color::WHITE),
+   | |             -^^^^^^^^^^ method not found in `EditorStateColors`
+   | |_____________|
+   |

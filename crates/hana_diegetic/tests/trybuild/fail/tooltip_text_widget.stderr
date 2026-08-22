@@ -1,0 +1,30 @@
+error[E0277]: the trait bound `hana_diegetic::Text: From<hana_diegetic::Text<WidgetElement<Button>>>` is not satisfied
+  --> tests/trybuild/fail/tooltip_text_widget.rs:10:18
+   |
+10 |     tooltip.text(widget_text);
+   |             ---- ^^^^^^^^^^^ the trait `From<hana_diegetic::Text<WidgetElement<Button>>>` is not implemented for `hana_diegetic::Text`
+   |             |
+   |             required by a bound introduced by this call
+   |
+help: `hana_diegetic::Text` implements trait `From<T>`
+  --> src/layout/builder.rs
+   |
+   |   impl From<&str> for Text {
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^ `From<&str>`
+...
+   |   impl From<&String> for Text {
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^ `From<&String>`
+...
+   |   impl From<String> for Text {
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^ `From<String>`
+...
+   | / impl<T> From<(T, TextStyle)> for Text
+   | | where
+   | |     T: Into<String>,
+   | |____________________^ `From<(T, TextStyle)>`
+   = note: required for `hana_diegetic::Text<WidgetElement<Button>>` to implement `Into<hana_diegetic::Text>`
+note: required by a bound in `Tooltip::text`
+  --> src/widgets/tooltip.rs
+   |
+   |     pub fn text(&mut self, text: impl Into<Text<LayoutOnly>>) -> &mut Self {
+   |                                       ^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `Tooltip::text`

@@ -1,0 +1,12 @@
+error[E0599]: no method named `with_asset_root` found for struct `SprinkleBuilder<NoOrbitCam>` in the current scope
+ --> tests/trybuild/fail/asset_root_after_capability.rs:4:10
+  |
+2 |       let builder = fairy_dust::sprinkle_example()
+  |  ___________________-
+3 | |         .with_brp_extras()
+4 | |         .with_asset_root("assets");
+  | |         -^^^^^^^^^^^^^^^ method not found in `SprinkleBuilder<NoOrbitCam>`
+  | |_________|
+  |
+  |
+  = note: the method was found for `SprinkleBuilder<S, AssetRootPending>`

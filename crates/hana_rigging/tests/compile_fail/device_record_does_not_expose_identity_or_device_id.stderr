@@ -1,0 +1,23 @@
+error[E0609]: no field `identity` on type `DeviceRecord`
+ --> tests/compile_fail/device_record_does_not_expose_identity_or_device_id.rs:5:27
+  |
+5 |     let _ = device_record.identity;
+  |                           ^^^^^^^^ unknown field
+  |
+  = note: available fields are: `reported_as`, `parent`, `presence`, `claim`, `capabilities` ... and 4 others
+
+error[E0609]: no field `device_id` on type `DeviceRecord`
+ --> tests/compile_fail/device_record_does_not_expose_identity_or_device_id.rs:6:27
+  |
+6 |     let _ = device_record.device_id;
+  |                           ^^^^^^^^^ unknown field
+  |
+  = note: available fields are: `reported_as`, `parent`, `presence`, `claim`, `capabilities` ... and 4 others
+
+error[E0609]: no field `key` on type `DeviceRecord`
+ --> tests/compile_fail/device_record_does_not_expose_identity_or_device_id.rs:7:27
+  |
+7 |     let _ = device_record.key;
+  |                           ^^^ unknown field
+  |
+  = note: available fields are: `reported_as`, `parent`, `presence`, `claim`, `capabilities` ... and 4 others

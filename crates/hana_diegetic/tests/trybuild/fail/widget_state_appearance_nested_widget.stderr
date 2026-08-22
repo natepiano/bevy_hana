@@ -1,0 +1,32 @@
+error[E0277]: `WidgetBuilder<'_, Button>` cannot accept `WidgetElement<Button>`
+ --> tests/trybuild/fail/widget_state_appearance_nested_widget.rs:7:22
+  |
+7 |         builder.with(El::new().button("inner"), |_| {});
+  |                 ---- ^^^^^^^^^^^^^^^^^^^^^^^^^ this element is not allowed in the current builder scope
+  |                 |
+  |                 required by a bound introduced by this call
+  |
+  = help: the trait `AcceptsElement<WidgetElement<Button>>` is not implemented for `WidgetBuilder<'_, Button>`
+  = note: put state appearance parts (`hovered` / `focused` / `disabled` / `pressed`) inside a widget closure; a widget closure accepts parts and layout content, but not another widget
+help: `WidgetBuilder<'_, W>` implements trait `AcceptsElement<Role>`
+ --> src/layout/builder.rs
+  |
+  | impl<W: WidgetOwner> AcceptsElement<LayoutOnly> for WidgetBuilder<'_, W> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `AcceptsElement<LayoutOnly>`
+...
+  | impl<W: WidgetOwner> AcceptsElement<WidgetChild> for WidgetBuilder<'_, W> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `AcceptsElement<WidgetChild>`
+...
+  | impl<W: WidgetOwner> AcceptsElement<WidgetPart> for WidgetBuilder<'_, W> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `AcceptsElement<WidgetPart>`
+...
+  | impl<W: Pressable> AcceptsElement<PressedPart> for WidgetBuilder<'_, W> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `AcceptsElement<PressedPart>`
+note: required by a bound in `WidgetBuilder::<'_, W>::with`
+ --> src/layout/builder.rs
+  |
+  |     pub fn with<L, Role>(
+  |            ---- required by a bound in this associated function
+...
+  |         Self: AcceptsElement<Role>,
+  |               ^^^^^^^^^^^^^^^^^^^^ required by this bound in `WidgetBuilder::<'_, W>::with`

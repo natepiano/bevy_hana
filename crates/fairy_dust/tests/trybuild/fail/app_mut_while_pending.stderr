@@ -1,0 +1,7 @@
+error[E0599]: no method named `app_mut` found for struct `SprinkleBuilder<NoOrbitCam, AssetRootPending>` in the current scope
+ --> tests/trybuild/fail/app_mut_while_pending.rs:2:46
+  |
+2 |     let app = fairy_dust::sprinkle_example().app_mut();
+  |                                              ^^^^^^^ method not found in `SprinkleBuilder<NoOrbitCam, AssetRootPending>`
+  |
+  = note: the method was found for `SprinkleBuilder<S>`

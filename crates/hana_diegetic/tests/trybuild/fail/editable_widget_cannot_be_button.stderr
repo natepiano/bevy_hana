@@ -1,0 +1,12 @@
+error[E0599]: no method named `button` found for struct `El<Row, WidgetElement<EditableField>>` in the current scope
+ --> tests/trybuild/fail/editable_widget_cannot_be_button.rs:9:10
+  |
+7 |       let _ = El::new()
+  |  _____________-
+8 | |         .editable_field("editable", field)
+9 | |         .button("button");
+  | |         -^^^^^^ method not found in `El<Row, WidgetElement<EditableField>>`
+  | |_________|
+  |
+  |
+  = note: the method was found for `El<L>`

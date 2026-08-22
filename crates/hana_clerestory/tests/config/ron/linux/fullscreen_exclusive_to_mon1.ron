@@ -1,0 +1,23 @@
+(
+    version: 3,
+    entries: [
+        (
+            key: Primary,
+            state: (
+                // Fullscreen (exclusive) targeting Monitor 1 (HDMI, scale 1)
+                position: MonitorOffset((0, 0)),
+                logical_width: ${MONITOR_1_VIDEO_MODE_LOGICAL_WIDTH},
+                logical_height: ${MONITOR_1_VIDEO_MODE_LOGICAL_HEIGHT},
+                monitor_index: 1,
+                mode: Fullscreen(
+                    video_mode: Some((
+                        physical_size: (${MONITOR_1_VIDEO_MODE_WIDTH}, ${MONITOR_1_VIDEO_MODE_HEIGHT}),
+                        bit_depth: ${MONITOR_1_VIDEO_MODE_DEPTH},
+                        refresh_rate_millihertz: ${MONITOR_1_VIDEO_MODE_REFRESH},
+                    )),
+                ),
+                app_name: "restore_window",
+            )
+        ),
+    ],
+)

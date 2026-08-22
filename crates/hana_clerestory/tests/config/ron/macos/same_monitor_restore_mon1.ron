@@ -1,0 +1,21 @@
+(
+    version: 2,
+    entries: [
+        // Retained on v2 deliberately: the only hardware coverage of the v1/v2
+        // migration path. The declared monitor_scale must match the live one, or the
+        // file is not something the app could have written and the rebase is testing
+        // a fiction. LOGICAL_POS is the monitor origin at that same scale.
+        (
+            key: Primary,
+            state: (
+                logical_position: Some((${MONITOR_1_LOGICAL_POS_X+200}, ${MONITOR_1_LOGICAL_POS_Y+100})),
+                logical_width: 900,
+                logical_height: 500,
+                monitor_scale: ${MONITOR_1_SCALE},
+                monitor_index: 1,
+                mode: Windowed,
+                app_name: "restore_window",
+            )
+        ),
+    ],
+)

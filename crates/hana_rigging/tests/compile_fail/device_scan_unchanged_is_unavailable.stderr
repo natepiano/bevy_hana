@@ -1,0 +1,5 @@
+error[E0599]: no variant, associated function, or constant named `Unchanged` found for enum `DeviceScan` in the current scope
+ --> tests/compile_fail/device_scan_unchanged_is_unavailable.rs:4:25
+  |
+4 |     let _ = DeviceScan::Unchanged;
+  |                         ^^^^^^^^^ variant, associated function, or constant not found in `DeviceScan`

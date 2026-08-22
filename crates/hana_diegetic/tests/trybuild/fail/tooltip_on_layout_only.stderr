@@ -1,0 +1,7 @@
+error[E0599]: no method named `tooltip` found for struct `El` in the current scope
+ --> tests/trybuild/fail/tooltip_on_layout_only.rs:6:23
+  |
+6 |     let _ = El::new().tooltip(tooltip);
+  |                       ^^^^^^^ method not found in `El`
+  |
+  = note: the method was found for `El<L, WidgetElement<W>>`

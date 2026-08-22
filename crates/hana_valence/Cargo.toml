@@ -1,0 +1,43 @@
+[package]
+authors.workspace    = true
+categories           = ["game-development"]
+description          = "hana_valence provides the bonds that create interesting patterns"
+edition.workspace    = true
+homepage             = "https://github.com/natepiano/hana/tree/main/crates/hana_valence"
+keywords             = ["bevy", "gamedev"]
+license.workspace    = true
+name                 = "hana_valence"
+publish              = false
+readme               = "README.md"
+repository.workspace = true
+version              = "0.1.0"
+
+[lints]
+workspace = true
+
+[features]
+tween = ["dep:bevy_tween"]
+
+[dependencies]
+bevy_app       = { workspace = true }
+bevy_asset     = { workspace = true }
+bevy_ecs       = { workspace = true }
+bevy_kana      = { workspace = true }
+bevy_math      = { workspace = true, features = ["curve"] }
+bevy_platform  = { workspace = true }
+bevy_reflect   = { workspace = true }
+bevy_scene     = { workspace = true }
+bevy_time      = { workspace = true }
+bevy_transform = { workspace = true, features = ["bevy-support"] }
+bevy_tween     = { workspace = true, optional = true }
+thiserror      = { workspace = true }
+tracing        = { workspace = true }
+
+[dev-dependencies]
+bevy                = { workspace = true, features = ["default"] }
+bevy_enhanced_input = { workspace = true }
+fairy_dust          = { workspace = true }
+hana_diegetic       = { workspace = true }
+hana_lagrange       = { workspace = true }
+hana_rubric         = { workspace = true }
+static_assertions   = { workspace = true }

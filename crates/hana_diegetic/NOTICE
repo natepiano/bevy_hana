@@ -1,0 +1,12 @@
+NOTICE
+
+This project's layout algorithm is inspired by Clay, a high-performance
+2D UI layout library written in C.
+
+  Clay — Copyright (c) 2024 Nic Barker
+  https://github.com/nicbarker/clay
+  Licensed under zlib/libpng
+
+hana_diegetic is a clean-room reimplementation in Rust, not a fork or
+derivative of Clay's source code. This acknowledgment is provided
+voluntarily to credit the original work that inspired this project.

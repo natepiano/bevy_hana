@@ -1,0 +1,9 @@
+error[E0599]: no method named `child_divider` found for struct `El<Overlay>` in the current scope
+ --> tests/trybuild/fail/overlay_child_divider.rs:7:27
+  |
+7 |     let _ = El::overlay().child_divider(ChildDivider::new(In(0.01), Color::WHITE));
+  |                           ^^^^^^^^^^^^^ method not found in `El<Overlay>`
+  |
+  = note: the method was found for
+          - `El<hana_diegetic::Column, Role>`
+          - `El<hana_diegetic::Row, Role>`

@@ -1,0 +1,21 @@
+(
+    version: 3,
+    entries: [
+        (
+            key: Primary,
+            state: (
+                // Saved on the low-DPI monitor, launched from the high-DPI monitor.
+                // Target monitor is chosen by scale ROLE, so it may be any index.
+                // Tests CompensateSizeOnly / HigherToLower strategy.
+                position: MonitorOffset((0, 0)),
+                // Fits the low-DPI VDD (800x600 physical at scale 1) so WARP never has to build a
+                // swapchain larger than the monitor during the cross-DPI move.
+                logical_width: 600,
+                logical_height: 400,
+                monitor_index: ${LOW_SCALE_MONITOR_INDEX},
+                mode: Windowed,
+                app_name: "restore_window",
+            )
+        ),
+    ],
+)

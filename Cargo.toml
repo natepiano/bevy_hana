@@ -1,0 +1,188 @@
+[workspace]
+exclude  = ["crates/.claude", "vendor/clay-layout"]
+members  = [
+  "crates/bevy_kana",
+  "crates/fairy_dust",
+  "crates/hana_clerestory",
+  "crates/hana_diegetic",
+  "crates/hana_lagrange",
+  "crates/hana_liminal",
+  "crates/hana_rigging",
+  "crates/hana_rigging_scripted",
+  "crates/hana_rubric",
+  "crates/hana_valence",
+]
+resolver = "3"
+
+[workspace.package]
+authors    = ["natepiano"]
+categories = ["game-engines", "graphics", "visualization"]
+edition    = "2024"
+keywords   = ["bevy", "dcc", "visualization"]
+license    = "MIT OR Apache-2.0"
+readme     = "README.md"
+repository = "https://github.com/natepiano/bevy_hana"
+version    = "0.1.0"
+
+[workspace.dependencies]
+#
+# Workspace member crates
+#
+bevy_kana             = { path = "crates/bevy_kana" }
+fairy_dust            = { path = "crates/fairy_dust" }
+hana_clerestory       = { path = "crates/hana_clerestory" }
+hana_diegetic         = { path = "crates/hana_diegetic" }
+hana_lagrange         = { path = "crates/hana_lagrange", features = ["fit_overlay"] }
+hana_liminal          = { path = "crates/hana_liminal" }
+hana_rigging          = { version = "0.1", path = "crates/hana_rigging" }
+hana_rigging_scripted = { path = "crates/hana_rigging_scripted" }
+hana_rubric           = { path = "crates/hana_rubric" }
+hana_valence          = { path = "crates/hana_valence", default-features = false }
+
+#
+# External dependencies
+#
+anyhow = "1.0.104"
+bevy = { version = "0.19.1", default-features = false, features = [
+  "3d",
+  "bevy_dev_tools",
+  "bevy_remote",
+  "bevy_ui_render",
+  "default_font",
+  "gif",
+  "jpeg",
+  "png",
+  "reflect_auto_register",
+  "serialize",
+  "track_location",
+  "webp",
+] }
+bevy-inspector-egui = "0.37.0"
+bevy_app = { version = "0.19.1", features = ["reflect_auto_register", "std"] }
+bevy_asset = "0.19.1"
+bevy_camera = "0.19.1"
+bevy_color = { version = "0.19.1", features = ["bevy_reflect"] }
+bevy_diagnostic = "0.19.1"
+bevy_ecs = { version = "0.19.1", features = [
+  "bevy_reflect",
+  "reflect_auto_register",
+  "std",
+] }
+bevy_enhanced_input = { version = "0.26.0", features = ["reflect"] }
+bevy_log = "0.19.1"
+bevy_lookup_curve = { version = "0.12.0", default-features = false, features = [
+  "bevy_asset",
+  "bevy_reflect",
+] }
+bevy_math = { version = "0.19.1", features = ["bevy_reflect", "std"] }
+bevy_platform = { version = "0.19.1", default-features = false, features = [
+  "std",
+] }
+bevy_reflect = { version = "0.19.1", features = ["glam"] }
+bevy_remote = "0.19.1"
+bevy_render = "0.19.1"
+bevy_scene = "0.19.1"
+bevy_time = { version = "0.19.1", default-features = false, features = ["std"] }
+bevy_transform = { version = "0.19.1", features = ["std"] }
+bevy_tween = { version = "0.13.0", default-features = false }
+bitflags = "2"
+bytemuck = "1"
+clap = { version = "4.6.6", features = ["derive"] }
+dirs = "6.0.0"
+flume = "0.11"
+getrandom = { version = "0.4.3", features = ["wasm_js"] }
+glam = { version = "0.33.5", features = ["serde"] }
+image = { version = "0.25", default-features = false }
+moonshine-save = "0.7.0"
+nokhwa = { version = "0.10.11", default-features = false, features = [
+  "input-native",
+  "output-threaded",
+] }
+nokhwa-bindings-macos = "0.2.4"
+nonmax = "0.5"
+notify = "8"
+objc2-av-foundation = { version = "0.3.2", default-features = false, features = [
+  "AVCaptureDevice",
+  "objc2-core-media",
+] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
+  "CFUUID",
+  "std",
+] }
+objc2-core-media = { version = "0.3.2", default-features = false, features = [
+  "CMFormatDescription",
+  "CMTime",
+  "objc2",
+] }
+parley = { version = "0.9.0", default-features = false, features = ["std"] }
+proc-macro2 = "1.0.107"
+quote = "1.0.47"
+rand = "0.10.2"
+ron = "0.12.2"
+schemars = "1.2.2"
+screencapturekit = "8.0.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json_lenient = "0.2"
+smallvec = "1"
+strum = { version = "0.28.0", features = ["derive"] }
+syn = { version = "3.0.3", features = ["full"] }
+thiserror = "2.0.20"
+toml = "1.1.4"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+ttf-parser = "0.25"
+ureq = "3.4"
+# Pinned to the exact winit that bevy 0.19 resolves so `MonitorHandle` unifies to
+# one crate instance; used only for per-platform native monitor ids.
+winit = { version = "0.30.13", default-features = false, features = [
+  "wayland",
+  "x11",
+] }
+xcap = "0.9.8"
+
+# dev-dependencies
+bevy_brp_extras   = "0.22.3"
+clay-layout       = { path = "vendor/clay-layout" }
+criterion         = { version = "0.8.2", features = ["html_reports"] }
+float-cmp         = "0.10.0"
+jsonschema        = { version = "0.50.1", default-features = false }
+serde_json        = "1.0.151"
+static_assertions = "1.1.0"
+tempfile          = "3.27.0"
+trybuild          = "1"
+
+[workspace.lints.clippy]
+# Our strict lints
+allow_attributes_without_reason = "deny"
+expect_used                     = "deny"
+panic                           = "deny"
+self_named_module_files         = "deny" # use module/mod.rs (directory form) when a module has submodules
+unreachable                     = "deny"
+unwrap_used                     = "deny"
+
+# Enable lint groups as errors (with lower priority so allows can override)
+all      = { level = "deny", priority = -1 }
+cargo    = { level = "deny", priority = -1 }
+nursery  = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+
+# Universal allows
+multiple_crate_versions = "allow"
+redundant_feature_names = "allow" # `bench_support` names a private benchmark support surface.
+redundant_pub_crate     = "allow" # cargo mend is the visibility authority, not clippy
+
+# Allow specific lints that conflict with Bevy patterns
+needless_pass_by_value = "allow" # Bevy systems require owned params
+option_if_let_else     = "allow" # False positives with Bevy reflect macros
+too_many_arguments     = "allow" # Bevy systems often require many params
+type_complexity        = "allow" # Bevy query types are inherently complex
+wildcard_imports       = "allow" # Bevy prelude convention
+
+[workspace.lints.rust]
+missing_docs = "deny"
+
+[profile.release]
+debug = true
+
+# Optimize dependencies even in dev builds; keeps own-crate incremental compiles fast.
+[profile.dev.package."*"]
+opt-level = 3

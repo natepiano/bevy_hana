@@ -1,0 +1,16 @@
+(
+    version: 4,
+    entries: [
+        (
+            key: Primary,
+            state: (
+                position: Unpositioned,
+                logical_width: 1_024,
+                logical_height: 640,
+                monitor_panel: Anonymous,
+                mode: Fullscreen(video_mode: None),
+                app_name: "phase-19-v4-anonymous",
+            ),
+        ),
+    ],
+)

@@ -1,0 +1,19 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+ --> tests/compile_fail/apply_permit_cannot_be_constructed.rs:4:13
+  |
+4 |     let _ = ApplyPermit(());
+  |             ^^^^^^^^^^^
+  |
+note: constructor is not visible here due to private fields
+ --> src/registration.rs
+  |
+  | pub struct ApplyPermit(Purpose);
+  |                        ^^^^^^^ private field
+help: you might have meant to use an associated function to build this type
+  |
+4 -     let _ = ApplyPermit(());
+4 +     let _ = ApplyPermit::in_service();
+  |
+4 -     let _ = ApplyPermit(());
+4 +     let _ = ApplyPermit::restore_only();
+  |

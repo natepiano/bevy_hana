@@ -1,0 +1,10 @@
+error[E0533]: expected value, found struct variant `Presence::Unreachable`
+ --> tests/compile_fail/presence_unreachable_requires_since.rs:4:13
+  |
+4 |     let _ = Presence::Unreachable;
+  |             ^^^^^^^^^^^^^^^^^^^^^ not a value
+  |
+help: you might have meant to create a new value of the struct
+  |
+4 |     let _ = Presence::Unreachable { since: /* value */ };
+  |                                   ++++++++++++++++++++++

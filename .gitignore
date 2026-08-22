@@ -1,0 +1,10 @@
+/target
+/.claude
+.DS_Store
+
+# Not committed on purpose. Every crate published from this workspace is a
+# library, and the point of this mirror is to show that their examples build
+# the way an outside consumer would get them -- with dependencies resolved
+# fresh. A committed lock would prove something weaker: that they built once,
+# against versions nobody else resolves to.
+/Cargo.lock

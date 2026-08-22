@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+  --> tests/trybuild/fail/editable_widget_editor_part_rejects_pressed_colors.rs:11:23
+   |
+11 |         .editor_caret(EditorStateColors::new().focused(Color::WHITE).pressed(Color::BLACK));
+   |          ------------ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `EditorStateColors`, found `PressedEditorStateColors`
+   |          |
+   |          arguments to this method are incorrect
+   |
+note: method defined here
+  --> src/layout/builder.rs
+   |
+   |     pub fn editor_caret(mut self, colors: EditorStateColors) -> Self {
+   |            ^^^^^^^^^^^^

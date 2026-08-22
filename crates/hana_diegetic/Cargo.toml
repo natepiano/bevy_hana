@@ -1,0 +1,109 @@
+[package]
+authors.workspace    = true
+categories           = ["game-development", "gui"]
+description          = "Diegetic UI layout engine for Bevy — in-world panels driven by a Clay-inspired layout algorithm"
+edition.workspace    = true
+homepage             = "https://github.com/natepiano/hana/tree/main/crates/hana_diegetic"
+keywords             = ["bevy", "diegetic", "layout", "ui"]
+license.workspace    = true
+name                 = "hana_diegetic"
+publish              = false
+readme               = "README.md"
+repository.workspace = true
+version.workspace    = true
+
+[lints]
+workspace = true
+
+[features]
+bench_support      = []
+default            = ["typography_overlay"]
+typography_overlay = []
+
+[dependencies]
+bevy = { workspace = true, features = [
+  "bevy_anti_alias",
+  "bevy_asset",
+  "bevy_core_pipeline",
+  "bevy_gizmos",
+  "bevy_image",
+  "bevy_log",
+  "bevy_pbr",
+  "bevy_picking",
+  "bevy_render",
+  "mesh_picking",
+] }
+bevy_enhanced_input = { workspace = true }
+bevy_kana = { workspace = true }
+bitflags = { workspace = true }
+hana_rubric = { workspace = true }
+hana_valence = { workspace = true }
+image = { workspace = true }
+parley = { workspace = true }
+smallvec = { workspace = true }
+thiserror = { workspace = true }
+ttf-parser = { workspace = true }
+
+[dev-dependencies]
+bevy            = { workspace = true, features = ["default_font", "tonemapping_luts"] }
+bevy_brp_extras = { workspace = true }
+clay-layout     = { workspace = true }
+criterion       = { workspace = true }
+fairy_dust      = { workspace = true }
+hana_clerestory = { workspace = true }
+hana_lagrange   = { workspace = true, features = ["fit_overlay"] }
+image           = { workspace = true, features = ["png"] }
+trybuild        = { workspace = true }
+wgpu            = "29"
+
+[[example]]
+name = "side_by_side"
+
+[[bench]]
+harness           = false
+name              = "layout_comparison"
+required-features = ["bench_support"]
+
+[[bench]]
+harness           = false
+name              = "panel_perf"
+required-features = ["bench_support"]
+
+[[bench]]
+harness           = false
+name              = "layout_engine_raw"
+required-features = ["bench_support"]
+
+[[example]]
+name              = "typography"
+required-features = ["typography_overlay"]
+
+[[example]]
+name = "font_loading"
+
+[[example]]
+name = "font_features"
+
+[[example]]
+name = "units"
+
+[[example]]
+name = "sizes"
+
+[[example]]
+name = "dimensions"
+
+[[example]]
+name = "panel_rendering"
+
+[[example]]
+name = "paper_sizes"
+
+[[example]]
+name = "screen_space"
+
+[[example]]
+name = "integral_advance"
+
+[[example]]
+name = "slug_text"

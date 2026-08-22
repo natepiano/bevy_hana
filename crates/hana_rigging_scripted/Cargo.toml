@@ -1,0 +1,17 @@
+[package]
+authors.workspace    = true
+description          = "Hardware-free scripted device reporting for hana_rigging tests and examples"
+edition.workspace    = true
+license.workspace    = true
+name                 = "hana_rigging_scripted"
+publish              = false
+repository.workspace = true
+version              = "0.1.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+bevy.workspace         = true
+hana_rigging.workspace = true
+thiserror.workspace    = true

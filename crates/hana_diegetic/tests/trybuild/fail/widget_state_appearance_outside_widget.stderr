@@ -1,0 +1,15 @@
+error[E0599]: no method named `disabled` found for struct `El` in the current scope
+  --> tests/trybuild/fail/widget_state_appearance_outside_widget.rs:11:14
+   |
+ 9 | /         El::new()
+10 | |             .background(Color::WHITE)
+11 | |             .disabled(Appearance::new().background(Color::BLACK)),
+   | |             -^^^^^^^^ method not found in `El`
+   | |_____________|
+   |
+   |
+   = note: the method was found for
+           - `El<L, PressedPart>`
+           - `El<L, WidgetChild>`
+           - `El<L, WidgetElement<W>>`
+           - `El<L, WidgetPart>`

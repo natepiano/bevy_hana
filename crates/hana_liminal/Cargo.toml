@@ -1,0 +1,79 @@
+[package]
+authors.workspace = true
+categories        = ["game-engines", "rendering"]
+description       = "A Bevy plugin for rendering 3d mesh outlines."
+edition.workspace = true
+exclude           = ["assets/"]
+homepage          = "https://github.com/natepiano/bevy_hana/tree/main/crates/hana_liminal"
+keywords          = ["bevy", "gamedev", "graphics", "outline"]
+license.workspace = true
+name              = "hana_liminal"
+readme            = "README.md"
+repository        = "https://github.com/natepiano/bevy_hana"
+rust-version      = "1.92.0"
+version           = "0.2.0-dev"
+
+[lints]
+workspace = true
+
+[dependencies]
+bevy = { workspace = true, features = [
+  "bevy_asset",
+  "bevy_color",
+  "bevy_core_pipeline",
+  "bevy_image",
+  "bevy_log",
+  "bevy_mesh",
+  "bevy_pbr",
+  "bevy_render",
+  "bevy_shader",
+  "bevy_world_serialization",
+  "std",
+] }
+bevy_kana = { workspace = true }
+bevy_render = { workspace = true }
+bytemuck = { workspace = true }
+nonmax = { workspace = true }
+rand = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true }
+
+[dev-dependencies]
+bevy = { version = "0.19.0", features = [
+  "bevy_animation",
+  "bevy_anti_alias",
+  "bevy_gltf",
+  "bevy_post_process",
+  "scene",
+] }
+bevy_brp_extras = { workspace = true }
+fairy_dust = { workspace = true }
+hana_clerestory = { workspace = true }
+hana_lagrange = { workspace = true, features = ["fit_overlay"] }
+
+[[example]]
+name = "simple"
+path = "examples/simple.rs"
+
+[[example]]
+name = "intersecting"
+path = "examples/intersecting.rs"
+
+[[example]]
+name = "transparent"
+path = "examples/transparent.rs"
+
+[[example]]
+name = "msaa"
+path = "examples/msaa.rs"
+
+[[example]]
+name = "benchmark"
+path = "examples/benchmark/main.rs"
+
+[[example]]
+name = "all_modes"
+
+[[example]]
+name = "outline_propagation"

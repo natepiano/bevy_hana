@@ -1,0 +1,11 @@
+error[E0532]: cannot match against a tuple struct which contains private fields
+ --> tests/compile_fail/apply_permit_cannot_be_matched.rs:4:9
+  |
+4 |     let ApplyPermit(_) = permit;
+  |         ^^^^^^^^^^^
+  |
+note: constructor is not visible here due to private fields
+ --> tests/compile_fail/apply_permit_cannot_be_matched.rs:4:21
+  |
+4 |     let ApplyPermit(_) = permit;
+  |                     ^ private field

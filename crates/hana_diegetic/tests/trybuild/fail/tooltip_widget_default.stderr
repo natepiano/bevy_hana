@@ -1,0 +1,5 @@
+error[E0599]: no associated function or constant named `default` found for struct `El<L, Role>` in the current scope
+ --> tests/trybuild/fail/tooltip_widget_default.rs:7:47
+  |
+7 |     let _ = El::<Row, WidgetElement<Button>>::default();
+  |                                               ^^^^^^^ associated function or constant not found in `El<Row, WidgetElement<Button>>`

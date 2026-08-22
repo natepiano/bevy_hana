@@ -1,0 +1,24 @@
+{
+  "$schema": "./keymap.schema.json",
+  "bindings": [
+    {
+      "bindings": {
+        "g r": "demo::open_recent",
+        "p": "demo::open_palette",
+        "w": "demo::move_selection"
+      }
+    },
+    {
+      "context": { "application": "browsing" },
+      "bindings": {
+        "enter": "demo::open_palette"
+      }
+    },
+    {
+      "context": { "application": "editing" },
+      "bindings": {
+        "enter": "demo::submit_edit"
+      }
+    }
+  ]
+}

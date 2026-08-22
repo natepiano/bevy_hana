@@ -1,0 +1,41 @@
+<?xml version='1.0' encoding='utf-8'?>
+<vdd_settings>
+    <monitors>
+        <count>1</count>
+    </monitors>
+    <gpu>
+        <friendlyname>default</friendlyname>
+    </gpu>
+    <global>
+        <g_refresh_rate>60</g_refresh_rate>
+    </global>
+    <resolutions>
+        <resolution>
+            <width>1920</width>
+            <height>1080</height>
+            <refresh_rate>60</refresh_rate>
+        </resolution>
+    </resolutions>
+    <logging>
+        <SendLogsThroughPipe>false</SendLogsThroughPipe>
+        <logging>false</logging>
+        <debuglogging>false</debuglogging>
+    </logging>
+    <colour>
+        <SDR10bit>false</SDR10bit>
+        <HDRPlus>false</HDRPlus>
+        <ColourFormat>RGB</ColourFormat>
+    </colour>
+    <cursor>
+        <HardwareCursor>true</HardwareCursor>
+        <CursorMaxY>128</CursorMaxY>
+        <CursorMaxX>128</CursorMaxX>
+        <AlphaCursorSupport>true</AlphaCursorSupport>
+        <XorCursorSupportLevel>2</XorCursorSupportLevel>
+    </cursor>
+    <edid>
+        <CustomEdid>false</CustomEdid>
+        <PreventSpoof>false</PreventSpoof>
+        <EdidCeaOverride>false</EdidCeaOverride>
+    </edid>
+</vdd_settings>

@@ -1,0 +1,12 @@
+error[E0050]: method `discover` has 2 parameters but the declaration in trait `discover` has 1
+ --> tests/compile_fail/device_reporter_discover_cannot_receive_world.rs:8:17
+  |
+8 |     fn discover(&mut self, _: &mut World) -> DiscoveryWork { todo!() }
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^ expected 1 parameter, found 2
+  |
+  = note: `discover` from trait: `fn(&mut Self) -> DiscoveryWork`
+help: remove the extra parameter to match the trait
+  |
+8 -     fn discover(&mut self, _: &mut World) -> DiscoveryWork { todo!() }
+8 +     fn discover(&mut self) -> DiscoveryWork { todo!() }
+  |

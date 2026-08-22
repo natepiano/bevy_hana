@@ -1,0 +1,39 @@
+error[E0308]: mismatched types
+ --> tests/compile_fail/runtime_discovery_limits_reject_zero.rs:5:46
+  |
+5 |     discovery_limits.set_max_concurrent_jobs(0);
+  |                      ----------------------- ^ expected `NonZero<usize>`, found integer
+  |                      |
+  |                      arguments to this method are incorrect
+  |
+  = note: expected struct `NonZero<usize>`
+               found type `{integer}`
+note: method defined here
+ --> src/discovery.rs
+  |
+  |     pub const fn set_max_concurrent_jobs(&mut self, max_concurrent_jobs: NonZeroUsize) {
+  |                  ^^^^^^^^^^^^^^^^^^^^^^^
+help: consider calling `NonZero::new`
+  |
+5 |     discovery_limits.set_max_concurrent_jobs(NonZero::new(0).unwrap());
+  |                                              +++++++++++++ ++++++++++
+
+error[E0308]: mismatched types
+ --> tests/compile_fail/runtime_discovery_limits_reject_zero.rs:6:52
+  |
+6 |     discovery_limits.set_max_completions_per_frame(0);
+  |                      ----------------------------- ^ expected `NonZero<usize>`, found integer
+  |                      |
+  |                      arguments to this method are incorrect
+  |
+  = note: expected struct `NonZero<usize>`
+               found type `{integer}`
+note: method defined here
+ --> src/discovery.rs
+  |
+  |     pub const fn set_max_completions_per_frame(&mut self, max_completions_per_frame: NonZeroUsize) {
+  |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: consider calling `NonZero::new`
+  |
+6 |     discovery_limits.set_max_completions_per_frame(NonZero::new(0).unwrap());
+  |                                                    +++++++++++++ ++++++++++

@@ -1,0 +1,177 @@
+[package]
+authors.workspace = true
+categories        = ["game-development", "gui"]
+description       = "Bevy plugin for primary window restoration and multi-monitor support"
+edition.workspace = true
+homepage          = "https://github.com/natepiano/bevy_hana/tree/main/crates/hana_clerestory"
+keywords          = ["bevy", "gamedev", "monitor", "multi-monitor", "window"]
+license.workspace = true
+name              = "hana_clerestory"
+readme            = "README.md"
+repository        = "https://github.com/natepiano/bevy_hana"
+version           = "0.4.0-dev"
+
+[lib]
+name = "hana_clerestory"
+path = "src/lib.rs"
+
+[[example]]
+name              = "restore_after_reconnect"
+path              = "examples/restore_after_reconnect/main.rs"
+required-features = ["monitor-probe"]
+test              = true
+
+[dependencies]
+bevy = { workspace = true, features = [
+  # `CameraUpdateSystems` only; ordering target for `resize_announcement`.
+  "bevy_camera",
+  "bevy_log",
+  "bevy_window",
+  "bevy_winit",
+  "wayland",
+  "x11",
+] }
+bevy_diagnostic = { workspace = true }
+bevy_kana = { workspace = true }
+hana_rigging = { workspace = true }
+winit = { workspace = true }
+
+dirs      = "6.0"
+ron       = "0.12"
+serde     = { version = "1.0", features = ["derive"] }
+thiserror = { workspace = true }
+tracing   = { workspace = true, optional = true }
+
+[dev-dependencies]
+bevy = { workspace = true, features = ["bevy_pbr", "bevy_ui", "default_font"] }
+bevy_remote = { version = "0.19.0", default-features = false, features = [
+  "http",
+] }
+fairy_dust = { workspace = true }
+hana_diegetic = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+windows = { version = "0.62.2", features = [
+  "Win32_Devices_DeviceAndDriverInstallation",
+  "Win32_Devices_Display",
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_Security",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Registry",
+  "Win32_System_Threading",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", features = [
+  "NSGraphics",
+  "NSResponder",
+  "NSScreen",
+  "NSView",
+  "NSWindow",
+] }
+objc2-foundation = { version = "0.3.2", features = [
+  "NSNotification",
+  "NSOperation",
+  "NSString",
+  "NSValue",
+  "block2",
+] }
+raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+raw-window-handle = "0.6"
+x11rb = { version = "0.13", default-features = false, features = [
+  "dl-libxcb",
+  "randr",
+] }
+
+[features]
+default = [
+  "workaround-winit-3124",
+  "workaround-winit-4341",
+  "workaround-winit-4440",
+  "workaround-winit-4443",
+  "workaround-winit-4445",
+]
+# Structured diagnostics for native monitor identity and topology rebuilds.
+monitor-probe = ["dep:tracing"]
+# Scripted display topology for consumers testing against the production display reporter.
+test = []
+# Scale factor compensation workaround (Windows, macOS, Linux X11)
+# Issue: https://github.com/rust-windowing/winit/issues/4440
+#
+# `set_outer_position` and `request_inner_size` use the current monitor's scale
+# factor for coordinate conversion instead of the target monitor's. When restoring
+# a window to a different-scale monitor, coordinates are converted incorrectly.
+#
+# - Windows: compensates size only (position works correctly)
+# - macOS/Linux X11: compensates both position and size
+# - Linux Wayland: no compensation (can't detect starting monitor or set position)
+#
+# Test without workaround: cargo run --example restore_window --no-default-features
+# Test with workaround:    cargo run --example restore_window
+workaround-winit-4440 = []
+# Windows DX12/DXGI exclusive fullscreen crash workaround
+# Issue: https://github.com/rust-windowing/winit/issues/3124
+#
+# DXGI flip model surfaces (used by DX12) don't support exclusive fullscreen at
+# startup. We defer fullscreen until after surface creation.
+#
+# Winit closed this as "not planned" because the swapchain is created by wgpu, not
+# winit. There's no Bevy issue for this yet - Bevy is the right place to fix it
+# since it orchestrates both window creation (winit) and surface creation (wgpu).
+#
+# Test without workaround: cargo run --example restore_window --no-default-features
+# Test with workaround:    cargo run --example restore_window
+workaround-winit-3124 = []
+# Windows DPI drag bounce workaround - remove when winit includes PR #4341
+# Issue: https://github.com/rust-windowing/winit/issues/4041
+# Fix: https://github.com/rust-windowing/winit/pull/4341
+#
+# Test without workaround: cargo run --example restore_window --no-default-features
+# Test with workaround:    cargo run --example restore_window
+workaround-winit-4341 = []
+# Linux X11 keyboard snap position workaround
+# Issue: https://github.com/rust-windowing/winit/issues/4443
+# Related: https://github.com/bevyengine/bevy/issues/17576
+#
+# On X11, when the window manager moves+resizes a window via keyboard shortcuts
+# (KDE: Meta+Arrow snap/tile), winit emits `SurfaceResized` but not `Moved`, even
+# though the window position changed. Bevy's cached `window.position` doesn't update.
+#
+# This workaround queries winit's `outer_position()` directly when saving state
+# instead of trusting bevy's cached position.
+#
+# Test without workaround (4440 provides foundational scale compensation):
+#   WAYLAND_DISPLAY= cargo run --example restore_window --no-default-features --features workaround-winit-4440
+# Test with workaround:
+#   WAYLAND_DISPLAY= cargo run --example restore_window
+workaround-winit-4443 = []
+# Linux X11 outer_position frame extents workaround
+# Issue: https://github.com/rust-windowing/winit/issues/4445
+#
+# On X11, winit's `outer_position()` returns the client area position instead of
+# the frame position (including title bar). This is because winit's heuristic
+# incorrectly zeros out `_NET_FRAME_EXTENTS` when the window is detected as
+# "not nested" - even though `_NET_FRAME_EXTENTS` correctly reports the title bar.
+#
+# Combined with W5 (workaround-winit-4443), this causes position drift on each
+# save/restore cycle. This workaround queries `_NET_FRAME_EXTENTS` directly via
+# x11rb and subtracts the top extent from the saved position.
+#
+# Test without workaround (4440 provides scale compensation, 4443 provides position caching):
+#   WAYLAND_DISPLAY= cargo run --example restore_window --no-default-features --features workaround-winit-4440,workaround-winit-4443
+# Test with workaround:
+#   WAYLAND_DISPLAY= cargo run --example restore_window
+workaround-winit-4445 = []
+
+[lints]
+workspace = true
