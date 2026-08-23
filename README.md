@@ -1,8 +1,5 @@
 # bevy_hana
 
-Bevy crates published to crates.io, together with the source of the crates they
-depend on for their examples and tests.
-
 **Generated. Do not send pull requests here.** The tree is force-synced on each
 release; anything committed directly is overwritten. Issues are welcome -- fixes
 arrive here on the next release.
