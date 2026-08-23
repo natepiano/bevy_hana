@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - 2026-08-22
 
 ### Added
 
@@ -46,12 +46,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ExternalAnimationTweenPlugin`, their errors, and the `external_progress`
   example. Producers now publish `SequenceMovement` and claim a target with
   `SequenceDriver`; there are no compatibility aliases
+- **Breaking:** Remove the `input` feature. `Keybindings` and the `action!`,
+  `event!`, and `bind_action_system!` macros moved to
+  [`hana_rubric`](https://crates.io/crates/hana_rubric) unchanged — no items
+  were renamed. Drop `features = ["input"]` and depend on `hana_rubric`
 
 ### Changed
 
 - **Breaking:** Renamed the crate from `bevy_kana` to `hana_kana`. The `bevy_`
   prefix is reserved for published legacy crates; every crate in this
-  workspace now uses the `hana_` prefix. `bevy_kana` 0.3.0 is the final
+  workspace now uses the `hana_` prefix. `bevy_kana` 0.3.1 is the final
   release under the old name. Change the dependency name and every
   `use bevy_kana::` path to `hana_kana`; no items were renamed
 

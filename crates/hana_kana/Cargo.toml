@@ -3,13 +3,14 @@ authors.workspace = true
 categories        = ["game-development", "game-engines"]
 description       = "Ergonomic, opinionated utilities for Bevy — type-safe math and cascade values"
 edition.workspace = true
+exclude           = ["examples/cascade.rs"]
 homepage          = "https://github.com/natepiano/bevy_hana/tree/main/crates/hana_kana"
 keywords          = ["bevy", "ecs", "gamedev", "math"]
 license.workspace = true
 name              = "hana_kana"
 readme            = "README.md"
 repository        = "https://github.com/natepiano/bevy_hana"
-version           = "0.4.0-dev"
+version           = "0.4.0"
 
 [lints]
 workspace = true

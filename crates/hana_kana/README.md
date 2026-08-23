@@ -18,9 +18,11 @@
 > subject to semver stability guarantees. APIs will change without notice
 > between commits. Do not depend on this in production code yet.
 
-> **Renamed from `bevy_kana`.** Releases through 0.3.0 were published under
+> **Renamed from `bevy_kana`.** Releases through 0.3.1 were published under
 > that name; 0.4.0 is the first release as `hana_kana`. No items were renamed —
-> change the dependency name and every `use bevy_kana::` path.
+> change the dependency name and every `use bevy_kana::` path. The `input`
+> feature did not come along: it now lives in
+> [`hana_rubric`](https://crates.io/crates/hana_rubric).
 
 **仮名** (*kana*) — from Japanese 仮 (*ka*, "simplified, borrowed") + 名 (*na*, "name, character"). The kana writing systems — hiragana (ひらがな) and katakana (カタカナ) — were born as simplified characters borrowed from complex kanji, making written language more accessible without losing meaning.
 
@@ -190,7 +192,10 @@ fn register(app: &mut App) {
 
 `insert_resource(Opacity(0.8))` then sets the app-wide default.
 
-Run the interactive generic cascade example:
+Run the interactive generic cascade example (in the
+[repository](https://github.com/natepiano/bevy_hana/tree/main/crates/hana_kana/examples);
+it depends on unpublished workspace crates, so it ships with the source tree
+rather than the crates.io package):
 
 ```bash
 cargo run --example cascade
@@ -259,7 +264,7 @@ distorting stage boundaries.
 Enable the optional `tween` feature to produce movement with `bevy_tween`:
 
 ```toml
-hana_kana = { version = "0.4.0-dev", features = ["tween"] }
+hana_kana = { version = "0.4.0", features = ["tween"] }
 ```
 
 `SequenceTweenAdapterPlugin<TimeCtx>` creates and advances no clock. Install
@@ -286,6 +291,7 @@ cargo run --example sequence_drivers
 | Crate | Version | Bevy |
 |-------|---------|------|
 | `hana_kana` | 0.4.0 | 0.19 |
+| `bevy_kana` | 0.3.1 | 0.19 |
 | `bevy_kana` | 0.3.0 | 0.19 |
 | `bevy_kana` | 0.2.0 | 0.19 |
 | `bevy_kana` | 0.1.0 | 0.19 |
@@ -297,7 +303,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-hana_kana = "0.3.0"
+hana_kana = "0.4.0"
 ```
 
 Run the example:
