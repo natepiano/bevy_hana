@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::sync::PoisonError;
 
 use bevy::prelude::Resource;
-use bevy_kana::ToF32;
+use hana_kana::ToF32;
 use parley::FontContext;
 use parley::Layout;
 use parley::LayoutContext;

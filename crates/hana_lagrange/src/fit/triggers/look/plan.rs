@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use bevy::math::curve::easing::EaseFunction;
 use bevy::prelude::Vec3;
-use bevy_kana::Displacement;
+use hana_kana::Displacement;
 
 use crate::CameraBasis;
 use crate::animation;

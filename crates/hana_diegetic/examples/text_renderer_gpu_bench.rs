@@ -43,11 +43,11 @@ use bevy::window::PresentMode;
 use bevy::window::WindowPosition;
 use bevy::window::WindowResolution;
 use bevy::winit::WinitSettings;
-use bevy_kana::ToF32;
-use bevy_kana::ToF64;
 use hana_diegetic::DiegeticText;
 use hana_diegetic::DiegeticUiPlugin;
 use hana_diegetic::GlyphShadowMode;
+use hana_kana::ToF32;
+use hana_kana::ToF64;
 
 const BENCH_TEXT: &str = "Typography";
 const CAMERA_DISTANCE: f32 = 9.0;

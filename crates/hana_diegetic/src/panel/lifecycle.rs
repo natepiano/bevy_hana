@@ -21,7 +21,7 @@ use bevy::prelude::ResMut;
 use bevy::prelude::With;
 use bevy::prelude::World;
 use bevy::window::PrimaryWindow;
-use bevy_kana::resolve_entity_cascade;
+use hana_kana::resolve_entity_cascade;
 use hana_valence::AnchoredHere;
 use hana_valence::AnchoredTo;
 use hana_valence::Member;

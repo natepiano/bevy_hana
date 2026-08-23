@@ -8,7 +8,7 @@ use std::sync::Mutex;
 
 use bevy::prelude::Event;
 use bevy::prelude::Resource;
-use bevy_kana::ToU16;
+use hana_kana::ToU16;
 
 /// How a font was loaded into the registry.
 #[derive(Clone, Debug, PartialEq, Eq)]

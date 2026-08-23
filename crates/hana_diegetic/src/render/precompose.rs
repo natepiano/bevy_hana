@@ -26,8 +26,8 @@ use bevy::prelude::ResMut;
 use bevy::prelude::Transform;
 use bevy::prelude::default;
 use bevy::render::render_resource::TextureFormat;
-use bevy_kana::ToF32;
-use bevy_kana::ToU32;
+use hana_kana::ToF32;
+use hana_kana::ToU32;
 
 use crate::cascade::Cascade;
 use crate::cascade::CascadeFrom;

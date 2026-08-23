@@ -64,7 +64,6 @@ use bevy::prelude::With;
 use bevy::prelude::error;
 use bevy::prelude::info;
 use bevy::prelude::warn;
-use bevy_kana::SequencePlaybackSystems;
 use fairy_dust::Anchor;
 use fairy_dust::CameraHomeTarget;
 use fairy_dust::ControlActivation;
@@ -94,6 +93,7 @@ use hana_diegetic::TextAlign;
 use hana_diegetic::TextStyle;
 use hana_diegetic::Unit;
 use hana_diegetic::default_panel_material;
+use hana_kana::SequencePlaybackSystems;
 use hana_lagrange::AnimateToFit;
 use hana_lagrange::AnimationBegin;
 use hana_lagrange::AnimationEnd;
@@ -394,7 +394,7 @@ fn produce_example_sequence_movement(
     for (mut producer_state, mut movement, mut source_state) in &mut producers {
         let (position, direction) = producer_state.sample(time.delta_secs());
         let Ok(sequence_movement) =
-            SequenceMovement::try_new(position, direction, 0, bevy_kana::RangeCrossings::NONE)
+            SequenceMovement::try_new(position, direction, 0, hana_kana::RangeCrossings::NONE)
         else {
             continue;
         };

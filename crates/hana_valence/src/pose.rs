@@ -1,12 +1,12 @@
 use bevy_ecs::prelude::Component;
 use bevy_ecs::prelude::ReflectComponent;
 use bevy_ecs::prelude::SystemSet;
-use bevy_kana::Displacement;
-use bevy_kana::Orientation;
 use bevy_math::Vec3;
 use bevy_platform::collections::HashMap;
 use bevy_reflect::Reflect;
 use bevy_reflect::std_traits::ReflectDefault;
+use hana_kana::Displacement;
+use hana_kana::Orientation;
 
 use crate::AnchorSite;
 

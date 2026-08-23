@@ -8,8 +8,8 @@ use bevy::prelude::StandardMaterial;
 use bevy::prelude::Transform;
 use bevy::prelude::Vec2;
 use bevy::prelude::Vec3;
-use bevy_kana::ToF32;
-use bevy_kana::ToUsize;
+use hana_kana::ToF32;
+use hana_kana::ToUsize;
 
 use super::GlyphMetricVisibility;
 use super::pipeline::FontContext;

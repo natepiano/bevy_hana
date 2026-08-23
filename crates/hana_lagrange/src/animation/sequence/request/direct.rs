@@ -5,7 +5,7 @@ use bevy::prelude::Entity;
 use bevy::prelude::Query;
 use bevy::prelude::Remove;
 use bevy::prelude::warn;
-use bevy_kana::SequenceStages;
+use hana_kana::SequenceStages;
 
 use super::super::controller_installation::*;
 use super::super::playback::*;
@@ -308,7 +308,7 @@ mod tests {
         record_lifecycle_order(app.world_mut(), camera);
         record_camera_boundary_order(app.world_mut(), camera);
         app.world_mut()
-            .spawn(bevy_kana::SequenceDriver::new(camera));
+            .spawn(hana_kana::SequenceDriver::new(camera));
         app.update();
 
         app.world_mut()
@@ -370,7 +370,7 @@ mod tests {
         count_animation_closures(app.world_mut(), camera);
         record_lifecycle_order(app.world_mut(), camera);
         app.world_mut()
-            .spawn(bevy_kana::SequenceDriver::new(camera));
+            .spawn(hana_kana::SequenceDriver::new(camera));
 
         app.update();
 

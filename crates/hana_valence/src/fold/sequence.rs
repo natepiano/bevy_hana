@@ -1,10 +1,10 @@
 use bevy_ecs::entity::Entity;
 use bevy_ecs::prelude::Component;
 use bevy_ecs::prelude::ReflectComponent;
-use bevy_kana::SequenceStageSpan;
-use bevy_kana::SequenceStages;
-use bevy_kana::SequenceTime;
 use bevy_reflect::Reflect;
+use hana_kana::SequenceStageSpan;
+use hana_kana::SequenceStages;
+use hana_kana::SequenceTime;
 
 use super::FoldLedger;
 use super::FoldMemberSample;
@@ -281,8 +281,8 @@ mod tests {
     use std::time::Duration;
 
     use bevy_ecs::world::World;
-    use bevy_kana::SequenceStageId;
     use bevy_math::curve::EaseFunction;
+    use hana_kana::SequenceStageId;
 
     use super::*;
     use crate::FoldAuthorError;

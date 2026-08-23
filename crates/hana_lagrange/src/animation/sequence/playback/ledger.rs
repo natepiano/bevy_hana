@@ -1,9 +1,9 @@
-use bevy_kana::Easing;
-use bevy_kana::SequencePosition;
-use bevy_kana::SequenceStageId;
-use bevy_kana::SequenceStageSpan;
-use bevy_kana::SequenceTime;
-use bevy_kana::ToF32;
+use hana_kana::Easing;
+use hana_kana::SequencePosition;
+use hana_kana::SequenceStageId;
+use hana_kana::SequenceStageSpan;
+use hana_kana::SequenceTime;
+use hana_kana::ToF32;
 
 use super::CameraPose;
 use super::normalized_camera_time;

@@ -24,8 +24,8 @@ use thiserror::Error;
 ///
 /// use bevy::math::Quat;
 /// use bevy::math::Vec3;
-/// use bevy_kana::Orientation;
-/// use bevy_kana::OrientationError;
+/// use hana_kana::Orientation;
+/// use hana_kana::OrientationError;
 ///
 /// # fn main() -> Result<(), OrientationError> {
 /// let orientation = Orientation::try_from(Quat::from_rotation_y(FRAC_PI_2))?;

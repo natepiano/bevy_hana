@@ -30,9 +30,9 @@ bevy = { workspace = true, features = [
   "bevy_world_serialization",
   "std",
 ] }
-bevy_kana = { workspace = true }
 bevy_render = { workspace = true }
 bytemuck = { workspace = true }
+hana_kana = { workspace = true }
 nonmax = { workspace = true }
 rand = { workspace = true }
 

@@ -1,8 +1,8 @@
-//! # `bevy_kana`
+//! # `hana_kana`
 //!
 //! Ergonomic, opinionated utilities for Bevy — type-safe math and cascade values.
 //!
-//! `bevy_kana` is a growing collection of ergonomic utilities for Bevy projects.
+//! `hana_kana` is a growing collection of ergonomic utilities for Bevy projects.
 //! Enable features to pull in what you need.
 //!
 //! ## Features
@@ -17,7 +17,7 @@
 //! Disable defaults to pick only what you need:
 //!
 //! ```toml
-//! bevy_kana = { version = "0.4.0", default-features = false, features = ["math"] }
+//! hana_kana = { version = "0.4.0", default-features = false, features = ["math"] }
 //! ```
 
 mod cascade;

@@ -549,7 +549,7 @@ mod tests {
     use bevy::prelude::ResMut;
     use bevy::prelude::Resource;
     use bevy::prelude::With;
-    use bevy_kana::ToF32;
+    use hana_kana::ToF32;
 
     use super::reify_text_entities;
     use crate::Mm;

@@ -13,10 +13,10 @@ use bevy::prelude::default;
 use bevy::window::Monitor;
 use bevy::window::PrimaryWindow;
 use bevy::window::WindowPosition;
-use bevy_kana::ToU32;
 use hana_clerestory::CurrentMonitor;
 use hana_clerestory::ManagedWindow;
 use hana_clerestory::ManagedWindowPersistence;
+use hana_kana::ToU32;
 
 use super::super::constants::AUTOMATIC_TEXT;
 use super::super::constants::DEFAULT_COLOR;

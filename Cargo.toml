@@ -1,10 +1,10 @@
 [workspace]
 exclude  = ["crates/.claude", "vendor/clay-layout"]
 members  = [
-  "crates/bevy_kana",
   "crates/fairy_dust",
   "crates/hana_clerestory",
   "crates/hana_diegetic",
+  "crates/hana_kana",
   "crates/hana_lagrange",
   "crates/hana_liminal",
   "crates/hana_rigging",
@@ -28,10 +28,10 @@ version    = "0.1.0"
 #
 # Workspace member crates
 #
-bevy_kana             = { path = "crates/bevy_kana" }
 fairy_dust            = { path = "crates/fairy_dust" }
 hana_clerestory       = { path = "crates/hana_clerestory" }
 hana_diegetic         = { path = "crates/hana_diegetic" }
+hana_kana             = { path = "crates/hana_kana" }
 hana_lagrange         = { path = "crates/hana_lagrange", features = ["fit_overlay"] }
 hana_liminal          = { path = "crates/hana_liminal" }
 hana_rigging          = { path = "crates/hana_rigging" }

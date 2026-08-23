@@ -20,8 +20,8 @@ use bevy::prelude::With;
 use bevy::prelude::debug;
 use bevy::prelude::warn;
 use bevy::window::WindowMode;
-use bevy_kana::ToI32;
-use bevy_kana::ToU32;
+use hana_kana::ToI32;
+use hana_kana::ToU32;
 use hana_rigging::prelude::AttemptOutcome;
 use hana_rigging::prelude::RoleKey;
 

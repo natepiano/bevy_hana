@@ -4,9 +4,9 @@ use bevy::prelude::Entity;
 use bevy::prelude::ParamSet;
 use bevy::prelude::Projection;
 use bevy::prelude::Query;
-use bevy_kana::SequenceCommands;
-use bevy_kana::SequenceDirection;
-use bevy_kana::SequenceOwner;
+use hana_kana::SequenceCommands;
+use hana_kana::SequenceDirection;
+use hana_kana::SequenceOwner;
 
 use super::super::controller_installation::*;
 use super::super::playback::*;
@@ -326,7 +326,7 @@ impl CameraRequestAdmission<'_, '_> {
             target: request.target,
             owner: SequenceOwner::NativePlayback,
             direction: SequenceDirection::Forward,
-            timing: CameraEventTiming::new(bevy_kana::SequencePosition::START, total),
+            timing: CameraEventTiming::new(hana_kana::SequencePosition::START, total),
         });
         true
     }
@@ -340,7 +340,7 @@ mod tests {
     use bevy::prelude::OrthographicProjection;
     use bevy::prelude::Transform;
     use bevy::prelude::Vec3;
-    use bevy_kana::SequenceStages;
+    use hana_kana::SequenceStages;
 
     use super::*;
     use crate::AnimationSource;

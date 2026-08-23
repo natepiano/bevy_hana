@@ -4,9 +4,9 @@ use bevy::math::Vec2;
 use bevy::math::Vec4;
 use bevy::render::render_resource::ShaderSize;
 use bevy::render::render_resource::ShaderType;
-use bevy_kana::ToF32;
-use bevy_kana::ToU32;
-use bevy_kana::ToUsize;
+use hana_kana::ToF32;
+use hana_kana::ToU32;
+use hana_kana::ToUsize;
 
 use super::Bounds;
 use super::PathContour;

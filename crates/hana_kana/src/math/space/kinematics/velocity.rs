@@ -16,7 +16,7 @@ semantic_newtype::semantic_newtype!(
     ///
     /// ```
     /// use bevy::math::Vec3;
-    /// use bevy_kana::Velocity;
+    /// use hana_kana::Velocity;
     ///
     /// let velocity = Velocity(Vec3::new(10.0, 0.0, 0.0));
     /// let time_delta = 0.016;

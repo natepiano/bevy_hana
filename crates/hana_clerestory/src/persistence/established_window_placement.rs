@@ -6,8 +6,8 @@ use bevy::prelude::Reflect;
 use bevy::prelude::ReflectComponent;
 use bevy::prelude::UVec2;
 use bevy::prelude::Window;
-use bevy_kana::ToI32;
-use bevy_kana::ToU32;
+use hana_kana::ToI32;
+use hana_kana::ToU32;
 use hana_rigging::prelude::DeviceKey;
 
 use super::PersistedPosition;

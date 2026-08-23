@@ -19,8 +19,8 @@ use bevy::prelude::AlphaMode;
 use bevy::prelude::Color;
 use bevy::prelude::Handle;
 use bevy::render::render_resource::Face;
-use bevy_kana::ToU32;
-use bevy_kana::ToUsize;
+use hana_kana::ToU32;
+use hana_kana::ToUsize;
 
 use crate::DrawZIndex;
 use crate::layout::GlyphShadowMode;

@@ -6,10 +6,10 @@
 //! one layer of winding clearance are the same three steps for both.
 
 use bevy_ecs::entity::Entity;
-use bevy_kana::Displacement;
-use bevy_kana::Orientation;
-use bevy_kana::Position;
 use bevy_math::Vec3;
+use hana_kana::Displacement;
+use hana_kana::Orientation;
+use hana_kana::Position;
 
 use crate::AnchorFrame;
 use crate::ArrangementConnection;

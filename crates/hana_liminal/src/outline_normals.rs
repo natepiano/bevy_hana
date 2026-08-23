@@ -13,7 +13,7 @@ use bevy::prelude::Query;
 use bevy::prelude::ResMut;
 use bevy::prelude::Vec3;
 use bevy::prelude::With;
-use bevy_kana::ToUsize;
+use hana_kana::ToUsize;
 
 use super::Outline;
 use super::constants::ATTRIBUTE_OUTLINE_NORMAL;

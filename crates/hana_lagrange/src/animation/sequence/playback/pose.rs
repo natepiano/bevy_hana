@@ -1,10 +1,10 @@
 use bevy::prelude::Quat;
 use bevy::prelude::Vec3;
-use bevy_kana::Easing;
-use bevy_kana::EasingSample;
-use bevy_kana::SequenceEasingSample;
-use bevy_kana::SequenceTime;
-use bevy_kana::ToF32;
+use hana_kana::Easing;
+use hana_kana::EasingSample;
+use hana_kana::SequenceEasingSample;
+use hana_kana::SequenceTime;
+use hana_kana::ToF32;
 
 use super::CameraMoveSample;
 use super::CameraPlaybackPreparationError;
@@ -343,7 +343,7 @@ mod tests {
     use std::time::Duration;
 
     use bevy::prelude::Transform;
-    use bevy_kana::SequenceEasingError;
+    use hana_kana::SequenceEasingError;
 
     use super::*;
     use crate::animation::sequence::CameraSequence;

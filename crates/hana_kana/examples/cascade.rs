@@ -1,4 +1,4 @@
-//! Interactive tour of `bevy_kana`'s relationship-backed cascade engine.
+//! Interactive tour of `hana_kana`'s relationship-backed cascade engine.
 //!
 //! `Source A`, `Source B`, and `Leaf` each carry `Cascade<CubeScale>`.
 //! `Leaf` also carries `CascadeFrom`, which selects the entity consulted when
@@ -46,14 +46,6 @@ use bevy::prelude::Vec3;
 use bevy::prelude::With;
 use bevy::prelude::error;
 use bevy::prelude::warn;
-use bevy_kana::Cascade;
-use bevy_kana::CascadeDefault;
-use bevy_kana::CascadeEntityCommandsExt;
-use bevy_kana::CascadeFrom;
-use bevy_kana::CascadePlugin;
-use bevy_kana::CascadeSet;
-use bevy_kana::Position;
-use bevy_kana::Resolved;
 use fairy_dust::Anchor;
 use fairy_dust::CameraHomeTarget;
 use fairy_dust::ControlActivation;
@@ -67,6 +59,14 @@ use fairy_dust::diegetic_stats_sections_panel_with_integral_advance;
 use fairy_dust::diegetic_stats_sections_tree_with_integral_advance;
 use hana_diegetic::DiegeticPanelCommands;
 use hana_diegetic::FontRegistry;
+use hana_kana::Cascade;
+use hana_kana::CascadeDefault;
+use hana_kana::CascadeEntityCommandsExt;
+use hana_kana::CascadeFrom;
+use hana_kana::CascadePlugin;
+use hana_kana::CascadeSet;
+use hana_kana::Position;
+use hana_kana::Resolved;
 use hana_lagrange::OrbitCamPreset;
 
 // camera

@@ -827,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn easing_curve_type_path_is_owned_by_bevy_kana() {
-        assert!(EasingCurve::type_path().starts_with("bevy_kana::"));
+    fn easing_curve_type_path_is_owned_by_hana_kana() {
+        assert!(EasingCurve::type_path().starts_with("hana_kana::"));
     }
 }

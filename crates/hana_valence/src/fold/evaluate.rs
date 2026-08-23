@@ -1,7 +1,7 @@
-use bevy_kana::Easing;
-use bevy_kana::EasingSample;
-use bevy_kana::SequenceEasingError;
-use bevy_kana::SequenceEasingSample;
+use hana_kana::Easing;
+use hana_kana::EasingSample;
+use hana_kana::SequenceEasingError;
+use hana_kana::SequenceEasingSample;
 use thiserror::Error;
 
 use super::FoldMemberSample;
@@ -13,7 +13,7 @@ use crate::Hinge;
 ///
 /// `select_easing` receives the member's raw segment progress and answers with
 /// the producer's easing decision for that position: the ECS caller forwards
-/// [`SequenceEasingSampler::sample`](bevy_kana::SequenceEasingSampler::sample)
+/// [`SequenceEasingSampler::sample`](hana_kana::SequenceEasingSampler::sample)
 /// and a value test answers with a [`SequenceEasingSample`] directly. Because
 /// the position travels inside the decision, a curve that replaced authored
 /// easing cannot also run it, and one that fed authored easing cannot skip it.
@@ -22,7 +22,7 @@ use crate::Hinge;
 ///
 /// `sample_authored_easing` supplies the eased output of the segment's own
 /// authored curve; the ECS caller passes
-/// [`EasingSampler`](bevy_kana::EasingSampler) and a value test passes a stub.
+/// [`EasingSampler`](hana_kana::EasingSampler) and a value test passes a stub.
 /// It runs only for [`SequenceEasingSample::AuthoredEasingApplies`].
 ///
 /// Interpolation runs in `f64` so finite easing overshoot and reversal survive
@@ -173,10 +173,10 @@ mod tests {
 
     use bevy_ecs::entity::Entity;
     use bevy_ecs::world::World;
-    use bevy_kana::EasingCurve;
-    use bevy_kana::EasingInput;
-    use bevy_kana::EasingOutput;
     use bevy_math::curve::EaseFunction;
+    use hana_kana::EasingCurve;
+    use hana_kana::EasingInput;
+    use hana_kana::EasingOutput;
 
     use super::*;
     use crate::AnchorSite;

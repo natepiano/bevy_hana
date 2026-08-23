@@ -53,8 +53,8 @@ use bevy::prelude::Visibility;
 use bevy::prelude::With;
 use bevy::render::render_resource::PrimitiveTopology;
 use bevy::render::storage::ShaderBuffer;
-use bevy_kana::ToU32;
-use bevy_kana::ToUsize;
+use hana_kana::ToU32;
+use hana_kana::ToUsize;
 
 use super::PanelTextLayout;
 use super::PreparedPanelText;
@@ -1362,7 +1362,7 @@ mod tests {
     use bevy::prelude::TransformSystems;
     use bevy::prelude::Vec3;
     use bevy::prelude::Vec4;
-    use bevy_kana::ToF32;
+    use hana_kana::ToF32;
 
     use super::*;
     use crate::Appearance;

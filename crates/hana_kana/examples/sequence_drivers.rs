@@ -9,7 +9,7 @@
 //! - one explicit takeover, then restoration of the displaced producer,
 //! - a target with no domain evaluator arbitrating exactly the same way.
 //!
-//! Run with `cargo run -p bevy_kana --example sequence_drivers`.
+//! Run with `cargo run -p hana_kana --example sequence_drivers`.
 
 use std::error::Error;
 use std::time::Duration;
@@ -29,34 +29,34 @@ use bevy::log::info;
 use bevy::math::curve::EaseFunction;
 use bevy::time::Time;
 use bevy::time::TimeUpdateStrategy;
-use bevy_kana::prelude::Easing;
-use bevy_kana::prelude::EasingCurve;
-use bevy_kana::prelude::EasingCurveError;
-use bevy_kana::prelude::EasingInput;
-use bevy_kana::prelude::EasingOutput;
-use bevy_kana::prelude::SequenceCommand;
-use bevy_kana::prelude::SequenceCommandRejected;
-use bevy_kana::prelude::SequenceCommandResponse;
-use bevy_kana::prelude::SequenceCommands;
-use bevy_kana::prelude::SequenceDriver;
-use bevy_kana::prelude::SequenceDriverClaimRejected;
-use bevy_kana::prelude::SequenceDriverReleased;
-use bevy_kana::prelude::SequenceDriverSelected;
-use bevy_kana::prelude::SequenceDriverTakeover;
-use bevy_kana::prelude::SequenceEasing;
-use bevy_kana::prelude::SequenceEasingSample;
-use bevy_kana::prelude::SequenceEasingSampler;
-use bevy_kana::prelude::SequenceEvaluation;
-use bevy_kana::prelude::SequenceMovement;
-use bevy_kana::prelude::SequenceMovementApplication;
-use bevy_kana::prelude::SequenceOwner;
-use bevy_kana::prelude::SequencePlayback;
-use bevy_kana::prelude::SequencePlaybackPlugin;
-use bevy_kana::prelude::SequencePlaybackSystems;
-use bevy_kana::prelude::SequencePosition;
-use bevy_kana::prelude::SequenceScope;
-use bevy_kana::prelude::SequenceSourceState;
-use bevy_kana::prelude::SequenceStages;
+use hana_kana::prelude::Easing;
+use hana_kana::prelude::EasingCurve;
+use hana_kana::prelude::EasingCurveError;
+use hana_kana::prelude::EasingInput;
+use hana_kana::prelude::EasingOutput;
+use hana_kana::prelude::SequenceCommand;
+use hana_kana::prelude::SequenceCommandRejected;
+use hana_kana::prelude::SequenceCommandResponse;
+use hana_kana::prelude::SequenceCommands;
+use hana_kana::prelude::SequenceDriver;
+use hana_kana::prelude::SequenceDriverClaimRejected;
+use hana_kana::prelude::SequenceDriverReleased;
+use hana_kana::prelude::SequenceDriverSelected;
+use hana_kana::prelude::SequenceDriverTakeover;
+use hana_kana::prelude::SequenceEasing;
+use hana_kana::prelude::SequenceEasingSample;
+use hana_kana::prelude::SequenceEasingSampler;
+use hana_kana::prelude::SequenceEvaluation;
+use hana_kana::prelude::SequenceMovement;
+use hana_kana::prelude::SequenceMovementApplication;
+use hana_kana::prelude::SequenceOwner;
+use hana_kana::prelude::SequencePlayback;
+use hana_kana::prelude::SequencePlaybackPlugin;
+use hana_kana::prelude::SequencePlaybackSystems;
+use hana_kana::prelude::SequencePosition;
+use hana_kana::prelude::SequenceScope;
+use hana_kana::prelude::SequenceSourceState;
+use hana_kana::prelude::SequenceStages;
 
 /// Fixed step so the printed positions are reproducible.
 const DEMO_STEP: Duration = Duration::from_millis(250);

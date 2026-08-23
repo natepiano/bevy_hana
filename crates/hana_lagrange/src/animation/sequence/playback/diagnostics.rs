@@ -1,9 +1,9 @@
 use bevy::prelude::Entity;
 use bevy::prelude::Reflect;
 use bevy::prelude::warn;
-use bevy_kana::SequenceEasingError;
-use bevy_kana::SequenceOwner;
-use bevy_kana::SequenceScopeError;
+use hana_kana::SequenceEasingError;
+use hana_kana::SequenceOwner;
+use hana_kana::SequenceScopeError;
 use thiserror::Error;
 
 /// Reasons a prepared camera pose cannot be evaluated.
@@ -106,16 +106,16 @@ mod tests {
     use bevy::prelude::IntoScheduleConfigs;
     use bevy::prelude::Update;
     use bevy::prelude::Vec3;
-    use bevy_kana::EasingSample;
-    use bevy_kana::RangeCrossings;
-    use bevy_kana::SequenceDirection;
-    use bevy_kana::SequenceEasing;
-    use bevy_kana::SequenceEasingSample;
-    use bevy_kana::SequenceEvaluation;
-    use bevy_kana::SequenceMovement;
-    use bevy_kana::SequencePlaybackSystems;
-    use bevy_kana::SequencePosition;
-    use bevy_kana::SequenceScope;
+    use hana_kana::EasingSample;
+    use hana_kana::RangeCrossings;
+    use hana_kana::SequenceDirection;
+    use hana_kana::SequenceEasing;
+    use hana_kana::SequenceEasingSample;
+    use hana_kana::SequenceEvaluation;
+    use hana_kana::SequenceMovement;
+    use hana_kana::SequencePlaybackSystems;
+    use hana_kana::SequencePosition;
+    use hana_kana::SequenceScope;
 
     use super::*;
     use crate::animation::sequence::CameraSequence;
@@ -168,7 +168,7 @@ mod tests {
         record_camera_boundary_order(app.world_mut(), camera);
         let driver = app
             .world_mut()
-            .spawn(bevy_kana::SequenceDriver::new(camera))
+            .spawn(hana_kana::SequenceDriver::new(camera))
             .id();
         app.add_systems(
             Update,
@@ -229,7 +229,7 @@ mod tests {
         record_camera_boundary_order(app.world_mut(), camera);
         let driver = app
             .world_mut()
-            .spawn(bevy_kana::SequenceDriver::new(camera))
+            .spawn(hana_kana::SequenceDriver::new(camera))
             .id();
         app.update();
         let start_pose = app

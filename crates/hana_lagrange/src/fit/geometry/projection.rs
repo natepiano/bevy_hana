@@ -11,8 +11,8 @@ use bevy::prelude::Projection;
 use bevy::prelude::Query;
 use bevy::prelude::Vec2;
 use bevy::prelude::Vec3;
-use bevy_kana::Position;
-use bevy_kana::ToF32;
+use hana_kana::Position;
+use hana_kana::ToF32;
 
 use crate::fit::constants::MIN_VISIBLE_DEPTH;
 

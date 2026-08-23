@@ -21,8 +21,8 @@ use std::sync::Mutex;
 use std::sync::PoisonError;
 
 use bevy::prelude::Resource;
-use bevy_kana::ToI32;
-use bevy_kana::ToU32;
+use hana_kana::ToI32;
+use hana_kana::ToU32;
 
 use super::font_features::FontFeatures;
 use super::text_props::FontSlant;

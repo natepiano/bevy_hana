@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authoring. A sequence describes its own `SequenceStages`, which is published
   on the sequence entity so shared driver arbitration and transport can resolve
   scopes against it.
-- Re-exports of the `bevy_kana` sequence and easing types reachable through
+- Re-exports of the `hana_kana` sequence and easing types reachable through
   camera signatures: `Easing`, `EasingCurve`, `EasingInput`,
   `EasingInterpolation`, `EasingKnot`, `EasingOutput`, `EasingSlope`,
   `EasingSlopes`, `SequenceCommand`, `SequenceCommandOutcome`,

@@ -1,7 +1,29 @@
 # hana_rubric
 
+[![Crates.io](https://img.shields.io/crates/v/hana_rubric.svg)](https://crates.io/crates/hana_rubric)
+[![Downloads](https://img.shields.io/crates/d/hana_rubric.svg)](https://crates.io/crates/hana_rubric)
+[![docs.rs](https://docs.rs/hana_rubric/badge.svg)](https://docs.rs/hana_rubric)
+[![License](https://img.shields.io/badge/license-MIT%2FApache-blue.svg)](https://github.com/natepiano/bevy_hana/tree/main/crates/hana_rubric#license)
+
 `hana_rubric` provides the JSONC keymap foundation for Bevy applications. It owns command IDs,
 load diagnostics, keymap layering, and reload support.
+
+> **Work in progress.** This crate is in active development (v0.1.0) and not
+> subject to semver stability guarantees. APIs will change without notice
+> between commits. Do not depend on this in production code yet.
+
+**Rubric** — in a medieval manuscript, the rubric was the text written in red: not the
+words to be spoken, but the instructions in the margin saying who acts, when, and what
+to do at each point. The performance lived in the black text; the rubric said how to
+carry it out. A keymap is the same artifact — it holds no behavior of its own, only the
+standing directions that turn a keystroke into the command an application already knows
+how to run.
+
+> **Coming from `bevy_kana`?** The `input` feature — `Keybindings`, `action!`, `event!`,
+> and `bind_action_system!` — moved here. `bevy_kana` 0.3.1 is the last release under
+> that name; its math and cascade halves continue as
+> [`hana_kana`](https://crates.io/crates/hana_kana). Drop `features = ["input"]` and
+> depend on `hana_rubric` instead.
 
 It also owns the multi-dimensional state model that state-specific bindings are authored against.
 This document is the whole public contract for that model: one setup mechanism, the JSONC
@@ -364,3 +386,27 @@ Fairy Dust's `palette_binding_presentation` and `PaletteBindingPresentation` are
 rendering of `PaletteBinding`, consumed only by Fairy Dust's own palette panel and example status
 surface. `fairy_dust` is an example crate; nothing in it is a reusable contract. Hana renders
 `PaletteBinding` with its own code and does not depend on `fairy_dust`.
+
+## Version Compatibility
+
+| Version           | Bevy |
+|-------------------|------|
+| hana_rubric 0.1.0 | 0.19 |
+
+## License
+
+`hana_rubric` is free, open source and permissively licensed!
+Except where noted (below and/or in individual files), all code in this repository is dual-licensed under either:
+
+* MIT License ([LICENSE-MIT](LICENSE-MIT) or [http://opensource.org/licenses/MIT](http://opensource.org/licenses/MIT))
+* Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or [http://www.apache.org/licenses/LICENSE-2.0](http://www.apache.org/licenses/LICENSE-2.0))
+
+at your option.
+
+### Your contributions
+
+Unless you explicitly state otherwise,
+any contribution intentionally submitted for inclusion in the work by you,
+as defined in the Apache-2.0 license,
+shall be dual licensed as above,
+without any additional terms or conditions.

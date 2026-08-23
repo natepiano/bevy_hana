@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-use bevy_kana::Easing;
-use bevy_kana::SequenceTime;
+use hana_kana::Easing;
+use hana_kana::SequenceTime;
 
 /// One authored movement's delay, extent, and curve inside its stage.
 ///
@@ -69,7 +69,7 @@ impl FoldTiming {
     /// Returns the stage duration this movement alone would require.
     ///
     /// This is the value handed to
-    /// [`SequenceStages::new`](bevy_kana::SequenceStages::new) for the stage
+    /// [`SequenceStages::new`](hana_kana::SequenceStages::new) for the stage
     /// whose members this movement outlasts. Unlike [`Self::end`] it saturates,
     /// because a `Duration` cannot hold every exact sum. A
     /// [`FoldSegment`](super::FoldSegment) ends on this same saturating sum, so

@@ -13,7 +13,7 @@ use bevy::prelude::Text;
 use bevy::prelude::Time;
 use bevy::prelude::Timer;
 use bevy::prelude::With;
-use bevy_kana::ToF64;
+use hana_kana::ToF64;
 
 use crate::benchmark_state::BenchmarkMode;
 use crate::benchmark_state::BenchmarkPhase;

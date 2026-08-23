@@ -16,7 +16,7 @@ semantic_newtype::semantic_newtype!(
     ///
     /// ```
     /// use bevy::math::Vec3;
-    /// use bevy_kana::Displacement;
+    /// use hana_kana::Displacement;
     ///
     /// let step = Displacement(Vec3::new(0.0, 0.0, -1.0));
     /// let double_step = step + step;

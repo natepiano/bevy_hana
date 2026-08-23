@@ -104,7 +104,7 @@ mod tests {
     use std::sync::Arc;
 
     use bevy::math::Vec2;
-    use bevy_kana::ToF32;
+    use hana_kana::ToF32;
 
     use super::collect_panel_field_records;
     use crate::El;

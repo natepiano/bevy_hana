@@ -311,7 +311,7 @@ mod tests {
     use bevy::prelude::Resource;
     use bevy::window::PrimaryWindow;
     use bevy::window::Window;
-    use bevy_kana::ToF32;
+    use hana_kana::ToF32;
 
     use super::panel_surface_bounds;
     use crate::Anchor;

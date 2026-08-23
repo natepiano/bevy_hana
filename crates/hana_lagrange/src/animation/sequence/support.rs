@@ -47,23 +47,23 @@ use bevy::reflect::ReflectFromReflect;
 use bevy::reflect::TypePath;
 use bevy::reflect::TypeRegistry;
 use bevy::window::WindowRef;
-use bevy_kana::DriverRestoration;
-use bevy_kana::RangeCrossings;
-use bevy_kana::SequenceCommand;
-use bevy_kana::SequenceCommandResponse;
-use bevy_kana::SequenceDirection;
-use bevy_kana::SequenceDriver;
-use bevy_kana::SequenceDriverReleased;
-use bevy_kana::SequenceMovement;
-use bevy_kana::SequenceOwner;
-use bevy_kana::SequenceOwnership;
-use bevy_kana::SequencePosition;
-use bevy_kana::SequenceSourceState;
-use bevy_kana::SequenceStageId;
-use bevy_kana::SequenceStageSpan;
-use bevy_kana::SequenceStages;
-use bevy_kana::SequenceStagesRevision;
-use bevy_kana::SequenceTime;
+use hana_kana::DriverRestoration;
+use hana_kana::RangeCrossings;
+use hana_kana::SequenceCommand;
+use hana_kana::SequenceCommandResponse;
+use hana_kana::SequenceDirection;
+use hana_kana::SequenceDriver;
+use hana_kana::SequenceDriverReleased;
+use hana_kana::SequenceMovement;
+use hana_kana::SequenceOwner;
+use hana_kana::SequenceOwnership;
+use hana_kana::SequencePosition;
+use hana_kana::SequenceSourceState;
+use hana_kana::SequenceStageId;
+use hana_kana::SequenceStageSpan;
+use hana_kana::SequenceStages;
+use hana_kana::SequenceStagesRevision;
+use hana_kana::SequenceTime;
 
 use super::CameraSequence;
 use super::controller_installation::*;
@@ -589,7 +589,7 @@ pub(super) fn run_selected_orbit_policy(behavior: CameraInputInterruptBehavior) 
     count_animation_closures(app.world_mut(), camera);
     let driver = app
         .world_mut()
-        .spawn(bevy_kana::SequenceDriver::new(camera))
+        .spawn(hana_kana::SequenceDriver::new(camera))
         .id();
 
     app.update();
@@ -682,7 +682,7 @@ pub(super) fn camera_prepared_for_native_command(
         .map_err(|_| "the endpoint fixture movement is valid")?;
         let driver = app
             .world_mut()
-            .spawn((bevy_kana::SequenceDriver::new(camera), movement))
+            .spawn((hana_kana::SequenceDriver::new(camera), movement))
             .id();
         app.update();
         app.world_mut().despawn(driver);
@@ -705,7 +705,7 @@ pub(super) fn camera_prepared_for_native_command(
                     (camera, SequenceOwner::NativePlayback, *precondition),
                 )
                 .map_err(|_| "native command precondition did not run")?,
-            SequenceCommandResponse::Permitted(bevy_kana::SequenceCommandOutcome::Applied,)
+            SequenceCommandResponse::Permitted(hana_kana::SequenceCommandOutcome::Applied,)
         );
     }
     Ok((app, camera))
@@ -761,7 +761,7 @@ pub(super) fn assert_native_camera_command_states() -> TestResult {
                     (camera, SequenceOwner::NativePlayback, command),
                 )
                 .map_err(|_| "permitted native command system did not run")?,
-            SequenceCommandResponse::Permitted(bevy_kana::SequenceCommandOutcome::Applied,),
+            SequenceCommandResponse::Permitted(hana_kana::SequenceCommandOutcome::Applied,),
             "{command:?} should apply from its prepared fixture state",
         );
         assert_eq!(
@@ -771,7 +771,7 @@ pub(super) fn assert_native_camera_command_states() -> TestResult {
                     (camera, SequenceOwner::NativePlayback, command),
                 )
                 .map_err(|_| "repeated native command system did not run")?,
-            SequenceCommandResponse::Permitted(bevy_kana::SequenceCommandOutcome::NoChange,),
+            SequenceCommandResponse::Permitted(hana_kana::SequenceCommandOutcome::NoChange,),
             "repeating {command:?} should be a permitted no-change",
         );
     }
@@ -789,7 +789,7 @@ pub(super) fn assert_selected_driver_command_state(app: &mut App) -> TestResult 
         .id();
     app.world_mut()
         .entity_mut(driver)
-        .insert(bevy_kana::SequenceDriver::new(camera));
+        .insert(hana_kana::SequenceDriver::new(camera));
     app.update();
     let (ownership, observation) = app
         .world_mut()
@@ -892,7 +892,7 @@ pub(super) fn release_stale_selected_driver(
 
     assert_eq!(
         app.world().resource::<ObservedDriverRestorations>().0,
-        [bevy_kana::DriverRestoration::DisplacedDriverStale(
+        [hana_kana::DriverRestoration::DisplacedDriverStale(
             displaced,
         )]
     );
@@ -925,7 +925,7 @@ pub(super) fn assert_restored_takeover_state(
 ) -> TestResult {
     assert_eq!(
         app.world().resource::<ObservedDriverRestorations>().0,
-        [bevy_kana::DriverRestoration::Restored(displaced)]
+        [hana_kana::DriverRestoration::Restored(displaced)]
     );
     assert_eq!(
         app.world().resource::<LifecycleEventOrder>().0,
@@ -977,8 +977,8 @@ pub(super) fn release_restored_driver_and_assert_idle(
     assert_eq!(
         app.world().resource::<ObservedDriverRestorations>().0,
         [
-            bevy_kana::DriverRestoration::Restored(displaced),
-            bevy_kana::DriverRestoration::NoDisplacedDriver,
+            hana_kana::DriverRestoration::Restored(displaced),
+            hana_kana::DriverRestoration::NoDisplacedDriver,
         ]
     );
     assert_eq!(

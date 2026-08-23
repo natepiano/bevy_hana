@@ -1,5 +1,5 @@
 use bevy::math::Vec2;
-use bevy_kana::ToF32;
+use hana_kana::ToF32;
 
 use super::layout_engine::ComputedLayout;
 use super::layout_engine::MeasureTextFn;

@@ -19,7 +19,7 @@ use bevy::prelude::Vec2;
 use bevy::prelude::Without;
 use bevy::prelude::default;
 use bevy::ui::UiTargetCamera;
-use bevy_kana::ScreenPosition;
+use hana_kana::ScreenPosition;
 
 use super::visual::FitOverlayVisual;
 use super::visual::FitOverlayVisualKind;
@@ -256,7 +256,7 @@ mod tests {
     use bevy::prelude::Res;
     use bevy::prelude::Resource;
     use bevy::prelude::Update;
-    use bevy_kana::ScreenPosition;
+    use hana_kana::ScreenPosition;
 
     use super::*;
 

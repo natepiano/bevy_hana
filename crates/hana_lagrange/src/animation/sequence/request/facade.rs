@@ -132,7 +132,7 @@ mod tests {
     use bevy::prelude::Transform;
     use bevy::prelude::Vec2;
     use bevy::prelude::Vec3;
-    use bevy_kana::SequenceStages;
+    use hana_kana::SequenceStages;
 
     use super::*;
     use crate::AnimateToFit;

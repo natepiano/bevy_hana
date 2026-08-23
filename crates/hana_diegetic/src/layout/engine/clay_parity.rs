@@ -20,7 +20,6 @@
 
 use std::sync::Arc;
 
-use bevy_kana::ToF32;
 use clay_layout::Clay;
 use clay_layout::ClayLayoutScope;
 use clay_layout::Declaration;
@@ -35,6 +34,7 @@ use clay_layout::math::Dimensions;
 use clay_layout::render_commands::RenderCommand;
 use clay_layout::render_commands::RenderCommandConfig;
 use clay_layout::text::TextConfig;
+use hana_kana::ToF32;
 
 use crate::layout::AlignX;
 use crate::layout::AlignY;

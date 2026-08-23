@@ -1,10 +1,10 @@
 use bevy::prelude::Commands;
 use bevy::prelude::Entity;
 use bevy::prelude::warn;
-use bevy_kana::SequenceDirection;
-use bevy_kana::SequenceOwner;
-use bevy_kana::SequenceStageId;
-use bevy_kana::SequenceUpdate;
+use hana_kana::SequenceDirection;
+use hana_kana::SequenceOwner;
+use hana_kana::SequenceStageId;
+use hana_kana::SequenceUpdate;
 
 use super::CameraPlaybackClosureReason;
 use super::CameraPlaybackLifecycleState;
@@ -211,10 +211,10 @@ pub(super) fn emit_camera_boundaries(
             (record.boundary, direction),
             (
                 CameraMoveBoundary::Begin { .. },
-                bevy_kana::SequenceDirection::Forward
+                hana_kana::SequenceDirection::Forward
             ) | (
                 CameraMoveBoundary::End { .. },
-                bevy_kana::SequenceDirection::Backward
+                hana_kana::SequenceDirection::Backward
             )
         );
         if begins {
@@ -325,12 +325,12 @@ mod tests {
     use bevy::prelude::Transform;
     use bevy::prelude::Vec3;
     use bevy::reflect::ReflectRef;
-    use bevy_kana::RangeCrossing;
-    use bevy_kana::RangeCrossings;
-    use bevy_kana::RangeEdge;
-    use bevy_kana::SequenceMovement;
-    use bevy_kana::SequencePosition;
-    use bevy_kana::SequenceStages;
+    use hana_kana::RangeCrossing;
+    use hana_kana::RangeCrossings;
+    use hana_kana::RangeEdge;
+    use hana_kana::SequenceMovement;
+    use hana_kana::SequencePosition;
+    use hana_kana::SequenceStages;
 
     use super::*;
     use crate::AnimateToFit;
@@ -383,7 +383,7 @@ mod tests {
         .map_err(|_| "the crossing record describes every forward repetition")?;
         let driver = app
             .world_mut()
-            .spawn((bevy_kana::SequenceDriver::new(camera), movement))
+            .spawn((hana_kana::SequenceDriver::new(camera), movement))
             .id();
 
         app.update();
@@ -451,7 +451,7 @@ mod tests {
         let driver = app
             .world_mut()
             .spawn((
-                bevy_kana::SequenceDriver::new(camera),
+                hana_kana::SequenceDriver::new(camera),
                 SequenceMovement::try_new(
                     SequencePosition::END,
                     SequenceDirection::Forward,
@@ -695,7 +695,7 @@ mod tests {
         assert_facade_journey_metadata(app.world(), camera, revision, target)?;
 
         app.world_mut()
-            .spawn(bevy_kana::SequenceDriver::new(camera));
+            .spawn(hana_kana::SequenceDriver::new(camera));
         app.update();
         app.world_mut().entity_mut(camera).insert(CameraBasis::Y_UP);
         app.update();

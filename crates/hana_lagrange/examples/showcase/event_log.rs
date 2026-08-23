@@ -7,7 +7,6 @@ use bevy::prelude::Vec3;
 use bevy::prelude::Visibility;
 use bevy::prelude::error;
 use bevy::prelude::warn;
-use bevy_kana::ToF32;
 use fairy_dust::ControlActivation;
 use fairy_dust::DEFAULT_PANEL_BACKGROUND;
 use fairy_dust::TITLE_COLOR;
@@ -26,6 +25,7 @@ use hana_diegetic::Sizing;
 use hana_diegetic::Text;
 use hana_diegetic::TextStyle;
 use hana_diegetic::TextWrap;
+use hana_kana::ToF32;
 
 use super::*;
 

@@ -481,7 +481,7 @@ impl Plugin for DiegeticTextPlugin {
 mod tests {
     use std::sync::Arc;
 
-    use bevy_kana::ToF32;
+    use hana_kana::ToF32;
 
     use super::*;
     use crate::layout::LayoutEngine;

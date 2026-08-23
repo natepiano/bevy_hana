@@ -24,8 +24,8 @@ upstream and arrive here on the next release.
 
 | Crate | crates.io |
 |---|---|
-| [`bevy_kana`](crates/bevy_kana) | [![crates.io](https://img.shields.io/crates/v/bevy_kana.svg)](https://crates.io/crates/bevy_kana) |
 | [`hana_clerestory`](crates/hana_clerestory) | [![crates.io](https://img.shields.io/crates/v/hana_clerestory.svg)](https://crates.io/crates/hana_clerestory) |
+| [`hana_kana`](crates/hana_kana) | [![crates.io](https://img.shields.io/crates/v/hana_kana.svg)](https://crates.io/crates/hana_kana) |
 | [`hana_lagrange`](crates/hana_lagrange) | [![crates.io](https://img.shields.io/crates/v/hana_lagrange.svg)](https://crates.io/crates/hana_lagrange) |
 | [`hana_liminal`](crates/hana_liminal) | [![crates.io](https://img.shields.io/crates/v/hana_liminal.svg)](https://crates.io/crates/hana_liminal) |
 | [`hana_rigging`](crates/hana_rigging) | [![crates.io](https://img.shields.io/crates/v/hana_rigging.svg)](https://crates.io/crates/hana_rigging) |

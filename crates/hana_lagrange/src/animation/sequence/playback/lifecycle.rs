@@ -1,8 +1,8 @@
 use bevy::prelude::Commands;
 use bevy::prelude::Entity;
 use bevy::prelude::Query;
-use bevy_kana::SequenceDirection;
-use bevy_kana::SequenceOwner;
+use hana_kana::SequenceDirection;
+use hana_kana::SequenceOwner;
 
 use super::CameraSequencePlayback;
 use super::emission;
@@ -460,12 +460,12 @@ mod tests {
     use bevy::prelude::Projection;
     use bevy::prelude::Transform;
     use bevy::prelude::Vec3;
-    use bevy_kana::SequenceDriver;
-    use bevy_kana::SequenceDriverTakeover;
-    use bevy_kana::SequenceEasing;
-    use bevy_kana::SequenceEvaluation;
-    use bevy_kana::SequenceScope;
-    use bevy_kana::SequenceSourceState;
+    use hana_kana::SequenceDriver;
+    use hana_kana::SequenceDriverTakeover;
+    use hana_kana::SequenceEasing;
+    use hana_kana::SequenceEvaluation;
+    use hana_kana::SequenceScope;
+    use hana_kana::SequenceSourceState;
 
     use super::*;
     use crate::CameraBasis;
@@ -592,7 +592,7 @@ mod tests {
         let displaced = app
             .world_mut()
             .spawn((
-                bevy_kana::SequenceDriver::new(camera),
+                hana_kana::SequenceDriver::new(camera),
                 SequenceEvaluation::new(SequenceScope::Stage(old_stage), SequenceEasing::Authored),
             ))
             .id();
@@ -602,7 +602,7 @@ mod tests {
         let selected = app
             .world_mut()
             .spawn((
-                bevy_kana::SequenceDriver::new(camera),
+                hana_kana::SequenceDriver::new(camera),
                 SequenceDriverTakeover,
             ))
             .id();
@@ -728,14 +728,14 @@ mod tests {
         record_camera_boundary_order(app.world_mut(), camera);
         let displaced = app
             .world_mut()
-            .spawn(bevy_kana::SequenceDriver::new(camera))
+            .spawn(hana_kana::SequenceDriver::new(camera))
             .id();
         app.update();
 
         let selected = app
             .world_mut()
             .spawn((
-                bevy_kana::SequenceDriver::new(camera),
+                hana_kana::SequenceDriver::new(camera),
                 SequenceDriverTakeover,
             ))
             .id();
@@ -773,7 +773,7 @@ mod tests {
         record_camera_boundary_order(app.world_mut(), camera);
         let driver = app
             .world_mut()
-            .spawn(bevy_kana::SequenceDriver::new(camera))
+            .spawn(hana_kana::SequenceDriver::new(camera))
             .id();
         app.update();
 
@@ -817,7 +817,7 @@ mod tests {
         record_camera_boundary_order(app.world_mut(), camera);
         let driver = app
             .world_mut()
-            .spawn(bevy_kana::SequenceDriver::new(camera))
+            .spawn(hana_kana::SequenceDriver::new(camera))
             .id();
         app.update();
 
@@ -864,7 +864,7 @@ mod tests {
         record_camera_boundary_order(app.world_mut(), camera);
         let driver = app
             .world_mut()
-            .spawn(bevy_kana::SequenceDriver::new(camera))
+            .spawn(hana_kana::SequenceDriver::new(camera))
             .id();
         app.update();
 

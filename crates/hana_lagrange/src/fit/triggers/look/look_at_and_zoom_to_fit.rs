@@ -270,7 +270,7 @@ mod tests {
     use bevy::prelude::Resource;
     use bevy::prelude::Time;
     use bevy::prelude::Vec3;
-    use bevy_kana::Displacement;
+    use hana_kana::Displacement;
 
     use super::*;
     use crate::CurrentFitTarget;

@@ -8,7 +8,7 @@ use bevy::prelude::Quat;
 use bevy::prelude::Transform;
 use bevy::prelude::Vec3;
 use bevy::prelude::Vec4;
-use bevy_kana::Position;
+use hana_kana::Position;
 
 use super::constants::MIN_ORBIT_RADIUS;
 use super::constants::PERSPECTIVE_NEAR_MIN;

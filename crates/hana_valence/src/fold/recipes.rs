@@ -1,9 +1,9 @@
 //! The three fold recipes the library ships.
 
 use bevy_ecs::entity::Entity;
-use bevy_kana::Angle;
-use bevy_kana::AngleError;
-use bevy_kana::Displacement;
+use hana_kana::Angle;
+use hana_kana::AngleError;
+use hana_kana::Displacement;
 
 use super::FoldAssignment;
 use super::FoldAuthorError;

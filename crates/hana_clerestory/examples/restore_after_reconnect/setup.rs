@@ -17,10 +17,10 @@ use bevy::window::OnMonitor;
 use bevy::window::PrimaryWindow;
 use bevy::window::WindowPosition;
 use bevy::window::WindowResolution;
-use bevy_kana::ToI32;
 use hana_clerestory::ManagedWindow;
 use hana_clerestory::ManagedWindowReapplyOnRequest;
 use hana_clerestory::Monitors;
+use hana_kana::ToI32;
 
 use super::ProbeMonitorIndex;
 use super::ProbeStartupMode;

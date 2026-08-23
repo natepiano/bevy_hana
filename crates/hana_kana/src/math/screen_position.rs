@@ -21,7 +21,7 @@ use bevy::reflect::Reflect;
 /// # Examples
 ///
 /// ```
-/// use bevy_kana::ScreenPosition;
+/// use hana_kana::ScreenPosition;
 ///
 /// let cursor = ScreenPosition::new(640.0, 480.0);
 /// let offset = ScreenPosition::new(10.0, -5.0);

@@ -1,15 +1,15 @@
 use bevy::prelude::Entity;
 use bevy::prelude::Query;
-use bevy_kana::EasingSampler;
-use bevy_kana::SequenceCommands;
-use bevy_kana::SequenceEasing;
-use bevy_kana::SequenceEasingSample;
-use bevy_kana::SequenceEasingSampler;
-use bevy_kana::SequenceEvaluation;
-use bevy_kana::SequenceOwner;
-use bevy_kana::SequencePosition;
-use bevy_kana::SequenceRange;
-use bevy_kana::SequenceScope;
+use hana_kana::EasingSampler;
+use hana_kana::SequenceCommands;
+use hana_kana::SequenceEasing;
+use hana_kana::SequenceEasingSample;
+use hana_kana::SequenceEasingSampler;
+use hana_kana::SequenceEvaluation;
+use hana_kana::SequenceOwner;
+use hana_kana::SequencePosition;
+use hana_kana::SequenceRange;
+use hana_kana::SequenceScope;
 
 use super::CameraMoveSample;
 use super::CameraPlaybackLifecycleState;

@@ -1,12 +1,12 @@
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::Entity;
 use bevy::prelude::Query;
-use bevy_kana::SequenceCommand;
-use bevy_kana::SequenceCommandResponse;
-use bevy_kana::SequenceCommands;
-use bevy_kana::SequenceOwner;
-use bevy_kana::SequenceOwnership;
-use bevy_kana::SequencePosition;
+use hana_kana::SequenceCommand;
+use hana_kana::SequenceCommandResponse;
+use hana_kana::SequenceCommands;
+use hana_kana::SequenceOwner;
+use hana_kana::SequenceOwnership;
+use hana_kana::SequencePosition;
 
 use super::playback::CameraSequencePlayback;
 

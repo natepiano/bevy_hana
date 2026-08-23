@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use bevy::color::Color;
-use bevy_kana::ToF32;
+use hana_kana::ToF32;
 
 use super::layout_engine::ComputedLayout;
 use super::sizing;

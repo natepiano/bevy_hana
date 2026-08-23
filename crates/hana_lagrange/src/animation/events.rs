@@ -10,11 +10,11 @@ use bevy::prelude::EntityEvent;
 use bevy::prelude::Reflect;
 use bevy::prelude::ReflectEvent;
 use bevy::prelude::ReflectFromReflect;
-use bevy_kana::SequenceDirection;
-use bevy_kana::SequenceOwner;
-use bevy_kana::SequencePosition;
-use bevy_kana::SequenceStageId;
-use bevy_kana::SequenceTime;
+use hana_kana::SequenceDirection;
+use hana_kana::SequenceOwner;
+use hana_kana::SequencePosition;
+use hana_kana::SequenceStageId;
+use hana_kana::SequenceTime;
 
 use super::lifecycle::AnimationConflictPolicy;
 use super::queue::CameraMove;

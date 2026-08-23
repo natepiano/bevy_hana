@@ -1,6 +1,6 @@
 use bevy::prelude::Vec2;
 use bevy::prelude::Vec3;
-use bevy_kana::ScreenPosition;
+use hana_kana::ScreenPosition;
 
 use super::Edge;
 use crate::fit::geometry::ProjectionBasis;

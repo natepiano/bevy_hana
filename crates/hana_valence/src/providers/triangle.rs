@@ -1,6 +1,6 @@
 use bevy_ecs::entity::Entity;
-use bevy_kana::Angle;
 use bevy_math::Vec3;
+use hana_kana::Angle;
 
 use super::sheet;
 use crate::AnchorSite;

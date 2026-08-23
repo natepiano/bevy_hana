@@ -11,28 +11,28 @@ use bevy_ecs::system::Commands;
 use bevy_ecs::system::Query;
 use bevy_ecs::system::Res;
 use bevy_ecs::system::SystemParam;
-use bevy_kana::EasingSampler;
-use bevy_kana::SequenceCommand;
-use bevy_kana::SequenceCommandResponse;
-use bevy_kana::SequenceCommands;
-use bevy_kana::SequenceEasing;
-use bevy_kana::SequenceEasingError;
-use bevy_kana::SequenceEasingSample;
-use bevy_kana::SequenceEasingSampler;
-use bevy_kana::SequenceEvaluation;
-use bevy_kana::SequenceMovement;
-use bevy_kana::SequenceMovementApplication;
-use bevy_kana::SequenceOwner;
-use bevy_kana::SequenceOwnership;
-use bevy_kana::SequencePlayback;
-use bevy_kana::SequencePlaybackError;
-use bevy_kana::SequencePosition;
-use bevy_kana::SequenceRange;
-use bevy_kana::SequenceScope;
-use bevy_kana::SequenceUpdate;
 use bevy_reflect::Reflect;
 use bevy_time::Time;
 use bevy_time::Virtual;
+use hana_kana::EasingSampler;
+use hana_kana::SequenceCommand;
+use hana_kana::SequenceCommandResponse;
+use hana_kana::SequenceCommands;
+use hana_kana::SequenceEasing;
+use hana_kana::SequenceEasingError;
+use hana_kana::SequenceEasingSample;
+use hana_kana::SequenceEasingSampler;
+use hana_kana::SequenceEvaluation;
+use hana_kana::SequenceMovement;
+use hana_kana::SequenceMovementApplication;
+use hana_kana::SequenceOwner;
+use hana_kana::SequenceOwnership;
+use hana_kana::SequencePlayback;
+use hana_kana::SequencePlaybackError;
+use hana_kana::SequencePosition;
+use hana_kana::SequenceRange;
+use hana_kana::SequenceScope;
+use hana_kana::SequenceUpdate;
 
 use super::EasedFoldFraction;
 use super::FoldEvaluationError;
@@ -257,7 +257,7 @@ impl FoldCommands<'_, '_> {
     ///
     /// A command issued while another producer holds the sequence is rejected
     /// without mutation or queuing and triggers
-    /// [`SequenceCommandRejected`](bevy_kana::SequenceCommandRejected). An
+    /// [`SequenceCommandRejected`](hana_kana::SequenceCommandRejected). An
     /// entity that carries no retained playback answers
     /// [`SequenceCommandResponse::NoRetainedSequence`] instead, so a caller can
     /// tell a sequence it does not own from one that does not exist.
@@ -343,7 +343,7 @@ enum EvaluationPlan<'evaluation> {
 ///
 /// The gate is change detection over [`FoldSequence`] alone.
 /// [`FoldSequence`] construction draws a fresh
-/// [`SequenceStages`](bevy_kana::SequenceStages) revision, so a needless rebuild would strand every
+/// [`SequenceStages`](hana_kana::SequenceStages) revision, so a needless rebuild would strand every
 /// producer's definition-bound scope on a stale revision.
 ///
 /// Replacement discards the previous derived state: with no selected driver the

@@ -8,8 +8,8 @@ use bevy::prelude::UVec2;
 use bevy::prelude::debug;
 #[cfg(test)]
 use bevy::prelude::warn;
-use bevy_kana::ToI32;
-use bevy_kana::ToU32;
+use hana_kana::ToI32;
+use hana_kana::ToU32;
 
 use super::strategy::FullscreenRestoreState;
 use super::strategy::MonitorScaleStrategy;

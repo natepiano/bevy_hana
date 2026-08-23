@@ -3,7 +3,7 @@ use std::env::var;
 use bevy::prelude::Resource;
 use bevy::prelude::Timer;
 use bevy::prelude::TimerMode;
-use bevy_kana::ToUsize;
+use hana_kana::ToUsize;
 use hana_liminal::OutlineMethod;
 
 use crate::constants::AUTO_EXIT_DELAY_SECS;

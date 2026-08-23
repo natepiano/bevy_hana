@@ -5,8 +5,8 @@ use core::fmt::Debug;
 use core::hash::Hash;
 
 use bevy_ecs::entity::Entity;
-use bevy_kana::Angle;
-use bevy_kana::Displacement;
+use hana_kana::Angle;
+use hana_kana::Displacement;
 
 use super::FoldGroups;
 use crate::ArrangementConnection;

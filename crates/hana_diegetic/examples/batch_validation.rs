@@ -53,7 +53,6 @@ use bevy::prelude::Vec3;
 use bevy::prelude::With;
 use bevy::prelude::default;
 use bevy::prelude::error;
-use bevy_kana::ToF32;
 use fairy_dust::CameraHomeTarget;
 use fairy_dust::ControlActivation;
 use fairy_dust::DEFAULT_PANEL_BACKGROUND;
@@ -105,6 +104,7 @@ use hana_diegetic::Text;
 use hana_diegetic::TextStyle;
 use hana_diegetic::TextWrap;
 use hana_diegetic::default_panel_material;
+use hana_kana::ToF32;
 use hana_lagrange::OrbitCamPreset;
 
 const PANEL_W: f32 = 170.0;

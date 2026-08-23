@@ -10,7 +10,7 @@ use bevy::prelude::Vec2;
 use bevy::prelude::Vec3;
 use bevy::prelude::debug;
 use bevy::prelude::warn;
-use bevy_kana::Position;
+use hana_kana::Position;
 
 use super::fit_solution::FitError;
 use super::fit_solution::FitSolution;

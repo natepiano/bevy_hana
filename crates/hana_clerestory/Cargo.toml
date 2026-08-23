@@ -32,7 +32,7 @@ bevy = { workspace = true, features = [
   "x11",
 ] }
 bevy_diagnostic = { workspace = true }
-bevy_kana = { workspace = true }
+hana_kana = { workspace = true }
 hana_rigging = { workspace = true }
 winit = { workspace = true }
 

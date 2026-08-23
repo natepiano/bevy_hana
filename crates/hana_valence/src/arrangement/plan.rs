@@ -3,10 +3,10 @@ use core::fmt::Debug;
 use core::hash::Hash;
 
 use bevy_ecs::entity::Entity;
-use bevy_kana::Angle;
-use bevy_kana::Displacement;
 use bevy_platform::collections::HashMap;
 use bevy_platform::collections::HashSet;
+use hana_kana::Angle;
+use hana_kana::Displacement;
 use thiserror::Error;
 
 use super::ArrangementMemberEntities;

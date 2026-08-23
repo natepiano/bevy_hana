@@ -78,8 +78,6 @@ use bevy::render::RenderSystems;
 use bevy::render::render_phase::ViewBinnedRenderPhases;
 use bevy::render::renderer::RenderGraph;
 use bevy::render::renderer::RenderGraphSystems;
-use bevy_kana::ToF32;
-use bevy_kana::ToU32;
 use diagnostics::DrawCounts;
 use diagnostics::MainThreadMs;
 use diagnostics::RenderThreadSpans;
@@ -121,6 +119,8 @@ use hana_diegetic::Sizing;
 use hana_diegetic::StableTransparency;
 use hana_diegetic::TextAlign;
 use hana_diegetic::TextStyle;
+use hana_kana::ToF32;
+use hana_kana::ToU32;
 use hana_lagrange::OrbitCam;
 use hana_lagrange::OrbitCamPreset;
 

@@ -15,7 +15,7 @@ use bevy::prelude::Without;
 use bevy::prelude::debug;
 use bevy::prelude::warn;
 use bevy::window::PrimaryWindow;
-use bevy_kana::ToU32;
+use hana_kana::ToU32;
 use hana_rigging::prelude::AvailableConfiguration;
 use hana_rigging::prelude::Bindings;
 use hana_rigging::prelude::RoleKey;

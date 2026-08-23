@@ -34,8 +34,8 @@ bevy = { workspace = true, features = [
   "mesh_picking",
 ] }
 bevy_enhanced_input = { workspace = true }
-bevy_kana = { workspace = true }
 bitflags = { workspace = true }
+hana_kana = { workspace = true }
 hana_rubric = { workspace = true }
 hana_valence = { workspace = true }
 image = { workspace = true }

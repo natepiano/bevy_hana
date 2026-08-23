@@ -532,7 +532,7 @@ mod tests {
     use bevy::prelude::ResMut;
     use bevy::prelude::Resource;
     use bevy::prelude::With;
-    use bevy_kana::ToF32;
+    use hana_kana::ToF32;
 
     use super::DiegeticTextMut;
     use super::PanelText;

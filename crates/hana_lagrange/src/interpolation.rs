@@ -1,7 +1,7 @@
 //! Frame-rate-independent smoothing shared across camera kinds.
 
 use bevy::prelude::FloatExt;
-use bevy_kana::Position;
+use hana_kana::Position;
 
 use crate::constants::EPSILON;
 use crate::constants::SMOOTHNESS_EXPONENT;

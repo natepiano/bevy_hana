@@ -3,7 +3,7 @@
 use std::f32::consts::TAU;
 
 use bevy::math::Vec2;
-use bevy_kana::ToF32;
+use hana_kana::ToF32;
 
 use crate::layout::BoundingBox;
 use crate::layout::PanelShapePrimitiveGeometry;
@@ -455,7 +455,7 @@ mod tests {
     use std::sync::Arc;
 
     use bevy::color::Color;
-    use bevy_kana::ToF32;
+    use hana_kana::ToF32;
 
     use super::*;
     use crate::cascade::Cascade;

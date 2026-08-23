@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
 use bevy::math::Vec2;
-use bevy_kana::ToU32;
+use hana_kana::ToU32;
 
 use crate::render::BandRecord;
 use crate::render::Bounds;

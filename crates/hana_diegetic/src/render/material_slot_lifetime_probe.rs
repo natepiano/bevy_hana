@@ -13,8 +13,8 @@ use bevy::prelude::Resource;
 use bevy::prelude::SystemSet;
 use bevy::prelude::Update;
 use bevy::prelude::World;
-use bevy_kana::ToU32;
-use bevy_kana::ToUsize;
+use hana_kana::ToU32;
+use hana_kana::ToUsize;
 
 const STRESS_SLOT_COUNT: usize = 128;
 const STRESS_FRAME_COUNT: usize = 12;

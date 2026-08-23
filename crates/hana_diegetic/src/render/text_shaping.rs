@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use std::sync::PoisonError;
 
 use bevy::prelude::Resource;
-use bevy_kana::ToU16;
+use hana_kana::ToU16;
 use parley::Layout;
 use parley::LayoutContext;
 use parley::RangedBuilder;

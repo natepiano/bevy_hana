@@ -1,8 +1,8 @@
 use bevy_ecs::entity::Entity;
-use bevy_kana::SequenceTime;
-use bevy_kana::ToF32;
 use bevy_reflect::Reflect;
 use bevy_reflect::std_traits::ReflectDefault;
+use hana_kana::SequenceTime;
+use hana_kana::ToF32;
 
 use super::FoldTarget;
 use super::FoldTiming;
@@ -61,7 +61,7 @@ impl FoldSegmentProgress {
     /// Clamping first leaves only rounding for the narrowing to do. NaN orders
     /// against nothing and so names no position within the segment; it reads as
     /// [`Self::ENTERED`], as
-    /// [`SequencePosition`](bevy_kana::SequencePosition) does for a sequence.
+    /// [`SequencePosition`](hana_kana::SequencePosition) does for a sequence.
     fn clamped_from_f64(normalized: f64) -> Self {
         if normalized.is_nan() {
             return Self::ENTERED;
@@ -290,11 +290,11 @@ impl FoldBoundaryRecord {
 /// The ordered boundary records of one authored fold sequence.
 ///
 /// Record order is the one
-/// [`SequencePlayback`](bevy_kana::SequencePlayback) documents for coincident
+/// [`SequencePlayback`](hana_kana::SequencePlayback) documents for coincident
 /// fold boundaries: the exiting stage's member ends, that stage's end, the next
 /// stage's begin, then its member begins in group order, with a zero-duration
 /// member's begin and end kept adjacent and a reached endpoint last.
-/// [`SequenceTraversal::boundaries`](bevy_kana::SequenceTraversal::boundaries)
+/// [`SequenceTraversal::boundaries`](hana_kana::SequenceTraversal::boundaries)
 /// reverses exactly this order for backward travel.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FoldLedger {
@@ -307,7 +307,7 @@ impl FoldLedger {
     pub fn records(&self) -> &[FoldBoundaryRecord] { &self.records }
 
     /// Returns the normalized positions
-    /// [`SequencePlayback::try_new`](bevy_kana::SequencePlayback::try_new)
+    /// [`SequencePlayback::try_new`](hana_kana::SequencePlayback::try_new)
     /// accepts, in the same ordinal order as [`Self::records`].
     pub fn boundary_positions(&self) -> impl Iterator<Item = f64> {
         self.records

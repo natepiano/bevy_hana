@@ -1003,7 +1003,7 @@ mod tests {
     use bevy::prelude::AlphaMode;
     use bevy::prelude::Color;
     use bevy::prelude::Handle;
-    use bevy_kana::Cascade;
+    use hana_kana::Cascade;
 
     use super::PanelBuildError;
     use crate::Appearance;

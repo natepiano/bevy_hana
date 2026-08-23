@@ -104,8 +104,8 @@ mod tests {
     use bevy::prelude::default;
     use bevy::window::WindowPlugin;
     use bevy::window::WindowResolution;
-    use bevy_kana::ToF32;
-    use bevy_kana::ToU32;
+    use hana_kana::ToF32;
+    use hana_kana::ToU32;
 
     use super::*;
 

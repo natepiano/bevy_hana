@@ -372,8 +372,8 @@ fn line_base_material() -> StandardMaterial {
 
 #[cfg(test)]
 mod tests {
-    use bevy_kana::ToF32;
-    use bevy_kana::ToUsize;
+    use hana_kana::ToF32;
+    use hana_kana::ToUsize;
 
     use super::*;
     use crate::render::CurveRecord;

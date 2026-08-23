@@ -66,8 +66,8 @@ use bevy::render::render_resource::SpecializedMeshPipelineError;
 use bevy::render::storage::ShaderBuffer;
 use bevy::shader::ShaderRef;
 use bevy::transform::TransformSystems;
-use bevy_kana::ToU32;
-use bevy_kana::ToUsize;
+use hana_kana::ToU32;
+use hana_kana::ToUsize;
 
 use super::BatchAlphaMode;
 use super::BatchRenderLayers;
@@ -1889,7 +1889,7 @@ mod tests {
     use bevy::shader::Shader;
     use bevy::shader::ShaderDefVal;
     use bevy::window::PrimaryWindow;
-    use bevy_kana::ToF32;
+    use hana_kana::ToF32;
 
     use super::*;
     use crate::AlignX;

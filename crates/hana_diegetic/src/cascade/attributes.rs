@@ -4,8 +4,8 @@ use bevy::prelude::Entity;
 use bevy::prelude::EntityCommands;
 use bevy::prelude::Handle;
 use bevy::prelude::World;
-use bevy_kana::CascadeAttribute;
-use bevy_kana::CascadeEntityCommandsExt as _;
+use hana_kana::CascadeAttribute;
+use hana_kana::CascadeEntityCommandsExt as _;
 
 use super::CascadeRoot;
 pub use super::resolved::FontUnit;
@@ -455,10 +455,10 @@ fn resolved_cascade<A>(world: &World, entity: Entity) -> A
 where
     A: CascadeAttribute + CascadeRoot,
 {
-    if let Some(value) = bevy_kana::resolved_cascade::<A>(world, entity) {
+    if let Some(value) = hana_kana::resolved_cascade::<A>(world, entity) {
         return value.clone();
     }
-    bevy_kana::resolve_entity_cascade::<A, A::Root>(world, entity).unwrap_or_else(A::root_default)
+    hana_kana::resolve_entity_cascade::<A, A::Root>(world, entity).unwrap_or_else(A::root_default)
 }
 
 #[cfg(test)]

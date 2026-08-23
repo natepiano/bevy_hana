@@ -1,5 +1,5 @@
 use bevy_ecs::entity::Entity;
-use bevy_kana::Displacement;
+use hana_kana::Displacement;
 
 use super::FoldAuthorError;
 use super::FoldGroups;
@@ -102,7 +102,7 @@ impl ProviderCapability for WindingClearance {}
 mod tests {
     use bevy_ecs::entity::Entity;
     use bevy_ecs::world::World;
-    use bevy_kana::Displacement;
+    use hana_kana::Displacement;
 
     use super::WindingClearance;
     use crate::FoldAuthorError;

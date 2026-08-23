@@ -9,7 +9,7 @@ use bevy::prelude::AlphaMode;
 use bevy::prelude::Reflect;
 use bevy::prelude::ReflectResource;
 use bevy::prelude::Resource;
-use bevy_kana::CascadeRootResource;
+use hana_kana::CascadeRootResource;
 
 use super::constants::CASCADE_ATTRIBUTE_BYTES;
 use crate::layout::GlyphShadowMode;
@@ -22,11 +22,11 @@ use crate::render::HairlineFade;
 use crate::render::HairlineWidth;
 use crate::widgets::WidgetInteractivity;
 
-/// Implements [`bevy_kana::CascadeRootResource`] for a `Copy` attribute type
+/// Implements [`hana_kana::CascadeRootResource`] for a `Copy` attribute type
 /// that is its own root resource. The type must derive `Resource`.
 macro_rules! cascade_root_resource {
     ($name:ident) => {
-        impl bevy_kana::CascadeRootResource<$name> for $name {
+        impl hana_kana::CascadeRootResource<$name> for $name {
             fn root(&self) -> Self { *self }
 
             fn from_root(root: Self) -> Self { root }
@@ -51,7 +51,7 @@ macro_rules! cascade_attribute {
 
     // Same, for an attribute whose root value is one field of a resource the
     // crate already exposes. That resource implements
-    // `bevy_kana::CascadeRootResource` where it is declared.
+    // `hana_kana::CascadeRootResource` where it is declared.
     (existing $name:ident, root = $root:ty, default = $default:expr) => {
         impl $crate::cascade::resolved::CascadeRoot for $name {
             type Root = $root;
@@ -253,9 +253,9 @@ cascade_attribute!(
     default = WidgetInteractivity::Enabled
 );
 
-pub(crate) trait CascadeRoot: bevy_kana::CascadeAttribute {
+pub(crate) trait CascadeRoot: hana_kana::CascadeAttribute {
     /// Resource holding this attribute's app-wide root value.
-    type Root: bevy_kana::CascadeRootResource<Self>;
+    type Root: hana_kana::CascadeRootResource<Self>;
 
     fn root_default() -> Self;
 
@@ -288,7 +288,7 @@ mod tests {
         app.add_plugins(MinimalPlugins)
             .add_plugins(cascade::cascade_plugin::<A>());
 
-        let default_value = bevy_kana::CascadeRootResource::root(app.world().resource::<A::Root>());
+        let default_value = hana_kana::CascadeRootResource::root(app.world().resource::<A::Root>());
         let root = app.world_mut().spawn(Cascade::<A>::Inherit).id();
         let panel = app
             .world_mut()

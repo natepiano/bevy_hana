@@ -2,7 +2,7 @@ use core::fmt;
 use core::fmt::Display;
 use core::fmt::Formatter;
 
-use bevy_kana::Position;
+use hana_kana::Position;
 
 /// Successful fit output: camera orbit radius and centered focus point.
 #[derive(Debug, Clone, Copy)]

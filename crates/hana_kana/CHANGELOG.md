@@ -49,6 +49,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** Renamed the crate from `bevy_kana` to `hana_kana`. The `bevy_`
+  prefix is reserved for published legacy crates; every crate in this
+  workspace now uses the `hana_` prefix. `bevy_kana` 0.3.0 is the final
+  release under the old name. Change the dependency name and every
+  `use bevy_kana::` path to `hana_kana`; no items were renamed
+
 - **Breaking:** `Easing::Curve` now owns an `EasingCurve` by value. Easing
   authoring no longer uses asset handles or storage, and sampling has no
   readiness branch. Construct semantic input, output, and slope values before

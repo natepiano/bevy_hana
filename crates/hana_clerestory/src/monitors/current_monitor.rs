@@ -37,7 +37,7 @@ use bevy::window::OnMonitor;
 use bevy::window::PrimaryWindow;
 use bevy::window::WindowMode;
 use bevy::winit::WINIT_WINDOWS;
-use bevy_kana::ToI32;
+use hana_kana::ToI32;
 
 use super::MonitorDescriptor;
 use super::Monitors;

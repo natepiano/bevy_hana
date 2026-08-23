@@ -15,7 +15,7 @@ use bevy::prelude::Reflect;
 use bevy::prelude::ReflectResource;
 use bevy::prelude::Res;
 use bevy::prelude::Resource;
-use bevy_kana::ToF64;
+use hana_kana::ToF64;
 
 use super::constants::DIAG_LAYOUT_COMPUTE_MS;
 use super::constants::DIAG_LAYOUT_COMPUTE_PANELS;

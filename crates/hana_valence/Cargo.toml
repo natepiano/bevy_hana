@@ -22,7 +22,6 @@ tween = ["dep:bevy_tween"]
 bevy_app       = { workspace = true }
 bevy_asset     = { workspace = true }
 bevy_ecs       = { workspace = true }
-bevy_kana      = { workspace = true }
 bevy_math      = { workspace = true, features = ["curve"] }
 bevy_platform  = { workspace = true }
 bevy_reflect   = { workspace = true }
@@ -30,6 +29,7 @@ bevy_scene     = { workspace = true }
 bevy_time      = { workspace = true }
 bevy_transform = { workspace = true, features = ["bevy-support"] }
 bevy_tween     = { workspace = true, optional = true }
+hana_kana      = { workspace = true }
 thiserror      = { workspace = true }
 tracing        = { workspace = true }
 

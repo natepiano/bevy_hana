@@ -11,9 +11,9 @@ use std::time::UNIX_EPOCH;
 
 use bevy::prelude::info;
 use bevy::prelude::warn;
-use bevy_kana::ToF64;
-use bevy_kana::ToU32;
-use bevy_kana::ToUsize;
+use hana_kana::ToF64;
+use hana_kana::ToU32;
+use hana_kana::ToUsize;
 
 use crate::constants::BENCHMARK_CSV_FRAMES_PER_SECOND_PRECISION;
 use crate::constants::BENCHMARK_CSV_HEADER;

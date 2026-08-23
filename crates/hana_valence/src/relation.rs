@@ -6,9 +6,9 @@ use bevy_ecs::prelude::FromWorld;
 use bevy_ecs::prelude::ReflectComponent;
 use bevy_ecs::prelude::ReflectFromWorld;
 use bevy_ecs::prelude::World;
-use bevy_kana::Displacement;
 use bevy_reflect::Reflect;
 use bevy_reflect::std_traits::ReflectDefault;
+use hana_kana::Displacement;
 
 use crate::AnchorSite;
 
@@ -140,9 +140,9 @@ mod tests {
     use bevy_ecs::prelude::ReflectComponent;
     use bevy_ecs::prelude::Schedule;
     use bevy_ecs::prelude::World;
-    use bevy_kana::Displacement;
     use bevy_math::Vec3;
     use bevy_reflect::TypeRegistry;
+    use hana_kana::Displacement;
 
     use super::AnchoredHere;
     use super::AnchoredTo;

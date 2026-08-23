@@ -35,8 +35,8 @@ bevy = { workspace = true, features = [
   "bevy_window",
 ] }
 bevy_enhanced_input = { workspace = true }
-bevy_kana = { workspace = true }
 bitflags = { workspace = true }
+hana_kana = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

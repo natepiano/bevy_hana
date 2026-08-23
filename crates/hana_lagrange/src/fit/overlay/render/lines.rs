@@ -413,7 +413,7 @@ mod tests {
     use bevy::prelude::Res;
     use bevy::prelude::ResMut;
     use bevy::prelude::Update;
-    use bevy_kana::Position;
+    use hana_kana::Position;
 
     use super::*;
     use crate::fit::geometry::ProjectionBasis;

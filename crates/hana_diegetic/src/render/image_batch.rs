@@ -48,8 +48,8 @@ use bevy::render::render_resource::ShaderSize;
 use bevy::render::render_resource::ShaderType;
 use bevy::render::storage::ShaderBuffer;
 use bevy::transform::TransformSystems;
-use bevy_kana::ToU32;
-use bevy_kana::ToUsize;
+use hana_kana::ToU32;
+use hana_kana::ToUsize;
 
 use super::BatchRenderLayers;
 use super::CommandIndex;

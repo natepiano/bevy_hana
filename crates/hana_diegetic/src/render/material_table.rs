@@ -62,9 +62,9 @@ use bevy::render::renderer::RenderQueue;
 use bevy::render::storage::GpuShaderBuffer;
 use bevy::render::storage::ShaderBuffer;
 use bevy::render::texture::GpuImage;
-use bevy_kana::ToF32;
-use bevy_kana::ToU32;
-use bevy_kana::ToUsize;
+use hana_kana::ToF32;
+use hana_kana::ToU32;
+use hana_kana::ToUsize;
 
 use super::PathExtendedMaterial;
 use super::SdfExtendedMaterial;

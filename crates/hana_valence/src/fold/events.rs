@@ -3,7 +3,7 @@
 //!
 //! Every event here is derived from the immutable ledger
 //! [`FoldSequence`](super::FoldSequence) built once at authoring time and from
-//! the [`SequenceTraversal`](bevy_kana::SequenceTraversal) the shared layer
+//! the [`SequenceTraversal`](hana_kana::SequenceTraversal) the shared layer
 //! returned for this update's movement. Eased output never reaches an event:
 //! an owned curve changes only what a member's pose interpolates, while a
 //! rejected curve or non-finite sample holds the pose. Each leaves raw position,
@@ -13,13 +13,13 @@ use bevy_ecs::entity::Entity;
 use bevy_ecs::event::EntityEvent;
 use bevy_ecs::reflect::ReflectEvent;
 use bevy_ecs::system::Commands;
-use bevy_kana::SequenceDirection;
-use bevy_kana::SequencePosition;
-use bevy_kana::SequenceStageId;
-use bevy_kana::SequenceTime;
-use bevy_kana::SequenceUpdate;
-use bevy_kana::ToF32;
 use bevy_reflect::Reflect;
+use hana_kana::SequenceDirection;
+use hana_kana::SequencePosition;
+use hana_kana::SequenceStageId;
+use hana_kana::SequenceTime;
+use hana_kana::SequenceUpdate;
+use hana_kana::ToF32;
 
 use super::FoldBoundary;
 use super::FoldBoundaryRecord;
@@ -128,7 +128,7 @@ pub struct FoldStageEnd {
 ///
 /// The event targets the member, so an observer watching a single hinged entity
 /// receives only its own movement. Reflection is opaque because
-/// [`FoldTiming`] carries an authored [`Easing`](bevy_kana::Easing) that is not
+/// [`FoldTiming`] carries an authored [`Easing`](hana_kana::Easing) that is not
 /// structurally reflected.
 #[derive(EntityEvent, Clone, Debug, PartialEq, Reflect)]
 #[reflect(opaque)]

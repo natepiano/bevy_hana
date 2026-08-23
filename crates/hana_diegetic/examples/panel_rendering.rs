@@ -46,7 +46,6 @@ use bevy::prelude::With;
 use bevy::prelude::Without;
 use bevy::prelude::default;
 use bevy::prelude::error;
-use bevy_kana::ToU8;
 use fairy_dust::CameraHomeTarget;
 use fairy_dust::DEFAULT_PANEL_BACKGROUND;
 use fairy_dust::LABEL_SIZE;
@@ -71,6 +70,7 @@ use hana_diegetic::Px;
 use hana_diegetic::Sizing;
 use hana_diegetic::TextStyle;
 use hana_diegetic::default_panel_material;
+use hana_kana::ToU8;
 use hana_lagrange::OrbitCamPreset;
 use hana_lagrange::ZoomToFit;
 

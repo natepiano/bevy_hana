@@ -1,6 +1,6 @@
 //! Diegetic cascade attributes and typed public commands.
 //!
-//! `bevy_kana` owns authored [`Cascade`], the explicit [`CascadeFrom`]
+//! `hana_kana` owns authored [`Cascade`], the explicit [`CascadeFrom`]
 //! relationship, propagation, and [`Resolved`] caches. This module chooses
 //! diegetic attributes and exposes domain-specific command and reader names.
 
@@ -31,14 +31,14 @@ pub use attributes::resolved_shape_material;
 pub use attributes::resolved_sidedness;
 pub use attributes::resolved_text_alpha;
 pub use attributes::resolved_text_material;
-pub(crate) use bevy_kana::Cascade;
-pub(crate) use bevy_kana::CascadeAttribute;
-pub(crate) use bevy_kana::CascadeFrom;
-pub(crate) use bevy_kana::CascadePlugin;
-pub(crate) use bevy_kana::Resolved;
 pub use cascade_set::CascadeSet;
 pub(crate) use constants::CASCADE_ATTRIBUTE_BYTES;
 pub use defaults::PanelDefaults;
+pub(crate) use hana_kana::Cascade;
+pub(crate) use hana_kana::CascadeAttribute;
+pub(crate) use hana_kana::CascadeFrom;
+pub(crate) use hana_kana::CascadePlugin;
+pub(crate) use hana_kana::Resolved;
 pub(crate) use resolved::CascadeRoot;
 
 pub(crate) fn cascade_plugin<A: CascadeRoot>() -> CascadePlugin<A, A::Root> {

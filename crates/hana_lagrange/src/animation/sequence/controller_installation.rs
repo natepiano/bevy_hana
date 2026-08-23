@@ -12,8 +12,8 @@ use bevy::prelude::Resource;
 use bevy::prelude::Transform;
 use bevy::prelude::With;
 use bevy::prelude::Without;
-use bevy_kana::SequenceCommands;
-use bevy_kana::SequenceOwner;
+use hana_kana::SequenceCommands;
+use hana_kana::SequenceOwner;
 
 use super::CameraSequence;
 use super::playback::CameraPose;

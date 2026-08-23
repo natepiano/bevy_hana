@@ -37,9 +37,9 @@ use bevy::render::renderer::RenderContext;
 use bevy::render::renderer::RenderDevice;
 use bevy::render::renderer::RenderQueue;
 use bevy::render::texture::CachedTexture;
-use bevy_kana::ToU32;
-use bevy_kana::ToUsize;
 use bevy_render::render_resource::TextureView;
+use hana_kana::ToU32;
+use hana_kana::ToUsize;
 
 use super::camera::OutlineCamera;
 use super::constants::FLOOD_SHADER_HANDLE;

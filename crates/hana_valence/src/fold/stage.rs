@@ -1,7 +1,7 @@
 use bevy_ecs::entity::Entity;
-use bevy_kana::Cascade;
-use bevy_kana::SequenceTime;
-use bevy_kana::resolve_cascade_ref;
+use hana_kana::Cascade;
+use hana_kana::SequenceTime;
+use hana_kana::resolve_cascade_ref;
 
 use super::FoldTarget;
 use super::FoldTiming;

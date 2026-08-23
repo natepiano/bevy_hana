@@ -2,26 +2,29 @@
 
 <img src="assets/kana.svg" alt="仮名" width="260"/>
 
-# bevy_kana
+# hana_kana
 
 **Ergonomic, opinionated utilities for Bevy — type-safe math and cascade values.**
 
-[![CI](https://github.com/natepiano/hana/actions/workflows/ci.yml/badge.svg)](https://github.com/natepiano/hana/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/bevy_kana.svg)](https://crates.io/crates/bevy_kana)
-[![docs.rs](https://docs.rs/bevy_kana/badge.svg)](https://docs.rs/bevy_kana)
-[![license](https://img.shields.io/crates/l/bevy_kana.svg)](LICENSE-MIT)
+[![crates.io](https://img.shields.io/crates/v/hana_kana.svg)](https://crates.io/crates/hana_kana)
+[![docs.rs](https://docs.rs/hana_kana/badge.svg)](https://docs.rs/hana_kana)
+[![license](https://img.shields.io/crates/l/hana_kana.svg)](LICENSE-MIT)
 
 </div>
 
 ---
 
-> **Work in progress.** This crate is in active development (v0.3.0) and not
+> **Work in progress.** This crate is in active development (v0.4.0) and not
 > subject to semver stability guarantees. APIs will change without notice
 > between commits. Do not depend on this in production code yet.
 
+> **Renamed from `bevy_kana`.** Releases through 0.3.0 were published under
+> that name; 0.4.0 is the first release as `hana_kana`. No items were renamed —
+> change the dependency name and every `use bevy_kana::` path.
+
 **仮名** (*kana*) — from Japanese 仮 (*ka*, "simplified, borrowed") + 名 (*na*, "name, character"). The kana writing systems — hiragana (ひらがな) and katakana (カタカナ) — were born as simplified characters borrowed from complex kanji, making written language more accessible without losing meaning.
 
-`bevy_kana` follows the same philosophy: small, named abstractions borrowed from Bevy's existing types, making game code more expressive and type-safe without adding complexity. It is a growing collection of ergonomic utilities — not limited to any single category.
+`hana_kana` follows the same philosophy: small, named abstractions borrowed from Bevy's existing types, making game code more expressive and type-safe without adding complexity. It is a growing collection of ergonomic utilities — not limited to any single category.
 
 ## What's in the box
 
@@ -53,10 +56,10 @@ Zero-cost newtype wrappers around Bevy's math primitives that prevent accidental
 ```rust
 use bevy::math::Quat;
 use bevy::math::Vec3;
-use bevy_kana::Angle;
-use bevy_kana::Orientation;
-use bevy_kana::Position;
-use bevy_kana::Velocity;
+use hana_kana::Angle;
+use hana_kana::Orientation;
+use hana_kana::Position;
+use hana_kana::Velocity;
 
 fn example() -> Result<(), Box<dyn std::error::Error>> {
 let start_position = Position(Vec3::new(1.0, 0.0, 0.0));
@@ -94,8 +97,8 @@ Convenience traits that replace bare `as` casts for common numeric conversions, 
 **These conversions are deliberately lossy.** They will silently produce wrong results if the input exceeds the target type's representable range. It is the caller's responsibility to ensure values are in bounds. Typical safe usage: loop indices, mesh vertex counts, and other small geometry values.
 
 ```rust
-use bevy_kana::ToF32;
-use bevy_kana::ToU32;
+use hana_kana::ToF32;
+use hana_kana::ToU32;
 
 let sides: u32 = 8;
 let angle = (j.to_f32() / sides.to_f32()) * std::f32::consts::TAU;
@@ -109,8 +112,8 @@ lower-precedence scope or overrides it. Ordinary structs can resolve authored
 layers without ECS storage:
 
 ```rust
-use bevy_kana::Cascade;
-use bevy_kana::resolve_cascade;
+use hana_kana::Cascade;
+use hana_kana::resolve_cascade;
 
 let member = Cascade::Inherit;
 let stage = Cascade::Override(0.25_f32);
@@ -132,10 +135,10 @@ over an explicit `CascadeFrom` relationship.
 
 ```rust
 use bevy::prelude::*;
-use bevy_kana::Cascade;
-use bevy_kana::CascadeEntityCommandsExt;
-use bevy_kana::CascadeFrom;
-use bevy_kana::CascadePlugin;
+use hana_kana::Cascade;
+use hana_kana::CascadeEntityCommandsExt;
+use hana_kana::CascadeFrom;
+use hana_kana::CascadePlugin;
 
 #[derive(Clone, Copy, Debug, PartialEq, Reflect)]
 struct Opacity(f32);
@@ -164,7 +167,7 @@ implements `CascadeRootResource<A>` on that type and selects it instead, which
 lets an attribute serve as its own root:
 
 ```rust
-use bevy_kana::CascadeRootResource;
+use hana_kana::CascadeRootResource;
 
 #[derive(Clone, Copy, Debug, PartialEq, Reflect, Resource)]
 #[reflect(Resource)]
@@ -256,7 +259,7 @@ distorting stage boundaries.
 Enable the optional `tween` feature to produce movement with `bevy_tween`:
 
 ```toml
-bevy_kana = { version = "0.4.0-dev", features = ["tween"] }
+hana_kana = { version = "0.4.0-dev", features = ["tween"] }
 ```
 
 `SequenceTweenAdapterPlugin<TimeCtx>` creates and advances no clock. Install
@@ -276,16 +279,17 @@ cargo run --example sequence_drivers
 
 ### More to come
 
-`bevy_kana` will grow to include other convenience macros and generic utilities that are broadly useful across Bevy projects.
+`hana_kana` will grow to include other convenience macros and generic utilities that are broadly useful across Bevy projects.
 
 ## Version Compatibility
 
-| bevy_kana | Bevy |
-|-----------|------|
-| 0.3.0 | 0.19 |
-| 0.2.0 | 0.19 |
-| 0.1.0 | 0.19 |
-| 0.0.6 | 0.18 |
+| Crate | Version | Bevy |
+|-------|---------|------|
+| `hana_kana` | 0.4.0 | 0.19 |
+| `bevy_kana` | 0.3.0 | 0.19 |
+| `bevy_kana` | 0.2.0 | 0.19 |
+| `bevy_kana` | 0.1.0 | 0.19 |
+| `bevy_kana` | 0.0.6 | 0.18 |
 
 ## Usage
 
@@ -293,7 +297,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-bevy_kana = "0.3.0"
+hana_kana = "0.3.0"
 ```
 
 Run the example:

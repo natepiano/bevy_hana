@@ -968,7 +968,7 @@ mod tests {
     use bevy::prelude::Vec2;
     use bevy::prelude::Vec3;
     use bevy::window::WindowRef;
-    use bevy_kana::EasingPlugin;
+    use hana_kana::EasingPlugin;
 
     use super::*;
     use crate::CameraCommands;

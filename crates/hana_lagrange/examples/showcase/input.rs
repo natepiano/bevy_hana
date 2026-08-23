@@ -1,4 +1,4 @@
-//! Keyboard shortcuts routed through `bevy_enhanced_input` via the `bevy_kana`
+//! Keyboard shortcuts routed through `bevy_enhanced_input` via the `hana_kana`
 //! macros.
 //!
 //! Every showcase shortcut lives in one of two input contexts:

@@ -13,8 +13,8 @@ use bevy::prelude::ReflectComponent;
 use bevy::prelude::ReflectDefault;
 use bevy::prelude::Vec3;
 use bevy::prelude::warn;
-use bevy_kana::Displacement;
-use bevy_kana::Easing;
+use hana_kana::Displacement;
+use hana_kana::Easing;
 use thiserror::Error;
 
 use crate::constants::MILLIS_PER_SECOND;

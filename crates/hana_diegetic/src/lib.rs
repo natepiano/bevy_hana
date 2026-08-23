@@ -492,7 +492,7 @@ impl Plugin for DiegeticUiPlugin {
         app.init_resource::<PanelDefaults>();
         app.configure_sets(
             Update,
-            bevy_kana::CascadeSet::Propagate.in_set(CascadeSet::Propagate),
+            hana_kana::CascadeSet::Propagate.in_set(CascadeSet::Propagate),
         );
         app.add_plugins((
             TextPlugin,

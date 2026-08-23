@@ -1,4 +1,4 @@
-//! Demonstrates core `bevy_kana` types and their compile-time safety.
+//! Demonstrates core `hana_kana` types and their compile-time safety.
 //!
 //! Run with: `cargo run --example basics`
 
@@ -8,12 +8,12 @@ use std::f32::consts::TAU;
 
 use bevy::math::Quat;
 use bevy::math::Vec3;
-use bevy_kana::Angle;
-use bevy_kana::Displacement;
-use bevy_kana::Orientation;
-use bevy_kana::Position;
-use bevy_kana::ScreenPosition;
-use bevy_kana::Velocity;
+use hana_kana::Angle;
+use hana_kana::Displacement;
+use hana_kana::Orientation;
+use hana_kana::Position;
+use hana_kana::ScreenPosition;
+use hana_kana::Velocity;
 
 // demo fixtures
 const CENTROID_DIVISOR: f32 = 2.0;

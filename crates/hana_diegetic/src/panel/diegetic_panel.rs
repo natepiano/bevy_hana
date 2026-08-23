@@ -1606,7 +1606,7 @@ fn apply_panel_world_conversion_now(
 /// matching `Cascade<A>` components for font unit, materials, text alpha, HDR
 /// coverage bias, shadow casting, anti-aliasing, hairline fade, lighting, and
 /// sidedness. The construction-seed fields are never replayed after spawn.
-/// `resolve_inserted_cascade<A>` in `bevy_kana` seeds the panel's
+/// `resolve_inserted_cascade<A>` in `hana_kana` seeds the panel's
 /// `Resolved<FontUnit>`, which `compute_panel_layouts` reads.
 ///
 /// At construction, a panel has no cascade ancestor and receives an overriding

@@ -11,13 +11,13 @@ use bevy_ecs::system::Commands;
 use bevy_ecs::system::Local;
 use bevy_ecs::system::Query;
 use bevy_ecs::system::SystemChangeTick;
-use bevy_kana::Angle;
-use bevy_kana::Displacement;
-use bevy_kana::Orientation;
-use bevy_kana::ToF32;
 use bevy_math::Dir3;
 use bevy_math::Quat;
 use bevy_reflect::Reflect;
+use hana_kana::Angle;
+use hana_kana::Displacement;
+use hana_kana::Orientation;
+use hana_kana::ToF32;
 use thiserror::Error;
 
 use crate::AnchorPose;
@@ -348,15 +348,15 @@ mod tests {
     use bevy_ecs::schedule::IntoScheduleConfigs;
     use bevy_ecs::schedule::Schedule;
     use bevy_ecs::world::World;
-    use bevy_kana::Angle;
-    use bevy_kana::Displacement;
-    use bevy_kana::Orientation;
     use bevy_math::Quat;
     use bevy_math::Vec3;
     use bevy_reflect::PartialReflect;
     use bevy_reflect::ReflectRef;
     use bevy_transform::prelude::GlobalTransform;
     use bevy_transform::prelude::Transform;
+    use hana_kana::Angle;
+    use hana_kana::Displacement;
+    use hana_kana::Orientation;
 
     use super::Hinge;
     use super::HingeError;

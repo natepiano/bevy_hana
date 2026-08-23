@@ -823,7 +823,7 @@ mod tests {
     use bevy::window::PrimaryWindow;
     use bevy::window::Window;
     use bevy::window::WindowRef;
-    use bevy_kana::ToF32;
+    use hana_kana::ToF32;
 
     use super::ScreenSpaceCamera;
     use super::ScreenSpaceLight;

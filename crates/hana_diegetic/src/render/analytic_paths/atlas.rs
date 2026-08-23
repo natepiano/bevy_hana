@@ -5,7 +5,7 @@ use std::hash::Hash;
 
 use bevy::prelude::Assets;
 use bevy::render::storage::ShaderBuffer;
-use bevy_kana::ToU32;
+use hana_kana::ToU32;
 
 use super::BandRecord;
 use super::CurveRecord;

@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use bevy_kana::ToF32;
 use clay_layout::math::Dimensions;
 use hana_diegetic::DiegeticTextMeasurer;
 use hana_diegetic::MeasureTextFn;
 use hana_diegetic::TextDimensions;
 use hana_diegetic::TextMeasure;
+use hana_kana::ToF32;
 
 pub const FONT_SIZE: f32 = 10.0;
 pub const CLAY_FONT_SIZE: u16 = 10;

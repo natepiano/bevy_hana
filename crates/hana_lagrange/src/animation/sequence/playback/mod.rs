@@ -9,18 +9,18 @@ mod pose;
 use bevy::prelude::Component;
 use bevy::prelude::Reflect;
 use bevy::prelude::ReflectComponent;
-use bevy_kana::EasingSample;
-use bevy_kana::SequenceDirection;
-use bevy_kana::SequenceEasingSample;
-use bevy_kana::SequencePlayback;
-use bevy_kana::SequencePlaybackError;
-use bevy_kana::SequencePosition;
-use bevy_kana::SequenceStagesRevision;
 use diagnostics::CameraEvaluationDiagnosticState;
 pub use diagnostics::CameraEvaluationError;
 use emission::emit_camera_boundaries;
 pub(super) use emission::emit_cancelled_camera_lifecycle;
 pub(in crate::animation) use evaluation::evaluate_camera_sequences;
+use hana_kana::EasingSample;
+use hana_kana::SequenceDirection;
+use hana_kana::SequenceEasingSample;
+use hana_kana::SequencePlayback;
+use hana_kana::SequencePlaybackError;
+use hana_kana::SequencePosition;
+use hana_kana::SequenceStagesRevision;
 use ledger::CameraBoundaryLedger;
 use ledger::CameraMoveInterval;
 use ledger::CameraMoveProgress;
@@ -268,9 +268,9 @@ mod tests {
 
     use bevy::math::curve::easing::EaseFunction;
     use bevy::prelude::Vec3;
-    use bevy_kana::Easing;
-    use bevy_kana::SequenceEasingSampler;
-    use bevy_kana::SequenceScope;
+    use hana_kana::Easing;
+    use hana_kana::SequenceEasingSampler;
+    use hana_kana::SequenceScope;
 
     use super::*;
     use crate::animation::sequence::support::*;
@@ -339,7 +339,7 @@ mod tests {
         assert_eq!(
             sampler.sample(
                 scope,
-                &bevy_kana::SequenceEasing::ReplacedBy(Easing::Bevy(EaseFunction::QuadraticIn)),
+                &hana_kana::SequenceEasing::ReplacedBy(Easing::Bevy(EaseFunction::QuadraticIn)),
                 0.5,
             ),
             SequenceEasingSample::AuthoredEasingSuppressed { eased: 0.25 }
@@ -347,7 +347,7 @@ mod tests {
         assert_eq!(
             sampler.sample(
                 scope,
-                &bevy_kana::SequenceEasing::ComposedWith(Easing::Bevy(EaseFunction::QuadraticIn)),
+                &hana_kana::SequenceEasing::ComposedWith(Easing::Bevy(EaseFunction::QuadraticIn)),
                 0.5,
             ),
             SequenceEasingSample::AuthoredEasingApplies { progress: 0.25 }

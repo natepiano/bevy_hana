@@ -50,8 +50,6 @@ use bevy::prelude::Vec3;
 use bevy::prelude::With;
 use bevy::prelude::default;
 use bevy::prelude::error;
-use bevy_kana::ToF32;
-use bevy_kana::ToUsize;
 use fairy_dust::CameraHomeTarget;
 use fairy_dust::DEFAULT_PANEL_BACKGROUND;
 use fairy_dust::OrbitCamPose;
@@ -75,6 +73,8 @@ use hana_diegetic::Sizing;
 use hana_diegetic::TextStyle;
 use hana_diegetic::Unit;
 use hana_diegetic::default_panel_material;
+use hana_kana::ToF32;
+use hana_kana::ToUsize;
 use hana_lagrange::OrbitCamPreset;
 
 // ── Text / layout constants (meters) ─────────────────────────────────────────

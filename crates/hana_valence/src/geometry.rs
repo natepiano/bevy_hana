@@ -1,10 +1,10 @@
 use bevy_ecs::prelude::Component;
 use bevy_ecs::prelude::ReflectComponent;
-use bevy_kana::Orientation;
-use bevy_kana::Position;
 use bevy_math::Dir3;
 use bevy_platform::collections::HashMap;
 use bevy_reflect::Reflect;
+use hana_kana::Orientation;
+use hana_kana::Position;
 use thiserror::Error;
 
 /// A named attachment site emitted by an anchor-geometry provider.
@@ -209,14 +209,14 @@ pub enum GeometryError {
 
 #[cfg(test)]
 mod tests {
-    use bevy_kana::Orientation;
-    use bevy_kana::Position;
     use bevy_math::Dir3;
     use bevy_math::Quat;
     use bevy_math::Vec3;
     use bevy_reflect::FromReflect;
     use bevy_reflect::ReflectKind;
     use bevy_reflect::Typed;
+    use hana_kana::Orientation;
+    use hana_kana::Position;
 
     use super::AnchorFrame;
     use super::AnchorSite;

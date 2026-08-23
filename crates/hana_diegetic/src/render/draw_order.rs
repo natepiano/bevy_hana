@@ -19,8 +19,8 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
-use bevy_kana::ToF32;
-use bevy_kana::ToU32;
+use hana_kana::ToF32;
+use hana_kana::ToU32;
 
 use super::constants::LAYER_DEPTH_BIAS;
 use super::constants::OIT_DEPTH_STEP;

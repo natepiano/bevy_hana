@@ -96,8 +96,8 @@ mod tests {
 
     use bevy_ecs::entity::Entity;
     use bevy_ecs::world::World;
-    use bevy_kana::SequenceTime;
     use bevy_math::curve::EaseFunction;
+    use hana_kana::SequenceTime;
 
     use super::*;
     use crate::AnchorSite;

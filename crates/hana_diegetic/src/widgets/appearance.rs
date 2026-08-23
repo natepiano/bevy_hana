@@ -20,7 +20,7 @@ use bevy::prelude::Reflect;
 use bevy::prelude::ReflectResource;
 use bevy::prelude::Resource;
 use bevy::prelude::StandardMaterial;
-use bevy_kana::CascadeRootResource;
+use hana_kana::CascadeRootResource;
 
 use super::VisualSlotOverride;
 use crate::DiegeticPanel;

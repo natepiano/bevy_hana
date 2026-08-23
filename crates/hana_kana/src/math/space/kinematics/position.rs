@@ -16,7 +16,7 @@ semantic_newtype::semantic_newtype!(
     ///
     /// ```
     /// use bevy::math::Vec3;
-    /// use bevy_kana::Position;
+    /// use hana_kana::Position;
     ///
     /// let start_position = Position(Vec3::new(1.0, 0.0, 0.0));
     /// let end_position = Position(Vec3::new(3.0, 0.0, 0.0));

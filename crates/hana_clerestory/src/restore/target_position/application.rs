@@ -22,8 +22,8 @@ use bevy::prelude::warn;
 use bevy::window::WindowMode;
 use bevy::window::WindowPosition;
 use bevy::window::WindowScaleFactorChanged;
-use bevy_kana::ToI32;
-use bevy_kana::ToU32;
+use hana_kana::ToI32;
+use hana_kana::ToU32;
 #[cfg(test)]
 use hana_rigging::prelude::AttemptId;
 

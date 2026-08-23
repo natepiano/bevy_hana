@@ -32,8 +32,8 @@ use bevy::window::MonitorSelection;
 use bevy::winit::WinitMonitors;
 #[cfg(feature = "monitor-probe")]
 use bevy_diagnostic::FrameCount;
-use bevy_kana::ToI32;
-use bevy_kana::ToU32;
+use hana_kana::ToI32;
+use hana_kana::ToU32;
 use hana_rigging::prelude::AttachmentPath;
 use hana_rigging::prelude::PlatformDeviceHandle;
 #[cfg(target_os = "macos")]

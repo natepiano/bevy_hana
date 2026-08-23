@@ -1,6 +1,6 @@
 use bevy::prelude::Component;
 use bevy::prelude::Entity;
-use bevy_kana::SequenceStagesRevision;
+use hana_kana::SequenceStagesRevision;
 
 use super::PendingCameraRequest;
 use crate::animation::events::AnimationSource;
