@@ -34,7 +34,7 @@ hana_clerestory       = { path = "crates/hana_clerestory" }
 hana_diegetic         = { path = "crates/hana_diegetic" }
 hana_lagrange         = { path = "crates/hana_lagrange", features = ["fit_overlay"] }
 hana_liminal          = { path = "crates/hana_liminal" }
-hana_rigging          = { version = "0.1", path = "crates/hana_rigging" }
+hana_rigging          = { version = "0.1.0", path = "crates/hana_rigging" }
 hana_rigging_scripted = { path = "crates/hana_rigging_scripted" }
 hana_rubric           = { path = "crates/hana_rubric" }
 hana_valence          = { path = "crates/hana_valence", default-features = false }

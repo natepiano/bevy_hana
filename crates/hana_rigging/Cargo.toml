@@ -3,6 +3,7 @@ authors.workspace = true
 categories        = ["game-development", "hardware-support"]
 description       = "Device identity, presence, availability, and recovery policy for Bevy providers"
 edition.workspace = true
+exclude           = ["examples/identity_decision.rs", "tests/"]
 homepage          = "https://github.com/natepiano/bevy_hana/tree/main/crates/hana_rigging"
 keywords          = ["bevy", "device", "hardware", "identity", "recovery"]
 license.workspace = true

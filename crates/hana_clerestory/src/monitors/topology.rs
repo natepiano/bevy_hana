@@ -1026,8 +1026,9 @@ pub(super) fn update_monitors(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use bevy::ecs::system::SystemParamValidationError;
+
+    use super::*;
 
     fn descriptor(index: usize) -> MonitorDescriptor {
         MonitorDescriptor::for_current_enumeration(
@@ -1107,8 +1108,7 @@ mod tests {
     }
 
     #[test]
-    fn build_monitors_exposes_an_injected_product_name()
-    -> Result<(), SystemParamValidationError> {
+    fn build_monitors_exposes_an_injected_product_name() -> Result<(), SystemParamValidationError> {
         let monitors = topology_with_injected_product_name(Some("DELL S3425DW"))?;
 
         assert_eq!(
