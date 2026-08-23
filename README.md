@@ -18,9 +18,7 @@ arrive here on the next release.
 ## Dev-dependency crates
 
 Not published. They are carried here as source so the examples and tests of the
-crates above build against their real dependencies -- something a crates.io
-tarball cannot show, because path-only dev-dependencies are stripped when a
-crate is packaged.
+crates above build against their real dependencies.
 
 - [`fairy_dust`](crates/fairy_dust)
 - [`hana_diegetic`](crates/hana_diegetic)
