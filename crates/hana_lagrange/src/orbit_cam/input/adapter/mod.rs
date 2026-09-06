@@ -205,6 +205,7 @@ mod tests {
     use super::OrbitCamInputActionEntities;
     use super::OrbitCamInputAdapterPlugin;
     use super::inject::OrbitCamTouchAdapterOverride;
+    use super::inject::TrackpadScrollTarget;
     use super::install::TrackpadBindingCondition;
     use crate::Focus;
     use crate::OrbitAngles;
@@ -769,6 +770,156 @@ mod tests {
         assert!(!input.has_orbit());
         assert_eq!(input.pan().pixels(), Vec2::new(5.0, -2.0));
         assert!(input.sources().contains(InteractionSources::MOUSE));
+        Ok(())
+    }
+
+    #[test]
+    fn forwarded_line_scroll_routes_modifiers_without_wheel_zoom() -> TestResult {
+        let gain = OrbitCamInputGain::new().orbit(12.0).pan(8.0).zoom(20.0);
+        for (keys, target) in [
+            (vec![], TrackpadScrollTarget::Orbit),
+            (vec![KeyCode::ShiftLeft], TrackpadScrollTarget::Pan),
+            (vec![KeyCode::ControlLeft], TrackpadScrollTarget::Zoom),
+            (
+                vec![KeyCode::ControlLeft, KeyCode::ShiftLeft],
+                TrackpadScrollTarget::Zoom,
+            ),
+        ] {
+            let mut app = test_app();
+            let bindings = OrbitCamBlenderLikePreset::default()
+                .line_scroll_input_gain(Some(gain))
+                .build()
+                .map_err(|_| "bindings should validate")?;
+            let camera = spawn_camera(app.world_mut(), OrbitCamInputMode::Bindings(bindings));
+            route_to(&mut app, camera);
+            for key in keys {
+                app.world_mut()
+                    .resource_mut::<ButtonInput<KeyCode>>()
+                    .press(key);
+            }
+            let delta = Vec2::new(2.0, 3.0);
+            *app.world_mut().resource_mut::<AccumulatedMouseScroll>() = AccumulatedMouseScroll {
+                unit: MouseScrollUnit::Line,
+                delta,
+            };
+            app.update();
+            let input = camera_input(&app, camera)?;
+            assert_eq!(input.has_orbit(), target == TrackpadScrollTarget::Orbit);
+            assert_eq!(input.has_pan(), target == TrackpadScrollTarget::Pan);
+            assert_eq!(input.has_zoom(), target == TrackpadScrollTarget::Zoom);
+            assert_f32_close(input.zoom_coarse().amount(), 0.0);
+            match target {
+                TrackpadScrollTarget::Orbit => assert_eq!(
+                    input.orbit(),
+                    OrbitDelta::from(delta * gain.orbit_input_gain().value())
+                ),
+                TrackpadScrollTarget::Pan => {
+                    assert_eq!(input.pan().pixels(), delta * gain.pan_input_gain().value());
+                },
+                TrackpadScrollTarget::Zoom => assert_f32_close(
+                    input.zoom_smooth().amount(),
+                    delta.y * gain.zoom_input_gain().value() * PIXEL_SCROLL_SCALE,
+                ),
+            }
+            assert!(input.sources().contains(InteractionSources::WHEEL));
+            assert!(!input.sources().contains(InteractionSources::SMOOTH_SCROLL));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn forwarded_mode_preserves_pixel_scroll_and_respects_camera_gating() -> TestResult {
+        let mut app = test_app();
+        let bindings = OrbitCamBlenderLikePreset::default()
+            .line_scroll_input_gain(Some(OrbitCamInputGain::uniform(20.0)))
+            .build()
+            .map_err(|_| "bindings should validate")?;
+        let camera = spawn_camera(app.world_mut(), OrbitCamInputMode::Bindings(bindings));
+        route_to(&mut app, camera);
+        let delta = Vec2::new(4.0, 6.0);
+        *app.world_mut().resource_mut::<AccumulatedMouseScroll>() = AccumulatedMouseScroll {
+            unit: MouseScrollUnit::Pixel,
+            delta,
+        };
+        app.update();
+        assert_eq!(camera_input(&app, camera)?.orbit(), OrbitDelta::from(delta));
+        assert!(
+            camera_input(&app, camera)?
+                .sources()
+                .contains(InteractionSources::SMOOTH_SCROLL)
+        );
+        *app.world_mut().resource_mut::<AccumulatedMouseScroll>() = AccumulatedMouseScroll {
+            unit: MouseScrollUnit::Line,
+            delta,
+        };
+        app.update();
+        assert!(camera_input(&app, camera)?.has_orbit());
+        app.world_mut()
+            .entity_mut(camera)
+            .insert(CameraInputDisabled);
+        app.update();
+        assert_no_camera_input(&app, camera)
+    }
+
+    #[test]
+    fn line_scroll_zoom_inverts_and_mode_changes_remove_old_bindings() -> TestResult {
+        use crate::input::OrbitCamLineScroll;
+        use crate::input::ZoomInversion;
+        let mut app = test_app();
+        let bindings = OrbitCamBindings::builder()
+            .zoom(OrbitCamLineScroll::default().with_input_gain(WHEEL_INPUT_GAIN))
+            .zoom_inversion(ZoomInversion::Inverted)
+            .build()
+            .map_err(|_| "bindings should validate")?;
+        let camera = spawn_camera(app.world_mut(), OrbitCamInputMode::Bindings(bindings));
+        route_to(&mut app, camera);
+        *app.world_mut().resource_mut::<AccumulatedMouseScroll>() = AccumulatedMouseScroll {
+            unit:  MouseScrollUnit::Line,
+            delta: Vec2::new(0.0, WHEEL_SCROLL_DELTA),
+        };
+        app.update();
+        assert_f32_close(
+            camera_input(&app, camera)?.zoom_smooth().amount(),
+            -WHEEL_SCROLL_DELTA * WHEEL_INPUT_GAIN * PIXEL_SCROLL_SCALE,
+        );
+        app.world_mut()
+            .entity_mut(camera)
+            .insert(OrbitCamInputMode::with_preset(
+                OrbitCamPreset::blender_like(),
+            ));
+        app.update();
+        assert_f32_close(
+            camera_input(&app, camera)?.zoom_coarse().amount(),
+            WHEEL_SCROLL_DELTA,
+        );
+        assert_f32_close(camera_input(&app, camera)?.zoom_smooth().amount(), 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn custom_line_binding_overrides_wheel_only_when_modifiers_match() -> TestResult {
+        use crate::input::OrbitCamLineScroll;
+        let mut app = test_app();
+        let bindings = OrbitCamBindings::builder()
+            .orbit(OrbitCamLineScroll::default().with_mod_keys(ModKeys::SHIFT))
+            .zoom(OrbitCamMouseWheelZoom)
+            .build()
+            .map_err(|_| "bindings should validate")?;
+        let camera = spawn_camera(app.world_mut(), OrbitCamInputMode::Bindings(bindings));
+        route_to(&mut app, camera);
+        *app.world_mut().resource_mut::<AccumulatedMouseScroll>() = AccumulatedMouseScroll {
+            unit:  MouseScrollUnit::Line,
+            delta: Vec2::new(2.0, 3.0),
+        };
+        app.update();
+        assert!(camera_input(&app, camera)?.has_zoom());
+        assert!(!camera_input(&app, camera)?.has_orbit());
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::ShiftLeft);
+        app.update();
+        assert!(camera_input(&app, camera)?.has_orbit());
+        assert!(!camera_input(&app, camera)?.has_zoom());
         Ok(())
     }
 

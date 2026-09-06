@@ -44,6 +44,7 @@ pub use input::OrbitCamHomeActionBindings;
 pub(super) use input::OrbitCamInputAdapterPlugin;
 pub use input::OrbitCamInputGain;
 pub use input::OrbitCamKeyboardPreset;
+pub use input::OrbitCamLineScroll;
 pub use input::OrbitCamMouseDrag;
 pub use input::OrbitCamMouseWheelZoom;
 pub use input::OrbitCamOrbitActionBindings;

@@ -68,8 +68,11 @@ pub(super) fn validate_bindings(
                 .collect(),
         )),
         trackpad_orbit:   descriptor.trackpad_orbit.clone(),
+        line_orbit:       descriptor.line_orbit.clone(),
         trackpad_pan:     descriptor.trackpad_pan.clone(),
+        line_pan:         descriptor.line_pan.clone(),
         trackpad_zoom:    descriptor.trackpad_zoom.clone(),
+        line_zoom:        descriptor.line_zoom.clone(),
         mouse_wheel_zoom: descriptor.mouse_wheel_zoom,
         pinch_zoom:       descriptor.pinch_zoom,
         touch:            descriptor.touch,
@@ -82,8 +85,11 @@ pub(super) fn validate_bindings(
 
 fn validate_adapter_entries(descriptor: &OrbitCamBindingsDescriptor) -> Result<(), BindingsError> {
     validate_sensitive_entries(&descriptor.trackpad_orbit)?;
+    validate_sensitive_entries(&descriptor.line_orbit)?;
     validate_sensitive_entries(&descriptor.trackpad_pan)?;
+    validate_sensitive_entries(&descriptor.line_pan)?;
     validate_sensitive_entries(&descriptor.trackpad_zoom)?;
+    validate_sensitive_entries(&descriptor.line_zoom)?;
     validate_sensitive_option(descriptor.mouse_wheel_zoom)?;
     validate_sensitive_option(descriptor.pinch_zoom)?;
     validate_sensitive_option(descriptor.button_drag_zoom)?;
@@ -122,6 +128,38 @@ mod tests {
     use super::*;
     use crate::input::InputGain;
     use crate::input::OrbitCamMouseDrag;
+
+    #[test]
+    fn line_scroll_rejects_invalid_gains_and_preserves_disabled_bindings()
+    -> Result<(), BindingsError> {
+        use crate::input::OrbitCamLineScroll;
+        for gain in [f32::NAN, f32::INFINITY, -1.0] {
+            assert!(
+                OrbitCamBindings::builder()
+                    .orbit(OrbitCamLineScroll::default().with_input_gain(gain))
+                    .build()
+                    .is_err()
+            );
+            assert!(
+                OrbitCamBindings::builder()
+                    .pan(OrbitCamLineScroll::default().with_input_gain(gain))
+                    .build()
+                    .is_err()
+            );
+            assert!(
+                OrbitCamBindings::builder()
+                    .zoom(OrbitCamLineScroll::default().with_input_gain(gain))
+                    .build()
+                    .is_err()
+            );
+        }
+        let bindings = OrbitCamBindings::builder()
+            .orbit(OrbitCamLineScroll::default().with_input_gain(InputGain::DISABLED.0))
+            .build()?;
+        assert_eq!(bindings.line_orbit().len(), 1);
+        assert_eq!(bindings.enabled_scroll_orbit().count(), 0);
+        Ok(())
+    }
 
     #[test]
     fn validation_preserves_authored_disabled_entries_but_enabled_views_filter_them()

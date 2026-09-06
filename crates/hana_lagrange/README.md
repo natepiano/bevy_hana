@@ -80,6 +80,35 @@ Blender-like controls:
 | Control + Trackpad Scroll | Zoom |
 | Scroll Wheel or Pinch | Zoom |
 
+For a trackpad forwarded as wheel events (for example through Deskflow), opt
+into line-scroll controls:
+
+```rust
+use hana_lagrange::{OrbitCamBlenderLikePreset, OrbitCamInputGain, OrbitCamInputMode, OrbitCamPreset};
+
+let mode = OrbitCamInputMode::Preset(OrbitCamPreset::from(
+    OrbitCamBlenderLikePreset::default()
+        .line_scroll_input_gain(Some(OrbitCamInputGain::uniform(20.0))),
+));
+```
+
+Line scrolling then orbits; Shift+scroll pans; Control+scroll zooms. Native
+pixel scrolling and mouse dragging keep their existing bindings. Every physical
+mouse wheel receives the same line-scroll controls: the event carries no
+reliable original-device identity. The gain is a pixel-equivalent multiplier
+per line, independently adjustable for orbit, pan, and zoom. Forwarding software
+must supply horizontal scrolling for horizontal orbit; lost precision cannot be
+recovered by the camera.
+
+For custom controls, pass `OrbitCamLineScroll::default().with_mod_keys(...)`
+to the binding builder's `.orbit()`, `.pan()`, or `.zoom()` methods. Each accepts
+`.with_input_gain(...)`. A matching enabled line binding takes precedence over
+`OrbitCamMouseWheelZoom`; unmatched input can still use that wheel-zoom binding.
+Modifier specificity wins, then zoom over pan over orbit, then the last binding
+for that action. Invalid gains are rejected; zero disables a binding. The
+Blender preset's opt-in replaces its ordinary wheel-zoom binding entirely;
+passing `None` restores its default controls.
+
 Default touch controls:
 
 | Input | Action |

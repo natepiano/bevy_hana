@@ -49,5 +49,10 @@ jobs:
             libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
+      - name: Warm the external-client cache for its nested offline build
+        run: >-
+          cargo fetch
+          --manifest-path crates/hana_rigging/tests/external_client/Cargo.toml
+          --locked
       - name: Run tests
         run: cargo nextest run --workspace --all-features

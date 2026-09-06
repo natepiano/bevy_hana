@@ -31,6 +31,7 @@ use super::OrbitCamBindings;
 use super::OrbitCamButtonDragZoom;
 use super::OrbitCamInputMode;
 use super::OrbitCamInteractionKind;
+use super::OrbitCamLineScroll;
 use super::OrbitCamTouchBinding;
 use super::OrbitCamTouchBindingConfig;
 use super::OrbitCamTrackpadScroll;
@@ -832,6 +833,15 @@ fn effective_control_rows(bindings: &OrbitCamBindings) -> Vec<OrbitCamControlRow
         enabled_input_gain_entries(bindings.trackpad_orbit())
             .map(|trackpad| describe_trackpad(trackpad, OrbitCamInteractionKind::Orbit)),
     );
+    rows.extend(
+        enabled_input_gain_entries(bindings.line_orbit()).map(|binding| {
+            control_row(
+                OrbitCamInteractionKind::Orbit,
+                with_mod_keys(binding.mod_keys, WHEEL_SOURCE_LABEL.to_string()),
+                InteractionSources::WHEEL,
+            )
+        }),
+    );
 
     rows.extend(
         bindings
@@ -842,6 +852,15 @@ fn effective_control_rows(bindings: &OrbitCamBindings) -> Vec<OrbitCamControlRow
     rows.extend(
         enabled_input_gain_entries(bindings.trackpad_pan())
             .map(|trackpad| describe_trackpad(trackpad, OrbitCamInteractionKind::Pan)),
+    );
+    rows.extend(
+        enabled_input_gain_entries(bindings.line_pan()).map(|binding| {
+            control_row(
+                OrbitCamInteractionKind::Pan,
+                with_mod_keys(binding.mod_keys, WHEEL_SOURCE_LABEL.to_string()),
+                InteractionSources::WHEEL,
+            )
+        }),
     );
 
     // Every zoom source shows one row per direction so zoom in and zoom out read
@@ -872,6 +891,10 @@ fn effective_control_rows(bindings: &OrbitCamBindings) -> Vec<OrbitCamControlRow
 
     for trackpad in enabled_input_gain_entries(bindings.trackpad_zoom()) {
         push_trackpad_zoom_pair(&mut rows, trackpad, inversion_sign);
+    }
+
+    for binding in enabled_input_gain_entries(bindings.line_zoom()) {
+        push_line_zoom_pair(&mut rows, binding, inversion_sign);
     }
 
     if let Some(button_drag) = enabled_input_gain_option(bindings.button_drag_zoom()) {
@@ -1036,6 +1059,20 @@ fn push_trackpad_zoom_pair(
         &zoom_in,
         &zoom_out,
         InteractionSources::SMOOTH_SCROLL,
+        inversion_sign,
+    );
+}
+
+fn push_line_zoom_pair(
+    rows: &mut Vec<OrbitCamControlRow>,
+    binding: OrbitCamBindingWithInputGain<OrbitCamLineScroll>,
+    inversion_sign: f32,
+) {
+    push_zoom_pair(
+        rows,
+        &with_mod_keys(binding.mod_keys, WHEEL_ZOOM_IN_LABEL.to_string()),
+        &with_mod_keys(binding.mod_keys, WHEEL_ZOOM_OUT_LABEL.to_string()),
+        InteractionSources::WHEEL,
         inversion_sign,
     );
 }
@@ -1520,6 +1557,33 @@ mod tests {
     use crate::input::OrbitCamPreset;
     use crate::input::OrbitCamTouchBinding;
     use crate::input::OrbitCamTrackpadScroll;
+
+    #[test]
+    fn forwarded_trackpad_summary_reports_wheel_modifiers() {
+        let preset = crate::OrbitCamBlenderLikePreset::default()
+            .line_scroll_input_gain(Some(crate::OrbitCamInputGain::uniform(20.0)));
+        let summary = describe_orbit_cam_controls(&OrbitCamInputMode::Preset(preset.into()));
+        let rows: Vec<_> = summary
+            .rows
+            .iter()
+            .filter(|row| row.camera_interaction_sources == InteractionSources::WHEEL)
+            .collect();
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().any(
+            |row| row.kind == OrbitCamInteractionKind::Orbit && row.label == WHEEL_SOURCE_LABEL
+        ));
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == OrbitCamInteractionKind::Pan
+                    && row.label == with_mod_keys(ModKeys::SHIFT, WHEEL_SOURCE_LABEL.to_string()))
+        );
+        for row in rows
+            .iter()
+            .filter(|row| row.kind == OrbitCamInteractionKind::Zoom)
+        {
+            assert!(row.label.starts_with(&compact_mod_keys(ModKeys::CONTROL)));
+        }
+    }
 
     #[test]
     fn summary_labels_follow_input_mode_variant() -> Result<(), BindingsError> {

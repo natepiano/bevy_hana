@@ -28,11 +28,13 @@ pub use action_set::OrbitCamOrbitActionBindings;
 pub use action_set::OrbitCamPanActionBindings;
 pub use action_set::OrbitCamZoomCoarseActionBindings;
 pub use action_set::OrbitCamZoomSmoothActionBindings;
+use bevy::input::mouse::MouseScrollUnit;
 use bevy::prelude::Reflect;
 pub use binding_kinds::CameraInputGamepadSelectionPolicy;
 pub use binding_kinds::OrbitCamBindingWithInputGain;
 pub use binding_kinds::OrbitCamButtonDragZoom;
 pub use binding_kinds::OrbitCamButtonDragZoomAxis;
+pub use binding_kinds::OrbitCamLineScroll;
 pub use binding_kinds::OrbitCamMouseDrag;
 pub use binding_kinds::OrbitCamMouseWheelZoom;
 pub use binding_kinds::OrbitCamPinchZoom;
@@ -76,8 +78,11 @@ pub struct OrbitCamBindings {
     pub(super) zoom_smooth:      OrbitCamZoomSmoothActionBindings,
     pub(super) zoom_coarse:      OrbitCamZoomCoarseActionBindings,
     pub(super) trackpad_orbit:   Vec<OrbitCamBindingWithInputGain<OrbitCamTrackpadScroll>>,
+    pub(super) line_orbit:       Vec<OrbitCamBindingWithInputGain<OrbitCamLineScroll>>,
     pub(super) trackpad_pan:     Vec<OrbitCamBindingWithInputGain<OrbitCamTrackpadScroll>>,
+    pub(super) line_pan:         Vec<OrbitCamBindingWithInputGain<OrbitCamLineScroll>>,
     pub(super) trackpad_zoom:    Vec<OrbitCamBindingWithInputGain<OrbitCamTrackpadScroll>>,
+    pub(super) line_zoom:        Vec<OrbitCamBindingWithInputGain<OrbitCamLineScroll>>,
     pub(super) mouse_wheel_zoom: Option<OrbitCamBindingWithInputGain<OrbitCamMouseWheelZoom>>,
     pub(super) pinch_zoom:       Option<OrbitCamBindingWithInputGain<OrbitCamPinchZoom>>,
     pub(super) touch:            Option<OrbitCamTouchBindingConfig>,
@@ -119,6 +124,24 @@ impl OrbitCamBindings {
     #[must_use]
     pub const fn zoom_coarse(&self) -> &OrbitCamZoomCoarseActionBindings { &self.zoom_coarse }
 
+    /// Returns line-scroll orbit bindings.
+    #[must_use]
+    pub fn line_orbit(&self) -> &[OrbitCamBindingWithInputGain<OrbitCamLineScroll>] {
+        &self.line_orbit
+    }
+
+    pub(super) fn enabled_scroll_orbit(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            usize,
+            OrbitCamBindingWithInputGain<OrbitCamTrackpadScroll>,
+            MouseScrollUnit,
+        ),
+    > + '_ {
+        enabled_scroll_entries(&self.trackpad_orbit, &self.line_orbit)
+    }
+
     /// Returns trackpad orbit bindings.
     #[must_use]
     pub fn trackpad_orbit(&self) -> &[OrbitCamBindingWithInputGain<OrbitCamTrackpadScroll>] {
@@ -134,6 +157,22 @@ impl OrbitCamBindings {
         enabled_input_gain_entries(&self.trackpad_orbit)
     }
 
+    /// Returns line-scroll pan bindings.
+    #[must_use]
+    pub fn line_pan(&self) -> &[OrbitCamBindingWithInputGain<OrbitCamLineScroll>] { &self.line_pan }
+
+    pub(super) fn enabled_scroll_pan(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            usize,
+            OrbitCamBindingWithInputGain<OrbitCamTrackpadScroll>,
+            MouseScrollUnit,
+        ),
+    > + '_ {
+        enabled_scroll_entries(&self.trackpad_pan, &self.line_pan)
+    }
+
     /// Returns trackpad pan bindings.
     #[must_use]
     pub fn trackpad_pan(&self) -> &[OrbitCamBindingWithInputGain<OrbitCamTrackpadScroll>] {
@@ -147,6 +186,24 @@ impl OrbitCamBindings {
     ) -> impl Iterator<Item = (usize, OrbitCamBindingWithInputGain<OrbitCamTrackpadScroll>)> + '_
     {
         enabled_input_gain_entries(&self.trackpad_pan)
+    }
+
+    /// Returns line-scroll zoom bindings.
+    #[must_use]
+    pub fn line_zoom(&self) -> &[OrbitCamBindingWithInputGain<OrbitCamLineScroll>] {
+        &self.line_zoom
+    }
+
+    pub(super) fn enabled_scroll_zoom(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            usize,
+            OrbitCamBindingWithInputGain<OrbitCamTrackpadScroll>,
+            MouseScrollUnit,
+        ),
+    > + '_ {
+        enabled_scroll_entries(&self.trackpad_zoom, &self.line_zoom)
     }
 
     /// Returns trackpad zoom bindings.
@@ -284,6 +341,35 @@ const fn enabled_input_gain_option<T: Copy>(
         Some(entry) if entry.input_gain().is_enabled() => Some(entry),
         Some(_) | None => None,
     }
+}
+
+/// Uses one index space per action for installed pixel and line bindings.
+fn enabled_scroll_entries<'a>(
+    pixel: &'a [OrbitCamBindingWithInputGain<OrbitCamTrackpadScroll>],
+    line: &'a [OrbitCamBindingWithInputGain<OrbitCamLineScroll>],
+) -> impl Iterator<
+    Item = (
+        usize,
+        OrbitCamBindingWithInputGain<OrbitCamTrackpadScroll>,
+        MouseScrollUnit,
+    ),
+> + 'a {
+    pixel
+        .iter()
+        .copied()
+        .map(|binding| (binding, MouseScrollUnit::Pixel))
+        .chain(line.iter().map(|binding| {
+            (
+                OrbitCamTrackpadScroll {
+                    mod_keys: binding.mod_keys,
+                }
+                .with_input_gain(binding.input_gain().value()),
+                MouseScrollUnit::Line,
+            )
+        }))
+        .enumerate()
+        .filter(|(_, (binding, _))| binding.input_gain().is_enabled())
+        .map(|(index, (binding, unit))| (index, binding, unit))
 }
 
 #[cfg(test)]

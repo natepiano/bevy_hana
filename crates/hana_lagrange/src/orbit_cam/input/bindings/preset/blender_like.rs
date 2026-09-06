@@ -14,6 +14,7 @@ use crate::orbit_cam::input::bindings::CameraSlowMode;
 use crate::orbit_cam::input::bindings::OrbitCamBindings;
 use crate::orbit_cam::input::bindings::OrbitCamBindingsBuilder;
 use crate::orbit_cam::input::bindings::OrbitCamInputGain;
+use crate::orbit_cam::input::bindings::OrbitCamLineScroll;
 use crate::orbit_cam::input::bindings::OrbitCamMouseDrag;
 use crate::orbit_cam::input::bindings::OrbitCamMouseWheelZoom;
 use crate::orbit_cam::input::bindings::OrbitCamPinchZoom;
@@ -25,6 +26,7 @@ use crate::orbit_cam::input::bindings::OrbitCamTrackpadScroll;
 pub struct OrbitCamBlenderLikePreset {
     mouse_input_gain:         OrbitCamInputGain,
     smooth_scroll_input_gain: OrbitCamInputGain,
+    line_scroll_input_gain:   Option<OrbitCamInputGain>,
     zoom_mod_keys:            ModKeys,
     slow_toggle_key:          Option<KeyCode>,
     slow_toggle_mod_keys:     ModKeys,
@@ -109,6 +111,18 @@ impl OrbitCamBlenderLikePreset {
         self
     }
 
+    /// Maps line scrolling to orbit, Shift+scroll to pan, and the configured
+    /// zoom modifiers (Control by default) plus scroll to zoom.
+    ///
+    /// Intended for trackpads forwarded as mouse-wheel input. Physical wheels
+    /// receive the same controls. `None` preserves ordinary wheel zoom.
+    /// Gains are independent of mouse and native pixel-scroll sensitivity.
+    #[must_use]
+    pub const fn line_scroll_input_gain(mut self, input_gain: Option<OrbitCamInputGain>) -> Self {
+        self.line_scroll_input_gain = input_gain;
+        self
+    }
+
     pub(super) fn build_into(
         self,
         builder: OrbitCamBindingsBuilder,
@@ -120,6 +134,9 @@ impl OrbitCamBlenderLikePreset {
     fn validate(&self) -> Result<(), BindingsError> {
         self.mouse_input_gain.validate()?;
         self.smooth_scroll_input_gain.validate()?;
+        if let Some(input_gain) = self.line_scroll_input_gain {
+            input_gain.validate()?;
+        }
         if self.slow_toggle_key.is_some()
             && (!self.slow_scale.is_finite()
                 || self.slow_scale <= Self::MIN_SLOW_SCALE
@@ -164,15 +181,33 @@ impl OrbitCamBlenderLikePreset {
                     .with_input_gain(self.smooth_scroll_input_gain.pan_input_gain().value()),
             )
             .zoom(
-                OrbitCamMouseWheelZoom
-                    .with_input_gain(self.mouse_input_gain.zoom_input_gain().value()),
-            )
-            .zoom(
                 OrbitCamTrackpadScroll::default()
                     .with_mod_keys(self.zoom_mod_keys)
                     .with_input_gain(self.smooth_scroll_input_gain.zoom_input_gain().value()),
             )
             .zoom(OrbitCamPinchZoom);
+        let builder = if let Some(input_gain) = self.line_scroll_input_gain {
+            builder
+                .orbit(
+                    OrbitCamLineScroll::default()
+                        .with_input_gain(input_gain.orbit_input_gain().value()),
+                )
+                .pan(
+                    OrbitCamLineScroll::default()
+                        .with_mod_keys(ModKeys::SHIFT)
+                        .with_input_gain(input_gain.pan_input_gain().value()),
+                )
+                .zoom(
+                    OrbitCamLineScroll::default()
+                        .with_mod_keys(self.zoom_mod_keys)
+                        .with_input_gain(input_gain.zoom_input_gain().value()),
+                )
+        } else {
+            builder.zoom(
+                OrbitCamMouseWheelZoom
+                    .with_input_gain(self.mouse_input_gain.zoom_input_gain().value()),
+            )
+        };
         self.home
             .into_iter()
             .flatten()
@@ -185,6 +220,7 @@ impl Default for OrbitCamBlenderLikePreset {
         Self {
             mouse_input_gain:         OrbitCamInputGain::default(),
             smooth_scroll_input_gain: OrbitCamInputGain::default(),
+            line_scroll_input_gain:   None,
             zoom_mod_keys:            ModKeys::CONTROL,
             slow_toggle_key:          Some(KeyCode::KeyS),
             slow_toggle_mod_keys:     ModKeys::ALT,
@@ -221,6 +257,22 @@ mod tests {
     use bevy::prelude::GamepadButton;
 
     use super::*;
+
+    #[test]
+    fn line_scroll_mode_is_opt_in_and_can_restore_defaults() -> Result<(), BindingsError> {
+        let default = OrbitCamBlenderLikePreset::default();
+        let enabled = default.line_scroll_input_gain(Some(OrbitCamInputGain::uniform(20.0)));
+        let bindings = enabled.build()?;
+        assert!(bindings.mouse_wheel_zoom().is_none());
+        assert_eq!(bindings.line_orbit().len(), 1);
+        assert_eq!(bindings.line_pan().len(), 1);
+        assert_eq!(bindings.line_zoom().len(), 1);
+        assert_eq!(
+            enabled.line_scroll_input_gain(None).build()?,
+            default.build()?
+        );
+        Ok(())
+    }
 
     #[test]
     fn default_blender_like_preset_binds_no_home() -> Result<(), BindingsError> {

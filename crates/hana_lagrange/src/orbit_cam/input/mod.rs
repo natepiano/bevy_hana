@@ -17,6 +17,7 @@ pub use bindings::OrbitCamGamepadPresetBuilder;
 pub use bindings::OrbitCamHomeActionBindings;
 pub use bindings::OrbitCamInputGain;
 pub use bindings::OrbitCamKeyboardPreset;
+pub use bindings::OrbitCamLineScroll;
 pub use bindings::OrbitCamMouseDrag;
 pub use bindings::OrbitCamMouseWheelZoom;
 pub use bindings::OrbitCamOrbitActionBindings;

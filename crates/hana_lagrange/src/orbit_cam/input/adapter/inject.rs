@@ -160,7 +160,9 @@ fn adapter_contributions(
     mouse_buttons: Option<&ButtonInput<MouseButton>>,
 ) -> AdapterContributions {
     let mut contributions = AdapterContributions::default();
-    apply_mouse_wheel_zoom_contribution(bindings, scroll, &mut contributions);
+    if trackpad_selection.is_none() {
+        apply_mouse_wheel_zoom_contribution(bindings, scroll, &mut contributions);
+    }
     apply_trackpad_scroll_contribution(scroll, trackpad_selection, &mut contributions);
     apply_pinch_contribution(bindings, pinch, keyboard, mouse_buttons, &mut contributions);
     apply_touch_contribution(bindings, touch_gestures, &mut contributions);
@@ -195,7 +197,7 @@ fn apply_trackpad_scroll_contribution(
     selection: Option<TrackpadScrollCandidate>,
     contributions: &mut AdapterContributions,
 ) {
-    if scroll.delta == Vec2::ZERO || scroll.unit != MouseScrollUnit::Pixel {
+    if scroll.delta == Vec2::ZERO {
         return;
     }
 
@@ -204,25 +206,20 @@ fn apply_trackpad_scroll_contribution(
     };
     debug_assert!(selection.input_gain.is_enabled());
 
+    let source = match scroll.unit {
+        MouseScrollUnit::Pixel => InteractionSources::SMOOTH_SCROLL,
+        MouseScrollUnit::Line => InteractionSources::WHEEL,
+    };
     contributions.trackpad = scroll.delta;
     match selection.target {
         TrackpadScrollTarget::Orbit => {
-            contributions.sources.orbit = contributions
-                .sources
-                .orbit
-                .union(InteractionSources::SMOOTH_SCROLL);
+            contributions.sources.orbit = contributions.sources.orbit.union(source);
         },
         TrackpadScrollTarget::Pan => {
-            contributions.sources.pan = contributions
-                .sources
-                .pan
-                .union(InteractionSources::SMOOTH_SCROLL);
+            contributions.sources.pan = contributions.sources.pan.union(source);
         },
         TrackpadScrollTarget::Zoom => {
-            contributions.sources.zoom_smooth = contributions
-                .sources
-                .zoom_smooth
-                .union(InteractionSources::SMOOTH_SCROLL);
+            contributions.sources.zoom_smooth = contributions.sources.zoom_smooth.union(source);
         },
     }
 }
@@ -247,19 +244,29 @@ fn selected_trackpad_binding(
     scroll: AccumulatedMouseScroll,
     keyboard: Option<&ButtonInput<KeyCode>>,
 ) -> Option<TrackpadScrollCandidate> {
-    if scroll.delta == Vec2::ZERO || scroll.unit != MouseScrollUnit::Pixel {
+    if scroll.delta == Vec2::ZERO {
         return None;
     }
-    let candidates =
-        bindings
-            .enabled_trackpad_orbit()
-            .map(|(index, binding)| trackpad_candidate(TrackpadScrollTarget::Orbit, index, binding))
-            .chain(bindings.enabled_trackpad_pan().map(|(index, binding)| {
-                trackpad_candidate(TrackpadScrollTarget::Pan, index, binding)
-            }))
-            .chain(bindings.enabled_trackpad_zoom().map(|(index, binding)| {
-                trackpad_candidate(TrackpadScrollTarget::Zoom, index, binding)
-            }));
+    let candidates = bindings
+        .enabled_scroll_orbit()
+        .filter(|(_, _, unit)| *unit == scroll.unit)
+        .map(|(index, binding, _)| trackpad_candidate(TrackpadScrollTarget::Orbit, index, binding))
+        .chain(
+            bindings
+                .enabled_scroll_pan()
+                .filter(|(_, _, unit)| *unit == scroll.unit)
+                .map(|(index, binding, _)| {
+                    trackpad_candidate(TrackpadScrollTarget::Pan, index, binding)
+                }),
+        )
+        .chain(
+            bindings
+                .enabled_scroll_zoom()
+                .filter(|(_, _, unit)| *unit == scroll.unit)
+                .map(|(index, binding, _)| {
+                    trackpad_candidate(TrackpadScrollTarget::Zoom, index, binding)
+                }),
+        );
 
     candidates
         .filter(|candidate| trackpad_mod_keys_pressed(keyboard, candidate.mod_keys))

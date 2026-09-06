@@ -520,7 +520,7 @@ fn spawn_trackpad_custom_bindings(
     entities: &mut Vec<Entity>,
 ) {
     let (orbit, pan, zoom_smooth) = actions;
-    for (index, binding) in bindings.enabled_trackpad_orbit() {
+    for (index, binding, _) in bindings.enabled_scroll_orbit() {
         entities.push(spawn_trackpad_binding(
             world,
             camera,
@@ -531,7 +531,7 @@ fn spawn_trackpad_custom_bindings(
             binding,
         ));
     }
-    for (index, binding) in bindings.enabled_trackpad_pan() {
+    for (index, binding, _) in bindings.enabled_scroll_pan() {
         entities.push(spawn_trackpad_binding(
             world,
             camera,
@@ -542,7 +542,7 @@ fn spawn_trackpad_custom_bindings(
             binding,
         ));
     }
-    for (index, binding) in bindings.enabled_trackpad_zoom() {
+    for (index, binding, _) in bindings.enabled_scroll_zoom() {
         entities.push(spawn_trackpad_zoom_binding(
             world,
             camera,

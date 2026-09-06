@@ -81,6 +81,15 @@ impl OrbitCamBindingWithInputGain<OrbitCamTrackpadScroll> {
     }
 }
 
+impl OrbitCamBindingWithInputGain<OrbitCamLineScroll> {
+    /// Requires keyboard modifiers on line-scroll input.
+    #[must_use]
+    pub const fn with_mod_keys(mut self, mod_keys: ModKeys) -> Self {
+        self.binding = self.binding.with_mod_keys(mod_keys);
+        self
+    }
+}
+
 impl OrbitCamBindingWithInputGain<OrbitCamButtonDragZoom> {
     /// Sets the axis used for button-drag zoom.
     #[must_use]
@@ -161,6 +170,33 @@ impl OrbitCamTrackpadScroll {
     }
 
     /// Sets the authored input gain for this smooth-scroll binding.
+    #[must_use]
+    pub const fn with_input_gain(self, input_gain: f32) -> OrbitCamBindingWithInputGain<Self> {
+        OrbitCamBindingWithInputGain::new(self, input_gain)
+    }
+}
+
+/// Line-scroll binding for orbit, pan, or zoom behavior.
+///
+/// Accepts mouse-wheel events, including trackpads forwarded as wheel input.
+/// A matching enabled binding takes precedence over [`OrbitCamMouseWheelZoom`].
+/// Orbit and pan gain is measured in pixels per line; zoom gain uses the same
+/// pixel-equivalent scale as [`OrbitCamTrackpadScroll`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Reflect)]
+pub struct OrbitCamLineScroll {
+    /// Keyboard modifiers required by the line-scroll binding.
+    pub mod_keys: ModKeys,
+}
+
+impl OrbitCamLineScroll {
+    /// Requires keyboard modifiers on line-scroll input.
+    #[must_use]
+    pub const fn with_mod_keys(mut self, mod_keys: ModKeys) -> Self {
+        self.mod_keys = mod_keys;
+        self
+    }
+
+    /// Sets the authored input gain for this line-scroll binding.
     #[must_use]
     pub const fn with_input_gain(self, input_gain: f32) -> OrbitCamBindingWithInputGain<Self> {
         OrbitCamBindingWithInputGain::new(self, input_gain)

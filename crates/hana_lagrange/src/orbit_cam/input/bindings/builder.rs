@@ -13,6 +13,7 @@ use super::OrbitCamBindings;
 use super::binding_kinds::CameraInputGamepadSelectionPolicy;
 use super::binding_kinds::OrbitCamBindingWithInputGain;
 use super::binding_kinds::OrbitCamButtonDragZoom;
+use super::binding_kinds::OrbitCamLineScroll;
 use super::binding_kinds::OrbitCamMouseDrag;
 use super::binding_kinds::OrbitCamMouseWheelZoom;
 use super::binding_kinds::OrbitCamPinchZoom;
@@ -37,8 +38,11 @@ pub(super) struct OrbitCamBindingsDescriptor {
     pub(super) zoom_smooth:      Vec<HeldBindingDescriptor>,
     pub(super) zoom_coarse:      Vec<ActionBindingDescriptor>,
     pub(super) trackpad_orbit:   Vec<OrbitCamBindingWithInputGain<OrbitCamTrackpadScroll>>,
+    pub(super) line_orbit:       Vec<OrbitCamBindingWithInputGain<OrbitCamLineScroll>>,
     pub(super) trackpad_pan:     Vec<OrbitCamBindingWithInputGain<OrbitCamTrackpadScroll>>,
+    pub(super) line_pan:         Vec<OrbitCamBindingWithInputGain<OrbitCamLineScroll>>,
     pub(super) trackpad_zoom:    Vec<OrbitCamBindingWithInputGain<OrbitCamTrackpadScroll>>,
+    pub(super) line_zoom:        Vec<OrbitCamBindingWithInputGain<OrbitCamLineScroll>>,
     pub(super) mouse_wheel_zoom: Option<OrbitCamBindingWithInputGain<OrbitCamMouseWheelZoom>>,
     pub(super) pinch_zoom:       Option<OrbitCamBindingWithInputGain<OrbitCamPinchZoom>>,
     pub(super) touch:            Option<OrbitCamTouchBindingConfig>,
@@ -62,6 +66,7 @@ impl OrbitCamBindingsBuilder {
         match binding.into() {
             OrbitCamOrbitBinding::Held(binding) => self.descriptor.orbit.push(binding.into()),
             OrbitCamOrbitBinding::Trackpad(binding) => self.descriptor.trackpad_orbit.push(binding),
+            OrbitCamOrbitBinding::LineScroll(binding) => self.descriptor.line_orbit.push(binding),
         }
         self
     }
@@ -72,6 +77,7 @@ impl OrbitCamBindingsBuilder {
         match binding.into() {
             OrbitCamPanBinding::Held(binding) => self.descriptor.pan.push(binding.into()),
             OrbitCamPanBinding::Trackpad(binding) => self.descriptor.trackpad_pan.push(binding),
+            OrbitCamPanBinding::LineScroll(binding) => self.descriptor.line_pan.push(binding),
         }
         self
     }
@@ -88,6 +94,7 @@ impl OrbitCamBindingsBuilder {
                 self.descriptor.zoom_smooth.push(binding.into());
             },
             OrbitCamZoomBinding::Trackpad(binding) => self.descriptor.trackpad_zoom.push(binding),
+            OrbitCamZoomBinding::LineScroll(binding) => self.descriptor.line_zoom.push(binding),
             OrbitCamZoomBinding::MouseWheel(binding) => {
                 self.descriptor.mouse_wheel_zoom = Some(binding);
             },
@@ -171,6 +178,8 @@ pub enum OrbitCamOrbitBinding {
     Held(HeldBinding),
     /// Trackpad smooth-scroll binding.
     Trackpad(OrbitCamBindingWithInputGain<OrbitCamTrackpadScroll>),
+    /// Line-scroll binding.
+    LineScroll(OrbitCamBindingWithInputGain<OrbitCamLineScroll>),
 }
 
 impl From<HeldBinding> for OrbitCamOrbitBinding {
@@ -209,6 +218,8 @@ pub enum OrbitCamPanBinding {
     Held(HeldBinding),
     /// Trackpad smooth-scroll binding.
     Trackpad(OrbitCamBindingWithInputGain<OrbitCamTrackpadScroll>),
+    /// Line-scroll binding.
+    LineScroll(OrbitCamBindingWithInputGain<OrbitCamLineScroll>),
 }
 
 impl From<HeldBinding> for OrbitCamPanBinding {
@@ -247,6 +258,8 @@ pub enum OrbitCamZoomBinding {
     Held(HeldBinding),
     /// Trackpad smooth-scroll binding.
     Trackpad(OrbitCamBindingWithInputGain<OrbitCamTrackpadScroll>),
+    /// Line-scroll binding.
+    LineScroll(OrbitCamBindingWithInputGain<OrbitCamLineScroll>),
     /// Mouse wheel zoom binding.
     MouseWheel(OrbitCamBindingWithInputGain<OrbitCamMouseWheelZoom>),
     /// Pinch gesture zoom binding.
@@ -298,5 +311,35 @@ impl From<OrbitCamButtonDragZoom> for OrbitCamZoomBinding {
 impl From<OrbitCamBindingWithInputGain<OrbitCamButtonDragZoom>> for OrbitCamZoomBinding {
     fn from(value: OrbitCamBindingWithInputGain<OrbitCamButtonDragZoom>) -> Self {
         Self::ButtonDrag(value)
+    }
+}
+
+impl From<OrbitCamLineScroll> for OrbitCamOrbitBinding {
+    fn from(value: OrbitCamLineScroll) -> Self { Self::LineScroll(value.into()) }
+}
+
+impl From<OrbitCamBindingWithInputGain<OrbitCamLineScroll>> for OrbitCamOrbitBinding {
+    fn from(value: OrbitCamBindingWithInputGain<OrbitCamLineScroll>) -> Self {
+        Self::LineScroll(value)
+    }
+}
+
+impl From<OrbitCamLineScroll> for OrbitCamPanBinding {
+    fn from(value: OrbitCamLineScroll) -> Self { Self::LineScroll(value.into()) }
+}
+
+impl From<OrbitCamBindingWithInputGain<OrbitCamLineScroll>> for OrbitCamPanBinding {
+    fn from(value: OrbitCamBindingWithInputGain<OrbitCamLineScroll>) -> Self {
+        Self::LineScroll(value)
+    }
+}
+
+impl From<OrbitCamLineScroll> for OrbitCamZoomBinding {
+    fn from(value: OrbitCamLineScroll) -> Self { Self::LineScroll(value.into()) }
+}
+
+impl From<OrbitCamBindingWithInputGain<OrbitCamLineScroll>> for OrbitCamZoomBinding {
+    fn from(value: OrbitCamBindingWithInputGain<OrbitCamLineScroll>) -> Self {
+        Self::LineScroll(value)
     }
 }

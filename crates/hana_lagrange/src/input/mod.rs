@@ -286,6 +286,7 @@ pub use crate::orbit_cam::OrbitCamHomeActionBindings;
 pub use crate::orbit_cam::OrbitCamInput;
 pub use crate::orbit_cam::OrbitCamInputGain;
 pub use crate::orbit_cam::OrbitCamKeyboardPreset;
+pub use crate::orbit_cam::OrbitCamLineScroll;
 pub use crate::orbit_cam::OrbitCamMouseDrag;
 pub use crate::orbit_cam::OrbitCamMouseWheelZoom;
 pub use crate::orbit_cam::OrbitCamOrbitActionBindings;

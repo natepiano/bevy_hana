@@ -208,6 +208,7 @@ pub use input::OrbitCamInteractionSpeedChanged;
 pub use input::OrbitCamInteractionStarted;
 pub use input::OrbitCamInteractionState;
 pub use input::OrbitCamKeyboardPreset;
+pub use input::OrbitCamLineScroll;
 pub use input::OrbitCamManualInput;
 pub use input::OrbitCamManualInputWriter;
 pub use input::OrbitCamMouseDrag;
