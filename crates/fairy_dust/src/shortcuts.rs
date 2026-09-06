@@ -12,8 +12,7 @@
 //! [`run_shortcuts`] runs a registered system only when its key fires **and no
 //! modifier is held**. Fairy Dust's own chords (`Ctrl+Shift+L` and friends)
 //! fire only *with* their modifiers, so a bare example key and a Fairy Dust
-//! chord on the same letter never both fire — the modifier guard is what the
-//! original raw-input examples were missing.
+//! chord on the same letter never both fire.
 //!
 //! Bare keys Fairy Dust already binds (`H` home, `P` cube spin or fold play)
 //! register into [`ReservedKeys`]. A second capability is rejected immediately,
@@ -361,7 +360,7 @@ impl<'world> ShortcutCollisionCheckAvailability<'world> {
     /// The command the live keymap runs from `key` alone.
     ///
     /// Only a one-keystroke, modifier-free binding can double-fire with an
-    /// example shortcut: [`run_shortcuts`] stands down while any modifier is
+    /// example shortcut: [`run_shortcuts`] returns early while any modifier is
     /// held.
     ///
     /// No-keymap, registry-assembly, and authored-unavailable outcomes leave
@@ -850,8 +849,8 @@ mod tests {
         );
     }
 
-    /// A user keymap can bind a Fairy Dust command to a bare letter, which the
-    /// hardcoded reservation list knows nothing about. The example shortcut on
+    /// A user keymap can bind a Fairy Dust command to a bare letter that the
+    /// hardcoded reservation list does not contain. The example shortcut on
     /// that letter would then double-fire, so the startup check reads the live
     /// keymap as well.
     #[test]

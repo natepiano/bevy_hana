@@ -1,8 +1,9 @@
 //! Diegetic cascade attributes and typed public commands.
 //!
 //! `hana_kana` owns authored [`Cascade`], the explicit [`CascadeFrom`]
-//! relationship, propagation, and [`Resolved`] caches. This module chooses
-//! diegetic attributes and exposes domain-specific command and reader names.
+//! relationship, propagation, and [`Resolved`] caches. This module declares
+//! the diegetic cascade attributes and exposes domain-specific command and
+//! reader names.
 
 mod attributes;
 mod cascade_set;

@@ -91,7 +91,7 @@ impl KeymapPlugin {
     /// Reserves `keystroke` for the application-owned recovery `command_id`.
     ///
     /// The association remains visible to palette consumers even when no authored keymap can
-    /// materialize. It is deliberately excluded from Rubric routing: the application detects and
+    /// materialize. It is excluded from Rubric routing: the application detects and
     /// invokes its recovery chord directly. Assembly validates that every associated command is a
     /// registered, palette-invocable [`Capability::Unremappable`] command; a failed association
     /// set records diagnostics and installs none of its associations.
@@ -544,9 +544,9 @@ fn record_missing_default_keymap(app: &mut App) {
 
 /// Reports the configuration directory the keymap could not resolve.
 ///
-/// An application that never named one asked for nothing and is refused nothing,
-/// so that case is advisory. An application that named one and still has no
-/// directory cannot read or write the user's keymap, which is a failure.
+/// An application that never called [`KeymapPlugin::with_app_name`] has no directory
+/// to resolve, so that case is advisory. An application that named one and still has
+/// no directory cannot read or write the user's keymap, which is a failure.
 fn record_unavailable_keymap_paths(app: &mut App, keymap_path_failure: KeymapPathFailure) {
     let severity = match keymap_path_failure {
         KeymapPathFailure::AppNameNotConfigured => DiagnosticSeverity::Advisory,

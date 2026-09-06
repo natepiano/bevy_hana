@@ -1,0 +1,37 @@
+error: unused `Establishment` that must be used
+  --> tests/compile_fail/ledger_outcomes_must_be_used.rs:19:5
+   |
+19 |     ledger.establish_lease(context, Establishing::Live, |()| ());
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+note: the lint level is defined here
+  --> tests/compile_fail/ledger_outcomes_must_be_used.rs:1:9
+   |
+ 1 | #![deny(unused_must_use)]
+   |         ^^^^^^^^^^^^^^^
+help: use `let _ = ...` to ignore the resulting value
+   |
+19 |     let _ = ledger.establish_lease(context, Establishing::Live, |()| ());
+   |     +++++++
+
+error: unused `AttemptFinish` that must be used
+  --> tests/compile_fail/ledger_outcomes_must_be_used.rs:23:5
+   |
+23 |     ledger.abort_attempt(attempt, DriverAbortReason::OperationEnded);
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+help: use `let _ = ...` to ignore the resulting value
+   |
+23 |     let _ = ledger.abort_attempt(attempt, DriverAbortReason::OperationEnded);
+   |     +++++++
+
+error: unused `DiscardedSession` that must be used
+  --> tests/compile_fail/ledger_outcomes_must_be_used.rs:27:5
+   |
+27 |     ledger.discard_retained(role);
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+help: use `let _ = ...` to ignore the resulting value
+   |
+27 |     let _ = ledger.discard_retained(role);
+   |     +++++++

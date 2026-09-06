@@ -20,7 +20,7 @@ pub(crate) const DEFAULT_BAND_COUNT: usize = 96;
 const BAND_OVERLAP_EM_UNITS: f32 = 1.0;
 /// Fewest curves a band must hold. Band count is capped at
 /// `ceil(curve_count / this)` so a sparse path collapses toward one band and
-/// its distance scan sees every curve at any grazing angle, where the
+/// its distance scan reads every curve at any grazing angle, where the
 /// on-screen footprint exceeds a thin band's overlap.
 const MIN_CURVES_PER_BAND: usize = 256;
 const CURVE_DEGENERATE_EPS: f32 = 0.000_000_01;
@@ -213,7 +213,8 @@ pub(crate) struct PathRenderRecord {
 }
 
 // GPU-layout assertions against the std430 sizes the shaders index by — the
-// WGSL mirror structs in `analytic_path_vertex_pull.wgsl` assume these strides.
+// WGSL mirror structs in `analytic_path_vertex_pull.wgsl` are declared at these
+// strides.
 // `ShaderSize` measures the encase layout, not the Rust layout.
 const _: () = assert!(CurveRecord::SHADER_SIZE.get() == 80);
 const _: () = assert!(PackedPathRecord::SHADER_SIZE.get() == 48);
@@ -260,7 +261,7 @@ pub(super) struct BandLayout {
     /// Vertical band count (splits the x extent).
     pub vertical_band_count:   usize,
     /// Design-unit margin around each band; curves within it are included so
-    /// the distance scan near a band edge still sees them.
+    /// the distance scan near a band edge still reads them.
     pub overlap:               f32,
 }
 
@@ -277,7 +278,7 @@ impl BandLayout {
 
     /// Per-axis counts sized so each band spans about `target_extent` design
     /// units, with a half-band overlap. Small paths keep one exact band (the
-    /// distance scan sees every curve at any zoom); large merged paths split
+    /// distance scan reads every curve at any zoom); large merged paths split
     /// so the per-fragment curve loop stays short.
     #[must_use]
     pub(super) fn for_extents(bounds: Bounds, target_extent: f32, curve_count: usize) -> Self {
@@ -589,8 +590,8 @@ fn overlaps_band(segment: &QuadraticSegment, band_min: f32, band_max: f32, axis:
     // Axis-parallel edges (e.g. a horizontal edge in an along-Y band) are kept:
     // they add 0 to winding (`curve_winding` returns 0 when the scanline is parallel)
     // but DO carry distance, which the signed-distance field needs. Dropping them
-    // left the field blind to those edges, so it saturated to ±edge_width near them
-    // and the screen-space AA band ballooned at grazing angles.
+    // leaves the field with no distance to those edges, so it saturates to
+    // ±edge_width near them and the screen-space AA band balloons at grazing angles.
     let segment_min = segment_axis_min(segment, axis);
     let segment_max = segment_axis_max(segment, axis);
     segment_min <= band_max && segment_max >= band_min

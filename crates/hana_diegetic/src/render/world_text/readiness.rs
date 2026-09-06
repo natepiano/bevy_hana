@@ -5,9 +5,9 @@ use bevy::prelude::EntityEvent;
 use bevy::prelude::Query;
 use bevy::prelude::With;
 
-/// Internal marker: a text entity's glyphs are ready and meshes are spawned, but
-/// the frame waits for Bevy's transform propagation before firing
-/// [`WorldTextReady`].
+/// Marks a text entity whose glyphs are ready and whose meshes are spawned.
+/// [`emit_world_text_ready`] removes the marker and fires [`WorldTextReady`]
+/// once Bevy's transform propagation has run.
 #[derive(Component)]
 pub(crate) struct AwaitingReady;
 

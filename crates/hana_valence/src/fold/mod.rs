@@ -77,7 +77,7 @@ use crate::ArrangementPlugin;
 /// The plugin does not install anchor geometry providers, anchor resolution, or
 /// transform propagation. Consumers continue to own those systems, and
 /// [`ArrangementPlugin`] remains the sole registrar of
-/// [`hinge_to_pose`](crate::hinge_to_pose).
+/// [`AnchorSystems::HingeToPose`](crate::AnchorSystems::HingeToPose).
 ///
 /// Adding [`ArrangementPlugin`] without `FoldPlugin` leaves a
 /// [`FoldSequence`] component present and inert: nothing rebuilds playback for

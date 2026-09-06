@@ -2,11 +2,12 @@
 //!
 //! [`Element`] is the data struct stored in the arena-based [`LayoutTree`]. It holds every
 //! layout property (sizing, padding, direction, background, border, etc.) plus an
-//! [`ElementContent`] that determines whether the node is a container, a text leaf, or empty.
+//! [`ElementContent`] that says whether the node is a container, a text leaf, an image leaf,
+//! or empty.
 //!
-//! Users rarely construct `Element` directly. Instead, the [`El`](super::builder::El) builder
-//! provides a fluent API that converts into an `Element` via `into_element()`. Think of `El`
-//! as the ergonomic front door and `Element` as the canonical storage format.
+//! Users rarely construct `Element` directly. The [`El`](super::builder::El) builder offers a
+//! fluent API and converts into an `Element` via `into_element()`; `Element` is the canonical
+//! storage format.
 
 use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
@@ -79,8 +80,8 @@ pub(super) enum ChildOverflow {
 
 /// Which edge [`Element::scroll_offset`] measures from. `Start` is an absolute
 /// offset from the top/left (clamped to `[0, max]`); `End` is a distance from
-/// the bottom/right, so `0` pins to the end and following a growing tail needs
-/// no knowledge of the content size.
+/// the bottom/right, so `0` pins to the end and a caller following a growing
+/// tail never has to supply the content size.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum ScrollAnchor {
     #[default]
@@ -101,8 +102,9 @@ pub(crate) enum PrecomposeMode {
 
 /// A single element in the layout tree.
 ///
-/// Elements are either containers (with children) or text leaves. The tree
-/// is built via [`LayoutTree`] and then sized/positioned by the layout engine.
+/// An element is a container (with children), a text leaf, an image leaf, or
+/// empty. The tree is built via [`LayoutTree`] and then sized and positioned by
+/// the layout engine.
 #[derive(Clone, Debug)]
 pub(super) struct Element {
     /// Optional panel-local identity for this layout element.
@@ -121,7 +123,7 @@ pub(super) struct Element {
     pub(super) border:            Option<Border>,
     /// Corner radius for rounded backgrounds and borders.
     pub(super) corner_radius:     CornerRadius,
-    /// How this element handles overflowing children (`Visible` or `Clipped`).
+    /// Whether overflowing children are clipped to this element's content box.
     pub(super) overflow:          ChildOverflow,
     /// Scroll offset (logical px) subtracted from child positions when this
     /// element clips. Clamped during positioning to `[0, content - viewport]`
@@ -340,8 +342,8 @@ impl LayoutTree {
                 },
                 ElementContent::Text { .. } | ElementContent::Image { .. } => {
                     // Leaf elements cannot have children — this is a programming error.
-                    // In release builds we silently ignore it; debug builds will catch it
-                    // via the orphan check in layout computation.
+                    // Release builds ignore it; debug builds catch it via the
+                    // orphan check in layout computation.
                 },
             }
         }
@@ -357,8 +359,8 @@ impl LayoutTree {
     /// (e.g. `Percent` or `Grow`) so that changing `panel.width`
     /// triggers correct reflow without a tree rebuild. Pass
     /// `Dimension { value: 0.0, unit: None }` for `min` and
-    /// `Dimension { value: f32::MAX, unit: None }` for `max` to match
-    /// the previous unbounded behavior.
+    /// `Dimension { value: f32::MAX, unit: None }` for `max` to leave the
+    /// range unbounded.
     pub(super) fn set_root_grow_width(&mut self, min: Dimension, max: Dimension) {
         if let Some(root) = self.root
             && let Some(element) = self.elements.get_mut(root)
@@ -502,8 +504,8 @@ impl LayoutTree {
     #[must_use]
     pub const fn is_empty(&self) -> bool { self.elements.is_empty() }
 
-    /// Classifies whether `next` differs from this tree only in render-only
-    /// fields.
+    /// Classifies how `next` differs from this tree: identical, render-only,
+    /// or layout-affecting.
     #[must_use]
     pub fn classify_change(&self, next: &Self) -> LayoutTreeChange {
         if self.root != next.root || self.elements.len() != next.elements.len() {
@@ -744,8 +746,8 @@ impl LayoutTree {
     }
 
     /// Returns the panel-local id of the text element at `index`, if that
-    /// element is a text leaf. Reification reads this to key a child by its id instead of
-    /// the former positional `(element_idx, command_index)` pair.
+    /// element is a text leaf. Reification reads this to key a child by its id
+    /// rather than by its `(element_idx, command_index)` position.
     #[must_use]
     pub(crate) fn text_element_id(&self, index: usize) -> Option<&PanelElementId> {
         self.elements
@@ -1020,7 +1022,7 @@ impl LayoutTree {
     ///
     /// The result is rebuilt as a compact arena so descendants hidden by the
     /// replacement cannot keep duplicate ids or participate in later scans.
-    /// Auto-generated text ids in `replacement` are reminted after the source
+    /// Auto-generated text ids in `replacement` are renumbered after the source
     /// tree's ids because each tree was originally built with its own counter.
     pub(crate) fn set_field_editing_content(
         &mut self,
@@ -1090,7 +1092,7 @@ impl LayoutTree {
         let target_index = target.add(clone);
 
         if source_index == field_index {
-            let replacement_index = replacement.clone_reminting_auto_ids_into(
+            let replacement_index = replacement.clone_renumbering_auto_ids_into(
                 replacement_root,
                 target,
                 next_auto_id,
@@ -1121,7 +1123,7 @@ impl LayoutTree {
         Some(target_index)
     }
 
-    fn clone_reminting_auto_ids_into(
+    fn clone_renumbering_auto_ids_into(
         &self,
         source_index: usize,
         target: &mut Self,
@@ -1144,7 +1146,7 @@ impl LayoutTree {
         }
         let target_index = target.add(clone);
         for child in children {
-            let child_index = self.clone_reminting_auto_ids_into(child, target, next_auto_id)?;
+            let child_index = self.clone_renumbering_auto_ids_into(child, target, next_auto_id)?;
             if let ElementContent::Children(target_children) =
                 &mut target.elements.get_mut(target_index)?.content
             {
@@ -2984,7 +2986,7 @@ mod tests {
     }
 
     #[test]
-    fn editing_content_replaces_only_field_descendants_and_remints_text_ids() {
+    fn editing_content_replaces_only_field_descendants_and_renumbers_text_ids() {
         let mut builder = LayoutBuilder::new(100.0, 40.0);
         builder.text(("before", TextStyle::new(10.0)));
         builder.with(

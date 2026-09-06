@@ -184,7 +184,7 @@ pub(crate) fn handle_capability_input(
     morph.active = true;
     morph.timer = 0.0;
     morph.from_index = if index == HINGE_CHAIN_INDEX {
-        // Leaving the fan: remember a fan index so the morph reads the fan link
+        // Leaving the fan: record a fan index so the morph reads the fan link
         // delta as the outgoing layout.
         ANCHOR_INDEX
     } else {

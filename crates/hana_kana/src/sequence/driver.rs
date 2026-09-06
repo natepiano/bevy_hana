@@ -40,8 +40,8 @@ enum SourceSampling {
 
 /// Producer-published evidence that its own source state is current.
 ///
-/// Restoration requires this marker, so the shared layer never infers producer
-/// activity from adjacent movement samples. A producer marks itself in
+/// Restoration reads this marker and nothing else; no adjacent movement sample
+/// stands in for it. A producer marks itself in
 /// [`SequencePlaybackSystems::ProduceMovement`](super::SequencePlaybackSystems::ProduceMovement);
 /// driver arbitration clears every marker after resolving claims and releases,
 /// so a restoration decision reads the most recent production.
@@ -172,8 +172,9 @@ pub enum SequenceMovementApplication {
 /// authored stage easing.
 ///
 /// Every [`SequenceDriver`] carries this component through Bevy's required
-/// components, so whole-sequence authored easing is a value the type states
-/// rather than a meaning assigned to absence.
+/// components, and its [`Default`] is [`SequenceEvaluation::AUTHORED_WHOLE`],
+/// so whole-sequence authored easing is a value present on the entity, never a
+/// missing component read as a default.
 #[derive(Component, Clone, Debug, PartialEq, Reflect)]
 #[reflect(Component)]
 pub struct SequenceEvaluation {

@@ -110,11 +110,6 @@ use crate::widgets::VisualSlotOverride;
 #[reflect(Component)]
 pub struct DiegeticTextBatch;
 
-/// Builds changed runs' glyph records, routes them through the batch store,
-/// and reconciles batch entities and GPU assets to the store's state (spawn
-/// on a key's first run, despawn on its last, mesh growth on a capacity
-/// crossing — created, written, and swapped in the same frame).
-///
 /// Cascade inputs feeding [`PathBatchKey`] fields: each run's resolved
 /// alpha / lighting / sidedness (with the global defaults for runs the
 /// cascade has not seeded) plus the changed-this-frame run set that triggers
@@ -231,12 +226,17 @@ impl PathBatchKeyCascades<'_, '_> {
     }
 }
 
+/// Builds changed runs' glyph records, routes them through the batch store,
+/// and reconciles batch entities and GPU assets to the store's state (spawn
+/// on a key's first run, despawn on its last, mesh growth on a capacity
+/// crossing — created, written, and swapped in the same frame).
+///
 /// The query walks every run but touches only those whose text changed, whose
 /// resolved cascade value changed (alpha / lighting / sidedness are batch-key
 /// fields, so the run re-routes through `upsert_run` and moves batches when the
-/// key differs), whose layout ordering changed, or that are not yet routed, so
-/// the system is self-healing: a skipped frame (e.g. a glyph not yet packed)
-/// re-routes on the next pass.
+/// key differs), whose layout ordering changed, or that are not yet routed. A
+/// run skipped on one frame (a glyph not yet packed, say) is picked up again on
+/// the next pass.
 pub(super) fn update_panel_text_batches(
     runs: Query<
         (
@@ -697,8 +697,8 @@ fn text_material_candidate_for_frame(
 
 /// Glyph quads carry position and UVs but no tangents, so normal and parallax
 /// (depth) maps would sample against an undefined tangent basis and skew the
-/// lighting. Drop them here so a text material that sets either still lights
-/// correctly from its remaining channels instead of rendering wrong.
+/// lighting. Dropping both here leaves a text material that sets either one
+/// lighting from its remaining channels.
 fn strip_tangent_dependent_maps(base: &StandardMaterial) -> StandardMaterial {
     let mut material = base.clone();
     material.normal_map_texture = None;
@@ -745,12 +745,12 @@ fn run_record_for(
     material: MaterialSlotId,
 ) -> PathRenderRecord {
     PathRenderRecord {
-        // Pre-propagation snapshot; write_batch_run_transforms corrects it
-        // after TransformSystems::Propagate the same frame.
+        // Pre-propagation value; `write_batch_run_transforms` overwrites it
+        // after `TransformSystems::Propagate` the same frame.
         transform:          record_transform,
         material:           material.into(),
         render_mode:        u32::from(RenderMode::from(prepared.render_mode)),
-        clip_depth_nudge:   panel_text_child.depth_bias,
+        clip_depth_nudge:   panel_text_child.clip_depth_nudge,
         oit_depth_offset:   panel_text_child.oit_depth_offset,
         aa_flags:           anti_alias.aa_flags(),
         text_coverage_bias: hdr_text_coverage_bias.shader_value(),
@@ -2522,8 +2522,8 @@ mod tests {
         let label = label_entities(&mut app)[0];
 
         // Same frame: the run's key changes AND its panel despawns. The
-        // routing system must observe one consistent end state (decision-4/9
-        // order independence).
+        // routing system must reach the same end state whichever order it
+        // observes the two in.
         app.world_mut()
             .commands()
             .entity(label)

@@ -97,9 +97,9 @@ impl Modifiers {
 
     /// Returns this modifier set's stable physical ordering parts.
     ///
-    /// The bit positions intentionally follow Control, Alt, Shift, Platform rather than any
-    /// platform-facing display order. Representative key bindings use this order while they are
-    /// committed, so their selection never depends on formatted text.
+    /// The bit positions follow Control, Alt, Shift, Platform, which is not the order
+    /// [`Keystroke`]'s `Display` writes them in. Representative key bindings use this order while
+    /// they are committed, so their selection never depends on formatted text.
     const fn structural_order(self) -> (u32, u8) { (self.0.bits().count_ones(), self.0.bits()) }
 
     /// Creates canonical modifiers from the modifier keys currently held down.

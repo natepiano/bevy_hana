@@ -307,19 +307,19 @@
       "missing_capability": "physical-cable-move"
     },
     {
-      "id": "different_same_model_panel",
+      "id": "different_same_model_display",
       "description": "A second DELL S3425DW does not inherit the original identity",
       "interaction": "operator-action",
-      "missing_capability": "second-same-model-panel"
+      "missing_capability": "second-same-model-display"
     },
     {
       "id": "duplicate_identity_evidence",
-      "description": "Indistinguishable panel evidence remains unverified",
+      "description": "Indistinguishable display evidence remains unverified",
       "interaction": "operator-action",
-      "missing_capability": "duplicate-panel-evidence"
+      "missing_capability": "duplicate-display-evidence"
     },
     {
-      "id": "different_panel_original_connector",
+      "id": "different_display_original_connector",
       "description": "The Samsung on the Dell connector does not satisfy Dell recovery",
       "interaction": "operator-action",
       "missing_capability": "physical-cable-move"
@@ -332,7 +332,7 @@
     },
     {
       "id": "repeated_cable_churn",
-      "description": "Repeated physical dock or cable disconnects retain one generation",
+      "description": "Repeated physical dock or cable disconnects return each eligible key once with no duplicate window key or recovery mismatch",
       "interaction": "operator-action",
       "missing_capability": "physical-cable-move"
     },
@@ -385,7 +385,7 @@
     },
     {
       "id": "repeated_dell_power_cycles",
-      "description": "Three power cycles retain one accepted generation and no duplicates",
+      "description": "Three power cycles return each eligible key once with no duplicates",
       "interaction": "automated",
       "startup_mode": "windowed",
       "cycles": 3

@@ -61,8 +61,7 @@ where
 /// authored endpoints.
 ///
 /// The interpolator writes position only. Direction, whole repetitions, and
-/// range crossings stay exactly as the producer published them, so a tween
-/// never invents traversal history.
+/// range crossings keep the values the producer published.
 #[derive(Clone, Copy, Debug, PartialEq, Reflect)]
 pub struct SequencePositionInterpolator {
     start: SequencePosition,
@@ -86,9 +85,10 @@ impl SequencePositionInterpolator {
 impl Interpolator for SequencePositionInterpolator {
     type Item = SequenceMovement;
 
-    /// A non-finite interpolation value, or an infinite one across a zero-width
-    /// span, names no position, so the movement holds the position it already
-    /// carries instead of publishing a NaN every consumer would then read.
+    /// Returns without writing when the interpolated position is not finite. A
+    /// non-finite `value` gives an infinite position across a nonzero-width
+    /// span and NaN across a zero-width one; either way the movement keeps the
+    /// position it already carries, so no consumer reads a NaN.
     fn interpolate(&self, movement: &mut Self::Item, value: f32, _previous_value: f32) {
         let start = self.start.normalized();
         let end = self.end.normalized();

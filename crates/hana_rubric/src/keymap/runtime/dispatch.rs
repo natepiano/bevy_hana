@@ -536,8 +536,9 @@ fn dispatch_one(world: &mut World, routed_command: RoutedCommand) {
 
 /// What a matched keystroke resolves to before the runtime acts on it.
 ///
-/// Routing decides this from the compiled keymap alone; the caller then decides which halves it
-/// honors, so the sequence-timeout path can drop a [`RoutedCommand::HoldChord`] that has no
+/// `routed_command` builds this from the compiled keymap and [`KeystrokeRouting`] alone; each
+/// caller then acts only on the variants it handles, so the sequence-timeout path, which calls
+/// `dispatch_all` and not `claim_held_chords`, drops a [`RoutedCommand::HoldChord`] that has no
 /// physical key to own it.
 #[derive(Clone, Copy, Default)]
 enum RoutedCommand {

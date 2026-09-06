@@ -370,9 +370,9 @@ fn clipped_instance(
     ))
 }
 
-/// Layout-point tolerance for deciding whether a clip edge came from the
-/// owner element. `BoundingBox::intersect` recomputes width/height, so a
-/// far edge that the owner contributed can drift by float rounding.
+/// Layout-point tolerance for matching a clip edge against the owner element's
+/// edge. `BoundingBox::intersect` recomputes width/height, so a far edge that
+/// the owner contributed can drift by float rounding.
 const CLIP_EDGE_EPSILON: f32 = 0.001;
 
 /// Converts the resolved clip to panel space, granting AA fringe room on the

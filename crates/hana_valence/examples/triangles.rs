@@ -75,7 +75,6 @@ use hana_valence::FoldSequenceBuilder;
 use hana_valence::FoldSequencePlayback;
 use hana_valence::FoldTiming;
 use hana_valence::Hinge;
-use hana_valence::hinge_to_pose;
 
 #[path = "../fixtures.rs"]
 #[allow(
@@ -242,7 +241,7 @@ fn main() {
             PostUpdate,
             activate_selected_algorithm
                 .in_set(AnchorSystems::AnimatePose)
-                .before(hinge_to_pose),
+                .before(AnchorSystems::HingeToPose),
         )
         .add_systems(Startup, setup)
         .run();
@@ -406,8 +405,9 @@ fn spawn_member_tile(
 }
 
 // The anchored tile entity carries only the fold geometry and pose the pipeline
-// drives; `resolve_anchors` owns its `Transform`, so anything static must ride a
-// child. The visible mesh and labels live on `spawn_tile_visual`'s child instead.
+// drives; `resolve_anchors` owns its `Transform`, so anything static has to sit
+// on a child. The visible mesh and labels live on `spawn_tile_visual`'s child
+// instead.
 fn spawn_tile(commands: &mut Commands, transform: Transform) -> Entity {
     commands
         .spawn((

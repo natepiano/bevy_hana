@@ -31,7 +31,7 @@ pub trait CameraHomeKind: CameraInputKind {
     /// The rising-edge interaction event for this kind.
     type InteractionStarted: EntityEvent;
 
-    /// Snapshot the current settled pose as a home pose.
+    /// Record the camera's current settled pose as a home pose.
     fn capture_home(camera: &Self::Camera) -> Self::HomePose;
 
     /// Re-target the camera's eased operations toward `home`.

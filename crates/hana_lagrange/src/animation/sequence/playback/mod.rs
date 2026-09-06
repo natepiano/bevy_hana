@@ -53,7 +53,7 @@ use crate::FreeCam;
 use crate::OrbitCam;
 use crate::animation::queue::CameraMove;
 
-/// Derived state that was invalid before retained playback could begin.
+/// Why preparing retained playback for a camera failed.
 #[derive(Debug, Error)]
 pub(super) enum CameraPlaybackPreparationError {
     #[error("the prepared camera boundary ledger was rejected: {0}")]

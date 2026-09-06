@@ -15,12 +15,12 @@ use super::outline_builder::WorldHullState;
 
 /// Which outline algorithm to use.
 ///
-/// - `JumpFlood`: Screen-space silhouette expansion. Works on **all** geometry including flat
-///   panels and UI planes. Width is in pixels.
-/// - `WorldHull`: Vertex extrusion with world-unit width. Best for 3D volumetric meshes where
+/// - [`JumpFlood`](OutlineMethod::JumpFlood): Screen-space silhouette expansion. Works on **all**
+///   geometry including flat panels and UI planes. Width is in pixels.
+/// - [`WorldHull`](OutlineMethod::WorldHull): Vertex extrusion with world-unit width. Use this when
 ///   outline thickness should scale with distance.
-/// - `ScreenHull`: Vertex extrusion with pixel width. Best for 3D volumetric meshes where outline
-///   thickness should remain constant on screen.
+/// - [`ScreenHull`](OutlineMethod::ScreenHull): Vertex extrusion with pixel width. Use this when
+///   outline thickness should stay constant on screen.
 #[derive(Debug, Clone, Copy, Reflect, PartialEq, Eq, Default)]
 pub enum OutlineMethod {
     /// Screen-space silhouette expansion via jump-flood algorithm. Width is in pixels.
@@ -34,7 +34,7 @@ pub enum OutlineMethod {
 
 impl OutlineMethod {
     /// Returns the shader factor that selects shell-based shading
-    /// (1.0 for `ScreenHull`, 0.0 otherwise).
+    /// (1.0 for [`ScreenHull`](OutlineMethod::ScreenHull), 0.0 otherwise).
     #[must_use]
     pub(crate) const fn as_shell_mode_factor(self) -> f32 {
         match self {
@@ -70,7 +70,8 @@ pub enum OverlapMode {
 }
 
 impl OverlapMode {
-    /// Returns the shader factor for this overlap mode (0.0 for `Merged`, 1.0 otherwise).
+    /// Returns the shader factor for this overlap mode (0.0 for [`Merged`](OverlapMode::Merged),
+    /// 1.0 otherwise).
     #[must_use]
     pub const fn as_shader_factor(self) -> f32 {
         match self {
@@ -88,7 +89,7 @@ pub enum LineStyle {
     Solid,
 }
 
-/// Whether an `Outline` is active without removing the component.
+/// Whether an [`Outline`] is active without removing the component.
 #[derive(Debug, Clone, Copy, Reflect, PartialEq, Eq, Default)]
 pub enum OutlineActivity {
     /// The outline participates in extraction and rendering.
@@ -99,15 +100,15 @@ pub enum OutlineActivity {
 }
 
 impl OutlineActivity {
-    /// Returns whether the outline should participate in extraction and rendering.
+    /// Returns whether the outline participates in extraction and rendering.
     #[must_use]
     pub const fn is_enabled(self) -> bool { matches!(self, Self::Enabled) }
 }
 
 /// Adds a mesh outline effect to an entity with a `Mesh3d` component.
 ///
-/// Construct via one of the three named constructors — each returns a type-safe
-/// builder that only exposes settings valid for that method.
+/// Construct via one of the three named constructors — each returns a builder
+/// that exposes only the settings its method uses.
 ///
 /// # Example
 ///
@@ -137,7 +138,7 @@ pub struct Outline {
     pub color:               Color,
     /// Multiplier applied to `color` in the shader. Values > 1.0 produce HDR glow via bloom.
     pub intensity:           f32,
-    /// Which algorithm to use. See `OutlineMethod` for guidance.
+    /// Which algorithm to use. See [`OutlineMethod`].
     pub method:              OutlineMethod,
     /// How overlapping outlines from different entities interact.
     pub overlap_mode:        OverlapMode,
@@ -173,7 +174,7 @@ impl Outline {
 /// Marker component that prevents outline propagation to this entity.
 ///
 /// When a parent entity has an outline that propagates to descendant `Mesh3d` entities,
-/// any descendant with `NoOutline` will be skipped. This is useful for invisible helper
+/// any descendant with [`NoOutline`] is skipped. This is useful for invisible helper
 /// meshes (e.g. backside pick planes with `AlphaMode::Blend`) that should never receive
 /// an outline, even when their ancestor is outlined.
 ///
@@ -196,12 +197,12 @@ pub struct NoOutline;
 
 /// Marker component that stops outline propagation at this entity's subtree.
 ///
-/// An ancestor's `Outline` never crosses a barrier: neither the barrier entity
+/// An ancestor's [`Outline`] never crosses a barrier: neither the barrier entity
 /// nor any of its descendants inherit it. The barrier can still source its own
-/// outline — inserting `Outline` on the barrier entity propagates to its
+/// outline — inserting [`Outline`] on the barrier entity propagates to its
 /// subtree as usual.
 ///
-/// Use [`NoOutline`] to exempt a single mesh; use `OutlineBarrier` to exempt a
+/// Use [`NoOutline`] to exempt a single mesh; use [`OutlineBarrier`] to exempt a
 /// whole subtree that manages its own outline, such as an interactive control
 /// mounted on an outlined host.
 ///

@@ -6,15 +6,14 @@ use std::time::Duration;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::reflect::ReflectComponent;
 use bevy::ecs::reflect::ReflectResource;
+use bevy::platform::time::Instant;
 use bevy::prelude::Component;
 use bevy::prelude::Reflect;
 use bevy::prelude::Resource;
 use thiserror::Error;
 
-use crate::ApplyPermit;
 use crate::AttachmentPath;
-use crate::Attempt;
-use crate::AttemptId;
+use crate::AttemptRef;
 use crate::Claim;
 use crate::ConfiguredDeviceConnection;
 use crate::ConfiguredDeviceMode;
@@ -22,17 +21,21 @@ use crate::DeviceId;
 use crate::DeviceKey;
 use crate::IdentityDecisionOwed;
 use crate::IdentityVerdict;
+use crate::KeyAvailability;
+use crate::NonEmptyReporterRefs;
 use crate::Presence;
+use crate::PresentEvidence;
+use crate::ReportedId;
 use crate::ReportedParent;
 use crate::ReporterId;
-use crate::RoleKey;
+use crate::RetirementEvidence;
+use crate::RiggingRuntimeClock;
+use crate::RiggingRuntimeTime;
 use crate::SchemeName;
-use crate::attempt::AttemptDeadlineStatus;
-#[cfg(test)]
-use crate::binding::Bindings;
-use crate::reconcile::FrameClockReading;
+use crate::UnconfirmedBasis;
+use crate::registration::ApplyPermit;
 
-/// First identifier `Attempts` issues, chosen so no issued value equals `AttemptId::default()`.
+/// First identifier `Attempts` issues, chosen so no issued value equals `AttemptRef::default()`.
 const FIRST_ISSUED_ATTEMPT: u64 = 1;
 
 /// Marker for the entity that mirrors one reconciled device.
@@ -42,7 +45,7 @@ const FIRST_ISSUED_ATTEMPT: u64 = 1;
 /// can select devices without naming every component the projection inserts.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Component, Reflect)]
 #[reflect(Component, PartialEq)]
-pub struct Device;
+pub(crate) struct Device;
 
 /// Marker inserted only while a device is present **and** its claim permits this process to use
 /// it.
@@ -55,7 +58,243 @@ pub struct Device;
 #[reflect(Component, PartialEq)]
 pub(crate) struct PresentWithUsableClaim;
 
-/// What the kernel currently believes about every device, keyed by the handle it issued.
+/// Whether the Collect stage found an availability whose departure grace has ended.
+#[derive(Default, Resource)]
+pub(crate) enum DepartureGraceDeadlineStatus {
+    /// No retained departure-grace deadline has reached the frame time.
+    #[default]
+    NoneReached,
+    /// At least one retained departure-grace deadline requires reconciliation.
+    Reached,
+}
+
+impl DepartureGraceDeadlineStatus {
+    pub(crate) fn refresh(&mut self, devices: &Devices, runtime_now: RiggingRuntimeTime) {
+        *self = if devices.departure_grace_due(runtime_now) {
+            Self::Reached
+        } else {
+            Self::NoneReached
+        };
+    }
+
+    pub(crate) const fn requires_reconciliation(&self) -> bool { matches!(self, Self::Reached) }
+}
+
+/// Whether a key has previously published an availability conclusion.
+pub(crate) enum PriorKeyAvailability<'a> {
+    /// The key has not entered the retained availability table.
+    NeverPublished,
+    /// The key has one retained conclusion.
+    Published(&'a KeyAvailability),
+}
+
+/// Ephemeral evidence calculated from all retained reporter completions for one key.
+pub(crate) enum KeyAvailabilityEvidence {
+    /// Fresh contributor records combine to `Presence::Present`.
+    Present(PresentEvidence),
+    /// Fresh coverage establishes absence.
+    ConfirmedAbsent(RetirementEvidence),
+    /// Covering reporters have not supplied their first complete sets.
+    AwaitingFirstReport(NonEmptyReporterRefs),
+    /// Fresh evidence confirms neither presence nor absence.
+    Unconfirmed(UnconfirmedBasis),
+    /// Reporter evidence is expired or explicitly unreachable.
+    Unreachable {
+        /// Runtime time at which reachability became uncertain.
+        since:     RiggingRuntimeTime,
+        /// Reporters contributing the uncertainty.
+        reporters: NonEmptyReporterRefs,
+    },
+}
+
+/// Apply the key availability transition table to one calculated evidence value.
+pub(crate) fn transition_key_availability(
+    evidence: KeyAvailabilityEvidence,
+    observed_at: Instant,
+    runtime_clock: RiggingRuntimeClock,
+    departure_grace: Duration,
+    prior: PriorKeyAvailability<'_>,
+) -> KeyAvailability {
+    let runtime_now = runtime_clock.time_at(observed_at);
+    match evidence {
+        KeyAvailabilityEvidence::Present(present_evidence) => {
+            KeyAvailability::Present(present_evidence)
+        },
+        KeyAvailabilityEvidence::ConfirmedAbsent(established_by) => confirmed_absence_availability(
+            established_by,
+            observed_at,
+            runtime_clock,
+            runtime_now,
+            departure_grace,
+            prior,
+        ),
+        KeyAvailabilityEvidence::AwaitingFirstReport(reporters) => {
+            KeyAvailability::AwaitingFirstReport {
+                since: prior_since(
+                    prior,
+                    |availability| {
+                        matches!(availability, KeyAvailability::AwaitingFirstReport { .. })
+                    },
+                    runtime_now,
+                ),
+                reporters,
+            }
+        },
+        KeyAvailabilityEvidence::Unconfirmed(basis) => KeyAvailability::Unconfirmed {
+            since: prior_since(
+                prior,
+                |availability| matches!(availability, KeyAvailability::Unconfirmed { .. }),
+                runtime_now,
+            ),
+            basis,
+        },
+        KeyAvailabilityEvidence::Unreachable { since, reporters } => KeyAvailability::Unreachable {
+            since: prior_since(
+                prior,
+                |availability| matches!(availability, KeyAvailability::Unreachable { .. }),
+                since,
+            ),
+            reporters,
+        },
+    }
+}
+
+fn same_present_contributors(first: &PresentEvidence, second: &PresentEvidence) -> bool {
+    let first = first.contributors().as_slice();
+    let second = second.contributors().as_slice();
+    first.len() == second.len()
+        && first.iter().zip(second).all(|(first, second)| {
+            first.reporter == second.reporter && first.presence == second.presence
+        })
+}
+
+const fn same_unconfirmed_basis(first: &UnconfirmedBasis, second: &UnconfirmedBasis) -> bool {
+    match (first, second) {
+        (UnconfirmedBasis::NoFreshEvidence, UnconfirmedBasis::NoFreshEvidence) => true,
+        (
+            UnconfirmedBasis::UncoveredAbsence {
+                reporter: first_reporter,
+                ..
+            },
+            UnconfirmedBasis::UncoveredAbsence {
+                reporter: second_reporter,
+                ..
+            },
+        ) => first_reporter.get() == second_reporter.get(),
+        (UnconfirmedBasis::NoFreshEvidence, UnconfirmedBasis::UncoveredAbsence { .. })
+        | (UnconfirmedBasis::UncoveredAbsence { .. }, UnconfirmedBasis::NoFreshEvidence) => false,
+    }
+}
+
+fn confirmed_absence_availability(
+    established_by: RetirementEvidence,
+    observed_at: Instant,
+    runtime_clock: RiggingRuntimeClock,
+    runtime_now: RiggingRuntimeTime,
+    departure_grace: Duration,
+    prior: PriorKeyAvailability<'_>,
+) -> KeyAvailability {
+    match prior {
+        PriorKeyAvailability::Published(KeyAvailability::Present(_)) => {
+            KeyAvailability::DepartureGrace {
+                since:    runtime_now,
+                deadline: runtime_clock.time_at(
+                    observed_at
+                        .checked_add(departure_grace)
+                        .unwrap_or(observed_at),
+                ),
+                evidence: established_by,
+            }
+        },
+        PriorKeyAvailability::Published(KeyAvailability::DepartureGrace {
+            since,
+            deadline,
+            evidence,
+        }) if runtime_now.elapsed() < deadline.elapsed() => KeyAvailability::DepartureGrace {
+            since:    *since,
+            deadline: *deadline,
+            evidence: if evidence.reporter == established_by.reporter {
+                *evidence
+            } else {
+                established_by
+            },
+        },
+        PriorKeyAvailability::Published(KeyAvailability::DepartureGrace { evidence, .. }) => {
+            KeyAvailability::Absent {
+                since:          runtime_now,
+                established_by: if evidence.reporter == established_by.reporter {
+                    *evidence
+                } else {
+                    established_by
+                },
+            }
+        },
+        PriorKeyAvailability::Published(KeyAvailability::Absent {
+            since,
+            established_by,
+        }) => KeyAvailability::Absent {
+            since:          *since,
+            established_by: *established_by,
+        },
+        PriorKeyAvailability::NeverPublished
+        | PriorKeyAvailability::Published(
+            KeyAvailability::AwaitingFirstReport { .. }
+            | KeyAvailability::Unconfirmed { .. }
+            | KeyAvailability::Unreachable { .. },
+        ) => KeyAvailability::Absent {
+            since: runtime_now,
+            established_by,
+        },
+    }
+}
+
+fn prior_since(
+    prior: PriorKeyAvailability<'_>,
+    same_state: impl FnOnce(&KeyAvailability) -> bool,
+    fallback: RiggingRuntimeTime,
+) -> RiggingRuntimeTime {
+    match prior {
+        PriorKeyAvailability::Published(availability) if same_state(availability) => {
+            match availability {
+                KeyAvailability::DepartureGrace { since, .. }
+                | KeyAvailability::AwaitingFirstReport { since, .. }
+                | KeyAvailability::Unconfirmed { since, .. }
+                | KeyAvailability::Unreachable { since, .. }
+                | KeyAvailability::Absent { since, .. } => *since,
+                KeyAvailability::Present(_) => fallback,
+            }
+        },
+        PriorKeyAvailability::NeverPublished | PriorKeyAvailability::Published(_) => fallback,
+    }
+}
+
+/// Which keyed device one reported platform handle names in a reconcile pass.
+///
+/// A handle two reporters attached to different keys names no device: joining an evidence-only
+/// record to whichever key happened to be ingested last is exactly the plausible fallback that
+/// exact-match identity exists to forbid.
+#[derive(Debug, PartialEq, Eq, Reflect)]
+pub(crate) enum HandleOwner {
+    /// Every keyed record carrying this handle reported the same key.
+    OneKey(DeviceKey),
+    /// Keyed records disagree about which key this handle belongs to.
+    SeveralKeys(HashSet<DeviceKey>),
+}
+
+/// Owned conclusions produced together by one reconcile pass.
+///
+/// Grouping these pass-scoped collections keeps `Devices::replace_reconciled` from assigning
+/// meaning by argument position and makes every conclusion advance with the reconciled device set.
+#[derive(Debug, Default)]
+pub(crate) struct ReconcilePassConclusions {
+    pub(crate) availability:           HashMap<DeviceKey, KeyAvailability>,
+    pub(crate) duplicate_keys:         HashSet<DeviceKey>,
+    pub(crate) reported_handle_owners: HashMap<ReportedId, HandleOwner>,
+    pub(crate) unregistered_schemes:   HashSet<SchemeName>,
+    pub(crate) withdrawn_reporters:    HashSet<ReporterId>,
+}
+
+/// The kernel's recorded state for every device, keyed by the handle it issued.
 ///
 /// Durable state cannot live only on entities: retirement by key runs during startup and
 /// immediately after a departure, when no entity is alive. The entity projection mirrors this
@@ -67,24 +306,57 @@ pub(crate) struct PresentWithUsableClaim;
 #[derive(Debug, Default, Resource, Reflect)]
 #[reflect(Resource)]
 pub struct Devices {
-    ids:                  HashMap<DeviceKey, DeviceId>,
-    state:                HashMap<DeviceId, ReconciledDeviceState>,
+    availability:           HashMap<DeviceKey, KeyAvailability>,
+    ids:                    HashMap<DeviceKey, DeviceId>,
+    state:                  HashMap<DeviceId, ReconciledDeviceState>,
     /// How many times each retained device's reconciled state has actually changed.
     ///
     /// Kept beside `Self::state` rather than on `ReconciledDeviceState` because the counter
     /// describes the history of a handle, not what the current pass concluded about the unit: a
     /// state a reporter supplies has no revision to carry, and the comparison that advances the
     /// counter would otherwise have to exclude a field of the value it is comparing.
-    revision:             HashMap<DeviceId, DeviceRevision>,
-    entity:               HashMap<DeviceId, Entity>,
+    revision:               HashMap<DeviceId, DeviceRevision>,
+    entity:                 HashMap<DeviceId, Entity>,
     /// Issues `DeviceId`. Monotonic, never reused within a process, so a retired handle dangles
     /// instead of denoting a later device.
-    next:                 u64,
-    duplicate_keys:       HashSet<DeviceKey>,
-    unregistered_schemes: HashSet<SchemeName>,
+    next:                   u64,
+    duplicate_keys:         HashSet<DeviceKey>,
+    reported_handle_owners: HashMap<ReportedId, HandleOwner>,
+    unregistered_schemes:   HashSet<SchemeName>,
+    /// Reporters whose retained records the latest reconciliation excluded from current evidence.
+    withdrawn_reporters:    HashSet<ReporterId>,
 }
 
 impl Devices {
+    /// Read the retained availability conclusion for one durable key.
+    pub(crate) fn key_availability(&self, key: &DeviceKey) -> PriorKeyAvailability<'_> {
+        self.availability.get(key).map_or(
+            PriorKeyAvailability::NeverPublished,
+            PriorKeyAvailability::Published,
+        )
+    }
+
+    /// Iterate keys that already have a retained availability conclusion.
+    pub(crate) fn availability_keys(&self) -> impl Iterator<Item = &DeviceKey> {
+        self.availability.keys()
+    }
+
+    /// Report whether the latest reconciliation already withdrew one reporter's retained records.
+    pub(crate) fn reporter_records_are_withdrawn(&self, reporter: ReporterId) -> bool {
+        self.withdrawn_reporters.contains(&reporter)
+    }
+
+    /// Report whether a departure-grace deadline has reached the current runtime time.
+    pub(crate) fn departure_grace_due(&self, runtime_now: RiggingRuntimeTime) -> bool {
+        self.availability.values().any(|availability| {
+            matches!(
+                availability,
+                KeyAvailability::DepartureGrace { deadline, .. }
+                    if deadline.elapsed() <= runtime_now.elapsed()
+            )
+        })
+    }
+
     /// Turn one durable key into the handle this process issued for it.
     ///
     /// Lookup is exact or nothing. There is deliberately no nearest-match, no first-of-kind, and
@@ -112,7 +384,18 @@ impl Devices {
     /// This is the counter an in-flight attempt is re-validated against, so a reporter's scan can
     /// only abandon attempts on the devices that scan actually changed.
     #[must_use]
+    #[cfg(feature = "test-support")]
     pub fn revision(&self, device_id: DeviceId) -> DeviceRevisionLookup {
+        self.revision
+            .get(&device_id)
+            .map_or(DeviceRevisionLookup::Retired, |device_revision| {
+                DeviceRevisionLookup::Retained(*device_revision)
+            })
+    }
+
+    #[must_use]
+    #[cfg(not(feature = "test-support"))]
+    pub(crate) fn revision(&self, device_id: DeviceId) -> DeviceRevisionLookup {
         self.revision
             .get(&device_id)
             .map_or(DeviceRevisionLookup::Retired, |device_revision| {
@@ -143,22 +426,42 @@ impl Devices {
     #[must_use]
     pub const fn unregistered_schemes(&self) -> &HashSet<SchemeName> { &self.unregistered_schemes }
 
+    /// Resolve a reported platform handle through keyed records from the latest reconcile pass.
+    ///
+    /// The answer is replaced with the device set on every completed pass. `NoKeyedRecord` means
+    /// the latest pass contained no keyed record carrying `reported_id`; it does not claim that the
+    /// platform handle or hardware is absent.
+    #[must_use]
+    pub fn resolve_reported_handle(&self, reported_id: &ReportedId) -> ReportedHandleResolution {
+        match self.reported_handle_owners.get(reported_id) {
+            Some(HandleOwner::OneKey(device_key)) => {
+                ReportedHandleResolution::OneKey(device_key.clone())
+            },
+            Some(HandleOwner::SeveralKeys(device_keys)) => {
+                ReportedHandleResolution::SeveralKeys(device_keys.clone())
+            },
+            None => ReportedHandleResolution::NoKeyedRecord,
+        }
+    }
+
     /// Replace the reconciled set with the current pass's conclusions.
     ///
     /// `reconciled` arrives roots first so presence is already folded down each parent chain.
-    /// Keys absent from it are retired by key: their handle, their state, and their entity mapping
-    /// are dropped, and a device that returns later receives a newly issued handle.
-    ///
-    /// A key a reporter still names while it stops reporting the unit `Presence::Present` is the
-    /// other way a device leaves. It is recorded through `Presence::is_same_variant`, the one
-    /// comparison the entity mirror also uses, and it retires nothing: the unplugged monitor keeps
-    /// its handle, its state, and its entity while the roles bound to it learn it is gone.
+    /// A device retains its handle and reconciled state through every unavailable conclusion except
+    /// `KeyAvailability::Absent`. Entry into `Absent` is the only transition that removes the
+    /// reconciled state and retires the runtime handle and entity.
     pub(crate) fn replace_reconciled(
         &mut self,
         reconciled: Vec<ReconciledDeviceState>,
-        duplicate_keys: HashSet<DeviceKey>,
-        unregistered_schemes: HashSet<SchemeName>,
+        conclusions: ReconcilePassConclusions,
     ) -> ReconciledDeviceReplacement {
+        let ReconcilePassConclusions {
+            availability,
+            duplicate_keys,
+            reported_handle_owners,
+            unregistered_schemes,
+            withdrawn_reporters,
+        } = conclusions;
         let mut ids = HashMap::with_capacity(reconciled.len());
         let mut state = HashMap::with_capacity(reconciled.len());
         let mut revision = HashMap::with_capacity(reconciled.len());
@@ -170,9 +473,10 @@ impl Devices {
                 .get(&reconciled_device_state.key)
                 .copied()
                 .unwrap_or_else(|| self.issue());
+            let key_availability = &availability[&reconciled_device_state.key];
             revision.insert(
                 device_id,
-                self.advanced_revision(device_id, &reconciled_device_state),
+                self.advanced_revision(device_id, &reconciled_device_state, key_availability),
             );
             let dispute_changed = self
                 .state
@@ -183,26 +487,18 @@ impl Devices {
             if dispute_changed {
                 changes.disputes_changed.push(device_id);
             }
-            if self.state.get(&device_id).is_some_and(|held| {
-                held.presence == Presence::Present
-                    && !held
-                        .presence
-                        .is_same_variant(reconciled_device_state.presence)
-            }) {
-                changes.departed.push(DepartedDevice {
-                    key:       reconciled_device_state.key.clone(),
-                    departure: DeviceDeparture::RetainedButNotPresent,
-                });
-            }
             ids.insert(reconciled_device_state.key.clone(), device_id);
             state.insert(device_id, reconciled_device_state);
         }
 
-        for (key, device_id) in &self.ids {
-            if !state.contains_key(device_id) {
-                changes.departed.push(DepartedDevice {
-                    key:       key.clone(),
-                    departure: DeviceDeparture::KeyLeftTheSet,
+        for (key, next) in &availability {
+            if let Some(previous) = self.availability.get(key)
+                && !same_key_availability_conclusion(previous, next)
+            {
+                changes.availability.push(DeviceAvailabilityChange {
+                    key:  key.clone(),
+                    from: previous.clone(),
+                    to:   next.clone(),
                 });
             }
         }
@@ -214,8 +510,11 @@ impl Devices {
                     .is_some_and(|retained| retained.holds_same_facts(reported))
             })
             && self.revision == revision
+            && same_key_availability_conclusions(&self.availability, &availability)
             && self.duplicate_keys == duplicate_keys
+            && self.reported_handle_owners == reported_handle_owners
             && self.unregistered_schemes == unregistered_schemes
+            && self.withdrawn_reporters == withdrawn_reporters
             && self
                 .entity
                 .keys()
@@ -236,8 +535,11 @@ impl Devices {
         self.ids = ids;
         self.state = state;
         self.revision = revision;
+        self.availability = availability;
         self.duplicate_keys = duplicate_keys;
+        self.reported_handle_owners = reported_handle_owners;
         self.unregistered_schemes = unregistered_schemes;
+        self.withdrawn_reporters = withdrawn_reporters;
 
         ReconciledDeviceReplacement {
             changes,
@@ -245,7 +547,7 @@ impl Devices {
         }
     }
 
-    /// Remember which entity mirrors one handle, so the next pass updates that entity instead of
+    /// Record which entity mirrors one handle, so the next pass updates that entity instead of
     /// spawning a second one for the same device.
     pub(crate) fn project_entity(&mut self, device_id: DeviceId, entity: Entity) {
         self.entity.insert(device_id, entity);
@@ -292,7 +594,7 @@ impl Devices {
             })
     }
 
-    /// Decide whether one device may be put in service.
+    /// Authorize one device to be put in service.
     ///
     /// The only in-service decision point in the kernel. Every check is against the merged view,
     /// so a co-reported device resolves most-restrictive-wins: one reporter seeing an idle camera
@@ -301,57 +603,45 @@ impl Devices {
     /// `disputed` is deliberately ignored. A unit whose reporters contradict each other about one
     /// capability is still correct about every other one, so refusing the whole device would take a
     /// Stream Deck dark over a disagreement about its LED brightness range. A consumer that must
-    /// not act on a contested capability reads the `crate::CapabilitiesDisputed` event, which names
-    /// the contested types for that device.
+    /// not act on a contested capability reads `ReconciledDeviceState::disputed`, which holds the
+    /// contested capability types for that device.
     ///
     /// # Errors
     ///
     /// Returns the `ApplyAuthorizationError` naming the first check that refused: an unknown
     /// handle, an identity that was never proven, a unit that is not reachable, a claim another
     /// process holds, or an authored entry the application marked offline.
+    #[cfg(feature = "test-support")]
     pub fn authorize_service(
         &self,
         device_id: DeviceId,
     ) -> Result<ApplyPermit, ApplyAuthorizationError> {
         self.in_service_state(device_id)?;
 
-        Ok(ApplyPermit::in_service())
+        Ok(ApplyPermit::authorized())
     }
 
-    /// Decide whether one device may receive a saved configuration back.
-    ///
-    /// The weaker gate: it additionally accepts `IdentityVerdict::RestoreOnly`, so a window can go
-    /// back to the monitor a synthesized key names. It still refuses an offline authored entry,
-    /// because returning a saved layout to hardware the application withdrew is still an automatic
-    /// action on that hardware.
-    ///
-    /// # Errors
-    ///
-    /// Returns the `ApplyAuthorizationError` naming the first check that refused, on the same
-    /// terms as `Self::authorize_service` except that a restore-only identity passes.
-    pub fn authorize_restore(
+    #[cfg(not(feature = "test-support"))]
+    pub(crate) fn authorize_service(
         &self,
         device_id: DeviceId,
     ) -> Result<ApplyPermit, ApplyAuthorizationError> {
-        let reconciled_device_state = self.authorized_state(device_id)?;
-        if !reconciled_device_state.verdict.identified() {
-            return Err(ApplyAuthorizationError::IdentityNotProven {
-                key: reconciled_device_state.key.clone(),
-            });
-        }
+        self.in_service_state(device_id)?;
 
-        Ok(ApplyPermit::restore_only())
+        Ok(ApplyPermit::authorized())
     }
 
-    /// Run every device-wide in-service check and hand back the state both in-service predicates
-    /// read, so neither of them resolves the same handle twice.
+    /// Run every device-wide service check and return the state used to authorize the permit, so
+    /// the handle is resolved only once.
     fn in_service_state(
         &self,
         device_id: DeviceId,
     ) -> Result<&ReconciledDeviceState, ApplyAuthorizationError> {
         let reconciled_device_state = self.authorized_state(device_id)?;
         match reconciled_device_state.verdict {
-            IdentityVerdict::Proven | IdentityVerdict::Authored => Ok(reconciled_device_state),
+            IdentityVerdict::Proven | IdentityVerdict::Presumed | IdentityVerdict::Authored => {
+                Ok(reconciled_device_state)
+            },
             _ => Err(ApplyAuthorizationError::IdentityNotProven {
                 key: reconciled_device_state.key.clone(),
             }),
@@ -372,7 +662,10 @@ impl Devices {
                 key: reconciled_device_state.key.clone(),
             });
         }
-        if reconciled_device_state.presence != Presence::Present {
+        if !matches!(
+            self.key_availability(&reconciled_device_state.key),
+            PriorKeyAvailability::Published(KeyAvailability::Present(_))
+        ) {
             return Err(ApplyAuthorizationError::NotPresent {
                 key: reconciled_device_state.key.clone(),
             });
@@ -399,12 +692,18 @@ impl Devices {
         &self,
         device_id: DeviceId,
         reported: &ReconciledDeviceState,
+        availability: &KeyAvailability,
     ) -> DeviceRevision {
         let Some(retained) = self.state.get(&device_id) else {
             return DeviceRevision::default();
         };
         let device_revision = self.revision.get(&device_id).copied().unwrap_or_default();
-        if retained.holds_same_facts(reported) {
+        if retained.holds_same_facts(reported)
+            && self
+                .availability
+                .get(&reported.key)
+                .is_some_and(|retained| same_key_availability_conclusion(retained, availability))
+        {
             device_revision
         } else {
             device_revision.advanced()
@@ -419,13 +718,90 @@ impl Devices {
     }
 }
 
-/// What the kernel currently believes about one device.
+fn same_key_availability_conclusions(
+    first: &HashMap<DeviceKey, KeyAvailability>,
+    second: &HashMap<DeviceKey, KeyAvailability>,
+) -> bool {
+    first.len() == second.len()
+        && first.iter().all(|(key, first)| {
+            second
+                .get(key)
+                .is_some_and(|second| same_key_availability_conclusion(first, second))
+        })
+}
+
+fn same_key_availability_conclusion(first: &KeyAvailability, second: &KeyAvailability) -> bool {
+    match (first, second) {
+        (KeyAvailability::Present(first), KeyAvailability::Present(second)) => {
+            same_present_contributors(first, second)
+        },
+        (
+            KeyAvailability::DepartureGrace {
+                since: first_since,
+                deadline: first_deadline,
+                evidence: first_evidence,
+            },
+            KeyAvailability::DepartureGrace {
+                since: second_since,
+                deadline: second_deadline,
+                evidence: second_evidence,
+            },
+        ) => {
+            first_since == second_since
+                && first_deadline == second_deadline
+                && first_evidence.reporter == second_evidence.reporter
+        },
+        (
+            KeyAvailability::AwaitingFirstReport {
+                since: first_since,
+                reporters: first_reporters,
+            },
+            KeyAvailability::AwaitingFirstReport {
+                since: second_since,
+                reporters: second_reporters,
+            },
+        )
+        | (
+            KeyAvailability::Unreachable {
+                since: first_since,
+                reporters: first_reporters,
+            },
+            KeyAvailability::Unreachable {
+                since: second_since,
+                reporters: second_reporters,
+            },
+        ) => first_since == second_since && first_reporters == second_reporters,
+        (
+            KeyAvailability::Unconfirmed {
+                since: first_since,
+                basis: first_basis,
+            },
+            KeyAvailability::Unconfirmed {
+                since: second_since,
+                basis: second_basis,
+            },
+        ) => first_since == second_since && same_unconfirmed_basis(first_basis, second_basis),
+        (
+            KeyAvailability::Absent {
+                since: first_since,
+                established_by: first_evidence,
+            },
+            KeyAvailability::Absent {
+                since: second_since,
+                established_by: second_evidence,
+            },
+        ) => first_since == second_since && first_evidence.reporter == second_evidence.reporter,
+        _ => false,
+    }
+}
+
+/// The kernel's recorded state for one device.
 ///
 /// Durable and entity-free, so retirement by key runs with no entity alive. Capability *values*
 /// stay with the reporter registry that retains them — `Box<dyn Reflect>` is neither clonable nor
 /// reflectable, and a second copy could drift from the reporter's. What lands here is the
 /// normalized conclusions the kernel itself drew, plus the one piece of reporter evidence a later
-/// pass has to remember: `Self::attachment`, without which a returning unit could never be judged
+/// pass has to read back: `Self::attachment`, without which a returning unit could never be judged
 /// against the slot the departed one occupied.
 #[derive(Clone, Debug, Reflect)]
 pub struct ReconciledDeviceState {
@@ -488,7 +864,8 @@ pub struct ReconciledDeviceState {
 
 impl ReconciledDeviceState {
     /// Report whether a newly reported state says the same thing about this device as the retained
-    /// one, which is what decides whether its `DeviceRevision` advances.
+    /// one. `Devices::advanced_revision` advances the device's [`DeviceRevision`] when this returns
+    /// `false`.
     ///
     /// `Self::presence` is compared by variant for the reason its own documentation gives:
     /// `Presence::Unreachable` carries an elapsed time that grows on every scan, so comparing
@@ -546,10 +923,9 @@ pub(crate) struct ReconciledDeviceReplacement {
 /// merge finds nothing left to re-apply.
 #[derive(Debug, Default, Resource)]
 pub(crate) struct ReconciledDeviceChanges {
-    /// Devices that stopped being usable this pass, whether their key left the reported set or a
-    /// reporter still names them while no longer reporting them present.
-    pub(crate) departed:          Vec<DepartedDevice>,
-    /// Entities that were mirroring a departed device and now need despawning.
+    /// Availability edges produced by the retained transition table.
+    pub(crate) availability:      Vec<DeviceAvailabilityChange>,
+    /// Entities that were mirroring a newly absent device and now need despawning.
     pub(crate) orphaned_entities: Vec<Entity>,
     /// Handles whose contributors changed what they disagree about, including a device whose first
     /// pass already found a disagreement.
@@ -562,30 +938,12 @@ pub(crate) struct ReconciledDeviceChanges {
     pub(crate) connections:       Vec<ConfiguredDeviceConnectionChange>,
 }
 
-/// One device that left service this pass, and which of the two ways it left by.
-///
-/// The cause travels with the key because the two lead to different work: both make every
-/// `crate::RecoveryPolicy::ReapplyOnReturn` role owe its restoration, but only a key that left the
-/// reported set retires a handle, despawns an entity, and drops a `crate::ResolvedToDevice` link.
-#[derive(Debug)]
-pub(crate) struct DepartedDevice {
-    pub(crate) key:       DeviceKey,
-    pub(crate) departure: DeviceDeparture,
-}
-
-/// How one device stopped being usable.
-///
-/// Public because it is the payload of `crate::DeviceDeparted`: a consumer that must tell an
-/// unplugged unit from one a reporter still enumerates but no longer reports present cannot get
-/// that from the key alone, and after a `Self::KeyLeftTheSet` there is no entity left to read it
-/// from either.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Reflect)]
-pub enum DeviceDeparture {
-    /// No reporter named the key this pass, so its handle, state, and entity are retired.
-    KeyLeftTheSet,
-    /// A reporter still names the key but no longer reports the unit present, so everything keyed
-    /// to it stays while the hardware itself is gone.
-    RetainedButNotPresent,
+/// One retained key availability edge and both published conclusions.
+#[derive(Clone, Debug)]
+pub(crate) struct DeviceAvailabilityChange {
+    pub(crate) key:  DeviceKey,
+    pub(crate) from: KeyAvailability,
+    pub(crate) to:   KeyAvailability,
 }
 
 /// Departures and connection conclusions held for the event stage after the projection consumed
@@ -597,11 +955,11 @@ pub enum DeviceDeparture {
 /// from the projection's own resource would mean the projection could not clear it and a settled
 /// frame would re-announce the last departure forever.
 #[derive(Debug, Default, Resource)]
-pub(crate) struct DepartureAnnouncements {
-    /// Devices that left service this pass, still carrying which of the two departures it was.
-    pub(crate) departed:    Vec<DepartedDevice>,
+pub(crate) struct DeviceChangeAnnouncements {
+    /// Availability edges retained until the event stage publishes them.
+    pub(crate) availability: Vec<DeviceAvailabilityChange>,
     /// Authored inventory keys whose connection conclusion this pass changed.
-    pub(crate) connections: Vec<ConfiguredDeviceConnectionChange>,
+    pub(crate) connections:  Vec<ConfiguredDeviceConnectionChange>,
 }
 
 /// One authored inventory key and the connection conclusion this pass reached for it.
@@ -623,6 +981,20 @@ pub enum DeviceResolution {
     NotResolved,
     /// The key names a device the kernel currently retains, and this handle addresses it.
     Resolved(DeviceId),
+}
+
+/// Result of resolving one reported platform handle through the latest reconcile pass.
+///
+/// The result names what keyed records in the registry establish. It makes no claim about whether
+/// the operating-system handle or the underlying hardware still exists.
+#[derive(Clone, PartialEq, Eq, Debug, Reflect)]
+pub enum ReportedHandleResolution {
+    /// No keyed record in the latest reconcile pass carried this handle.
+    NoKeyedRecord,
+    /// Every keyed record carrying the handle named this one durable device key.
+    OneKey(DeviceKey),
+    /// Keyed records in the latest reconcile pass attached the handle to different device keys.
+    SeveralKeys(HashSet<DeviceKey>),
 }
 
 /// Result of asking which entity mirrors one handle.
@@ -674,7 +1046,7 @@ pub enum ApplyAuthorizationError {
         key: DeviceKey,
     },
     /// The identity verdict does not authorize this operation: in-service use requires `Proven` or
-    /// `Authored`, and a restore additionally accepts `RestoreOnly`.
+    /// `Presumed`, or `Authored`.
     #[error("device `{key:?}` identity does not authorize this operation")]
     IdentityNotProven {
         /// Durable key of the device whose verdict refused the operation.
@@ -682,7 +1054,7 @@ pub enum ApplyAuthorizationError {
     },
 }
 
-/// Result of reading the kernel's belief about one handle.
+/// Result of reading the kernel's recorded state for one handle.
 #[derive(Clone, Copy, Debug)]
 pub enum DeviceStateLookup<'a> {
     /// The handle addresses no retained device: it was issued for a device that has since departed
@@ -694,11 +1066,9 @@ pub enum DeviceStateLookup<'a> {
 
 /// One global revision, combining every reporter's own revision.
 ///
-/// It advances once per reconcile pass in which any reporter returned a complete scan, whether or
-/// not the contents changed. Counting completed scans rather than content changes keeps a rapid
-/// absent-then-present cycle visible to a consumer watching this value: the set looks identical at
-/// both ends, so a content hash would report no change and a panel watching the revision would
-/// stay blank.
+/// It advances once per reconcile pass that accepts at least one complete set whose records differ
+/// from that reporter's retained set. An unchanged complete set may still refresh reporter
+/// freshness and run reconciliation, but it does not advance this counter.
 ///
 /// Reacquisition does not read this counter. It compares each device's presence reading from one
 /// pass to the next, and attempt staleness keys on the per-device [`DeviceRevision`].
@@ -708,7 +1078,7 @@ pub enum DeviceStateLookup<'a> {
 pub struct RiggingRevision(u64);
 
 impl RiggingRevision {
-    /// Report the number of reconcile passes that ingested at least one completed scan.
+    /// Report the number of reconcile passes that ingested at least one changed complete set.
     #[must_use]
     pub const fn get(self) -> u64 { self.0 }
 
@@ -718,10 +1088,10 @@ impl RiggingRevision {
 /// How many times one device's own reconciled state has changed since the kernel issued its handle.
 ///
 /// Separate from `RiggingRevision` because the two answer different questions: the global counter
-/// says how many scans have landed anywhere, which is a fact about the reporters, while this says
-/// whether *this* unit moved. An attempt validated against the global counter is abandoned by any
-/// reporter's routine scan, including one that never names its device; validated against this
-/// counter it survives every pass that reports it unchanged.
+/// says how many reconcile passes accepted a changed complete set from any reporter, while this
+/// says whether *this* unit changed. An attempt validated against the global counter is abandoned
+/// by a change from a reporter that never names its device; validated against this counter it
+/// survives every pass that leaves this device's reconciled state unchanged.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Reflect)]
 #[reflect(opaque)]
 pub struct DeviceRevision(u64);
@@ -752,219 +1122,42 @@ pub enum DeviceRevisionLookup {
     Retained(DeviceRevision),
 }
 
-/// In-flight endpoint attempts, keyed by the identifier this registry issued.
+/// Monotonic issuer for process-local attempt identifiers.
 ///
-/// The registry is the only issuer of `AttemptId`, and its counter is monotonic and never reused,
-/// so a driver poll that arrives after its attempt finished resolves to nothing rather than to a
-/// later attempt for another role.
-///
-/// `next` starts at 1, not 0: `AttemptId` derives `Default`, so `AttemptId::default()` is
-/// `AttemptId(0)`. An issued identifier equal to a defaulted or reflection-round-tripped one
-/// would make "a late poll for a finished attempt resolves to nothing" unenforceable, because the
-/// zero value appears wherever a field was left unset.
+/// `next` starts at 1, not 0: `AttemptRef` derives `Default`, so `AttemptRef::default()` is
+/// `AttemptRef(0)`. An issued identifier equal to a defaulted or reflection-round-tripped one
+/// would collide with the value used wherever a field was left unset.
 #[derive(Debug, Resource, Reflect)]
 #[reflect(Resource)]
-pub struct Attempts {
-    in_flight:       HashMap<AttemptId, Attempt>,
-    /// Which attempt each role currently has in flight.
-    ///
-    /// Retirement and replacement both destroy the `crate::RoleState::Applying` that named the
-    /// in-flight attempt before the abort path runs, and `crate::binding::BindingTransition`
-    /// carries only the role. Without this index an abandoned attempt would keep polling a
-    /// driver for a role that no longer exists.
-    attempt_by_role: HashMap<RoleKey, AttemptId>,
-    next:            u64,
+pub(crate) struct Attempts {
+    next: u64,
 }
 
 impl Default for Attempts {
     fn default() -> Self {
         Self {
-            in_flight:       HashMap::new(),
-            attempt_by_role: HashMap::new(),
-            next:            FIRST_ISSUED_ATTEMPT,
+            next: FIRST_ISSUED_ATTEMPT,
         }
     }
 }
 
 impl Attempts {
-    /// Read the record the kernel retained for one issued identifier.
-    #[must_use]
-    pub fn in_flight(&self, attempt: AttemptId) -> AttemptLookup<'_> {
-        self.in_flight
-            .get(&attempt)
-            .map_or(AttemptLookup::Finished, AttemptLookup::InFlight)
-    }
-
     /// Advance the counter and hand back the identifier the next attempt record must carry.
     ///
     /// # Errors
     ///
     /// Returns `AttemptIssueError::SequenceExhausted` when the counter cannot advance without
-    /// wrapping back to `AttemptId::default()` and reusing identifiers a late driver poll could
-    /// still resolve.
-    pub(crate) fn issue(&mut self) -> Result<AttemptId, AttemptIssueError> {
+    /// wrapping back to `AttemptRef::default()` and reusing an earlier identifier.
+    pub(crate) fn issue(&mut self) -> Result<AttemptRef, AttemptIssueError> {
         let next = self
             .next
             .checked_add(1)
             .ok_or(AttemptIssueError::SequenceExhausted)?;
-        let attempt = AttemptId::new(self.next);
+        let attempt = AttemptRef::new(self.next);
         self.next = next;
 
         Ok(attempt)
     }
-
-    /// Hand back an identifier whose dispatch never committed, so the counter does not advance.
-    ///
-    /// Minting has to happen before erased dispatch, because the request the driver receives
-    /// carries the identifier — but a driver that is unregistered or refuses the configuration
-    /// contract returns without ever seeing it. Without this, a role whose driver refuses would
-    /// consume one identifier on every dispatch, and the sequence guarding against reuse would be
-    /// spent by attempts that never ran.
-    ///
-    /// Only the most recently issued identifier is reclaimed, and only while it is not retained:
-    /// rewinding past a retained attempt would reissue an identifier a driver may still poll.
-    fn release(&mut self, attempt: AttemptId) {
-        if self.in_flight.contains_key(&attempt) {
-            return;
-        }
-        if self.next == attempt.value().saturating_add(1) {
-            self.next = attempt.value();
-        }
-    }
-
-    /// Remove and reclaim the provisional attempt for a driver start that did not commit.
-    ///
-    /// Only the most recently issued identifier can be provisional. Checking that identifier before
-    /// removing anything prevents a late rollback from ending older work that a driver may still
-    /// poll. The normal attempt-ending paths use [`Self::end`] and never return an identifier to
-    /// the counter.
-    pub(crate) fn rollback_dispatch(&mut self, attempt: AttemptId) {
-        let Some(next) = attempt.value().checked_add(1) else {
-            return;
-        };
-        if self.next != next {
-            return;
-        }
-        self.end(attempt);
-        self.release(attempt);
-    }
-
-    /// How many attempts are still in flight.
-    #[must_use]
-    pub fn len(&self) -> usize { self.in_flight.len() }
-
-    /// Report whether no attempt is in flight.
-    #[must_use]
-    pub fn is_empty(&self) -> bool { self.in_flight.is_empty() }
-
-    /// Begin retaining one attempt record until its driver reports a terminal outcome.
-    ///
-    /// Named for the act rather than for the storage: every other `retain` in this crate filters a
-    /// collection, and a reader meeting `Attempts::retain` would expect this call to drop records.
-    pub(crate) fn begin(&mut self, attempt: Attempt) {
-        self.attempt_by_role
-            .insert(attempt.role.clone(), attempt.id);
-        self.in_flight.insert(attempt.id, attempt);
-    }
-
-    /// Stop retaining one attempt, whether it succeeded, failed, or was abandoned.
-    ///
-    /// Removing the role index here rather than at each ending site is what keeps a later poll from
-    /// resolving a role to an attempt the kernel already finished.
-    pub(crate) fn end(&mut self, attempt: AttemptId) {
-        if let Some(ended) = self.in_flight.remove(&attempt)
-            && self.attempt_by_role.get(&ended.role) == Some(&attempt)
-        {
-            self.attempt_by_role.remove(&ended.role);
-        }
-    }
-
-    /// Iterate every attempt the kernel currently retains.
-    ///
-    /// The apply systems re-validate each one before any driver poll, so the registry has to be
-    /// walkable rather than only addressable by identifier.
-    pub(crate) fn in_flight_attempts(&self) -> impl Iterator<Item = &Attempt> {
-        self.in_flight.values()
-    }
-
-    /// Ask which attempt is in flight for one application role.
-    ///
-    /// `bindings` is consulted only to separate a bound role that happens to be idle from a role
-    /// that has no binding at all: a test that conflated the two would pass while a registration
-    /// silently failed.
-    #[must_use]
-    #[cfg(test)]
-    pub(crate) fn in_flight_for(&self, role: &RoleKey, bindings: &Bindings) -> RoleAttemptLookup {
-        self.attempt_by_role.get(role).copied().map_or_else(
-            || {
-                if bindings.binding(role).is_ok() {
-                    RoleAttemptLookup::Idle
-                } else {
-                    RoleAttemptLookup::NoSuchRole
-                }
-            },
-            RoleAttemptLookup::InFlight,
-        )
-    }
-
-    /// Report where one attempt stands against its own deadline and the bounded overrun budget.
-    ///
-    /// Being overdue is neither an error nor a failure, so the kernel keeps polling through
-    /// `AttemptDeadlineStatus::OverdueWithinOverrun` and only abandons the attempt once the budget
-    /// is spent. A clock that has not advanced past application startup answers
-    /// `AttemptDeadlineStatus::WithinDeadline`, because a first frame carries no elapsed time an
-    /// overrun could be computed from.
-    #[must_use]
-    pub(crate) fn deadline_status(
-        &self,
-        attempt: AttemptId,
-        now: FrameClockReading,
-        apply_overrun: Duration,
-    ) -> AttemptDeadlineStatus {
-        let Some(retained) = self.in_flight.get(&attempt) else {
-            return AttemptDeadlineStatus::NoSuchAttempt;
-        };
-        let FrameClockReading::Measurable(now) = now else {
-            return AttemptDeadlineStatus::WithinDeadline;
-        };
-        if now <= retained.deadline {
-            return AttemptDeadlineStatus::WithinDeadline;
-        }
-        let past_deadline = now.duration_since(retained.deadline);
-        if past_deadline > apply_overrun {
-            AttemptDeadlineStatus::OverrunExhausted { past_deadline }
-        } else {
-            AttemptDeadlineStatus::OverdueWithinOverrun { past_deadline }
-        }
-    }
-}
-
-/// Result of asking which attempt one application role currently has in flight.
-///
-/// A named result rather than an optional identifier: a test that could not tell "this role is
-/// bound and idle" from "there is no such role" would treat a failed registration as a settled one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg(test)]
-pub(crate) enum RoleAttemptLookup {
-    /// No binding exists for this role, so nothing could have been in flight for it.
-    NoSuchRole,
-    /// The role is bound and has no driver operation in flight.
-    Idle,
-    /// This attempt is in flight for the role and is the one an abort must end.
-    InFlight(AttemptId),
-}
-
-/// Result of looking one issued identifier up in the attempt registry.
-///
-/// A named result rather than an optional record: "no record" is the terminal answer a late poll
-/// must receive, and a caller that read it as "not ready yet" would keep polling a driver whose
-/// attempt already ended.
-#[derive(Clone, Copy, Debug)]
-pub enum AttemptLookup<'a> {
-    /// No record remains for this identifier, so the attempt it named has already ended.
-    Finished,
-    /// The kernel retains this attempt and the authorization it was started under.
-    InFlight(&'a Attempt),
 }
 
 /// Failure from asking the attempt registry for another identifier.
@@ -991,17 +1184,14 @@ mod tests {
     use bevy::ecs::reflect::AppTypeRegistry;
     use bevy::ecs::reflect::ReflectComponent;
     use bevy::ecs::reflect::ReflectResource;
-    use bevy::platform::time::Instant;
     use bevy::prelude::Component;
     use bevy::prelude::Reflect;
     use bevy::reflect::FromReflect;
     use bevy::reflect::tuple_struct::DynamicTupleStruct;
 
     use super::ApplyAuthorizationError;
-    use super::AttemptLookup;
     use super::Attempts;
     use super::Device;
-    use super::DeviceDeparture;
     use super::DeviceRegisterChangeDetection;
     use super::DeviceResolution;
     use super::DeviceRevision;
@@ -1009,33 +1199,39 @@ mod tests {
     use super::DeviceStateLookup;
     use super::Devices;
     use super::PresentWithUsableClaim;
+    use super::PriorKeyAvailability;
+    use super::ReconcilePassConclusions;
     use super::ReconciledDeviceState;
     use super::RiggingRevision;
-    use super::RoleAttemptLookup;
-    use crate::ApplyDeadline;
     use crate::AttachmentPath;
-    use crate::Attempt;
-    use crate::AttemptId;
+    use crate::AttemptRef;
+    use crate::BatchRef;
     use crate::Claim;
     use crate::ClaimHolder;
     use crate::ConfiguredDeviceMode;
+    use crate::ContributorView;
     use crate::DeviceId;
     use crate::DeviceIdSource;
     use crate::DeviceKey;
     use crate::DeviceKind;
-    use crate::EndpointId;
+    use crate::DiscoveryBatchId;
     use crate::IdentityDecisionOwed;
     use crate::IdentityVerdict;
+    use crate::KeyAvailability;
+    use crate::NonEmptyContributors;
+    use crate::NonEmptyReporterRefs;
     use crate::PermissionGate;
     use crate::Presence;
-    use crate::RecoveryPolicy;
+    use crate::PresenceView;
+    use crate::PresentEvidence;
     use crate::ReportedId;
     use crate::ReportedParent;
-    use crate::RetryOn;
+    use crate::ReporterId;
+    use crate::ReporterRef;
+    use crate::RetirementEvidence;
+    use crate::RiggingRuntimeTime;
     use crate::SchemeName;
     use crate::UnverifiedReason;
-    use crate::attempt::AttemptDeadlineStatus;
-    use crate::reconcile::FrameClockReading;
 
     /// Capability type the contributing reporters disagree about in the authorization tests.
     #[derive(Component, Reflect)]
@@ -1068,6 +1264,56 @@ mod tests {
         }
     }
 
+    fn conclusions_for(states: &[ReconciledDeviceState]) -> ReconcilePassConclusions {
+        let reporter = ReporterId(0);
+        let reporter_ref = ReporterRef::from_reporter_id(reporter);
+        let batch = BatchRef::from_batch_id(DiscoveryBatchId(0));
+        let availability = states
+            .iter()
+            .map(|state| {
+                let availability = match state.presence {
+                    Presence::Present => KeyAvailability::Present(PresentEvidence::new(
+                        NonEmptyContributors::from_contributors(vec![ContributorView::new(
+                            reporter_ref,
+                            batch,
+                            PresenceView::Present,
+                        )])
+                        .expect("one contributor is non-empty"),
+                    )),
+                    Presence::Unreachable { since } => KeyAvailability::Unreachable {
+                        since:     RiggingRuntimeTime::from_elapsed(since),
+                        reporters: NonEmptyReporterRefs::from_first_and_rest(reporter, &[]),
+                    },
+                    Presence::Absent => KeyAvailability::Absent {
+                        since:          RiggingRuntimeTime::from_elapsed(Duration::ZERO),
+                        established_by: RetirementEvidence::new(reporter_ref, batch),
+                    },
+                };
+                (state.key.clone(), availability)
+            })
+            .collect();
+        ReconcilePassConclusions {
+            availability,
+            ..ReconcilePassConclusions::default()
+        }
+    }
+
+    fn replace(
+        devices: &mut Devices,
+        states: Vec<ReconciledDeviceState>,
+    ) -> super::ReconciledDeviceReplacement {
+        let mut conclusions = conclusions_for(&states);
+        for (key, availability) in &mut conclusions.availability {
+            let PriorKeyAvailability::Published(previous) = devices.key_availability(key) else {
+                continue;
+            };
+            if std::mem::discriminant(previous) == std::mem::discriminant(availability) {
+                *availability = previous.clone();
+            }
+        }
+        devices.replace_reconciled(states, conclusions)
+    }
+
     #[test]
     fn resolution_distinguishes_an_unknown_key_from_a_retained_handle() -> Result<(), Box<dyn Error>>
     {
@@ -1077,11 +1323,7 @@ mod tests {
 
         assert_eq!(devices.resolve(&key), DeviceResolution::NotResolved);
 
-        devices.replace_reconciled(
-            vec![reconciled(key.clone())],
-            HashSet::new(),
-            HashSet::new(),
-        );
+        replace(&mut devices, vec![reconciled(key.clone())]);
 
         let DeviceResolution::Resolved(device_id) = devices.resolve(&key) else {
             panic!("an ingested key must resolve to the handle the registry issued");
@@ -1100,11 +1342,7 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let key = reported_key("DELL-U2723QE-9J4K2H3")?;
         let mut devices = Devices::default();
-        let first_replacement = devices.replace_reconciled(
-            vec![reconciled(key.clone())],
-            HashSet::new(),
-            HashSet::new(),
-        );
+        let first_replacement = replace(&mut devices, vec![reconciled(key.clone())]);
         assert_eq!(
             first_replacement.device_register_change_detection,
             DeviceRegisterChangeDetection::MarkChanged
@@ -1119,11 +1357,7 @@ mod tests {
         );
 
         for _ in 0..3 {
-            let replacement = devices.replace_reconciled(
-                vec![reconciled(key.clone())],
-                HashSet::new(),
-                HashSet::new(),
-            );
+            let replacement = replace(&mut devices, vec![reconciled(key.clone())]);
             assert_eq!(
                 replacement.device_register_change_detection,
                 DeviceRegisterChangeDetection::Preserve
@@ -1138,8 +1372,7 @@ mod tests {
         unreachable.presence = Presence::Unreachable {
             since: Duration::from_secs(9),
         };
-        let unreachable_replacement =
-            devices.replace_reconciled(vec![unreachable], HashSet::new(), HashSet::new());
+        let unreachable_replacement = replace(&mut devices, vec![unreachable]);
         assert_eq!(
             unreachable_replacement.device_register_change_detection,
             DeviceRegisterChangeDetection::MarkChanged
@@ -1156,8 +1389,7 @@ mod tests {
         later.presence = Presence::Unreachable {
             since: Duration::from_secs(30),
         };
-        let later_replacement =
-            devices.replace_reconciled(vec![later], HashSet::new(), HashSet::new());
+        let later_replacement = replace(&mut devices, vec![later]);
         assert_eq!(
             later_replacement.device_register_change_detection,
             DeviceRegisterChangeDetection::Preserve
@@ -1176,16 +1408,12 @@ mod tests {
     {
         let key = reported_key("DELL-U2723QE-9J4K2H3")?;
         let mut devices = Devices::default();
-        devices.replace_reconciled(
-            vec![reconciled(key.clone())],
-            HashSet::new(),
-            HashSet::new(),
-        );
+        replace(&mut devices, vec![reconciled(key.clone())]);
         let DeviceResolution::Resolved(device_id) = devices.resolve(&key) else {
             panic!("an ingested key must resolve to the handle the registry issued");
         };
 
-        devices.replace_reconciled(Vec::new(), HashSet::new(), HashSet::new());
+        devices.replace_reconciled(Vec::new(), ReconcilePassConclusions::default());
 
         assert_eq!(devices.revision(device_id), DeviceRevisionLookup::Retired);
 
@@ -1196,23 +1424,15 @@ mod tests {
     fn a_returning_key_never_reuses_the_retired_handle() -> Result<(), Box<dyn Error>> {
         let key = reported_key("DELL-U2723QE-9J4K2H3")?;
         let mut devices = Devices::default();
-        devices.replace_reconciled(
-            vec![reconciled(key.clone())],
-            HashSet::new(),
-            HashSet::new(),
-        );
+        replace(&mut devices, vec![reconciled(key.clone())]);
         let DeviceResolution::Resolved(first) = devices.resolve(&key) else {
             panic!("an ingested key must resolve");
         };
 
-        devices.replace_reconciled(Vec::new(), HashSet::new(), HashSet::new());
+        devices.replace_reconciled(Vec::new(), ReconcilePassConclusions::default());
         assert!(matches!(devices.state(first), DeviceStateLookup::Retired));
 
-        devices.replace_reconciled(
-            vec![reconciled(key.clone())],
-            HashSet::new(),
-            HashSet::new(),
-        );
+        replace(&mut devices, vec![reconciled(key.clone())]);
         let DeviceResolution::Resolved(second) = devices.resolve(&key) else {
             panic!("a returning key must resolve again");
         };
@@ -1226,18 +1446,10 @@ mod tests {
     fn an_unchanged_key_keeps_its_handle_across_passes() -> Result<(), Box<dyn Error>> {
         let key = reported_key("DELL-U2723QE-9J4K2H3")?;
         let mut devices = Devices::default();
-        devices.replace_reconciled(
-            vec![reconciled(key.clone())],
-            HashSet::new(),
-            HashSet::new(),
-        );
+        replace(&mut devices, vec![reconciled(key.clone())]);
         let first = devices.resolve(&key);
 
-        devices.replace_reconciled(
-            vec![reconciled(key.clone())],
-            HashSet::new(),
-            HashSet::new(),
-        );
+        replace(&mut devices, vec![reconciled(key.clone())]);
 
         assert_eq!(devices.resolve(&key), first);
 
@@ -1279,32 +1491,21 @@ mod tests {
     }
 
     #[test]
-    fn both_ways_a_device_leaves_are_reported_and_stay_distinguishable()
-    -> Result<(), Box<dyn Error>> {
+    fn an_availability_edge_names_the_key_and_both_conclusions() -> Result<(), Box<dyn Error>> {
         let unplugged = reported_key("UNPLUGGED")?;
-        let removed = reported_key("REMOVED")?;
         let mut devices = Devices::default();
-        devices.replace_reconciled(
-            vec![reconciled(unplugged.clone()), reconciled(removed.clone())],
-            HashSet::new(),
-            HashSet::new(),
-        );
+        replace(&mut devices, vec![reconciled(unplugged.clone())]);
         let unplugged_handle = handle(&devices, &unplugged);
         let mut absent = reconciled(unplugged.clone());
         absent.presence = Presence::Absent;
 
-        let replacement = devices.replace_reconciled(vec![absent], HashSet::new(), HashSet::new());
-
-        let departures: Vec<(DeviceKey, DeviceDeparture)> = replacement
-            .changes
-            .departed
-            .iter()
-            .map(|departed_device| (departed_device.key.clone(), departed_device.departure))
-            .collect();
-        assert!(departures.contains(&(unplugged.clone(), DeviceDeparture::RetainedButNotPresent)));
-        assert!(departures.contains(&(removed, DeviceDeparture::KeyLeftTheSet)));
-        // The unit that stopped being present keeps everything keyed to it, so its roles stay bound
-        // to the same handle while the hardware is away.
+        let replacement = replace(&mut devices, vec![absent]);
+        let [change] = replacement.changes.availability.as_slice() else {
+            panic!("one availability edge must be retained");
+        };
+        assert_eq!(change.key, unplugged);
+        assert!(matches!(change.from, KeyAvailability::Present(_)));
+        assert!(matches!(change.to, KeyAvailability::Absent { .. }));
         assert_eq!(
             devices.resolve(&unplugged),
             DeviceResolution::Resolved(unplugged_handle)
@@ -1326,27 +1527,20 @@ mod tests {
     }
 
     #[test]
-    fn a_proven_present_unclaimed_device_authorizes_both_service_and_restore()
-    -> Result<(), Box<dyn Error>> {
+    fn proven_presumed_and_authored_devices_each_authorize_service() -> Result<(), Box<dyn Error>> {
         let key = reported_key("DELL-U2723QE-9J4K2H3")?;
-        let mut devices = Devices::default();
-        devices.replace_reconciled(
-            vec![reconciled(key.clone())],
-            HashSet::new(),
-            HashSet::new(),
-        );
-        let device_id = handle(&devices, &key);
+        for verdict in [
+            IdentityVerdict::Proven,
+            IdentityVerdict::Presumed,
+            IdentityVerdict::Authored,
+        ] {
+            let mut state = reconciled(key.clone());
+            state.verdict = verdict;
+            let mut devices = Devices::default();
+            replace(&mut devices, vec![state]);
 
-        assert!(
-            devices
-                .authorize_service(device_id)?
-                .allows_in_service_use()
-        );
-        assert!(
-            !devices
-                .authorize_restore(device_id)?
-                .allows_in_service_use()
-        );
+            devices.authorize_service(handle(&devices, &key))?;
+        }
 
         Ok(())
     }
@@ -1373,7 +1567,8 @@ mod tests {
         let mut unverified_state = reconciled(unverified.clone());
         unverified_state.verdict = IdentityVerdict::Unverified(UnverifiedReason::NotUniqueInScan);
         let mut devices = Devices::default();
-        devices.replace_reconciled(
+        replace(
+            &mut devices,
             vec![
                 offline_state,
                 absent_state,
@@ -1381,8 +1576,6 @@ mod tests {
                 blocked_state,
                 unverified_state,
             ],
-            HashSet::new(),
-            HashSet::new(),
         );
 
         let retired = DeviceId::new(u64::MAX);
@@ -1423,51 +1616,23 @@ mod tests {
             ),
         ] {
             let device_id = handle(&devices, key);
-            assert_eq!(
-                devices.authorize_service(device_id).err(),
-                Some(expected.clone())
-            );
-            assert_eq!(devices.authorize_restore(device_id).err(), Some(expected));
+            assert_eq!(devices.authorize_service(device_id).err(), Some(expected));
         }
 
         Ok(())
     }
 
     #[test]
-    fn a_restore_only_verdict_returns_a_saved_configuration_and_drives_nothing()
-    -> Result<(), Box<dyn Error>> {
-        let key = reported_key("SERIAL-LESS-PANEL")?;
-        let mut restore_only = reconciled(key.clone());
-        restore_only.verdict = IdentityVerdict::RestoreOnly;
-        let mut devices = Devices::default();
-        devices.replace_reconciled(vec![restore_only], HashSet::new(), HashSet::new());
-        let device_id = handle(&devices, &key);
-
-        assert_eq!(
-            devices.authorize_service(device_id).err(),
-            Some(ApplyAuthorizationError::IdentityNotProven { key })
-        );
-        assert!(
-            !devices
-                .authorize_restore(device_id)?
-                .allows_in_service_use()
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn an_offline_authored_entry_refuses_a_restore_as_well_as_service() -> Result<(), Box<dyn Error>>
-    {
+    fn an_offline_authored_entry_refuses_service() -> Result<(), Box<dyn Error>> {
         let key = reported_key("WITHDRAWN")?;
         let mut offline = reconciled(key.clone());
         offline.mode = ConfiguredDeviceMode::Offline;
         let mut devices = Devices::default();
-        devices.replace_reconciled(vec![offline], HashSet::new(), HashSet::new());
+        replace(&mut devices, vec![offline]);
         let device_id = handle(&devices, &key);
 
         assert_eq!(
-            devices.authorize_restore(device_id).err(),
+            devices.authorize_service(device_id).err(),
             Some(ApplyAuthorizationError::Offline { key })
         );
 
@@ -1480,16 +1645,15 @@ mod tests {
         let mut disputed_state = reconciled(key.clone());
         disputed_state.disputed = HashSet::from([TypeId::of::<DisputedCapability>()]);
         let mut devices = Devices::default();
-        devices.replace_reconciled(vec![disputed_state], HashSet::new(), HashSet::new());
+        replace(&mut devices, vec![disputed_state]);
         let device_id = handle(&devices, &key);
 
         assert!(devices.authorize_service(device_id).is_ok());
-        assert!(devices.authorize_restore(device_id).is_ok());
 
         Ok(())
     }
 
-    // --- the attempt registry ---
+    // --- attempt identifier issuance ---
 
     #[test]
     fn successive_issued_attempt_identifiers_differ_and_none_equals_the_default() {
@@ -1497,287 +1661,13 @@ mod tests {
 
         let first = attempts
             .issue()
-            .expect("a fresh registry can issue an identifier");
+            .expect("a fresh counter can issue an identifier");
         let second = attempts
             .issue()
-            .expect("a fresh registry can issue a second identifier");
+            .expect("a fresh counter can issue a second identifier");
 
         assert_ne!(first, second);
-        assert_ne!(first, AttemptId::default());
-        assert_ne!(second, AttemptId::default());
+        assert_ne!(first, AttemptRef::default());
+        assert_ne!(second, AttemptRef::default());
     }
-
-    #[test]
-    fn an_identifier_whose_dispatch_never_committed_goes_back_on_offer() {
-        let mut attempts = Attempts::default();
-        let first = attempts
-            .issue()
-            .expect("a fresh registry can issue an identifier");
-
-        attempts.release(first);
-
-        assert_eq!(
-            attempts
-                .issue()
-                .expect("the released identifier is on offer again"),
-            first
-        );
-
-        // A retained attempt is never reclaimed, because a driver may still poll it, and neither is
-        // an identifier the counter has already moved past.
-        let retained = attempts
-            .issue()
-            .expect("a fresh registry can issue a second identifier");
-        attempts.begin(test_attempt(retained, bevy::platform::time::Instant::now()));
-        attempts.release(retained);
-        attempts.release(first);
-
-        assert_ne!(
-            attempts
-                .issue()
-                .expect("the registry can still issue after two refused releases"),
-            retained
-        );
-    }
-
-    #[test]
-    fn a_provisional_dispatch_rollback_removes_the_attempt_and_its_role_index() {
-        let mut attempts = Attempts::default();
-        let attempt = attempts
-            .issue()
-            .expect("a fresh registry can issue an identifier");
-        attempts.begin(test_attempt(attempt, bevy::platform::time::Instant::now()));
-
-        attempts.rollback_dispatch(attempt);
-
-        assert!(matches!(
-            attempts.in_flight(attempt),
-            AttemptLookup::Finished
-        ));
-        assert!(attempts.attempt_by_role.is_empty());
-        assert_eq!(
-            attempts
-                .issue()
-                .expect("the provisional identifier is on offer again"),
-            attempt
-        );
-    }
-
-    #[test]
-    fn a_dispatch_rollback_can_reclaim_only_the_most_recently_issued_identifier() {
-        let mut attempts = Attempts::default();
-        let retained = attempts
-            .issue()
-            .expect("a fresh registry can issue an identifier");
-        attempts.begin(test_attempt(retained, bevy::platform::time::Instant::now()));
-        let provisional = attempts
-            .issue()
-            .expect("the registry can issue beside retained work");
-
-        attempts.rollback_dispatch(retained);
-
-        assert!(matches!(
-            attempts.in_flight(retained),
-            AttemptLookup::InFlight(_)
-        ));
-        attempts.rollback_dispatch(provisional);
-        assert_eq!(
-            attempts
-                .issue()
-                .expect("only the provisional identifier was reclaimed"),
-            provisional
-        );
-    }
-
-    #[test]
-    fn a_retained_attempt_is_in_flight_while_an_unissued_identifier_is_finished() {
-        let mut attempts = Attempts::default();
-        let attempt = attempts
-            .issue()
-            .expect("a fresh registry can issue an identifier");
-        attempts.begin(Attempt {
-            id:                 attempt,
-            role:               crate::RoleKey::new("window/main")
-                .expect("`window/main` is a valid role handle"),
-            endpoint:           crate::DeviceEndpoint {
-                device: DeviceKey {
-                    kind: DeviceKind::Display,
-                    id:   DeviceIdSource::Authored {
-                        value: crate::AuthoredId::new("panel")
-                            .expect("`panel` is a valid authored identifier"),
-                    },
-                },
-                id:     EndpointId::Whole,
-            },
-            permit:             crate::ApplyPermit::in_service(),
-            binding_generation: crate::BindingGeneration::default(),
-            expected_device_id: DeviceId::new(0),
-            device_revision:    DeviceRevision::default(),
-            deadline:           bevy::platform::time::Instant::now(),
-        });
-
-        assert!(matches!(
-            attempts.in_flight(attempt),
-            AttemptLookup::InFlight(_)
-        ));
-        assert!(matches!(
-            attempts.in_flight(AttemptId::default()),
-            AttemptLookup::Finished
-        ));
-    }
-
-    #[test]
-    fn the_attempt_registry_registers_reflection_metadata() {
-        let app = App::new();
-        let type_registry = app.world().resource::<AppTypeRegistry>().read();
-        let type_id = TypeId::of::<Attempts>();
-
-        assert!(type_registry.contains(type_id));
-        assert!(
-            type_registry
-                .get_type_data::<ReflectResource>(type_id)
-                .is_some()
-        );
-
-        drop(type_registry);
-    }
-
-    fn test_attempt(id: AttemptId, deadline: Instant) -> Attempt {
-        Attempt {
-            id,
-            role: crate::RoleKey::new("window/main").expect("`window/main` is a valid role handle"),
-            endpoint: test_endpoint(),
-            permit: crate::ApplyPermit::in_service(),
-            binding_generation: crate::BindingGeneration::default(),
-            expected_device_id: DeviceId::new(0),
-            device_revision: DeviceRevision::default(),
-            deadline,
-        }
-    }
-
-    fn test_endpoint() -> crate::DeviceEndpoint {
-        crate::DeviceEndpoint {
-            device: DeviceKey {
-                kind: DeviceKind::Display,
-                id:   DeviceIdSource::Authored {
-                    value: crate::AuthoredId::new("panel")
-                        .expect("`panel` is a valid authored identifier"),
-                },
-            },
-            id:     EndpointId::Whole,
-        }
-    }
-
-    #[test]
-    fn the_deadline_query_separates_healthy_overdue_exhausted_and_unknown_attempts() {
-        let mut attempts = Attempts::default();
-        let attempt = attempts
-            .issue()
-            .expect("a fresh registry can issue an identifier");
-        let now = bevy::platform::time::Instant::now();
-        let overrun = Duration::from_secs(5);
-        attempts.begin(test_attempt(attempt, now + Duration::from_secs(10)));
-        let reading = |elapsed| FrameClockReading::Measurable(now + Duration::from_secs(elapsed));
-
-        assert_eq!(
-            attempts.deadline_status(attempt, reading(1), overrun),
-            AttemptDeadlineStatus::WithinDeadline
-        );
-        assert_eq!(
-            attempts.deadline_status(attempt, reading(12), overrun),
-            AttemptDeadlineStatus::OverdueWithinOverrun {
-                past_deadline: Duration::from_secs(2),
-            }
-        );
-        assert_eq!(
-            attempts.deadline_status(attempt, reading(20), overrun),
-            AttemptDeadlineStatus::OverrunExhausted {
-                past_deadline: Duration::from_secs(10),
-            }
-        );
-        assert_eq!(
-            attempts.deadline_status(AttemptId::default(), reading(20), overrun),
-            AttemptDeadlineStatus::NoSuchAttempt
-        );
-    }
-
-    #[test]
-    fn a_clock_that_has_not_advanced_never_reports_an_attempt_overdue() {
-        let mut attempts = Attempts::default();
-        let attempt = attempts
-            .issue()
-            .expect("a fresh registry can issue an identifier");
-        // A deadline already in the past: only the missing clock reading keeps this within it.
-        let long_past = bevy::platform::time::Instant::now()
-            .checked_sub(Duration::from_mins(1))
-            .expect("the process started after the clock's origin");
-        attempts.begin(test_attempt(attempt, long_past));
-
-        assert_eq!(
-            attempts.deadline_status(
-                attempt,
-                crate::reconcile::FrameClockReading::NotYetAdvanced,
-                Duration::ZERO,
-            ),
-            AttemptDeadlineStatus::WithinDeadline
-        );
-    }
-
-    #[test]
-    fn the_role_keyed_lookup_separates_an_unbound_role_from_an_idle_and_a_working_one()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let role = crate::RoleKey::new("window/main")?;
-        let mut attempts = Attempts::default();
-        let mut bindings = crate::binding::Bindings::default();
-
-        assert_eq!(
-            attempts.in_flight_for(&role, &bindings),
-            RoleAttemptLookup::NoSuchRole
-        );
-
-        bindings.register(crate::Binding {
-            role:            role.clone(),
-            endpoint:        test_endpoint(),
-            driver:          crate::DriverId(0),
-            recovery:        RecoveryPolicy::Forget,
-            retry:           RetryOn::NewRevision,
-            on_abort:        crate::OnAbort::default(),
-            on_loss:         crate::OnSessionLoss::default(),
-            state:           crate::RoleState::default(),
-            requested:       crate::RequestedConfiguration::new(RoleAttemptTestConfiguration(3)),
-            last_known_good: crate::LastKnownGoodConfiguration::default(),
-            apply_deadline:  ApplyDeadline::ProcessDefault,
-        })?;
-
-        assert_eq!(
-            attempts.in_flight_for(&role, &bindings),
-            RoleAttemptLookup::Idle
-        );
-
-        let attempt = attempts
-            .issue()
-            .expect("a fresh registry can issue an identifier");
-        attempts.begin(test_attempt(attempt, bevy::platform::time::Instant::now()));
-
-        assert_eq!(
-            attempts.in_flight_for(&role, &bindings),
-            RoleAttemptLookup::InFlight(attempt)
-        );
-
-        // Retirement takes the binding while the driver is still working. The lookup is keyed by
-        // role and not by binding for exactly this case: the kernel has to be able to find the
-        // orphaned attempt in order to abandon it deliberately.
-        bindings.retire(&role)?;
-
-        assert_eq!(
-            attempts.in_flight_for(&role, &bindings),
-            RoleAttemptLookup::InFlight(attempt)
-        );
-
-        Ok(())
-    }
-
-    #[derive(Component, Reflect)]
-    #[reflect(Component)]
-    struct RoleAttemptTestConfiguration(u32);
 }

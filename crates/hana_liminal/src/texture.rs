@@ -36,8 +36,8 @@ pub(crate) struct FloodTextures {
     /// passes.
     pub(crate) input:         CachedTexture,
     pub(crate) output:        CachedTexture,
-    /// A dedicated depth texture for mesh outlines to later compare against
-    /// global depth
+    /// Depth texture for the outline passes, sampled later to compare against
+    /// the main pass depth.
     pub(crate) outline_depth: Texture,
     /// Stores mask `appearance_data`: color in rgb and priority in alpha.
     pub(crate) appearance:    CachedTexture,

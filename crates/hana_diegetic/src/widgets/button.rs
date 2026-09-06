@@ -153,12 +153,13 @@ impl Button {
 /// removal, are visible in the same frame. Each `Changed` query and
 /// [`RemovedComponents`] stream is consumed here, so a quiet frame never walks
 /// the live buttons.
+///
 /// Hover reads the all-pointer [`PickingInteraction`] aggregate and pressed
 /// reads the private [`ButtonPress`] marker; [`WidgetCaptures`] and
-/// [`ButtonCaptures`] stay lifecycle authority and are never consulted for
-/// presentation. Writes go
-/// through [`visual::write_widget_overrides`], which compares immutably first,
-/// so an unchanged state never marks [`WidgetVisualOverrides`] changed.
+/// [`ButtonCaptures`] stay lifecycle authority and are never read for
+/// presentation. Writes go through [`visual::write_widget_overrides`], which
+/// compares immutably first, so an unchanged state never marks
+/// [`WidgetVisualOverrides`] changed.
 pub(super) fn present_button_state(
     changed: Query<
         (Entity, &WidgetKind),
@@ -334,8 +335,8 @@ pub(crate) struct ButtonPress;
 /// Tracked handle to a widget's registered click-callback system.
 ///
 /// Reify installs and replaces this component; dropping it releases the
-/// widget's strong handle so Bevy can clean up the registered system once the
-/// final handle is gone.
+/// widget's strong handle, and Bevy unregisters the system once the final
+/// handle is gone.
 #[derive(Component)]
 pub(super) struct ButtonCallbackHandle(SystemHandle<In<ButtonClicked>, ()>);
 
@@ -829,7 +830,8 @@ fn emit_button_terminal(mut world: DeferredWorld, context: HookContext) {
 
 /// Records a button cancellation and, when newly recorded, removes
 /// [`ButtonPress`] so its hook emits the terminal. Returns whether a terminal
-/// was recorded, so the shared dispatcher knows shared occupancy will free.
+/// was recorded, so the shared dispatcher marks the pointer freed only when
+/// shared occupancy will be released.
 pub(super) fn cancel_button_press(
     entity: Entity,
     cause: ButtonCancelCause,

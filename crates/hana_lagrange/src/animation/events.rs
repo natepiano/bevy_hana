@@ -22,29 +22,29 @@ use super::queue::CameraMoveError;
 use super::sequence::CameraEvaluationError;
 use crate::fit::ZoomContext;
 
-/// Identifies which event triggered an animation lifecycle.
+/// Which request started an animation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Reflect)]
 pub enum AnimationSource {
-    /// Animation was triggered by `PlayAnimation`.
+    /// Started by [`PlayAnimation`].
     PlayAnimation,
-    /// Animation was triggered by `ZoomToFit`.
+    /// Started by [`ZoomToFit`](crate::ZoomToFit).
     ZoomToFit,
-    /// Animation was triggered by `AnimateToFit`.
+    /// Started by [`AnimateToFit`](crate::AnimateToFit).
     AnimateToFit,
-    /// Animation was triggered by `LookAt`.
+    /// Started by [`LookAt`](crate::LookAt).
     LookAt,
-    /// Animation was triggered by `LookAtAndZoomToFit`.
+    /// Started by [`LookAtAndZoomToFit`](crate::LookAtAndZoomToFit).
     LookAtAndZoomToFit,
-    /// Animation was triggered by direct retained `CameraSequence` authoring.
+    /// Started by direct retained [`CameraSequence`](crate::CameraSequence)
+    /// authoring.
     CameraSequence,
 }
 
-/// `CameraEventTiming` captures raw retained playback timing for one camera event.
+/// Raw retained playback timing for one camera event.
 ///
-/// The normalized position identifies traversal ordering while `total` keeps
-/// the exact authored duration available.  It intentionally carries no
-/// reconstructed elapsed time: an interior normalized value cannot identify
-/// one exact authored nanosecond.
+/// The normalized position gives traversal ordering; `total` keeps the exact
+/// authored duration. There is no elapsed-time field, because an interior
+/// normalized position does not name one exact authored nanosecond.
 #[derive(Clone, Copy, Debug, PartialEq, Reflect)]
 #[reflect(opaque)]
 pub struct CameraEventTiming {
@@ -53,7 +53,7 @@ pub struct CameraEventTiming {
 }
 
 impl CameraEventTiming {
-    /// Creates a `CameraEventTiming` snapshot for an event payload.
+    /// Creates a `CameraEventTiming` for an event payload.
     #[must_use]
     pub const fn new(position: SequencePosition, total: SequenceTime) -> Self {
         Self { position, total }
@@ -137,10 +137,9 @@ pub struct AnimationBegin {
     /// The camera being animated.
     #[event_target]
     pub camera:    Entity,
-    /// Whether this animation originated from `PlayAnimation`, `ZoomToFit`, `AnimateToFit`,
-    /// `LookAt`, or `LookAtAndZoomToFit`.
+    /// Which request started this animation.
     pub source:    AnimationSource,
-    /// The entity this animation frames, or `None` for a raw `PlayAnimation`.
+    /// The entity this animation frames, or `None` for a raw [`PlayAnimation`].
     pub target:    Option<Entity>,
     /// Playback owner that made the journey effective.
     pub owner:     SequenceOwner,
@@ -158,10 +157,9 @@ pub struct AnimationEnd {
     /// The camera that stopped animating.
     #[event_target]
     pub camera:    Entity,
-    /// Whether this animation originated from `PlayAnimation`, `ZoomToFit`, `AnimateToFit`,
-    /// `LookAt`, or `LookAtAndZoomToFit`.
+    /// Which request started this animation.
     pub source:    AnimationSource,
-    /// The entity this animation framed, or `None` for a raw `PlayAnimation`.
+    /// The entity this animation framed, or `None` for a raw [`PlayAnimation`].
     pub target:    Option<Entity>,
     /// Playback owner that closes this lifecycle episode.
     pub owner:     SequenceOwner,
@@ -205,8 +203,7 @@ pub struct AnimationRejected {
     pub reason: AnimationRejectionReason,
 }
 
-/// `AnimationRejectionReason` identifies the exact failure reported by
-/// [`AnimationRejected`].
+/// The exact failure reported by [`AnimationRejected`].
 #[derive(Clone, Debug, Reflect)]
 pub enum AnimationRejectionReason {
     /// The request did not contain any authored movement.
@@ -232,8 +229,8 @@ pub enum AnimationRejectionReason {
     },
 }
 
-/// `CameraRequestPreparationError` identifies an exact high-level preparation
-/// failure.
+/// Why a fit or look request could not assemble the camera and target data its
+/// solve reads.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Reflect)]
 pub enum CameraRequestPreparationError {
     /// The requested camera entity no longer has a `Camera` component.

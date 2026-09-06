@@ -18,9 +18,10 @@ use crate::animation::lifecycle::OrbitControllerOverrideRestoration;
 use crate::animation::sequence::CameraSequence;
 
 /// Publishes direct retained authoring early enough for driver arbitration.
-/// A matching revision is already prepared atomically, so the steady path is
-/// write-free. Rechecking the controller tuple also lets authoring recover
-/// when a compatible controller or camera basis arrives.
+/// A camera whose prepared playback already matches the sequence's current
+/// revision is skipped without a write, so the steady path is one check per
+/// camera. Rechecking the controller tuple on every pass also lets authoring
+/// recover once a compatible controller or camera basis arrives.
 pub(in crate::animation) fn prepare_direct_camera_sequences(
     mut commands: Commands,
     mut sequences: Query<(

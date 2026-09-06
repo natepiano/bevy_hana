@@ -13,7 +13,7 @@ pub enum HoldState<'a, T> {
     Idle,
 }
 
-/// Remembers the last active value for a fixed duration after input ends.
+/// Keeps the last active value for a fixed duration after input ends.
 #[derive(Clone, Debug)]
 pub struct ReleaseHold<T> {
     hold:      Duration,
@@ -32,7 +32,7 @@ impl<T> ReleaseHold<T> {
         }
     }
 
-    /// Clears any remembered value and returns to idle immediately.
+    /// Drops the stored value and returns to idle immediately.
     pub fn clear(&mut self) {
         self.remaining = Duration::ZERO;
         self.value = None;

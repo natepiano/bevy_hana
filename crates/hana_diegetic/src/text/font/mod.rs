@@ -116,12 +116,11 @@ pub struct FontMetrics {
     /// Font-recommended inter-line spacing, also called "leading" in
     /// traditional typography. In parley's half-leading model this value
     /// is split in half and absorbed into the `top` and `bottom` of
-    /// each line box — see `LineMetricsSnapshot`.
+    /// each line box — see `ShapedLineMetrics`.
     pub line_gap:            f32,
     /// Total line height: `ascent + descent + line_gap`.
     pub line_height:         f32,
     /// Height of lowercase letters like `x` (baseline to mean line).
-    /// Also called the "mean line" in some references.
     pub x_height:            f32,
     /// Height of uppercase letters like `H` (baseline to cap line).
     /// Always <= [`ascent`](Self::ascent) because ascent includes room
@@ -288,9 +287,10 @@ impl Font {
     /// text by keeping glyph-edge coverage consistent across a run.
     ///
     /// The calculation uses the standard screen conversion of 96 logical
-    /// pixels per inch and 72 typographic points per inch. It assumes no extra
-    /// letter spacing; integral-pixel letter spacing preserves the guarantee.
-    /// Ties resolve to the larger point size.
+    /// pixels per inch and 72 typographic points per inch, and covers the
+    /// glyph advance alone — letter spacing is not part of it, so the whole
+    /// pixel advance survives only when letter spacing is zero or is itself a
+    /// whole number of pixels. Ties resolve to the larger point size.
     ///
     /// # Errors
     ///

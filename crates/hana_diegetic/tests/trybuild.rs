@@ -1,4 +1,5 @@
-//! Compile-pass coverage for the public layout builder API.
+//! Compile-time coverage for the public layout builder API: the typestate
+//! helpers that must compile, and the misuses that must not.
 
 #[test]
 #[ignore = "slow compile-time API test; run when changing widget state or tooltip typestates"]

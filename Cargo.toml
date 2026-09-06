@@ -5,6 +5,7 @@ members  = [
   "crates/hana_clerestory",
   "crates/hana_diegetic",
   "crates/hana_kana",
+  "crates/hana_lading",
   "crates/hana_lagrange",
   "crates/hana_liminal",
   "crates/hana_rigging",
@@ -32,6 +33,7 @@ fairy_dust            = { path = "crates/fairy_dust" }
 hana_clerestory       = { path = "crates/hana_clerestory" }
 hana_diegetic         = { path = "crates/hana_diegetic" }
 hana_kana             = { path = "crates/hana_kana" }
+hana_lading           = { path = "crates/hana_lading" }
 hana_lagrange         = { path = "crates/hana_lagrange", features = ["fit_overlay"] }
 hana_liminal          = { path = "crates/hana_liminal" }
 hana_rigging          = { path = "crates/hana_rigging" }
@@ -86,14 +88,17 @@ bevy_time = { version = "0.19.1", default-features = false, features = ["std"] }
 bevy_transform = { version = "0.19.1", features = ["std"] }
 bevy_tween = { version = "0.13.0", default-features = false }
 bitflags = "2"
+blake3 = "1.8.2"
 bytemuck = "1"
 clap = { version = "4.6.6", features = ["derive"] }
+crossbeam-channel = "0.5.15"
 dirs = "6.0.0"
 flume = "0.11"
 getrandom = { version = "0.4.3", features = ["wasm_js"] }
 glam = { version = "0.33.5", features = ["serde"] }
 image = { version = "0.25", default-features = false }
 moonshine-save = "0.7.0"
+moonshine-util = "0.5"
 nokhwa = { version = "0.10.11", default-features = false, features = [
   "input-native",
   "output-threaded",
@@ -182,6 +187,15 @@ missing_docs = "deny"
 
 [profile.release]
 debug = true
+
+# Link time, not binary size, is what iteration pays here: ~18 integration-test
+# binaries each statically link the whole engine. `line-tables-only` keeps panic
+# backtraces pointing at file:line while dropping the type and variable records
+# the linker would otherwise have to merge, and `unpacked` leaves debug info in
+# the .o files instead of copying it into every binary.
+[profile.dev]
+debug           = "line-tables-only"
+split-debuginfo = "unpacked"
 
 # Optimize dependencies even in dev builds; keeps own-crate incremental compiles fast.
 [profile.dev.package."*"]

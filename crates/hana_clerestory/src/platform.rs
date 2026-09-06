@@ -1,7 +1,7 @@
 //! Runtime platform detection.
 //!
-//! Consolidates all platform-specific behavior branching into a single enum
-//! with methods, replacing scattered `cfg!()` and `is_wayland()` checks.
+//! Every platform-specific branch in this crate goes through a method on
+//! [`Platform`], so no call site writes its own `cfg!()` or `is_wayland()` check.
 //!
 //! On macOS and Windows the variant is known at compile time. On Linux the
 //! binary can run under either Wayland or X11, so the variant is detected
@@ -12,20 +12,28 @@ use std::env::var;
 
 use bevy::prelude::Resource;
 use bevy::window::WindowMode;
+use hana_rigging::prelude::DeviceAccessError;
+use hana_rigging::prelude::DeviceIdSource;
+use hana_rigging::prelude::DeviceKey;
+use hana_rigging::prelude::DeviceKind;
+use hana_rigging::prelude::Digest;
+use hana_rigging::prelude::SchemeName;
 
 use super::constants::SCALE_FACTOR_EPSILON;
 #[cfg(target_os = "linux")]
 use super::constants::WAYLAND_DISPLAY_ENVIRONMENT_VARIABLE;
+use super::monitors::DisplayDeviceEvidence;
+use super::monitors::DisplayIdentityEvidence;
 use super::persistence::EstablishedWindowPosition;
 use super::persistence::SavedWindowMode;
+use super::reporter::DisplayKeyClassification;
 use super::restore::FullscreenRestoreState;
 use super::restore::MonitorScaleStrategy;
 use super::restore::WindowRestoreState;
 
 /// The display platform, detected once at startup and inserted as a [`Resource`].
 ///
-/// All platform-specific window restoration behavior is expressed as methods on
-/// this enum rather than ad-hoc `cfg!()` / `is_wayland()` checks.
+/// Each method below answers one platform question the window restore path asks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Resource)]
 pub enum Platform {
     /// macOS.
@@ -36,6 +44,19 @@ pub enum Platform {
     X11,
     /// Linux running a Wayland session.
     Wayland,
+}
+
+#[cfg(target_os = "macos")]
+const CORE_GRAPHICS_SUCCESS: i32 = 0;
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGGetActiveDisplayList(
+        max_displays: u32,
+        active_displays: *mut u32,
+        display_count: *mut u32,
+    ) -> i32;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,11 +142,10 @@ impl Platform {
         }
     }
 
-    /// Whether the given target and actual window modes should be considered a match
-    /// during settle comparison.
+    /// Whether `target` and `actual` window modes count as a match during settle comparison.
     ///
-    /// On Wayland, exclusive fullscreen is not supported by winit and falls back to
-    /// borderless fullscreen. The settle system must accept this substitution.
+    /// On Wayland, winit does not implement exclusive fullscreen and falls back to
+    /// borderless fullscreen, so the settle comparison accepts that substitution.
     #[must_use]
     pub fn modes_match(self, target: WindowMode, actual: WindowMode) -> bool {
         target == actual
@@ -167,6 +187,21 @@ impl Platform {
         {
             false
         }
+    }
+
+    /// Whether restore preparation must wait for X11 frame compensation before placement.
+    ///
+    /// `compensate_target_position` subtracts the `_NET_FRAME_EXTENTS` top from the saved
+    /// position and inserts the `X11FrameCompensated` token that gates
+    /// `place_window_at_saved_geometry`. Only a windowed restore carries a title bar to
+    /// subtract, so a fullscreen restore is marked compensated at preparation, as is every
+    /// platform whose `outer_position()` already reports frame coordinates.
+    #[must_use]
+    pub(crate) const fn awaits_frame_compensation(
+        self,
+        saved_window_mode: &SavedWindowMode,
+    ) -> bool {
+        self.needs_frame_compensation() && !saved_window_mode.is_fullscreen()
     }
 
     /// Whether position readback is reliable for settle comparison.
@@ -263,8 +298,9 @@ impl Platform {
     ///   different scale than the primary's launch monitor recorded by `RestoreTargetBuilder` for
     ///   `TargetPosition::starting_scale`.
     ///
-    /// In all three cases the `starting_scale` assumption is wrong, so initial restore
-    /// preparation re-reads the window's actual `base_scale_factor()` and recomputes the strategy.
+    /// In all three cases the recorded `starting_scale` is not the scale of the monitor the
+    /// window was created on, so initial restore preparation re-reads the window's actual
+    /// `base_scale_factor()` and recomputes the strategy.
     /// Once a two-phase strategy advances beyond `NeedInitialMove`, its stored starting scale and
     /// strategy are retained until that restore finishes.
     ///
@@ -280,11 +316,96 @@ impl Platform {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn empty_current_display_list_error(observed_count: usize) -> DeviceAccessError {
+    let mut active_display_count = 0;
+    // SAFETY: a zero-capacity query writes only `display_count`; the active-display pointer is null
+    // because no display identifiers are requested by this count query.
+    let error_code =
+        unsafe { CGGetActiveDisplayList(0, std::ptr::null_mut(), &raw mut active_display_count) };
+    if error_code != CORE_GRAPHICS_SUCCESS {
+        return discovery_transport_error(&format!(
+            "CGGetActiveDisplayList failed with CGError code {error_code} while \
+             {observed_count} observed displays remained"
+        ));
+    }
+
+    discovery_transport_error(&format!(
+        "winit returned no current display handles while CGGetActiveDisplayList reported \
+         {active_display_count} active displays and {observed_count} observed displays remained"
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn empty_current_display_list_error(observed_count: usize) -> DeviceAccessError {
+    discovery_transport_error(&format!(
+        "winit returned no current display handles while {observed_count} observed displays \
+         remained"
+    ))
+}
+
+/// Apply the reporter's durable display-key rules to one display's evidence.
+#[cfg(all(target_os = "macos", not(test)))]
+pub(crate) const fn classify_display_key(
+    evidence: &DisplayDeviceEvidence,
+    _: &SchemeName,
+) -> DisplayKeyClassification {
+    match &evidence.identity_evidence {
+        DisplayIdentityEvidence::Synthesized {
+            display_fingerprint,
+            ..
+        } => DisplayKeyClassification::Keyed(DeviceKey {
+            kind: DeviceKind::Display,
+            id:   DeviceIdSource::Synthesized {
+                digest: Digest::new(display_fingerprint.get()),
+            },
+        }),
+        DisplayIdentityEvidence::Unavailable { .. } => DisplayKeyClassification::MatchEvidenceOnly,
+    }
+}
+
+/// Apply the reporter's durable display-key rules to one display's evidence.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) fn classify_display_key(
+    evidence: &DisplayDeviceEvidence,
+    edid_serial_scheme: &SchemeName,
+) -> DisplayKeyClassification {
+    match &evidence.identity_evidence {
+        #[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
+        DisplayIdentityEvidence::ReportedSerial(value) => {
+            DisplayKeyClassification::Keyed(DeviceKey {
+                kind: DeviceKind::Display,
+                id:   DeviceIdSource::Reported {
+                    scheme: edid_serial_scheme.clone(),
+                    value:  value.clone(),
+                },
+            })
+        },
+        DisplayIdentityEvidence::Synthesized {
+            display_fingerprint,
+            ..
+        } => DisplayKeyClassification::Keyed(DeviceKey {
+            kind: DeviceKind::Display,
+            id:   DeviceIdSource::Synthesized {
+                digest: Digest::new(display_fingerprint.get()),
+            },
+        }),
+        DisplayIdentityEvidence::Unavailable { .. } => DisplayKeyClassification::MatchEvidenceOnly,
+    }
+}
+
+fn discovery_transport_error(detail: &str) -> DeviceAccessError {
+    DeviceAccessError::Transport {
+        detail: detail.to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bevy::prelude::IVec2;
 
     use super::*;
+    use crate::persistence::SavedFullscreenVideoMode;
 
     #[test]
     fn automatic_return_rejects_exclusive_fullscreen_on_every_platform() {
@@ -338,6 +459,38 @@ mod tests {
                 ReturnCapability::Unsupported,
             );
         }
+    }
+
+    #[test]
+    fn only_a_windowed_restore_waits_for_x11_frame_compensation() {
+        let fullscreen_modes = [
+            SavedWindowMode::BorderlessFullscreen,
+            SavedWindowMode::Fullscreen {
+                video_mode: SavedFullscreenVideoMode::Current,
+            },
+        ];
+
+        for platform in [
+            Platform::MacOs,
+            Platform::Windows,
+            Platform::X11,
+            Platform::Wayland,
+        ] {
+            // A fullscreen restore has no title bar to subtract, so nothing waits on the
+            // `_NET_FRAME_EXTENTS` query.
+            for saved_window_mode in &fullscreen_modes {
+                assert!(!platform.awaits_frame_compensation(saved_window_mode));
+            }
+            // A windowed restore waits exactly when the platform compensates frames.
+            assert_eq!(
+                platform.awaits_frame_compensation(&SavedWindowMode::Windowed),
+                platform.needs_frame_compensation(),
+            );
+        }
+
+        // X11 is that platform whenever the workaround is compiled in.
+        #[cfg(feature = "workaround-winit-4445")]
+        assert!(Platform::X11.awaits_frame_compensation(&SavedWindowMode::Windowed));
     }
 
     #[test]

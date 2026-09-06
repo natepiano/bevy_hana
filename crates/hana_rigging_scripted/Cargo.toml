@@ -12,6 +12,6 @@ version              = "0.1.0"
 workspace = true
 
 [dependencies]
-bevy.workspace         = true
-hana_rigging.workspace = true
-thiserror.workspace    = true
+bevy.workspace      = true
+hana_rigging        = { workspace = true, features = ["test-support"] }
+thiserror.workspace = true

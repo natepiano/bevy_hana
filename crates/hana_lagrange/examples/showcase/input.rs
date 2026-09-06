@@ -10,8 +10,8 @@
 //!
 //! Single keys are spawned through [`Keybindings::spawn_key`], which attaches a
 //! `BlockBy` on every modifier. A bare key therefore stays quiet while a
-//! modifier is held, so `fairy_dust`'s `Shift+C` preset cycle no longer also
-//! fires the showcase's `C` conflict-policy shortcut.
+//! modifier is held, so `fairy_dust`'s `Shift+C` preset cycle does not also
+//! fire the showcase's `C` conflict-policy shortcut.
 //!
 //! Discrete shortcuts are wired with [`bind_action_system!`]; the two scroll
 //! keys are continuous and run from `On<Fire<…>>` observers that scale by frame

@@ -61,15 +61,15 @@ key is allowed to authorize:
 |---|---|---|
 | `Reported` | The unit published it — an EDID serial, a CoreAudio UID | Drive output |
 | `Authored` | A human assigned it, for units that report nothing | Drive output |
-| `Synthesized` | Derived from descriptors as a location hint | Restore saved configuration only |
+| `Synthesized` | Derived from an exact unit-or-location match | Drive output after one live unit matches |
 
 That distinction is the point. A webcam with no serial gets a synthesized key,
-so its saved window position can come back — but it can never silently become
-the camera a recording writes to, because a location hint is not proof of which
-unit is plugged in.
+but it can drive output only when one live unit matches that exact key. Ambiguous
+matches authorize nothing, while displaced and wrong-unit questions stay with
+the identity-decision machinery.
 
 Reconciliation turns a key plus live evidence into an `IdentityVerdict`:
-`Proven`, `RestoreOnly`, `Authored`, `Displaced` (a same-kind unit took the
+`Proven`, `Presumed`, `Authored`, `Displaced` (a same-kind unit took the
 slot — a human decides), `WrongUnit`, or `Unverified`.
 
 ## Usage
@@ -98,6 +98,7 @@ let reporter = app.add_device_reporter(
                 scheme: SchemeName::new("edid")?,
             },
         )),
+    std::time::Duration::from_secs(10),
     ),
 );
 ```
@@ -119,6 +120,30 @@ impl DeviceReporter for MonitorReporter {
 `discover` receives no `World` on purpose — it is the boundary that keeps
 enumeration out of the kernel's own state.
 
+### Implementing an endpoint driver
+
+Every `EndpointDriver` names the live handle it needs as `type Target`. Before
+starting each apply, the kernel calls
+`resolve_target(...) -> TargetResolution<Self::Target>`:
+
+- `Reached(target)` proves that the driver can reach the target. This is the
+  only outcome that proceeds to `start_apply`, and the kernel passes that exact
+  `target: Self::Target` into the call.
+- `TargetDetached` means the application entity the driver operates is not
+  attached for this lifetime, even if the physical device is healthy. No apply
+  starts.
+- `DeviceUnavailable(error)` retains the classified `DeviceAccessError` for
+  kernel policy. No apply starts.
+
+`ApplyStart` no longer exists; these `TargetResolution` variants carry its
+former outcomes. `start_apply` returns `()` and reports later progress through `poll`. The
+kernel uses `DeviceAccessError::apply_failure_disposition()` for the same
+class-to-policy decision whether the error came from target resolution or a
+started apply: `Reconsider`, `AwaitClearance`, or `Fault`. A reconsidered
+resolution failure rolls back the unstarted attempt and emits no attempt-ending
+event. The role's reflected `RoleStatus` retains the actionable wait, retry run,
+and last started-attempt ending for operator diagnostics.
+
 Bind an application-stable role to a device endpoint, and state every policy
 explicitly. There are no implicit recovery defaults hiding in the kernel:
 
@@ -131,16 +156,16 @@ app.world_mut().resource_mut::<Bindings>().register(Binding {
     retry:    RetryOn::NewRevision,
     on_abort: OnAbort::Revert,
     on_loss:  OnSessionLoss::Recreate,
-    state:    RoleState::default(),
     requested: RequestedConfiguration::new(WindowPlacement { left: 0, top: 0 }),
     last_known_good: LastKnownGoodConfiguration::default(),
     apply_deadline:  ApplyDeadline::ProcessDefault,
+    flow_expectation: FlowExpectation::NotMonitored,
 })?;
 ```
 
-Then read state off the mirrored entities, or observe the derived events —
-`DeviceArrived`, `DeviceDeparted`, `PresenceChanged`, `IdentityChanged`,
-`RoleAwaiting`, `RoleAvailable`, `AttemptFinished`, and the rest.
+Then read `RoleStatus` off the mirrored entities, or observe `DeviceArrived`, `DeviceChange`,
+`IdentityChanged`, `LiveRoleChanged`, `RetiredRoleChanged`, `RegistrationAttemptEnded`, and the
+discovery events.
 
 The `rigging_kernel` example is a complete headless run: two reporters pushing
 overlapping scans that agree on one panel and disagree about everything else, an
@@ -175,7 +200,8 @@ These are enforced, not aspirational:
 - The kernel never silently puts a device in service; the default policy is
   `Forget`
 - Resources are authoritative, entity components are read-only mirrors
-- `start_apply` returns immediately and every poll re-validates that the
+- `resolve_target` must return `Reached` before `start_apply` runs;
+  `start_apply` returns immediately, and every poll re-validates that the
   attempt still targets the same physical unit
 
 ## Version Compatibility

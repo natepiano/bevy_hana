@@ -3,8 +3,8 @@
 //! Rust's `as` casts between numeric types trigger a family of clippy pedantic lints
 //! (`cast_precision_loss`, `cast_possible_truncation`, `cast_possible_wrap`,
 //! `cast_sign_loss`) that are noisy in geometry and game code where the values are
-//! known to be small. These traits centralize the `#[allow]` in one place so call
-//! sites stay clean and the cast intent is explicit.
+//! known to be small. These traits hold the `#[allow]` in one place, and the method
+//! name at the call site states which type the value is converted to.
 //!
 //! # Safety contract
 //!
@@ -243,9 +243,9 @@ impl ToU16 for f32 {
 
 /// Widening conversion to `f64`.
 ///
-/// All current impls are lossless or precision-losing only for very large
-/// `usize` values (above 2^53). The caller should be aware that `usize`
-/// values above `f64`'s exact-integer range will silently lose precision.
+/// The `u32`, `i32`, and `f32` impls are lossless. The `usize` and `u64` impls
+/// lose precision above 2^53, the top of `f64`'s exact-integer range, and lose
+/// it silently.
 pub trait ToF64 {
     /// Convert to `f64`.
     fn to_f64(self) -> f64;

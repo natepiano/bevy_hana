@@ -78,7 +78,7 @@ use crate::ScalarLimit;
 /// lagrange camera input mode.
 ///
 /// `CameraControlSummary` is produced from runtime input-mode settings and,
-/// when available, camera state. It is intended for UI/help surfaces such as
+/// when available, camera state, and is rendered by UI/help surfaces such as
 /// Fairy Dust panels. It does not contain the runtime input bindings consumed
 /// by the controller.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -174,7 +174,7 @@ pub enum CameraControlAction {
     Roll,
     /// Reset the camera to its home pose.
     Home,
-    /// Fallback for custom or future camera actions a renderer cannot name yet.
+    /// Fallback for a camera action with no variant of its own.
     Other,
 }
 
@@ -1805,8 +1805,8 @@ mod tests {
         assert_eq!(row_speed(&summary, "rb+rt"), Some(ControlSpeed::Slow));
         assert_eq!(row_speed(&summary, "lb+lt"), Some(ControlSpeed::Slow));
 
-        // The right triggers zoom in, the left triggers zoom out — the panel
-        // highlights only the engaged direction off these tags.
+        // The right triggers zoom in, the left triggers zoom out; the panel
+        // highlights only the engaged direction from these tags.
         assert_eq!(row_direction(&summary, "rt"), Some(ZoomDirection::In));
         assert_eq!(row_direction(&summary, "lt"), Some(ZoomDirection::Out));
         assert_eq!(row_direction(&summary, "rb+rt"), Some(ZoomDirection::In));

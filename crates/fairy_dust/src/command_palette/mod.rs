@@ -7,7 +7,7 @@
 //! capabilities are reached through it — see [`crate::keymap`]. The query field
 //! is an editable panel field driven by `hana_diegetic`'s IME session, so the
 //! platform candidate window is positioned at the caret and Fairy Dust's own
-//! keyboard shortcuts stand down while the session holds the window's input
+//! keyboard shortcuts do not run while the session holds the window's input
 //! lease.
 
 mod constants;
@@ -260,9 +260,9 @@ struct PaletteCommittedQuery(String);
 
 /// Whether Rubric has assembled the registry needed to query the palette.
 ///
-/// This is deliberately separate from a keymap availability result: once the
-/// registry is assembled, a terminal `KeymapBindings` state is still queried
-/// and rendered through Rubric's typed `PaletteBinding::KeymapUnavailable`.
+/// This is separate from a keymap availability result: once the registry is
+/// assembled, a terminal `KeymapBindings` state is still queried and rendered
+/// through Rubric's typed `PaletteBinding::KeymapUnavailable`.
 enum PaletteRegistryAssembly<'registry> {
     /// Plugin assembly has not yet published command metadata.
     AwaitingAssembly,
@@ -342,8 +342,8 @@ fn hand_keyboard_to_query_field(
 
 /// Opens or closes the palette from Fairy Dust's physical recovery chord.
 ///
-/// This bypasses Rubric's matcher intentionally, so it cancels any existing
-/// partial match before the observer below decides whether to open or close the panel.
+/// This bypasses Rubric's matcher, so it cancels any existing partial match
+/// before the observer below opens the panel or closes it.
 fn toggle_command_palette_from_recovery_keystroke(world: &mut World) {
     let recovery_pressed = world
         .get_resource::<ButtonInput<KeyCode>>()
@@ -429,7 +429,7 @@ fn open_palette_ime_after_panel_layout(
 }
 
 /// Selects the palette's inline field in applications and a stable app-owned
-/// target in headless tests, which deliberately omit screen-panel positioning.
+/// target in headless tests, which omit screen-panel positioning.
 fn palette_ime_target(panel: Entity) -> ImeTarget {
     #[cfg(test)]
     {
@@ -1465,9 +1465,9 @@ mod tests {
         assert_eq!(app.world().resource::<DispatchedCommands>().0, 1);
     }
 
-    /// The shipped document deliberately leaves the recovery chord out of
-    /// authored bindings, so opening remains available only through the direct
-    /// Fairy Dust recovery system.
+    /// The shipped document leaves the recovery chord out of authored
+    /// bindings, so opening remains available only through the direct Fairy Dust
+    /// recovery system.
     #[test]
     fn the_shipped_defaults_leave_the_recovery_command_unbound() {
         let app = palette_test_app();

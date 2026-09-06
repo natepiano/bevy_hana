@@ -54,17 +54,19 @@ pub fn command_palette_recovery_keystroke() -> Keystroke {
 
 /// Returns the command id the application-owned recovery chord invokes.
 ///
-/// Applications that install the state-dimension `KeymapPlugin` themselves use this together
-/// with [`command_palette_recovery_keystroke`] so their base configuration exactly matches Fairy
-/// Dust's deferred install.
+/// Applications that install a contextual [`KeymapPlugin`] before Fairy Dust
+/// pass this and [`command_palette_recovery_keystroke`] to
+/// [`KeymapPlugin::with_protected_command_binding`], so their base
+/// configuration matches Fairy Dust's deferred install instead of being
+/// refused as a disagreement.
 #[must_use]
 pub fn command_palette_recovery_command_id() -> CommandId { command_palette::recovery_command_id() }
 
 /// Reports whether this frame pressed Fairy Dust's recovery chord.
 ///
-/// This deliberately reads physical input rather than going through Rubric's
-/// keymap routing: the chord must still open the repair palette when no
-/// validated bindings exist.
+/// This reads physical input directly instead of going through Rubric's keymap
+/// routing: the chord must still open the repair palette when no validated
+/// bindings exist.
 pub(crate) fn recovery_keystroke_pressed(keys: &ButtonInput<KeyCode>) -> bool {
     keys.just_pressed(KeyCode::KeyP)
         && recovery_has_secondary_modifier(keys)
@@ -83,8 +85,8 @@ fn recovery_has_secondary_modifier(keys: &ButtonInput<KeyCode>) -> bool {
         .any(|modifier| keys.pressed(modifier))
 }
 
-/// Reports modifiers that turn Command/Control+P into a different authored
-/// chord, such as secondary-shift-p.
+/// Reports whether a modifier is down that turns Command/Control+P into a
+/// different authored chord, such as secondary-shift-p.
 fn recovery_has_extra_modifier(keys: &ButtonInput<KeyCode>) -> bool {
     let non_secondary_modifiers = if cfg!(target_os = "macos") {
         [KeyCode::ControlLeft, KeyCode::ControlRight]
@@ -491,9 +493,9 @@ mod tests {
         install(&mut app);
     }
 
-    /// The whole point of the baseline install: an application that never asks
-    /// for the command palette still reaches every Fairy Dust capability by its
-    /// keystroke. A missing binding here is a dead hotkey in every example.
+    /// An application that never asks for the command palette still reaches
+    /// every Fairy Dust capability by its keystroke. A missing binding here is a
+    /// dead hotkey in every example.
     #[test]
     fn the_baseline_install_binds_every_fairy_dust_command() {
         let mut app = App::new();

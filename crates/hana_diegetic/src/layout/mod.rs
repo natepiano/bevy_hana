@@ -1,7 +1,7 @@
 //! Layout engine for diegetic UI panels.
 //!
-//! This module provides a Clay-inspired layout algorithm implemented in pure Rust
-//! with no global state, no unsafe code, and full thread safety.
+//! A Clay-inspired layout algorithm in pure Rust, with no global state, no unsafe
+//! code, and full thread safety.
 //!
 //! # Retained-mode vs immediate-mode
 //!
@@ -23,13 +23,15 @@
 //!
 //! Retained mode is the natural fit for Bevy. The entire ECS is built around doing nothing
 //! unless something changed — `Changed<T>`, `Added<T>`, `Res::is_changed()`, observers.
-//! An immediate-mode layout engine would fight the framework by recomputing unconditionally
-//! every frame. Retained mode lets Bevy's change detection skip layout entirely on frames
-//! where the tree hasn't been touched.
+//! An immediate-mode layout engine recomputes every frame whether or not anything changed.
+//! Retained mode lets Bevy's change detection skip layout entirely on frames where the tree
+//! hasn't been touched.
 //!
 //! # Architecture
 //!
-//! - [`types`] — Core layout types: `Sizing`, `Direction`, `Padding`, `BoundingBox`, etc.
+//! - [`sizing`] — Sizing and child-flow types: [`Sizing`], [`Direction`], [`Padding`], [`AlignX`],
+//!   [`AlignY`].
+//! - [`geometry`] — [`BoundingBox`], [`Border`], [`CornerRadius`], [`ChildDivider`].
 //! - [`element`] — Arena-based element tree ([`LayoutTree`], [`Element`]). [`Element`] is the
 //!   canonical storage format; users construct elements via [`El`] instead.
 //! - [`builder`] — [`El`] is the ergonomic fluent builder that converts into [`Element`].
@@ -110,9 +112,9 @@ pub(crate) use render::DrawSortTier;
 pub use render::RectangleSource;
 pub use render::RenderCommand;
 pub use render::RenderCommandKind;
-pub use shape_cache::LineMetricsSnapshot;
 pub use shape_cache::ResolvedFontFace;
 pub use shape_cache::ShapedGlyph;
+pub use shape_cache::ShapedLineMetrics;
 pub use shape_cache::ShapedTextCache;
 pub use shape_cache::ShapedTextRun;
 pub use sizing::AlignX;
@@ -148,15 +150,15 @@ pub use units::Unit;
 
 /// Sets the root element's width sizing to `Grow { min, max }`.
 ///
-/// Screen-space dynamic sizing uses this crate-internal facade so wider
-/// callers do not need direct access to nested `element` internals.
+/// Screen-space dynamic sizing calls this crate-internal wrapper, so code
+/// outside `layout` does not need access to `element`'s `pub(super)` methods.
 pub(crate) fn set_root_grow_width(tree: &mut LayoutTree, min: Dimension, max: Dimension) {
     tree.set_root_grow_width(min, max);
 }
 
 /// Sets the root element's height sizing to `Grow { min, max }`.
 ///
-/// See [`set_root_grow_width`] for the rationale behind this facade.
+/// See [`set_root_grow_width`] for why this wrapper exists.
 pub(crate) fn set_root_grow_height(tree: &mut LayoutTree, min: Dimension, max: Dimension) {
     tree.set_root_grow_height(min, max);
 }

@@ -11,8 +11,8 @@ use crate::layout::constants::POINTS_PER_INCH;
 /// what "1.0" means for layout dimensions and font sizes. Standalone
 /// per-entity font units are authored through `override_font_unit`.
 ///
-/// `Custom(f32)` is an escape hatch for any unit not covered by the named
-/// variants — the value is meters per unit.
+/// `Custom(f32)` covers any unit outside the named variants; its value is
+/// meters per unit.
 ///
 /// # Examples
 ///

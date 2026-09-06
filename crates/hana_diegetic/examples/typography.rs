@@ -281,7 +281,7 @@ struct WordCycle {
     timer: Timer,
 }
 
-/// Keeps loaded font handles alive so they don't get unloaded.
+/// Holds the loaded font handles so the font assets are not dropped.
 #[derive(Resource, Default)]
 struct FontHandles(Vec<Handle<Font>>);
 

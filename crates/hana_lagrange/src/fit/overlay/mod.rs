@@ -1,4 +1,4 @@
-//! Debug overlay system for fit target debugging.
+//! Debug overlay for the camera's current fit target.
 //!
 //! Provides retained screen-aligned boundary box, silhouette polygon, margin
 //! line, and label visualization for the current camera fit target.
@@ -28,8 +28,8 @@ pub use render::FitTargetOverlayConfig;
 
 /// Enables the fit target debug overlay on a camera entity.
 ///
-/// Insert this component to enable the overlay; remove it to disable the
-/// overlay. The presence or absence of `FitOverlay` is the toggle.
+/// Insert this component to turn the overlay on; remove it to turn it off.
+/// There is no enabled flag — presence on the camera is the whole toggle.
 ///
 /// Generated overlay visuals are owned by this camera. Retained line visuals
 /// copy this camera's effective `RenderLayers`, render through normal Bevy
@@ -44,7 +44,8 @@ pub struct FitOverlay;
 #[derive(SystemSet, Debug, Hash, PartialEq, Eq, Clone)]
 struct FitOverlaySystemSet;
 
-/// Plugin that enables fit target debug visualization.
+/// Registers the overlay's line material, config resources, and the
+/// `PostUpdate` systems that draw and reconcile its visuals.
 pub(super) struct FitOverlayPlugin;
 
 impl Plugin for FitOverlayPlugin {

@@ -79,8 +79,8 @@ where
 ///
 /// Every stage inherits `default_timing` and folds each of its members to
 /// [`FoldTarget::FOLDED`](crate::FoldTarget::FOLDED), which is the
-/// ordinary "unfold this sheet one group at a time" sequence. A provider that
-/// wants anything else authors it through
+/// ordinary "unfold this sheet one group at a time" sequence. Any other stage
+/// layout is authored through
 /// [`ArrangementProvider::with_custom_fold_sequence`].
 pub(super) fn stage_per_group(groups: &FoldGroups, default_timing: FoldTiming) -> FoldSequence {
     FoldSequenceBuilder::new(default_timing)

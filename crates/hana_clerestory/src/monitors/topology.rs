@@ -1,7 +1,7 @@
 //! Installed monitor topology and raw lifetime events.
 
 use std::collections::HashMap;
-#[cfg(test)]
+#[cfg(any(test, feature = "test"))]
 use std::collections::HashSet;
 use std::fmt;
 use std::fmt::Display;
@@ -14,14 +14,13 @@ use bevy::prelude::DetectChanges;
 use bevy::prelude::Entity;
 use bevy::prelude::Event;
 use bevy::prelude::IVec2;
-use bevy::prelude::Mut;
 use bevy::prelude::Query;
 use bevy::prelude::Reflect;
 use bevy::prelude::ReflectEvent;
 use bevy::prelude::ReflectResource;
 use bevy::prelude::RemovedComponents;
 use bevy::prelude::Res;
-#[cfg(test)]
+#[cfg(any(test, feature = "test"))]
 use bevy::prelude::ResMut;
 use bevy::prelude::Resource;
 use bevy::prelude::UVec2;
@@ -44,18 +43,17 @@ use winit::monitor::MonitorHandle;
 use winit::platform::macos::MonitorHandleExtMacOS;
 
 use super::DisplayProductName;
-use super::MonitorDeviceAssociation;
 use super::MonitorDiscoveryRequestCoverage;
 use super::current_monitor;
 use super::display_product_name;
 use super::identity;
+use super::identity::DisplayIdentity;
+use super::identity::DisplayIdentityEvidence;
 use super::identity::MonitorConfiguration;
 use super::identity::MonitorConfigurationState;
-#[cfg(test)]
+#[cfg(any(test, feature = "test"))]
 use super::identity::MonitorIdentificationError;
-use super::identity::PanelIdentity;
-use super::identity::PanelIdentityEvidence;
-#[cfg(test)]
+#[cfg(any(test, feature = "test"))]
 use super::identity::QualifiedEvidence;
 #[cfg(feature = "monitor-probe")]
 use super::monitor_probe;
@@ -358,8 +356,10 @@ impl Monitors {
             .expect("Monitors::closest_to() requires at least one monitor")
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_test_monitors(
+    /// Builds an installed monitor topology for downstream regression tests.
+    #[cfg(any(test, feature = "test"))]
+    #[must_use]
+    pub fn from_test_monitors(
         monitors: impl IntoIterator<Item = (Entity, MonitorDescriptor)>,
     ) -> Self {
         let live = monitors
@@ -369,7 +369,7 @@ impl Monitors {
                 descriptor,
                 product_name: DisplayProductName::PlatformHasNoConcept,
                 device_evidence: DisplayDeviceEvidence::unavailable(),
-                legacy_panel_identity: PanelIdentity::Anonymous,
+                legacy_identity: DisplayIdentity::Anonymous,
             })
             .collect();
         Self { live }
@@ -378,30 +378,30 @@ impl Monitors {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct InstalledMonitor {
-    pub(super) entity:                Entity,
-    pub(super) descriptor:            MonitorDescriptor,
-    pub(super) product_name:          DisplayProductName,
-    pub(super) device_evidence:       DisplayDeviceEvidence,
-    pub(super) legacy_panel_identity: PanelIdentity,
+    pub(super) entity:          Entity,
+    pub(super) descriptor:      MonitorDescriptor,
+    pub(super) product_name:    DisplayProductName,
+    pub(super) device_evidence: DisplayDeviceEvidence,
+    pub(super) legacy_identity: DisplayIdentity,
 }
 
 /// Kernel-facing evidence retained for one display without its Clerestory descriptor.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DisplayDeviceEvidence {
-    pub(crate) panel_identity:         PanelIdentityEvidence,
+    pub(crate) identity_evidence:      DisplayIdentityEvidence,
     pub(crate) platform_device_handle: PlatformDeviceHandle,
     pub(crate) attachment:             AttachmentPath,
 }
 
 impl DisplayDeviceEvidence {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test"))]
     #[allow(
         clippy::missing_const_for_fn,
         reason = "`platform_device_handle` is a `const fn` only on non-macOS targets"
     )]
     fn unavailable() -> Self {
         Self {
-            panel_identity:         PanelIdentityEvidence::Unavailable {
+            identity_evidence:      DisplayIdentityEvidence::Unavailable {
                 serial: ReportedSerial::PlatformCannotReport,
             },
             platform_device_handle: platform_device_handle(None),
@@ -414,7 +414,9 @@ impl DisplayDeviceEvidence {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct EnumeratedDisplayEvidence {
     pub(crate) entity:          Entity,
+    pub(crate) descriptor:      MonitorDescriptor,
     pub(crate) device_evidence: DisplayDeviceEvidence,
+    pub(crate) legacy_identity: DisplayIdentity,
 }
 
 /// Whether Clerestory has installed an observed display topology for the device reporter.
@@ -445,7 +447,7 @@ pub(super) struct MonitorChanges {
     pub(super) evidence_changed: Vec<InstalledMonitor>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct TopologyProducerActivity {
     pub topology_scans:       usize,
@@ -456,55 +458,105 @@ pub(super) struct TopologyProducerActivity {
     pub evidence_loads:       usize,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test"))]
 #[derive(Default, Resource)]
 pub(crate) struct InjectedMonitorEvidence {
-    evidence:        HashMap<Entity, Result<&'static [u8], MonitorIdentificationError>>,
+    evidence:        HashMap<Entity, Result<Vec<u8>, MonitorIdentificationError>>,
     attachments:     HashMap<Entity, AttachmentPath>,
+    /// The capture address the scripted platform reports for each display.
+    ///
+    /// A scripted display has no `MonitorHandle` to read one off, and the handle is not identity
+    /// material: it is the per-process address a screen reporter joins its own records to the
+    /// display reporter's on. Deriving it from the absent handle reports
+    /// `PlatformDeviceHandle::PlatformReportedNothing` for every scripted display, which keys
+    /// correctly and joins to nothing.
+    device_handles:  HashMap<Entity, PlatformDeviceHandle>,
     product_names:   HashMap<Entity, DisplayProductName>,
     missing_handles: HashSet<Entity>,
     activity:        TopologyProducerActivity,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test"))]
 impl InjectedMonitorEvidence {
+    #[cfg(test)]
     pub(crate) fn identified(entity: Entity, evidence: &'static [u8]) -> Self {
         Self {
-            evidence: HashMap::from([(entity, Ok(evidence))]),
+            evidence: HashMap::from([(entity, Ok(evidence.to_vec()))]),
             ..Self::default()
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn identified_pair(
         first: (Entity, &'static [u8]),
         second: (Entity, &'static [u8]),
     ) -> Self {
         Self {
-            evidence: HashMap::from([(first.0, Ok(first.1)), (second.0, Ok(second.1))]),
+            evidence: HashMap::from([
+                (first.0, Ok(first.1.to_vec())),
+                (second.0, Ok(second.1.to_vec())),
+            ]),
             ..Self::default()
         }
     }
 
+    /// Stand in for the platform behind a set of scripted displays.
+    ///
+    /// `bytes` is the identity material the display publishes, or `None` for a display whose scan
+    /// produces none; the second case joins `missing_handles`, which is how the scan reports a
+    /// display it can name no durable key for.
+    pub(crate) fn for_scripted_displays(
+        displays: impl IntoIterator<
+            Item = (
+                Entity,
+                Option<Vec<u8>>,
+                AttachmentPath,
+                PlatformDeviceHandle,
+            ),
+        >,
+    ) -> Self {
+        let mut injected = Self::default();
+        for (entity, bytes, attachment, device_handle) in displays {
+            injected.attachments.insert(entity, attachment);
+            injected.device_handles.insert(entity, device_handle);
+            match bytes {
+                Some(bytes) => {
+                    injected.evidence.insert(entity, Ok(bytes));
+                },
+                None => {
+                    injected.missing_handles.insert(entity);
+                },
+            }
+        }
+        injected
+    }
+
+    #[cfg(test)]
     pub(crate) fn report_product_name(&mut self, entity: Entity, product_name: impl Into<String>) {
         self.product_names
             .insert(entity, DisplayProductName::Reported(product_name.into()));
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test"))]
 #[derive(Default, Resource)]
 pub(crate) struct InjectedWinitMonitorOrder {
     entities: Vec<Entity>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test"))]
 impl InjectedWinitMonitorOrder {
+    #[cfg(test)]
     pub(crate) fn single(entity: Entity) -> Self {
         Self {
             entities: vec![entity],
         }
     }
 
+    /// Stand in for the cached winit enumeration order behind a set of scripted displays.
+    pub(crate) const fn for_entities(entities: Vec<Entity>) -> Self { Self { entities } }
+
+    #[cfg(test)]
     pub(crate) fn pair(first: Entity, second: Entity) -> Self {
         Self {
             entities: vec![first, second],
@@ -544,7 +596,7 @@ fn monitor_changes(previous: &Monitors, rebuilt: &Monitors) -> MonitorChanges {
             previous.live.iter().any(|previous| {
                 previous.entity == monitor.entity
                     && (previous.device_evidence != monitor.device_evidence
-                        || previous.legacy_panel_identity != monitor.legacy_panel_identity)
+                        || previous.legacy_identity != monitor.legacy_identity)
             })
         })
         .cloned()
@@ -570,8 +622,7 @@ fn installed_topology_changed(previous: &Monitors, rebuilt: &Monitors) -> bool {
                         || rebuilt_monitor.descriptor != previous_monitor.descriptor
                         || rebuilt_monitor.product_name != previous_monitor.product_name
                         || rebuilt_monitor.device_evidence != previous_monitor.device_evidence
-                        || rebuilt_monitor.legacy_panel_identity
-                            != previous_monitor.legacy_panel_identity
+                        || rebuilt_monitor.legacy_identity != previous_monitor.legacy_identity
                 })
         })
 }
@@ -579,10 +630,10 @@ fn installed_topology_changed(previous: &Monitors, rebuilt: &Monitors) -> bool {
 fn assign_cached_monitor_order(
     scanned: &mut [ScannedMonitor],
     winit_monitors: &WinitMonitors,
-    #[cfg(test)] mut injected_evidence: Option<&mut InjectedMonitorEvidence>,
-    #[cfg(test)] injected_order: Option<&InjectedWinitMonitorOrder>,
+    #[cfg(any(test, feature = "test"))] mut injected_evidence: Option<&mut InjectedMonitorEvidence>,
+    #[cfg(any(test, feature = "test"))] injected_order: Option<&InjectedWinitMonitorOrder>,
 ) {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test"))]
     if let Some(injected_order) = injected_order {
         for monitor in &mut *scanned {
             if let Some(injected_evidence) = injected_evidence.as_deref_mut() {
@@ -599,7 +650,7 @@ fn assign_cached_monitor_order(
 
     let cached_handles: Vec<_> = (0..).map_while(|index| winit_monitors.nth(index)).collect();
     for monitor in &mut *scanned {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test"))]
         if let Some(injected_evidence) = injected_evidence.as_deref_mut() {
             injected_evidence.activity.cached_order_lookups += 1;
         }
@@ -636,31 +687,50 @@ fn display_evidence(
     monitor: &ScannedMonitor,
     configuration: MonitorConfigurationState,
     platform: Platform,
-    #[cfg(test)] injected_evidence: Option<&mut InjectedMonitorEvidence>,
-) -> (DisplayDeviceEvidence, PanelIdentity) {
+    #[cfg(any(test, feature = "test"))] injected_evidence: Option<&mut InjectedMonitorEvidence>,
+) -> (DisplayDeviceEvidence, DisplayIdentity) {
     let unavailable = |attachment| {
         (
             DisplayDeviceEvidence {
-                panel_identity: PanelIdentityEvidence::Unavailable {
+                identity_evidence: DisplayIdentityEvidence::Unavailable {
                     serial: ReportedSerial::PlatformCannotReport,
                 },
                 platform_device_handle: platform_device_handle(monitor.handle.as_ref()),
                 attachment,
             },
-            PanelIdentity::Anonymous,
+            DisplayIdentity::Anonymous,
         )
     };
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test"))]
     if let Some(injected_evidence) = injected_evidence {
         injected_evidence.activity.identity_requests += 1;
+        // A scripted display publishes its capture address through the injection rather than
+        // through a `MonitorHandle` it does not have, and every branch below reports the same one.
+        let scripted_device_handle = injected_evidence
+            .device_handles
+            .get(&monitor.entity)
+            .cloned()
+            .unwrap_or_else(|| platform_device_handle(monitor.handle.as_ref()));
+        let scripted_unavailable = |attachment| {
+            (
+                DisplayDeviceEvidence {
+                    identity_evidence: DisplayIdentityEvidence::Unavailable {
+                        serial: ReportedSerial::PlatformCannotReport,
+                    },
+                    platform_device_handle: scripted_device_handle.clone(),
+                    attachment,
+                },
+                DisplayIdentity::Anonymous,
+            )
+        };
         if monitor.cached_index.is_none() {
             injected_evidence.activity.handle_lookups += 1;
-            return unavailable(identity::attachment_path_when_unreported(platform));
+            return scripted_unavailable(identity::attachment_path_when_unreported(platform));
         }
         if injected_evidence.missing_handles.contains(&monitor.entity) {
             injected_evidence.activity.handle_lookups += 1;
-            return unavailable(identity::attachment_path_when_unreported(platform));
+            return scripted_unavailable(identity::attachment_path_when_unreported(platform));
         }
         let attachment = injected_evidence
             .attachments
@@ -670,25 +740,25 @@ fn display_evidence(
         let evidence = injected_evidence
             .evidence
             .get(&monitor.entity)
-            .copied()
+            .cloned()
             .unwrap_or(Err(
                 MonitorIdentificationError::StablePhysicalIdentityUnavailable,
             ));
         injected_evidence.activity.handle_lookups += 1;
         injected_evidence.activity.evidence_loads += 1;
         return evidence.map_or_else(
-            |_| unavailable(attachment.clone()),
+            |_| scripted_unavailable(attachment.clone()),
             |bytes| {
-                let qualified = QualifiedEvidence::Synthetic(bytes.to_vec());
-                let (panel_identity, legacy_panel_identity) =
-                    identity::classify_panel_evidence(&qualified);
+                let qualified = QualifiedEvidence::Synthetic(bytes);
+                let (identity_evidence, legacy_identity) =
+                    identity::classify_display_evidence(&qualified);
                 (
                     DisplayDeviceEvidence {
-                        panel_identity,
-                        platform_device_handle: platform_device_handle(monitor.handle.as_ref()),
+                        identity_evidence,
+                        platform_device_handle: scripted_device_handle.clone(),
                         attachment: attachment.clone(),
                     },
-                    legacy_panel_identity,
+                    legacy_identity,
                 )
             },
         );
@@ -709,15 +779,15 @@ fn display_evidence(
     observation.identity.map_or_else(
         |_| unavailable(attachment.clone()),
         |evidence| {
-            let (panel_identity, legacy_panel_identity) =
-                identity::classify_panel_evidence(&evidence);
+            let (identity_evidence, legacy_identity) =
+                identity::classify_display_evidence(&evidence);
             (
                 DisplayDeviceEvidence {
-                    panel_identity,
+                    identity_evidence,
                     platform_device_handle: platform_device_handle(monitor.handle.as_ref()),
                     attachment: attachment.clone(),
                 },
-                legacy_panel_identity,
+                legacy_identity,
             )
         },
     )
@@ -744,15 +814,15 @@ const fn platform_device_handle(_: Option<&MonitorHandle>) -> PlatformDeviceHand
 fn display_product_name(
     monitor: &ScannedMonitor,
     platform: Platform,
-    #[cfg(test)] injected_evidence: Option<&InjectedMonitorEvidence>,
+    #[cfg(any(test, feature = "test"))] injected_evidence: Option<&InjectedMonitorEvidence>,
 ) -> DisplayProductName {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test"))]
     if let Some(injected_evidence) = injected_evidence {
         return injected_evidence
             .product_names
             .get(&monitor.entity)
             .cloned()
-            .unwrap_or(DisplayProductName::PlatformReportedNothing);
+            .unwrap_or(DisplayProductName::PlatformHasNoConcept);
     }
 
     display_product_name::from_platform(
@@ -767,17 +837,17 @@ fn build_monitors(
     winit_monitors: &WinitMonitors,
     configuration: MonitorConfigurationState,
     platform: Platform,
-    #[cfg(test)] mut injected_evidence: Option<&mut InjectedMonitorEvidence>,
-    #[cfg(test)] injected_order: Option<&InjectedWinitMonitorOrder>,
+    #[cfg(any(test, feature = "test"))] mut injected_evidence: Option<&mut InjectedMonitorEvidence>,
+    #[cfg(any(test, feature = "test"))] injected_order: Option<&InjectedWinitMonitorOrder>,
 ) -> Monitors {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test"))]
     if let Some(injected_evidence) = injected_evidence.as_deref_mut() {
         injected_evidence.activity.topology_scans += 1;
     }
 
     let mut scanned = Vec::new();
     for (entity, monitor) in monitors.iter() {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test"))]
         if let Some(injected_evidence) = injected_evidence.as_deref_mut() {
             injected_evidence.activity.component_reads += 1;
         }
@@ -795,9 +865,9 @@ fn build_monitors(
     assign_cached_monitor_order(
         &mut scanned,
         winit_monitors,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test"))]
         injected_evidence.as_deref_mut(),
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test"))]
         injected_order,
     );
 
@@ -808,7 +878,7 @@ fn build_monitors(
                 monitor,
                 configuration,
                 platform,
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test"))]
                 injected_evidence.as_deref_mut(),
             );
             (monitor.entity, evidence)
@@ -818,20 +888,20 @@ fn build_monitors(
     let live = scanned
         .into_iter()
         .map(|monitor| {
-            let (device_evidence, legacy_panel_identity) =
+            let (device_evidence, legacy_identity) =
                 evidence.get(&monitor.entity).cloned().unwrap_or_else(|| {
                     display_evidence(
                         &monitor,
                         configuration,
                         platform,
-                        #[cfg(test)]
+                        #[cfg(any(test, feature = "test"))]
                         None,
                     )
                 });
             let product_name = display_product_name(
                 &monitor,
                 platform,
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test"))]
                 injected_evidence.as_deref(),
             );
             InstalledMonitor {
@@ -844,7 +914,7 @@ fn build_monitors(
                 ),
                 product_name,
                 device_evidence,
-                legacy_panel_identity,
+                legacy_identity,
             }
         })
         .collect();
@@ -865,7 +935,9 @@ fn queue_topology_install(
             .iter()
             .map(|monitor| EnumeratedDisplayEvidence {
                 entity:          monitor.entity,
+                descriptor:      monitor.descriptor,
                 device_evidence: monitor.device_evidence.clone(),
+                legacy_identity: monitor.legacy_identity,
             })
             .collect(),
     );
@@ -873,12 +945,6 @@ fn queue_topology_install(
         world.insert_resource(rebuilt);
         world.insert_resource(display_topology_observation);
         world.insert_resource(revision);
-        if world.contains_resource::<MonitorDeviceAssociation>() {
-            world.resource_scope(|world, mut association: Mut<MonitorDeviceAssociation>| {
-                let monitors = world.resource::<Monitors>();
-                association.refresh(monitors);
-            });
-        }
         if topology_is_empty {
             current_monitor::remove_current_monitors_for_empty_topology(world);
         }
@@ -909,8 +975,10 @@ pub(super) fn init_monitors(
     configuration: Res<MonitorConfiguration>,
     platform: Res<Platform>,
     #[cfg(feature = "monitor-probe")] frame_count: Res<FrameCount>,
-    #[cfg(test)] mut injected_evidence: Option<ResMut<InjectedMonitorEvidence>>,
-    #[cfg(test)] injected_order: Option<Res<InjectedWinitMonitorOrder>>,
+    #[cfg(any(test, feature = "test"))] mut injected_evidence: Option<
+        ResMut<InjectedMonitorEvidence>,
+    >,
+    #[cfg(any(test, feature = "test"))] injected_order: Option<Res<InjectedWinitMonitorOrder>>,
     _: NonSendMarker,
 ) {
     let configuration = configuration.state();
@@ -919,9 +987,9 @@ pub(super) fn init_monitors(
         &winit_monitors,
         configuration,
         *platform,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test"))]
         injected_evidence.as_deref_mut(),
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test"))]
         injected_order.as_deref(),
     );
     debug!("[init_monitors] Found {} monitors", rebuilt.iter().len());
@@ -960,8 +1028,10 @@ pub(super) fn update_monitors(
     configuration: Res<MonitorConfiguration>,
     platform: Res<Platform>,
     #[cfg(feature = "monitor-probe")] frame_count: Res<FrameCount>,
-    #[cfg(test)] mut injected_evidence: Option<ResMut<InjectedMonitorEvidence>>,
-    #[cfg(test)] injected_order: Option<Res<InjectedWinitMonitorOrder>>,
+    #[cfg(any(test, feature = "test"))] mut injected_evidence: Option<
+        ResMut<InjectedMonitorEvidence>,
+    >,
+    #[cfg(any(test, feature = "test"))] injected_order: Option<Res<InjectedWinitMonitorOrder>>,
     _: NonSendMarker,
 ) {
     let configuration_changed = configuration.is_changed();
@@ -977,9 +1047,9 @@ pub(super) fn update_monitors(
         &winit_monitors,
         configuration,
         *platform,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test"))]
         injected_evidence.as_deref_mut(),
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test"))]
         injected_order.as_deref(),
     );
     if !installed_topology_changed(&previous, &rebuilt) {
@@ -1039,13 +1109,17 @@ mod tests {
         )
     }
 
-    fn retained(entity: Entity, index: usize, panel: PanelIdentity) -> InstalledMonitor {
+    fn retained(
+        entity: Entity,
+        index: usize,
+        legacy_identity: DisplayIdentity,
+    ) -> InstalledMonitor {
         InstalledMonitor {
             entity,
             descriptor: descriptor(index),
             product_name: DisplayProductName::PlatformHasNoConcept,
             device_evidence: DisplayDeviceEvidence::unavailable(),
-            legacy_panel_identity: panel,
+            legacy_identity,
         }
     }
 
@@ -1054,10 +1128,10 @@ mod tests {
         let first = Entity::from_bits(1);
         let replacement = Entity::from_bits(2);
         let previous = Monitors {
-            live: vec![retained(first, 0, PanelIdentity::Anonymous)],
+            live: vec![retained(first, 0, DisplayIdentity::Anonymous)],
         };
         let rebuilt = Monitors {
-            live: vec![retained(replacement, 0, PanelIdentity::Anonymous)],
+            live: vec![retained(replacement, 0, DisplayIdentity::Anonymous)],
         };
 
         let changes = monitor_changes(&previous, &rebuilt);
@@ -1129,7 +1203,7 @@ mod tests {
         assert_eq!(monitors.iter().len(), 1);
         assert!(monitors.iter().all(|monitor| matches!(
             monitor.product_name,
-            DisplayProductName::PlatformReportedNothing
+            DisplayProductName::PlatformHasNoConcept
         )));
         Ok(())
     }

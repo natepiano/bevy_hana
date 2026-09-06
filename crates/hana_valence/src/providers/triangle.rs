@@ -150,8 +150,9 @@ impl TriangleCreaseEdge {
 /// edge faces the row above. Row zero chains leftward from its root at
 /// `TriangleCell::new(0, 0)`. Each later row attaches to the row above through
 /// its leftmost downward-pointing cell — column zero on odd rows, column one
-/// on even rows — and chains outward from that link in both directions. No
-/// cell assumes it follows the previously enumerated member.
+/// on even rows — and chains outward from that link in both directions. Each
+/// cell's target comes from its own row and column, not from the enumeration
+/// order.
 ///
 /// One row or one column is a normal degenerate sheet and keeps the same
 /// row/column selection vocabulary. A single-column sheet has no downward cell

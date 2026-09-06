@@ -1,89 +1,184 @@
 //! Turning reconciled state changes into the events in `crate::events`.
 //!
-//! Everything here runs at the end of `crate::RiggingSystems::Reconcile`, after
+//! Device changes run at the end of `crate::RiggingSystems::Reconcile`, after
 //! `crate::reconcile::project_device_entities` has written this pass's conclusions onto entities.
-//! The mirrors are written only when a value differs, so Bevy's own change detection is the
-//! once-per-change gate: a settled frame leaves every mirror untouched and this stage emits
-//! nothing.
-//!
-//! `crate::RoleState` is the one axis emitted elsewhere. `crate::apply` writes it a full system set
-//! later and can move one role `Applying → Waiting → Applying` inside a single frame, which a
-//! mirror-derived event would arrive too late to see and would collapse into one arrival.
+//! Role status changes also run between lifecycle systems so an `Applying -> Waiting -> Applying`
+//! sequence in one frame publishes both edges.
 
-use bevy::ecs::change_detection::DetectChanges;
 use bevy::ecs::change_detection::Ref;
 use bevy::ecs::observer::On;
 use bevy::ecs::system::Commands;
 use bevy::ecs::system::Query;
-use bevy::ecs::system::Res;
 use bevy::ecs::system::ResMut;
+use bevy::log::info;
 use bevy::prelude::Added;
 use bevy::prelude::Entity;
 use bevy::prelude::Resource;
+use bevy::prelude::World;
 
 use crate::Bindings;
-use crate::Claim;
-use crate::ClaimChanged;
-use crate::ConfiguredDeviceConnectionChanged;
 use crate::DeviceArrived;
-use crate::DeviceDeparted;
+use crate::DeviceChange;
 use crate::DeviceKey;
-use crate::DeviceResolution;
-use crate::DeviceStateLookup;
 use crate::Devices;
 use crate::DiscoveryControl;
 use crate::DiscoveryFinished;
 use crate::DiscoveryProgressChanged;
 use crate::IdentityChanged;
 use crate::IdentityVerdict;
-use crate::Presence;
-use crate::PresenceChanged;
+use crate::KernelRolePresentation;
+use crate::KeyAvailability;
+use crate::LiveRoleChange;
+use crate::LiveRoleChanged;
 use crate::ReapplyConfiguration;
-use crate::RecoveryPolicy;
-use crate::RecoveryPolicyChanged;
+use crate::ReporterActivation;
 use crate::RetireRole;
-use crate::RoleAvailable;
-use crate::RoleAwaiting;
 use crate::RoleKey;
-use crate::SchemeName;
+use crate::RoleStatus;
 use crate::StartupDiscoveryChanged;
-use crate::UnregisteredSchemeReported;
 use crate::WaitingWork;
-use crate::devices::DepartureAnnouncements;
+use crate::apply;
+use crate::devices::DeviceChangeAnnouncements;
+use crate::devices::PriorKeyAvailability;
 use crate::discovery::DiscoveryTransition;
 use crate::discovery::DiscoveryTransitionJournal;
+use crate::presentation;
 use crate::registration::Reporters;
 
-/// Which schemes and role-availability edges have already reached a consumer.
-///
-/// Kept because neither fact is mirrored onto an entity, so neither has Bevy change detection
-/// behind it. `crate::Devices::unregistered_schemes` is a retained set that keeps naming a rejected
-/// scheme for the life of the process, and a role's availability is derived from a resource lookup
-/// rather than from a component, so both would restate themselves on every frame without a record
-/// of what was already said.
-#[derive(Debug, Default, Resource)]
-pub(crate) struct AnnouncedEdges {
-    /// Schemes a `crate::UnregisteredSchemeReported` has already been emitted for.
-    schemes:   Vec<SchemeName>,
-    /// Roles currently reported as waiting for hardware, so the closing `crate::RoleAvailable`
-    /// edge fires once and the opening `crate::RoleAwaiting` edge does not repeat while the
-    /// wait lasts.
-    awaiting:  Vec<RoleKey>,
-    /// Roles already reported as resolved, so a role that never went absent is not re-announced
-    /// every frame its device stays put.
-    available: Vec<RoleKey>,
+enum RoleStatusWriteTarget {
+    LiveMirror(Entity),
+    MirrorBeingRebuilt,
 }
 
-/// Emit one event per device-entity state axis that moved this pass.
+/// Roles whose missing devices have already requested reporter discovery.
+#[derive(Default, Resource)]
+pub(crate) struct ReporterWaitDiscoveryRequests {
+    waiting_roles: Vec<RoleKey>,
+}
+
+fn live_binding_entity(world: &World, binding: Entity) -> RoleStatusWriteTarget {
+    if world.get_entity(binding).is_ok() {
+        RoleStatusWriteTarget::LiveMirror(binding)
+    } else {
+        RoleStatusWriteTarget::MirrorBeingRebuilt
+    }
+}
+
+/// Write every queued role status and emit its typed edge from the same boundary.
+pub(crate) fn publish_role_status_changes(world: &mut World) {
+    let changes = if world.resource::<Bindings>().has_status_changes() {
+        world.resource_mut::<Bindings>().take_status_changes()
+    } else {
+        Vec::new()
+    };
+    for change in changes {
+        let Ok(indexed_binding) = world.resource::<Bindings>().role_entity(&change.role) else {
+            continue;
+        };
+        let RoleStatusWriteTarget::LiveMirror(binding) =
+            live_binding_entity(world, indexed_binding)
+        else {
+            // `reconcile_role_entities` replaces the missing entity on the next frame. The
+            // consumed `LiveRoleChanged` edge is not replayed; the backfill below inserts the
+            // current `Bindings::projected_role_status` on the replacement.
+            continue;
+        };
+        world
+            .entity_mut(binding)
+            .insert(RoleStatus::from_view(change.to.clone()));
+        world.trigger(LiveRoleChanged {
+            binding,
+            role: change.role.clone(),
+            change: LiveRoleChange::Status {
+                from: crate::RoleStatusBeforeChange::new(change.from),
+                to:   crate::RoleStatusAfterChange::new(change.to),
+            },
+        });
+    }
+
+    let registered_roles = world
+        .resource::<Bindings>()
+        .registered_role_entities()
+        .map(|(role, entity)| (role.clone(), entity))
+        .collect::<Vec<_>>();
+    let mut missing_statuses = Vec::new();
+    for (role, indexed_binding) in registered_roles {
+        let RoleStatusWriteTarget::LiveMirror(binding) =
+            live_binding_entity(world, indexed_binding)
+        else {
+            continue;
+        };
+        if world.get::<RoleStatus>(binding).is_some() {
+            continue;
+        }
+        if let Ok(status) = world.resource::<Bindings>().projected_status(&role) {
+            missing_statuses.push((binding, status));
+        }
+    }
+    for (binding, status) in missing_statuses {
+        world
+            .entity_mut(binding)
+            .insert(RoleStatus::from_view(status));
+    }
+    request_discovery_for_waiting_roles(world);
+    apply::publish_pending_attempt_endings(world);
+}
+
+/// Write the derived operator vocabulary for every registered role whose presentation moved.
 ///
-/// `Ref::is_changed` is true on the tick a component is inserted as well as on a later write, so a
-/// device's first reported reachability is an edge like any other and does not need a separate
-/// first-value path.
+/// Registered as the immediate successor of `publish_role_status_changes` at each of the kernel's
+/// three role-status publication boundaries, so the derivation reads the `crate::RoleStatus` that
+/// boundary just wrote rather than projecting a second one. A presentation therefore cannot
+/// disagree with the status published beside it, and no pass pays for a duplicate projection.
+pub(crate) fn publish_role_presentation_changes(world: &mut World) {
+    let bound_roles = {
+        let bindings = world.resource::<Bindings>();
+        bindings
+            .registered_role_entities()
+            .filter_map(|(role, entity)| {
+                let binding = bindings.binding(role).ok()?;
+                Some((binding.endpoint.device.clone(), entity))
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut moved_presentations = Vec::new();
+    for (device, indexed_binding) in bound_roles {
+        let RoleStatusWriteTarget::LiveMirror(binding) =
+            live_binding_entity(world, indexed_binding)
+        else {
+            continue;
+        };
+        // Neither half of this read can go missing under a live mirror, so the kernel never
+        // withdraws a presentation it has published: `publish_role_status_changes` backfills
+        // `RoleStatus` onto every live mirror in the immediately preceding system, and the
+        // retained availability table is only ever inserted into — `crate::reconcile` forces a
+        // merge pass whenever any bound key still lacks a conclusion. The two `let ... else`
+        // arms below are how the derivation borrows its evidence, not a withdrawal path.
+        let Some(status) = world.get::<RoleStatus>(binding) else {
+            continue;
+        };
+        let PriorKeyAvailability::Published(availability) =
+            world.resource::<Devices>().key_availability(&device)
+        else {
+            continue;
+        };
+        let derived = presentation::derive_role_presentation(status.view(), availability.clone());
+        let published = world.get::<KernelRolePresentation>(binding);
+        if !published.is_some_and(|published| *published.view() == derived) {
+            moved_presentations.push((binding, derived));
+        }
+    }
+    for (binding, derived) in moved_presentations {
+        world
+            .entity_mut(binding)
+            .insert(KernelRolePresentation::from_view(derived));
+    }
+}
+
+/// Emit application-observable device entity arrivals and identity changes.
 pub(crate) fn announce_device_changes(
     mut commands: Commands,
     arrived: Query<(Entity, &DeviceKey), Added<DeviceKey>>,
-    presences: Query<(Entity, Ref<'_, Presence>)>,
-    claims: Query<(Entity, Ref<'_, Claim>)>,
     verdicts: Query<(Entity, Ref<'_, IdentityVerdict>)>,
 ) {
     for (device, key) in &arrived {
@@ -92,24 +187,8 @@ pub(crate) fn announce_device_changes(
             key: key.clone(),
         });
     }
-    for (device, presence) in &presences {
-        if presence.is_changed() {
-            commands.trigger(PresenceChanged {
-                device,
-                presence: *presence,
-            });
-        }
-    }
-    for (device, claim) in &claims {
-        if claim.is_changed() {
-            commands.trigger(ClaimChanged {
-                device,
-                claim: (*claim).clone(),
-            });
-        }
-    }
     for (device, verdict) in &verdicts {
-        if verdict.is_changed() {
+        if bevy::ecs::change_detection::DetectChanges::is_changed(&verdict) {
             commands.trigger(IdentityChanged {
                 device,
                 verdict: (*verdict).clone(),
@@ -118,145 +197,92 @@ pub(crate) fn announce_device_changes(
     }
 }
 
-/// Emit one event per binding-entity state axis that moved this pass.
-///
-/// Only `crate::RecoveryPolicy` is mirror-derived here. `crate::RoleState` is announced from
-/// `crate::RiggingSystems::Apply` for the reason this module's own documentation gives.
-pub(crate) fn announce_binding_changes(
-    mut commands: Commands,
-    recoveries: Query<(Entity, &RoleKey, Ref<'_, RecoveryPolicy>)>,
-) {
-    for (binding, role, recovery) in &recoveries {
-        if recovery.is_changed() {
-            commands.trigger(RecoveryPolicyChanged {
-                binding,
-                role: role.clone(),
-                recovery: *recovery,
-            });
-        }
-    }
-}
-
-/// Emit the departure, connection, and rejected-scheme facts that have no mirrored component.
-///
-/// A departure that retired its key despawned the device entity before this runs, which is exactly
-/// why `crate::DeviceDeparted` is global and carries the durable key: there is nothing left to
-/// address or to read the key back from.
+/// Emit retained device availability changes.
 pub(crate) fn announce_reconciled_facts(
     mut commands: Commands,
-    mut departure_announcements: ResMut<DepartureAnnouncements>,
-    devices: Res<Devices>,
-    mut announced_edges: ResMut<AnnouncedEdges>,
+    mut device_change_announcements: ResMut<DeviceChangeAnnouncements>,
 ) {
-    for departed_device in departure_announcements.departed.drain(..) {
-        commands.trigger(DeviceDeparted {
-            key:       departed_device.key,
-            departure: departed_device.departure,
-        });
-    }
-    for connection_change in departure_announcements.connections.drain(..) {
-        commands.trigger(ConfiguredDeviceConnectionChanged {
-            key:        connection_change.key,
-            connection: connection_change.connection,
-        });
-    }
-    for scheme in devices.unregistered_schemes() {
-        if !announced_edges.schemes.contains(scheme) {
-            announced_edges.schemes.push(scheme.clone());
-            commands.trigger(UnregisteredSchemeReported {
-                scheme: scheme.clone(),
-            });
+    for change in device_change_announcements.availability.drain(..) {
+        if let KeyAvailability::Absent { established_by, .. } = &change.to {
+            info!(
+                "device `{:?}` entered Absent; established by reporter {} batch {}",
+                change.key,
+                established_by.reporter.get(),
+                established_by.batch.get()
+            );
         }
+        commands.trigger(DeviceChange::Availability {
+            key:  change.key,
+            from: change.from,
+            to:   change.to,
+        });
     }
+    device_change_announcements.connections.clear();
 }
 
-/// Whether a role's endpoint currently has a usable unit behind it.
-///
-/// `Devices::resolve` answers only whether the key is still mapped, and it stays mapped for a unit
-/// the scan still names while reporting it `Presence::Absent` or `Presence::Unreachable` — the
-/// departure a reporter produces when it can still enumerate the unit it lost. Presence is the
-/// question the availability edges are defined on, so resolution alone leaves a departed unit
-/// indistinguishable from a live one.
 fn endpoint_has_live_device(devices: &Devices, device: &DeviceKey) -> bool {
-    let DeviceResolution::Resolved(device_id) = devices.resolve(device) else {
-        return false;
-    };
     matches!(
-        devices.state(device_id),
-        DeviceStateLookup::Retained(reconciled_device_state)
-            if reconciled_device_state.presence == Presence::Present
+        devices.key_availability(device),
+        crate::devices::PriorKeyAvailability::Published(crate::KeyAvailability::Present(_))
     )
 }
 
-/// Emit the interval in which a registered role has no live device behind its endpoint.
-///
-/// Both events are global because during that interval there may be no device entity at all, and a
-/// role registered this frame may not have had its binding entity spawned yet.
-pub(crate) fn announce_role_availability(
-    mut commands: Commands,
-    bindings: Res<Bindings>,
-    devices: Res<Devices>,
-    mut announced_edges: ResMut<AnnouncedEdges>,
-) {
-    let mut awaiting = Vec::new();
-    let mut available = Vec::new();
-    for role in bindings.registered_roles() {
-        let Ok(binding) = bindings.binding(role) else {
-            continue;
-        };
-        if endpoint_has_live_device(&devices, &binding.endpoint.device) {
-            available.push(role.clone());
-        } else {
-            awaiting.push(role.clone());
-        }
+/// Request the enabled reporter covering every newly unresolved role.
+fn request_discovery_for_waiting_roles(world: &mut World) {
+    let unresolved_roles = {
+        let bindings = world.resource::<Bindings>();
+        let devices = world.resource::<Devices>();
+        bindings
+            .registered_role_entities()
+            .filter_map(|(role, _)| {
+                let binding = bindings.binding(role).ok()?;
+                (!endpoint_has_live_device(devices, &binding.endpoint.device)).then(|| role.clone())
+            })
+            .collect::<Vec<_>>()
+    };
+    let new_requests = {
+        let mut requests = world.resource_mut::<ReporterWaitDiscoveryRequests>();
+        let new_requests = unresolved_roles
+            .iter()
+            .filter(|role| !requests.waiting_roles.contains(role))
+            .cloned()
+            .collect::<Vec<_>>();
+        requests.waiting_roles = unresolved_roles;
+        new_requests
+    };
+    for role in new_requests {
+        request_discovery_for_hardware_wait(world, &role);
     }
-
-    for role in &awaiting {
-        if !announced_edges.awaiting.contains(role) {
-            commands.trigger(RoleAwaiting { role: role.clone() });
-        }
-    }
-    for role in &available {
-        if !announced_edges.available.contains(role) {
-            commands.trigger(RoleAvailable { role: role.clone() });
-        }
-    }
-    announced_edges.awaiting = awaiting;
-    announced_edges.available = available;
 }
 
-/// Arm the reporter whose coverage can settle a role's wait for hardware.
-///
-/// A registered binding is a standing claim on hardware, so the kernel — not each caller — asks
-/// for the scan that resolves it: on the opening `crate::RoleAwaiting` edge, the first registered
-/// reporter whose `crate::ReporterCoverage` establishes absence for the endpoint's
-/// `crate::DeviceKey` is enabled through `DiscoveryControl::enable`, which also requests exactly
-/// one run — the only verb that reaches a `crate::ReporterActivation::Disabled` reporter, since
-/// `DiscoveryControl::mark_dirty` stays out of the due list while disabled. The edge fires once
-/// per awaiting interval, so an already-enabled reporter gets a single extra scan on a device
-/// departure and a settled wait requests nothing. A key no registered reporter covers arms
-/// nothing: no scan's omission of that key would prove anything.
-pub(crate) fn on_role_awaiting(
-    role_awaiting: On<RoleAwaiting>,
-    bindings: Res<Bindings>,
-    reporters: Res<Reporters>,
-    mut discovery_control: ResMut<DiscoveryControl>,
-) {
-    let Ok(binding) = bindings.binding(&role_awaiting.role) else {
+/// Request the enabled reporter covering one role's hardware endpoint.
+fn request_discovery_for_hardware_wait(world: &mut World, role: &RoleKey) {
+    let Some(device_key) = world
+        .resource::<Bindings>()
+        .binding(role)
+        .ok()
+        .map(|binding| binding.endpoint.device.clone())
+    else {
         return;
     };
-    let Some(covering_reporter) = reporters
+    let Some(covering_reporter) = world
+        .resource::<Reporters>()
         .registered_reporters()
         .find(|registered_reporter| {
-            registered_reporter
-                .coverage
-                .establishes_absence_for(&binding.endpoint.device)
+            registered_reporter.activation == ReporterActivation::Enabled
+                && registered_reporter
+                    .coverage
+                    .establishes_absence_for(&device_key)
         })
         .map(|registered_reporter| registered_reporter.reporter)
     else {
         return;
     };
-    drop(discovery_control.enable(covering_reporter));
+    drop(
+        world
+            .resource_mut::<DiscoveryControl>()
+            .request(covering_reporter),
+    );
 }
 
 /// Retire a role because application code asked for it, rather than because a device left.
@@ -270,11 +296,14 @@ pub(crate) fn on_retire_role(retire_role: On<RetireRole>, mut bindings: ResMut<B
 
 /// Answer an application's request to re-apply a role's saved configuration.
 ///
-/// Honoured only for `crate::RecoveryPolicy::ReapplyOnRequest`. `crate::RecoveryPolicy::Retain`
-/// promises the kernel remembers and reports but never touches the device, so honouring a request
-/// would break that promise through the front door; `crate::RecoveryPolicy::Forget` dropped the
-/// saved value at the departure and has nothing left to re-apply. Both leave the role's owed
-/// application request exactly where it was.
+/// Honoured for exactly the role the kernel is holding a saved value for:
+/// `crate::WaitingWork::ReapplyRequestOwed`. The hold is what the request answers, so the hold is
+/// what this reads — reaching back for the `crate::RecoveryPolicy` would re-derive a conclusion the
+/// departure already recorded, and the two derivations would eventually disagree.
+///
+/// `crate::WaitingWork::RegistrationOwed` is refused: that role's saved value was dropped at the
+/// departure and there is nothing left to re-apply, so its hold is cleared by registering a binding
+/// carrying a fresh configuration instead. Every other state is refused because nothing is owed.
 pub(crate) fn on_reapply_configuration(
     reapply_configuration: On<ReapplyConfiguration>,
     roles: Query<&RoleKey>,
@@ -283,12 +312,7 @@ pub(crate) fn on_reapply_configuration(
     let Ok(role) = roles.get(reapply_configuration.binding).cloned() else {
         return;
     };
-    let Ok(binding) = bindings.binding(&role) else {
-        return;
-    };
-    if binding.recovery != RecoveryPolicy::ReapplyOnRequest
-        || bindings.waiting_work(&role) != WaitingWork::ApplicationRequestOwed
-    {
+    if bindings.waiting_work(&role) != WaitingWork::ReapplyRequestOwed {
         return;
     }
     bindings.request_reapply(&role);
@@ -296,7 +320,7 @@ pub(crate) fn on_reapply_configuration(
 
 /// Emit every discovery transition the scheduler recorded this frame, and empty the journal.
 ///
-/// Ordered after the four systems above so a consumer that watches both sees this frame's device
+/// Ordered after device publication so a consumer that watches both sees this frame's device
 /// conclusions before the discovery bookkeeping that produced them. Draining here is what keeps the
 /// journal bounded — it is a record of one frame's transitions, never a history.
 ///
@@ -354,10 +378,28 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
+    use bevy::MinimalPlugins;
     use bevy::app::App;
+    use bevy::prelude::Component;
+    use bevy::prelude::Entity;
+    use bevy::prelude::On;
+    use bevy::prelude::Res;
+    use bevy::prelude::ResMut;
+    use bevy::prelude::Resource;
+    use bevy::prelude::Update;
+    use bevy::prelude::With;
+    use bevy::prelude::World;
+    use bevy::time::TimeUpdateStrategy;
 
+    use crate::Applied;
+    use crate::ApplyContext;
+    use crate::AttemptInvalidation;
+    use crate::AttemptRef;
     use crate::AuthoritativeReporterCoverage;
     use crate::Binding;
+    use crate::BindingAuthoring;
+    use crate::BindingPolicy;
+    use crate::BindingRegistration;
     use crate::Bindings;
     use crate::CoveredDeviceIdentitySpace;
     use crate::DeviceEndpoint;
@@ -369,8 +411,14 @@ mod tests {
     use crate::DiscoveryCadence;
     use crate::DiscoveryControl;
     use crate::DiscoveryWork;
+    use crate::DriverCleanupRoleEntity;
+    use crate::DriverCompletion;
+    use crate::EndpointDriver;
     use crate::EndpointId;
+    use crate::EstablishedContext;
+    use crate::FlowExpectation;
     use crate::LastKnownGoodConfiguration;
+    use crate::LiveRoleChanged;
     use crate::MainThreadDiscoveryJob;
     use crate::OnAbort;
     use crate::OnSessionLoss;
@@ -383,9 +431,16 @@ mod tests {
     use crate::RetryOn;
     use crate::RiggingAppExt;
     use crate::RiggingPlugin;
+    use crate::RoleEndpoint;
     use crate::RoleKey;
-    use crate::RoleState;
+    use crate::RoleStatus;
+    use crate::SessionRef;
+    use crate::SessionReleaseCause;
+    use crate::TargetResolution;
+    use crate::TargetResolutionContext;
+    use crate::WaitingWork;
     use crate::binding::ApplyDeadline;
+    use crate::register_binding;
     use crate::registration::DriverId;
     use crate::scheme::AuthoredId;
 
@@ -394,6 +449,170 @@ mod tests {
 
     struct CountingReporter {
         scans: Arc<AtomicUsize>,
+    }
+
+    #[derive(Component)]
+    #[relationship(relationship_target = RecoveryTestClients)]
+    struct RecoveryTestRiggingRole(Entity);
+
+    #[derive(Component)]
+    #[relationship_target(relationship = RecoveryTestRiggingRole)]
+    struct RecoveryTestClients(Vec<Entity>);
+
+    #[derive(Default, Resource)]
+    struct ChangedRoleEntities(Vec<Entity>);
+
+    fn record_changed_role_entity(
+        event: On<LiveRoleChanged>,
+        mut changed: ResMut<ChangedRoleEntities>,
+    ) {
+        changed.0.push(event.binding);
+    }
+
+    #[derive(Component, bevy::prelude::Reflect)]
+    struct RecoveryTestConfiguration;
+
+    struct RecoveryTestDriver;
+
+    impl EndpointDriver for RecoveryTestDriver {
+        type Configuration = RecoveryTestConfiguration;
+        type Target = ();
+
+        fn resolve_target(
+            &mut self,
+            _: &mut World,
+            _: &TargetResolutionContext<'_>,
+            _: &Self::Configuration,
+        ) -> TargetResolution<Self::Target> {
+            TargetResolution::Reached(())
+        }
+
+        fn start_apply(
+            &mut self,
+            _: &mut World,
+            context: ApplyContext<'_, Self::Configuration>,
+            _: &Self::Configuration,
+            (): Self::Target,
+        ) {
+            context
+                .into_completion()
+                .finish(DriverCompletion::Succeeded(Applied::AsDispatched));
+        }
+
+        fn established(&mut self, _: &mut World, _: EstablishedContext<'_, Self::Configuration>) {}
+
+        fn cancel_apply(
+            &mut self,
+            _: &mut World,
+            _: &RoleKey,
+            _: DriverCleanupRoleEntity,
+            _: AttemptRef,
+            _: AttemptInvalidation,
+        ) {
+        }
+
+        fn release_session(
+            &mut self,
+            _: &mut World,
+            _: &RoleKey,
+            _: DriverCleanupRoleEntity,
+            _: SessionRef,
+            _: SessionReleaseCause,
+        ) {
+        }
+    }
+
+    #[derive(Resource)]
+    struct RecoveryTestDriverRegistration(
+        crate::EndpointDriverRegistration<RecoveryTestConfiguration>,
+    );
+
+    #[derive(Default, Resource)]
+    struct RegistrationResults {
+        registered: Option<Entity>,
+        conflict:   Option<String>,
+    }
+
+    fn register_role_and_conflict(
+        driver: Res<RecoveryTestDriverRegistration>,
+        mut registration: BindingRegistration,
+        mut results: ResMut<RegistrationResults>,
+    ) {
+        if results.registered.is_some() {
+            return;
+        }
+        let Ok(role) = RoleKey::new("same-frame-role") else {
+            results.conflict = Some("the test role is invalid".to_owned());
+            return;
+        };
+        let Ok(first) = recovery_test_authoring(role.clone(), driver.0) else {
+            results.conflict = Some("the first test authoring is invalid".to_owned());
+            return;
+        };
+        let Ok(conflict) = recovery_test_authoring(role, driver.0) else {
+            results.conflict = Some("the conflicting test authoring is invalid".to_owned());
+            return;
+        };
+        results.registered = registration.register(first).ok();
+        results.conflict = registration
+            .register(conflict)
+            .err()
+            .map(|error| error.to_string());
+    }
+
+    fn recovery_test_authoring(
+        role: RoleKey,
+        driver: crate::EndpointDriverRegistration<RecoveryTestConfiguration>,
+    ) -> Result<BindingAuthoring<RecoveryTestConfiguration>, Box<dyn Error>> {
+        let endpoint = DeviceEndpoint {
+            device: DeviceKey {
+                kind: DeviceKind::Camera,
+                id:   DeviceIdSource::Authored {
+                    value: AuthoredId::new(role.as_str())?,
+                },
+            },
+            id:     EndpointId::Whole,
+        };
+        Ok(BindingAuthoring::new(
+            role,
+            endpoint,
+            driver,
+            RecoveryTestConfiguration,
+            BindingPolicy::new(
+                RecoveryPolicy::Forget,
+                RetryOn::NewRevision,
+                OnAbort::default(),
+                OnSessionLoss::default(),
+                ApplyDeadline::ProcessDefault,
+            ),
+        ))
+    }
+
+    #[test]
+    fn typed_registration_returns_its_complete_entity_and_conflicts_spawn_nothing()
+    -> Result<(), &'static str> {
+        let mut app = App::new();
+        app.add_plugins(RiggingPlugin);
+        let driver = app.add_endpoint_driver(RecoveryTestDriver);
+        app.insert_resource(RecoveryTestDriverRegistration(driver))
+            .init_resource::<RegistrationResults>()
+            .add_systems(Update, register_role_and_conflict);
+
+        app.update();
+
+        let results = app.world().resource::<RegistrationResults>();
+        let role_entity = results
+            .registered
+            .ok_or("registration did not return an entity")?;
+        assert!(results.conflict.is_some());
+        assert!(app.world().get::<RoleEndpoint>(role_entity).is_some());
+        let role_entities = app
+            .world_mut()
+            .query_filtered::<Entity, With<RoleEndpoint>>()
+            .iter(app.world())
+            .count();
+        assert_eq!(role_entities, 1);
+        Ok(())
     }
 
     impl DeviceReporter for CountingReporter {
@@ -423,6 +642,7 @@ mod tests {
                 ReporterCoverage::EstablishesAbsence(AuthoritativeReporterCoverage::one(
                     CoveredDeviceIdentitySpace::AllKeysOfKind { kind },
                 )),
+                std::time::Duration::from_secs(10),
             ),
         );
 
@@ -431,8 +651,8 @@ mod tests {
 
     fn unresolved_camera_binding(role: &str) -> Result<Binding, Box<dyn Error>> {
         Ok(Binding {
-            role:            RoleKey::new(role)?,
-            endpoint:        DeviceEndpoint {
+            role:             RoleKey::new(role)?,
+            endpoint:         DeviceEndpoint {
                 device: DeviceKey {
                     kind: DeviceKind::Camera,
                     id:   DeviceIdSource::Authored {
@@ -441,20 +661,137 @@ mod tests {
                 },
                 id:     EndpointId::Whole,
             },
-            driver:          DriverId(0),
-            recovery:        RecoveryPolicy::Forget,
-            retry:           RetryOn::NewRevision,
-            on_abort:        OnAbort::default(),
-            on_loss:         OnSessionLoss::default(),
-            state:           RoleState::default(),
-            requested:       RequestedConfiguration::new(()),
-            last_known_good: LastKnownGoodConfiguration::default(),
-            apply_deadline:  ApplyDeadline::ProcessDefault,
+            driver:           DriverId(0),
+            recovery:         RecoveryPolicy::Forget,
+            retry:            RetryOn::NewRevision,
+            on_abort:         OnAbort::default(),
+            on_loss:          OnSessionLoss::default(),
+            requested:        RequestedConfiguration::new(()),
+            last_known_good:  LastKnownGoodConfiguration::default(),
+            apply_deadline:   ApplyDeadline::ProcessDefault,
+            flow_expectation: FlowExpectation::NotMonitored,
         })
     }
 
     #[test]
-    fn a_role_awaiting_edge_enables_and_runs_the_covering_disabled_reporter()
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the recovery scenario keeps each frame and assertion visible in one test"
+    )]
+    fn a_registered_role_rebuilds_a_despawned_mirror_and_resumes_status_publication()
+    -> Result<(), Box<dyn Error>> {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs(1)))
+            .add_plugins(RiggingPlugin)
+            .register_rigging_role_relationship::<RecoveryTestRiggingRole>()
+            .init_resource::<ChangedRoleEntities>()
+            .add_observer(record_changed_role_entity);
+        let repaired_role = RoleKey::new("repaired-role")?;
+        let untouched_role = RoleKey::new("untouched-role")?;
+        let driver = app.add_endpoint_driver(RecoveryTestDriver);
+        let repaired_binding = recovery_test_authoring(repaired_role.clone(), driver)?;
+        let repaired_endpoint = repaired_binding.endpoint().clone();
+        let repaired_recovery = RecoveryPolicy::Forget;
+        let repaired_entity = register_binding(app.world_mut(), repaired_binding)?;
+        let untouched_entity = register_binding(
+            app.world_mut(),
+            recovery_test_authoring(untouched_role.clone(), driver)?,
+        )?;
+        let client = app
+            .world_mut()
+            .spawn(RecoveryTestRiggingRole(repaired_entity))
+            .id();
+        app.update();
+
+        let despawned_mirror = repaired_entity;
+        let untouched_mirror = untouched_entity;
+        let untouched_status = app
+            .world()
+            .get::<RoleStatus>(untouched_mirror)
+            .ok_or("the untouched role has no published status")?
+            .view()
+            .clone();
+
+        app.world_mut().entity_mut(despawned_mirror).despawn();
+        let queued_status = {
+            let mut bindings = app.world_mut().resource_mut::<Bindings>();
+            bindings.set_waiting_work(&repaired_role, WaitingWork::ReapplyRequestOwed);
+            assert!(bindings.has_status_changes());
+            bindings.projected_status(&repaired_role)?
+        };
+
+        app.update();
+
+        let rebuilt_mirror = app
+            .world()
+            .resource::<Bindings>()
+            .role_entity(&repaired_role)?;
+        assert_ne!(rebuilt_mirror, despawned_mirror);
+        assert!(app.world().get_entity(rebuilt_mirror).is_ok());
+        assert_eq!(
+            app.world().get::<RoleKey>(rebuilt_mirror),
+            Some(&repaired_role)
+        );
+        assert_eq!(
+            app.world().get::<RecoveryPolicy>(rebuilt_mirror),
+            Some(&repaired_recovery)
+        );
+        assert_eq!(
+            app.world()
+                .get::<RoleEndpoint>(rebuilt_mirror)
+                .map(RoleEndpoint::endpoint),
+            Some(&repaired_endpoint)
+        );
+        assert_eq!(
+            app.world()
+                .get::<RoleStatus>(rebuilt_mirror)
+                .ok_or("the rebuilt mirror has no published status")?
+                .view(),
+            &queued_status
+        );
+        assert_eq!(
+            app.world()
+                .get::<RecoveryTestRiggingRole>(client)
+                .map(|relationship| relationship.0),
+            Some(rebuilt_mirror)
+        );
+
+        assert_eq!(
+            app.world()
+                .resource::<Bindings>()
+                .role_entity(&untouched_role),
+            Ok(untouched_mirror)
+        );
+        assert!(app.world().get_entity(untouched_mirror).is_ok());
+        assert_eq!(
+            app.world()
+                .get::<RoleStatus>(untouched_mirror)
+                .ok_or("the untouched role lost its published status")?
+                .view(),
+            &untouched_status
+        );
+
+        app.world_mut()
+            .resource_mut::<ChangedRoleEntities>()
+            .0
+            .clear();
+        app.world_mut()
+            .resource_mut::<Bindings>()
+            .set_waiting_work(&repaired_role, WaitingWork::Nothing);
+        app.update();
+        let changed_entities = &app.world().resource::<ChangedRoleEntities>().0;
+        assert!(!changed_entities.is_empty());
+        assert!(
+            changed_entities
+                .iter()
+                .all(|changed| *changed == rebuilt_mirror)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_unresolved_role_does_not_enable_the_covering_disabled_reporter()
     -> Result<(), Box<dyn Error>> {
         let (mut app, reporter, scans) = app_with_disabled_reporter_covering(DeviceKind::Camera);
         app.world_mut()
@@ -466,15 +803,15 @@ mod tests {
             app.world()
                 .resource::<DiscoveryControl>()
                 .activation(reporter),
-            ReporterActivation::Enabled,
-            "the RoleAwaiting edge for an unresolved covered claim must enable the reporter"
+            ReporterActivation::Disabled,
+            "application code owns optional reporter activation"
         );
 
         app.update();
         assert_eq!(
             scans.load(Ordering::Relaxed),
-            1,
-            "the enable must carry one requested run, collected on the next frame"
+            0,
+            "an unresolved role must not run an application-disabled reporter"
         );
 
         Ok(())

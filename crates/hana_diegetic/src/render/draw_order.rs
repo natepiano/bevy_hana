@@ -231,7 +231,8 @@ impl DrawCommandDepth {
     /// Returns the dense rank of the command's authored z-index in its panel.
     pub(super) const fn z_index_rank(self) -> DrawZIndexRank { self.z_index_rank }
 
-    /// Returns the layer count consumed by non-OIT shader clip-depth nudging.
+    /// Returns this command's clip-depth nudge, in layer-units, for the non-OIT
+    /// shader path.
     pub(super) const fn clip_depth_nudge(self) -> ClipDepthNudge { self.clip_depth_nudge }
 
     /// Returns the OIT `position.z` offset for this command.

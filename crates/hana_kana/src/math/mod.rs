@@ -1,6 +1,9 @@
-//! Zero-cost newtype wrappers around Bevy math primitives.
+//! Zero-cost newtype wrappers around Bevy math primitives, plus the lossy
+//! numeric cast traits.
 //!
-//! All types `Deref` to their inner type for ergonomic field and method access.
+//! [`Position`], [`Velocity`], [`Displacement`], [`ScreenPosition`], and
+//! [`Orientation`] `Deref` to their inner type for field and method access.
+//! [`Angle`] wraps `f32` and reads through [`Angle::radians`] instead.
 
 mod cast;
 mod screen_position;

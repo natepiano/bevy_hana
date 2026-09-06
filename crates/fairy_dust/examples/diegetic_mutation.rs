@@ -57,8 +57,8 @@ use hana_lagrange::OrbitCamPreset;
 // RUNTIME TEXT MUTATION — DiegeticTextMut<M> for markers, PanelText for ids.
 // ═════════════════════════════════════════════════════════════════════════════
 //
-// How it works: `setup` spawns one label and one panel in each space. Every
-// frame `advance_tick` rounds the elapsed time to whole seconds and only bumps
+// `setup` spawns one label and one panel in each space. Every frame
+// `advance_tick` rounds the elapsed time to whole seconds and only bumps
 // the `Tick` resource when that integer changes, so a retext (and its relayout)
 // happens once per second, not every frame. Each mutator gates on
 // `tick.is_changed()` and writes its flavor's text: the two standalone labels
@@ -71,8 +71,8 @@ const HOME_PITCH: f32 = 0.3;
 const TEXT_COLOR: Color = Color::srgb(0.92, 0.92, 0.94);
 
 /// Shared element id for the single counter run inside each panel's tree. The
-/// panel's structure is fixed, so the run is named once at build and retext in
-/// place rather than rebuilt.
+/// panel's structure is fixed, so the run is named once at build time and
+/// retexted in place rather than rebuilt.
 const COUNTER_FIELD: &str = "counter";
 
 // World-space placement and sizing (meters).
@@ -114,7 +114,7 @@ struct Tick(u64);
 fn main() {
     // `hana_diegetic::DiegeticUiPlugin` is registered automatically by
     // `fairy_dust::sprinkle_example`. `advance_tick` runs first in the chain so
-    // the four mutators observe the second-counter change the same frame.
+    // the four mutators read the second-counter change in the same frame.
     fairy_dust::sprinkle_example()
         .with_studio_lighting()
         .with_ground_plane()

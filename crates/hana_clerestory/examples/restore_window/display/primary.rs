@@ -14,7 +14,7 @@ use bevy::window::Monitor;
 use bevy::window::PrimaryWindow;
 use bevy::window::WindowPosition;
 use hana_clerestory::CurrentMonitor;
-use hana_clerestory::ManagedWindow;
+use hana_clerestory::ManagedWindowName;
 use hana_clerestory::ManagedWindowPersistence;
 use hana_kana::ToU32;
 
@@ -46,7 +46,7 @@ pub(crate) fn update_primary_display(
     bevy_monitors: Query<(Entity, &Monitor)>,
     mut selected_video_modes: ResMut<SelectedVideoModes>,
     managed_window_persistence: Res<ManagedWindowPersistence>,
-    managed_query: Query<(&Window, &ManagedWindow, Option<&CurrentMonitor>)>,
+    managed_query: Query<(&Window, &ManagedWindowName, Option<&CurrentMonitor>)>,
     restored_states: Res<RestoredStates>,
     mismatch_states: Res<MismatchStates>,
     mut commands: Commands,
@@ -134,7 +134,7 @@ pub(crate) fn update_primary_display(
                 };
                 managed_lines.push(format!(
                     "  {}: position={position} physical={}x{} logical={}x{} {SCALE_LABEL} {} {MONITOR_INDEX_LABEL} {}\n",
-                    managed.name,
+                    managed.0,
                     managed_window.physical_width(),
                     managed_window.physical_height(),
                     managed_window.resolution.width().to_u32(),

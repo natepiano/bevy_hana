@@ -28,7 +28,8 @@ pub struct OutlineCamera;
 /// Fires once when `OutlineCamera` is added, rather than polling every frame.
 ///
 /// Needs to run in the main app because `Camera3d::depth_texture_usages` controls
-/// how the GPU texture is allocated — by the time extraction runs, it's too late.
+/// how the GPU texture is allocated, and the texture is already allocated by the
+/// time extraction runs.
 ///
 /// See `bevy_pbr::atmosphere::configure_camera_depth_usages` for the same pattern in Bevy.
 pub(crate) fn configure_outline_camera_depth_texture(

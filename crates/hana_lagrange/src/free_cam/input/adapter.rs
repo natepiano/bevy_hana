@@ -374,9 +374,9 @@ impl CameraActionResolutionKind for FreeCamKind {
     }
 }
 
-/// Whether the move-speed boost gate is held, deciding whether horizontal stick
-/// input reports as [`FreeCamControlDirection::Boost`] or
-/// [`FreeCamControlDirection::Stick`].
+/// Whether the move-speed boost gate is held. Horizontal stick input reports as
+/// [`FreeCamControlDirection::Boost`] while the gate is held and
+/// [`FreeCamControlDirection::Stick`] while it is not.
 #[derive(Clone, Copy)]
 enum BoostGate {
     Engaged,

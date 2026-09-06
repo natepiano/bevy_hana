@@ -2,7 +2,7 @@
 //! `Camera::order` layers a minimap overlay on top of the main view;
 //! `Camera::viewport` clips that overlay to a square in the top-right corner;
 //! `RenderTarget::Window` aims a third camera at a second OS window spawned
-//! via `hana_clerestory::ManagedWindow`; and
+//! via `hana_clerestory::ManagedWindowName`; and
 //! `ResolvedCameraInputRoute::routed_camera()` resolves which camera the
 //! cursor is currently over so input goes to that one.
 //!
@@ -44,7 +44,8 @@ use fairy_dust::CameraHomeEntity;
 use fairy_dust::CameraHomeTarget;
 use fairy_dust::Face;
 use fairy_dust::TitleBar;
-use hana_clerestory::ManagedWindow;
+use hana_clerestory::ManagedWindowName;
+use hana_clerestory::RecoverOnReturn;
 use hana_lagrange::AnimateToFit;
 use hana_lagrange::OrbitCam;
 use hana_lagrange::OrbitCamInputMode;
@@ -217,9 +218,8 @@ fn setup(mut commands: Commands) {
                 title: SECOND_WINDOW_TITLE.to_owned(),
                 ..default()
             },
-            ManagedWindow {
-                name: SECOND_WINDOW_NAME.into(),
-            },
+            ManagedWindowName(SECOND_WINDOW_NAME.into()),
+            RecoverOnReturn,
         ))
         .id();
 

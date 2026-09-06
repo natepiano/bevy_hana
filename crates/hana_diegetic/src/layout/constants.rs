@@ -42,7 +42,7 @@ pub(super) const MIN_CUSTOM_METERS_PER_UNIT: f32 = METERS_PER_INCH / POINTS_PER_
 /// `Pt(12)` render at 16 logical pixels, matching CSS/Word/etc. conventions.
 ///
 /// Physical pixels on a high-DPI display are still 1:1 with logical pixels
-/// via the window's `scale_factor`; we operate in logical pixels throughout.
+/// via the window's `scale_factor`; layout operates in logical pixels throughout.
 pub(super) const PIXELS_PER_INCH: f32 = 96.0;
 
 /// Typographic points in one inch (1 point = 1/72 inch).

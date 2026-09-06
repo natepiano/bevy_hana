@@ -72,8 +72,8 @@ use crate::panel::FrameWork;
 use crate::panel::PanelLayout;
 use crate::panel::PanelOwned;
 
-/// The invisible full-panel interaction quad (Geometry mode only), tagged with
-/// its panel-local size and center so a rebuild can leave it untouched when the
+/// The invisible full-panel interaction quad, one per panel, tagged with its
+/// panel-local size and center so a rebuild can leave it untouched when the
 /// panel has not resized. Its material is a local picking-only invisible asset,
 /// not a source material resolved from `SdfMaterial`. Both pairs are stored as
 /// `f32` bit patterns for exact equality.
@@ -549,7 +549,8 @@ fn desired_surfaces(gathered: GatheredCommands) -> Vec<ElementSurface> {
 /// Borrowed source material handle plus the layout color override for one SDF
 /// material slot.
 pub(super) struct ResolvedSdfMaterial<'a> {
-    /// Authorship state that decides whether this role appends a material row.
+    /// Authorship state: only an [`SdfRoleAuthorship::Authored`] role appends a
+    /// material row.
     pub(super) authorship:    SdfRoleAuthorship,
     /// Element or panel material handle used as the `StandardMaterial` source;
     /// `None` connects this slot to the seeded `SdfMaterial` default.
@@ -640,7 +641,7 @@ pub(super) enum SdfRoleAuthorship {
 }
 
 impl SdfRoleAuthorship {
-    /// Returns whether this role should append a material-table row.
+    /// Returns whether this role appends a material-table row.
     #[must_use]
     pub(super) const fn is_authored(self) -> bool { matches!(self, Self::Authored) }
 }

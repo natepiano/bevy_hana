@@ -1,0 +1,17 @@
+error: cannot construct `AttemptCompletion<Configuration>` with struct literal syntax due to private fields
+  --> tests/compile_fail/authorities_cannot_be_constructed.rs:10:13
+   |
+10 |     let _ = AttemptCompletion::<Configuration> {};
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+help: you might have meant to use the `new` associated function
+   |
+10 -     let _ = AttemptCompletion::<Configuration> {};
+10 +     let _ = AttemptCompletion::<Configuration>::new(_, _, _);
+   |
+
+error: cannot construct `SessionLease<Configuration>` with struct literal syntax due to private fields
+  --> tests/compile_fail/authorities_cannot_be_constructed.rs:11:13
+   |
+11 |     let _ = SessionLease::<Configuration> {};
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

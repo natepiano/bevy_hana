@@ -4,7 +4,7 @@
 //! On X11, winit's `outer_position()` returns the client-area position instead of
 //! the frame position, so a save/restore cycle drifts the window down by the title
 //! bar height each time. This module queries the X11 frame extents and rewrites
-//! `TargetPosition` before `restore_windows` runs.
+//! `TargetPosition` before `place_window_at_saved_geometry` runs.
 //!
 //! See: <https://github.com/rust-windowing/winit/issues/4445>
 
@@ -31,37 +31,40 @@ use x11rb::protocol::xproto::ConnectionExt;
 use x11rb::xcb_ffi::XCBConnection;
 
 use super::MonitorScaleStrategy;
-use super::RestorePreparation;
 use super::TargetPosition;
+use super::WindowRestoreAttempt;
 use super::X11FrameCompensated;
+use super::target_position::WindowSettleProgress;
 use crate::constants::FRAME_EXTENT_COUNT;
 use crate::constants::FRAME_EXTENT_PROPERTY_OFFSET;
 use crate::constants::FRAME_EXTENT_TOP_INDEX;
 use crate::constants::FRAME_EXTENTS_ATOM_NAME;
+use crate::events::ExpectedPhysicalPosition;
 
 /// The `_NET_FRAME_EXTENTS` top (physical pixels) queried during W6 compensation.
 ///
-/// Recorded so [`reapply_compensated_position`] knows the expected mapped-window
-/// readback (`compensated_position + frame_top`) without re-opening an X11 connection
+/// Recorded so [`reapply_compensated_position`] can compute the mapped-window readback it
+/// compares against (`compensated_position + frame_top`) without re-opening an X11 connection
 /// every frame. Present only on windows whose position was compensated.
 #[derive(Component)]
 pub(crate) struct X11FrameTop(i32);
 
-/// Subtract the X11 title bar height from `TargetPosition.physical_position`.
+/// Subtract the X11 title bar height from `TargetPosition::placement_decision`.
 ///
 /// Inserts `X11FrameCompensated` once frame extents are available; this gates
-/// `restore_windows`. If `_NET_FRAME_EXTENTS` is not yet set by the WM, returns
+/// `place_window_at_saved_geometry`. If `_NET_FRAME_EXTENTS` is not yet set by the WM, returns
 /// silently and retries next frame.
 pub(crate) fn compensate_target_position(
     mut commands: Commands,
     mut windows: Query<
         (Entity, &mut TargetPosition),
-        (With<RestorePreparation>, Without<X11FrameCompensated>),
+        (With<WindowRestoreAttempt>, Without<X11FrameCompensated>),
     >,
     _: NonSendMarker,
 ) {
     for (entity, mut target) in &mut windows {
-        let Some(physical_position) = target.physical_position else {
+        let ExpectedPhysicalPosition::Specified(physical_position) = target.physical_position()
+        else {
             commands.entity(entity).insert(X11FrameCompensated);
             continue;
         };
@@ -77,7 +80,7 @@ pub(crate) fn compensate_target_position(
         info!(
             "[W6] Compensating position: {physical_position:?} -> {physical_compensated:?} (physical_frame_top={physical_frame_top})"
         );
-        target.physical_position = Some(physical_compensated);
+        target.compensate_physical_position(physical_frame_top);
         commands
             .entity(entity)
             .insert((X11FrameCompensated, X11FrameTop(physical_frame_top)));
@@ -98,10 +101,13 @@ pub(crate) fn compensate_target_position(
 /// Same-scale (`ApplyUnchanged`) windowed restores only — cross-DPI strategies drive
 /// position through their own multi-phase move and tolerate the W6 offset.
 pub(crate) fn reapply_compensated_position(
-    mut windows: Query<(&TargetPosition, &X11FrameTop, &mut Window), With<RestorePreparation>>,
+    mut windows: Query<(&TargetPosition, &X11FrameTop, &mut Window), With<WindowRestoreAttempt>>,
 ) {
     for (target_position, physical_frame_top, mut window) in &mut windows {
-        if target_position.settle_state.is_none() {
+        if !matches!(
+            &target_position.window_settle_progress,
+            WindowSettleProgress::Settling(_)
+        ) {
             continue;
         }
         if !matches!(
@@ -110,7 +116,9 @@ pub(crate) fn reapply_compensated_position(
         ) {
             continue;
         }
-        let Some(physical_compensated) = target_position.physical_position else {
+        let ExpectedPhysicalPosition::Specified(physical_compensated) =
+            target_position.physical_position()
+        else {
             continue;
         };
         let WindowPosition::At(physical_actual) = window.position else {

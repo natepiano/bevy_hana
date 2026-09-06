@@ -2,11 +2,11 @@ use bevy::ecs::reflect::ReflectComponent;
 use bevy::prelude::Component;
 use bevy::prelude::Reflect;
 
-/// Exclusive-ownership state reported by a provider alongside `crate::Presence`.
+/// Exclusive-ownership state reported by a provider alongside [`Presence`](crate::Presence).
 ///
-/// `Claim` records a platform fact, not the policy that Hana should use. A camera can be present
-/// while another process owns its capture stream, so reconciliation keeps `Claim` independent of
-/// `Presence` before deciding whether output is permitted.
+/// [`Claim`] records a platform fact, not the policy that Hana should use. A camera can be present
+/// while another process owns its capture stream, so reconciliation keeps [`Claim`] independent of
+/// [`Presence`](crate::Presence) and consults both when it permits output.
 #[derive(Clone, PartialEq, Eq, Debug, Component, Reflect)]
 #[reflect(Component, PartialEq)]
 pub enum Claim {
@@ -20,7 +20,7 @@ pub enum Claim {
     /// Another process owns the device or owns it in a way that prevents useful use by this
     /// process, such as a camera already open in another application.
     Contended {
-        /// Identity information supplied by the operating system for the competing process.
+        /// Identity information the operating system supplied for the competing process.
         holder: ClaimHolder,
     },
     /// The platform rejected access until a permission class is granted, as when camera access is
@@ -48,7 +48,7 @@ pub enum ClaimHolder {
 
 /// Permission class that prevented a provider from claiming an otherwise visible device.
 ///
-/// Providers report a `PermissionGate` instead of opaque text because remediation can depend on
+/// Providers report a [`PermissionGate`] instead of opaque text because remediation can depend on
 /// the class: opening camera privacy settings differs from enabling screen recording.
 #[derive(Clone, PartialEq, Eq, Debug, Reflect)]
 pub enum PermissionGate {

@@ -49,7 +49,7 @@ pub enum DeferredMatch<T> {
     NothingToFire,
 }
 
-/// What a pending prefix was doing when [`SequenceMatcher::resolve_timeout`] examined it.
+/// The state [`SequenceMatcher::resolve_timeout`] found the pending prefix in.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TimeoutOutcome<T> {
     /// A completed sequence timed out; its deferred value is now the caller's to fire.

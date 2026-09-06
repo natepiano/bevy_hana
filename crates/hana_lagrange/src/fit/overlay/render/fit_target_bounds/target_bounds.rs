@@ -103,7 +103,8 @@ fn silhouette_points(layout: &FitOverlayLayout) -> Vec<Vec2> {
         .collect()
 }
 
-/// Observer that cleans up overlay state when `FitOverlay` is removed from a camera.
+/// Despawns a camera's generated overlay visuals when `FitOverlay` is removed
+/// from it.
 pub fn on_remove_fit_visualization(
     trigger: On<Remove, FitOverlay>,
     mut commands: Commands,

@@ -63,8 +63,9 @@ use super::mode_reconciliation::CameraInputInstallationOf;
 /// under the right enhanced-input context, tag them with the camera's
 /// installation marker, and spawn the camera's gate action.
 pub(crate) trait CameraInstallKind: CameraInputModeKind {
-    /// The bool action a gated binding reads to decide whether its gate keys or
-    /// buttons are currently actuated.
+    /// The bool action spawned for a gate key or button.
+    /// [`CameraBindingGateCondition`] treats the gate as actuated while this
+    /// action's [`TriggerState`] is `Ongoing` or `Fired`.
     type GateAction: InputAction<Output = bool>;
 }
 
@@ -177,9 +178,9 @@ const fn action_settings() -> ActionSettings {
 }
 
 /// Spawns every enabled entry of a held action binding set: the motion binding
-/// routes to the speed-specific action so the active speed falls out of which
-/// motion action fires, and the engagement binding routes to the engagement
-/// action. Both carry the entry's gate conditions.
+/// routes to the action for the entry's speed, so the reported speed comes from
+/// which motion action fired, and the engagement binding routes to the
+/// engagement action. Both carry the entry's gate conditions.
 pub(crate) fn spawn_held_bindings<'a, A, K>(
     world: &mut World,
     camera: Entity,

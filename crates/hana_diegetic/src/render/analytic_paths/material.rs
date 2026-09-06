@@ -172,17 +172,16 @@ impl MaterialExtension for PathExtension {
 
     fn prepass_fragment_shader() -> ShaderRef { ANALYTIC_PATH_SHADER_PATH.into() }
 
-    // Standing contract of the path renderer: the camera depth prepass cannot
-    // run vertex-pull batches. Bevy strips the material bind group from
-    // depth-only opaque prepass pipelines (`is_depth_only_opaque_prepass`),
-    // and the vertex-pull vertex stage reads bindings 104/105 from that
-    // group — pipeline creation fails with a wgpu validation error. The main
-    // opaque pass writes its own depth (`GreaterEqual`, write enabled), so
-    // skipping the prepass is an early-z loss only. Shadow views still queue
-    // (`enable_shadows`); the ones bevy routes depth-only fall back to the
-    // standard vertex stage in `specialize` (see
-    // `material_group_is_stripped`). Any future change that re-enables the
-    // prepass must keep (or consciously extend) that guard.
+    // The camera depth prepass cannot run vertex-pull batches. Bevy strips the
+    // material bind group from depth-only opaque prepass pipelines
+    // (`is_depth_only_opaque_prepass`), and the vertex-pull vertex stage reads
+    // bindings 104/105 from that group — pipeline creation fails with a wgpu
+    // validation error. The main opaque pass writes its own depth
+    // (`GreaterEqual`, write enabled), so skipping the prepass is an early-z
+    // loss only. Shadow views still queue (`enable_shadows`); the ones bevy
+    // routes depth-only fall back to the standard vertex stage in `specialize`
+    // (see `material_group_is_stripped`). Re-enabling the prepass requires
+    // extending that guard to cover it.
     fn enable_prepass() -> bool { false }
 
     fn specialize(
@@ -217,9 +216,9 @@ fn specialize_path_extension_descriptor(
                 .push("FRAGMENT_DATA_FROM_BATCHED_PATHS".into());
         }
     } else if vertex_pull && material_group_is_stripped(descriptor) {
-        // Deliberately share the SDF helper's stripped-material-group branch:
-        // the standard vertex stage avoids vertex-pull bindings 104/105, and
-        // the helper avoids material-table binding 106.
+        // Share the SDF helper's stripped-material-group branch: the standard
+        // vertex stage avoids vertex-pull bindings 104/105, and the helper
+        // avoids material-table binding 106.
         if let Some(fragment) = descriptor.fragment.as_mut() {
             fragment
                 .shader_defs
@@ -234,8 +233,8 @@ fn specialize_path_extension_descriptor(
 /// bindings 104/105 from the material group, so swapping it in would fail
 /// wgpu validation. Such pipelines keep the standard vertex stage instead:
 /// the inert batch mesh's all-zero positions rasterize nothing, so the batch
-/// casts no shadow there. This also catches any future mode or engine change
-/// that strips the material group.
+/// casts no shadow there. The check reads the layout itself, so any other mode
+/// or engine change that strips the material group takes the same branch.
 fn material_group_is_stripped(descriptor: &RenderPipelineDescriptor) -> bool {
     descriptor
         .layout

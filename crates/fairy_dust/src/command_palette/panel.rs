@@ -82,7 +82,7 @@ pub(super) enum PalettePresentationInput<'view, 'registry, 'keymap, 'context> {
     AwaitingRegistryAssembly,
     /// One borrowed query result from the live registry and its complete context observation.
     AssembledQuery {
-        /// What the query resolved to, which decides the highlighted row and the status line.
+        /// What the query resolved to, which determines the highlighted row and the status line.
         selection_outcome: PaletteSelectionOutcome<'registry>,
         /// The command rows matching the query, in registry order.
         command_rows:      &'view [CommandPaletteRow<'registry, 'keymap, 'context>],
@@ -99,7 +99,7 @@ pub(super) struct PaletteView<'view, 'registry, 'keymap, 'context> {
     pub(super) presentation_input:  PalettePresentationInput<'view, 'registry, 'keymap, 'context>,
     /// Keymap failures rendered above the field.
     pub(super) keymap_failure_rows: &'view [KeymapFailureRow],
-    /// Width the box occupies, which the window decides.
+    /// Width the box occupies, derived from the window size.
     pub(super) panel_width:         f32,
 }
 
@@ -456,7 +456,7 @@ fn build_command_row(
     });
 }
 
-/// Renders a typed binding state instead of pretending it is an authored
+/// Renders a typed binding state instead of rendering it as an authored
 /// unbound command.
 fn build_binding_state(builder: &mut LayoutBuilder, state: &str) {
     builder.text(
@@ -559,8 +559,8 @@ mod tests {
     const WINDOW_HEIGHT: f32 = 1080.0;
     const WINDOW_WIDTH: f32 = 1920.0;
 
-    /// A context whose state is deliberately absent, exercising Rubric's
-    /// public `ContextUnavailable` snapshot for the consumer renderer.
+    /// A context whose state is absent, exercising Rubric's public
+    /// `ContextUnavailable` snapshot for the consumer renderer.
     #[derive(AsRefStr, Clone, Copy, Debug, EnumIter, EnumMessage, Eq, Hash, PartialEq, States)]
     #[strum(serialize_all = "snake_case")]
     enum AbsentPaletteContext {

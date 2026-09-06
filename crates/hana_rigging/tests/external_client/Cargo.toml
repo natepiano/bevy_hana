@@ -1,0 +1,17 @@
+[package]
+edition = "2024"
+name    = "hana_rigging_external_client"
+publish = false
+version = "0.0.0"
+
+[workspace]
+
+[[bin]]
+name = "rigging_kernel"
+path = "../../examples/rigging_kernel.rs"
+
+[dependencies]
+bevy = { version = "=0.19.1", default-features = false, features = [
+  "reflect_auto_register",
+] }
+hana_rigging = { path = "../..", default-features = false }

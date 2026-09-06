@@ -18,9 +18,9 @@ use super::scheme::SchemeName;
 /// handle that silently denotes a later device.
 ///
 /// Reflection sees the handle opaquely, which registers `DeviceId` as a component while denying
-/// construction from a dynamic tuple struct: without that, an inspector could mint a handle the
-/// device registry never issued and route an apply to another unit. Opacity also withholds the
-/// field, so reflection-driven tooling reads the issued value through `DeviceId::get` rather than
+/// construction from a dynamic tuple struct: without that, an inspector could fabricate a handle
+/// the device registry never issued and route an apply to another unit. Opacity also withholds the
+/// field, so reflection-driven tooling reads the issued value through [`DeviceId::get`] rather than
 /// through the type registry.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Component, Reflect)]
 #[reflect(opaque)]
@@ -30,8 +30,8 @@ pub struct DeviceId(u64);
 impl DeviceId {
     /// Wrap the device registry's next counter value.
     ///
-    /// Private to the crate because only `crate::Devices` issues handles; a reporter or an
-    /// application that could mint one would be asserting an identity it never established.
+    /// Private to the crate because only [`crate::Devices`] issues handles; a reporter or an
+    /// application that could fabricate one would be asserting an identity it never established.
     pub(crate) const fn new(value: u64) -> Self { Self(value) }
 
     /// Report the issued counter value for diagnostics and stable ordering in reports.
@@ -41,16 +41,27 @@ impl DeviceId {
 
 /// Durable designation for a device that can cross process and storage boundaries.
 ///
-/// `DeviceKey::id` retains whether its value is proof or a hint. Storing that distinction in the
+/// [`DeviceKey::id`] retains whether its value is proof or a hint. Storing that distinction in the
 /// enum variant prevents callers from copying a string while losing the rule that controls output.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Component, Serialize, Deserialize, Reflect)]
 #[reflect(Component, PartialEq, Serialize, Deserialize)]
 pub struct DeviceKey {
-    /// Physical role that keeps a display, audio interface, DMX universe, or HID panel separate
-    /// even when two providers use similar identifier values.
+    /// Physical role that keeps a display, audio interface, DMX universe, or control surface
+    /// separate even when two providers use similar identifier values.
     pub kind: DeviceKind,
     /// Identity source whose variant records whether this designation may ever authorize output.
     pub id:   DeviceIdSource,
+}
+
+impl DeviceKey {
+    /// Name a device with an identity value reported by the physical unit.
+    #[must_use]
+    pub const fn reported(kind: DeviceKind, scheme: SchemeName, id: ReportedId) -> Self {
+        Self {
+            kind,
+            id: DeviceIdSource::Reported { scheme, value: id },
+        }
+    }
 }
 
 /// Trust classification for the value used in a `DeviceKey`.
@@ -73,8 +84,8 @@ pub enum DeviceIdSource {
     },
     /// Hana derived this value from descriptors because the unit exposes no unique identity.
     ///
-    /// A port-derived camera value and a serial-less display UUID can restore saved configuration,
-    /// but neither can authorize output because a later scan can assign the hint to another unit.
+    /// A port-derived camera value and a serial-less display UUID can authorize output only after
+    /// one live unit matches that exact key. Ambiguous matches authorize nothing.
     Synthesized {
         /// Fixed-width FNV-1a result derived from the provider's descriptors.
         digest: Digest,
@@ -92,9 +103,8 @@ pub enum DeviceIdSource {
 
 /// Physical role used to keep identifier spaces for unrelated hardware separate.
 ///
-/// This enum is non-exhaustive because future providers can report device classes that existing
-/// applications do not control; downstream matches must retain a wildcard for those classes.
-#[non_exhaustive]
+/// Adding a new device class is a workspace-wide change: every application match must classify
+/// the new class before the workspace compiles.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, Reflect)]
 #[reflect(Serialize, Deserialize)]
 pub enum DeviceKind {
@@ -106,8 +116,10 @@ pub enum DeviceKind {
     AudioInterface,
     /// A DMX universe that a lighting provider addresses through a patch or network endpoint.
     DmxUniverse,
-    /// A HID control panel, such as a USB Stream Deck or a network-attached dock child.
-    HidPanel,
+    /// A control surface whose keys and faders an operator presses, such as a Stream Deck or a
+    /// network-attached dock child.
+    #[serde(alias = "HidPanel")]
+    ControlSurface,
 }
 
 #[cfg(test)]
@@ -125,7 +137,9 @@ mod tests {
     use bevy::reflect::tuple_struct::DynamicTupleStruct;
     use bevy::world_serialization::DynamicWorldBuilder;
     use ron::Options;
+    use ron::error::SpannedError;
     use ron::extensions::Extensions;
+    use ron::from_str;
     use ron::ser::PrettyConfig;
     use serde::Serialize;
 
@@ -153,8 +167,13 @@ mod tests {
             DeviceKind::AudioInterface,
         )?;
         let dmx_universe = reported_key("patch", "artnet/10.0.0.7/u1", DeviceKind::DmxUniverse)?;
-        let hid_panel = reported_key("usb-serial", "CL15K1A00080", DeviceKind::HidPanel)?;
-        let dock_child = reported_key("net-dock-node", "dock:AB12/child/2", DeviceKind::HidPanel)?;
+        let control_surface =
+            reported_key("usb-serial", "CL15K1A00080", DeviceKind::ControlSurface)?;
+        let dock_child = reported_key(
+            "net-dock-node",
+            "dock:AB12/child/2",
+            DeviceKind::ControlSurface,
+        )?;
         let camera = DeviceKey {
             kind: DeviceKind::Camera,
             id:   DeviceIdSource::Synthesized {
@@ -182,11 +201,11 @@ mod tests {
                 dmx_universe,
             ),
             (
-                r#"DeviceKey(kind: HidPanel, id: Reported(scheme: "usb-serial", value: "CL15K1A00080"))"#,
-                hid_panel,
+                r#"DeviceKey(kind: ControlSurface, id: Reported(scheme: "usb-serial", value: "CL15K1A00080"))"#,
+                control_surface,
             ),
             (
-                r#"DeviceKey(kind: HidPanel, id: Reported(scheme: "net-dock-node", value: "dock:AB12/child/2"))"#,
+                r#"DeviceKey(kind: ControlSurface, id: Reported(scheme: "net-dock-node", value: "dock:AB12/child/2"))"#,
                 dock_child,
             ),
             (
@@ -205,6 +224,14 @@ mod tests {
             assert_eq!(serialized, ron);
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn historical_hid_panel_kind_loads_as_control_surface() -> Result<(), SpannedError> {
+        let device_kind = from_str::<DeviceKind>("HidPanel")?;
+
+        assert_eq!(device_kind, DeviceKind::ControlSurface);
         Ok(())
     }
 

@@ -11,8 +11,10 @@
 //!   accidental mixing at compile time.
 //! - **`tween`** — sequence position movement produced by `bevy_tween`, sequenced before movement
 //!   application and domain evaluation.
-//! - [`Cascade`] — explicit inherited/overridden authoring values plus optional relationship-backed
-//!   ECS propagation through [`CascadePlugin`].
+//!
+//! [`Cascade`] and the sequence types are compiled under every feature combination. A [`Cascade`]
+//! value either inherits from the next lower-precedence scope or overrides it; [`CascadePlugin`]
+//! keeps the matching [`Resolved`] cache across the [`CascadeFrom`] relationship.
 //!
 //! Disable defaults to pick only what you need:
 //!

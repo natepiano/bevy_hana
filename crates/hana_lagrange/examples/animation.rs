@@ -3,10 +3,10 @@
 //!
 //! - **Manual (M)** writes `OrbitCam` fields every frame for a continuous orbit loop — input
 //!   disabled, smoothing zeroed.
-//! - **`PlayAnimation` (P)** atomically requests a retained sequence. Each move eases over its own
-//!   duration, then traversal advances to the next.
-//! - **`AnimateToFit` (A)** declaratively frames a target entity — here the cube wearing its
-//!   "`AnimateToFit` target" name on each face.
+//! - **`PlayAnimation` (P)** requests a whole retained sequence in one trigger. Each move eases
+//!   over its own duration, then traversal advances to the next.
+//! - **`AnimateToFit` (A)** names a target entity and lets the fit solve pick the pose — here the
+//!   cube wearing its "`AnimateToFit` target" name on each face.
 //!
 //! Two cubes sit as a centered pair on the ground: the home cube and the
 //! `AnimateToFit` target. Both are `CameraHomeTarget`s, so the startup home fit
@@ -163,7 +163,7 @@ fn main() {
         )
         // M / A / P run through Fairy Dust's shortcut binding, which fires each
         // only when no modifier is held — so the `Ctrl+Shift+A` home-gizmo chord
-        // no longer also triggers the bare-`A` AnimateToFit. H is read in
+        // does not also trigger the bare-`A` AnimateToFit. H is read in
         // `manual_animate` only while manual mode has disabled the camera input
         // context; otherwise Fairy Dust's filled preset handles home.
         .with_shortcut(KeyCode::KeyM, toggle_manual)
@@ -206,7 +206,7 @@ fn main() {
 //     `PLAY_ANIMATION_STEPS`; retained traversal evaluates one move at a time.
 //   - `A` (`animate_to_fit`) triggers `AnimateToFit` on the `FitTarget` cube.
 //   - `stop_manual_on_animation_begin` observes `AnimationBegin` and leaves manual mode whenever A,
-//     P, or another animation starts, so manual writes never fight it.
+//     P, or another animation starts, so manual writes never overwrite the animation's output.
 //   - `D` replaces the retained definition directly; F/B/U/R/X/N/V exercise every `SequenceCommand`
 //     through `CameraCommands`.
 //   - `C` first claims ownership with authored easing; a second press is an ordinary rejected
@@ -431,7 +431,7 @@ fn toggle_manual(
 }
 
 /// `A` — frames the `FitTarget` cube with `AnimateToFit`. Manual orbit, if
-/// active, yields through `stop_manual_on_animation_begin`.
+/// active, is switched off by `stop_manual_on_animation_begin`.
 fn animate_to_fit(
     mut commands: Commands,
     camera_query: Query<Entity, With<OrbitCam>>,

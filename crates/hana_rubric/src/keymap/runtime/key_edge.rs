@@ -62,7 +62,7 @@ pub(super) enum PhysicalKeyRole {
     ModifierFamily(ModifierFamily),
     /// A key code no keystroke can name, so no binding can reach it.
     ///
-    /// Routing treats it as inert: it claims no primary trigger and suspends no modifier-family
+    /// It is inert in routing: it claims no primary trigger and suspends no modifier-family
     /// hold, so holding a media key while `shift` is bound to a hold-to-act command leaves that
     /// command running.
     Unroutable,

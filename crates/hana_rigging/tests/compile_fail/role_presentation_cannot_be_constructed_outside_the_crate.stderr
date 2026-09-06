@@ -1,0 +1,15 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+ --> tests/compile_fail/role_presentation_cannot_be_constructed_outside_the_crate.rs:6:37
+  |
+6 |     let _: KernelRolePresentation = RolePresentation(RolePresentationView::Presenting);
+  |                                     ^^^^^^^^^^^^^^^^
+  |
+note: constructor is not visible here due to private fields
+ --> src/presentation.rs
+  |
+  | pub struct RolePresentation<UnavailableCause>(RolePresentationView<UnavailableCause>);
+  |                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private field
+help: you might have meant to use the `from_view` associated function
+  |
+6 |     let _: KernelRolePresentation = RolePresentation::from_view(RolePresentationView::Presenting);
+  |                                                     +++++++++++

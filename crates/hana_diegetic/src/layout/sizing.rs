@@ -5,7 +5,7 @@ use bevy::prelude::ReflectDefault;
 
 use super::Dimension;
 
-/// `Sizing` behavior for a layout element along one axis.
+/// How a layout element is sized along one axis.
 #[derive(Clone, Copy, Debug, PartialEq, Reflect)]
 #[reflect(Default, PartialEq, Debug)]
 pub enum Sizing {
@@ -224,7 +224,7 @@ impl Sizing {
     }
 }
 
-/// `Direction` in which children are laid out.
+/// The axis along which children flow.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Direction {
     /// Children flow left to right.
@@ -270,7 +270,7 @@ pub enum AlignY {
 
 /// Interior padding between an element's edges and its children.
 ///
-/// Note: [`Sizing::Percent`] on child elements is computed against the parent's
+/// [`Sizing::Percent`] on child elements is computed against the parent's
 /// content area (i.e., after this padding and child gap are subtracted).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Padding {

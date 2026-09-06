@@ -27,7 +27,7 @@ pub enum AttachmentResolveCandidate<R> {
     Skipped {
         /// Entity that cannot be resolved this frame.
         source: Entity,
-        /// Entity that the source attempted to target.
+        /// Entity the source's relation names as its target.
         target: Entity,
         /// Consumer-specific skip reason.
         reason: R,
@@ -532,7 +532,7 @@ impl<R: Send + Sync + 'static> Default for AttachmentResolveDiagnostics<R> {
 pub struct AttachmentResolveDiagnostic<R> {
     /// Entity that could not be resolved.
     pub source:           Entity,
-    /// Entity that `source` attempted to target.
+    /// Entity that `source`'s relation names as its target.
     pub target:           Entity,
     /// Consumer-specific skip reason.
     pub reason:           R,

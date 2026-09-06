@@ -22,6 +22,7 @@ crates above build against their real dependencies.
 
 - [`fairy_dust`](crates/fairy_dust)
 - [`hana_diegetic`](crates/hana_diegetic)
+- [`hana_lading`](crates/hana_lading)
 - [`hana_rigging_scripted`](crates/hana_rigging_scripted)
 - [`hana_valence`](crates/hana_valence)
 

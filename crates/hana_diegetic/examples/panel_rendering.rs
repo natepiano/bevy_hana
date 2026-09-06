@@ -161,9 +161,9 @@ struct RequestedPreset(Option<u8>);
 /// Registered panel source materials used when lighting presets swap handles.
 #[derive(Resource)]
 struct PanelMaterialHandles {
-    /// Lit source material handle for panels that should use scene lighting.
+    /// Lit source material handle for panels rendered under the scene lights.
     lit:   Handle<StandardMaterial>,
-    /// Unlit source material handle for panels that should ignore scene lights.
+    /// Unlit source material handle for panels rendered without scene lighting.
     unlit: Handle<StandardMaterial>,
 }
 

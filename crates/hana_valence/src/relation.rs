@@ -115,8 +115,8 @@ impl Deref for AnchoredHere {
 
 /// Resolver-owned per-frame offset override.
 ///
-/// Resolver systems prefer `ResolvedAnchorOffset` over [`AnchoredTo::offset`]
-/// when both components are present on the source entity.
+/// When both components are present on the source entity, resolver systems use
+/// `ResolvedAnchorOffset` and ignore [`AnchoredTo::offset`].
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Reflect)]
 #[reflect(Component, Default, opaque)]
 pub struct ResolvedAnchorOffset(Displacement);

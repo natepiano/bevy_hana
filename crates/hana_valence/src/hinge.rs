@@ -1,16 +1,23 @@
 //! Resting fold endpoints and their conversion into an anchor pose.
 
+use bevy_app::App;
+use bevy_app::Plugin;
+use bevy_app::PostUpdate;
 use bevy_ecs::change_detection::DetectChanges;
 use bevy_ecs::change_detection::DetectChangesMut;
 use bevy_ecs::change_detection::Mut;
 use bevy_ecs::entity::Entity;
+use bevy_ecs::lifecycle::HookContext;
 use bevy_ecs::prelude::Component;
 use bevy_ecs::prelude::ReflectComponent;
+use bevy_ecs::prelude::Resource;
 use bevy_ecs::query::Has;
+use bevy_ecs::schedule::IntoScheduleConfigs;
 use bevy_ecs::system::Commands;
 use bevy_ecs::system::Local;
 use bevy_ecs::system::Query;
 use bevy_ecs::system::SystemChangeTick;
+use bevy_ecs::world::DeferredWorld;
 use bevy_math::Dir3;
 use bevy_math::Quat;
 use bevy_reflect::Reflect;
@@ -22,6 +29,7 @@ use thiserror::Error;
 
 use crate::AnchorPose;
 use crate::AnchorSite;
+use crate::AnchorSystems;
 use crate::AnchoredTo;
 use crate::EasedFoldFraction;
 use crate::Edge;
@@ -31,6 +39,52 @@ use crate::FoldMemberFraction;
 use crate::FoldSequencePlayback;
 use crate::GeometryError;
 use crate::ResolvedAnchorGeometry;
+
+/// Proof that [`HingePlugin`] installed the hinge driver.
+///
+/// A [`Hinge`] is inert without that driver: the component sits on the entity,
+/// the resolver never sees a fold, and nothing warns. A pintle is the pin a
+/// hinge turns on, and [`Hinge::require_driver`] demands one of every hinge
+/// entering a world, so a hinge cannot reach a world holding nothing to move
+/// it.
+///
+/// The resource is crate-private, so an application cannot file the proof by
+/// hand; the private field, the crate-private constructor, and
+/// `#[reflect(opaque)]` close the literal and the dynamic reflected tuple as
+/// well. [`HingePlugin`] is the sole issuer, which is what makes the hook the
+/// single place a missing driver is ever reported.
+#[derive(Resource, Clone, Copy, Debug, Reflect)]
+#[reflect(opaque)]
+pub(crate) struct Pintle(());
+
+impl Pintle {
+    /// Creates the proof that the hinge driver is registered.
+    pub(crate) const fn installed() -> Self { Self(()) }
+}
+
+/// Registers the hinge driver, without which no [`Hinge`] may enter the world.
+///
+/// [`crate::ArrangementPlugin`] adds this plugin, so an application that builds
+/// arrangements needs nothing further. Add it directly when hinges are authored
+/// by hand: it requires no assets and no scene support, so it composes into a
+/// headless app that has neither.
+///
+/// This is the sole registrar of the hinge driver, which it places in
+/// [`AnchorSystems::HingeToPose`] nested inside [`AnchorSystems::AnimatePose`].
+/// The driver itself is private: order against the set instead.
+#[derive(Default)]
+pub struct HingePlugin;
+
+impl Plugin for HingePlugin {
+    fn build(&self, app: &mut App) {
+        app.insert_resource(Pintle::installed())
+            .configure_sets(
+                PostUpdate,
+                AnchorSystems::HingeToPose.in_set(AnchorSystems::AnimatePose),
+            )
+            .add_systems(PostUpdate, hinge_to_pose.in_set(AnchorSystems::HingeToPose));
+    }
+}
 
 /// The two resting fold endpoints of one arrangement connection.
 ///
@@ -50,6 +104,7 @@ use crate::ResolvedAnchorGeometry;
 #[derive(Component, Clone, Copy, Debug, PartialEq, Reflect)]
 #[reflect(Component, PartialEq, Debug, Clone, opaque)]
 #[require(AnchorPose)]
+#[component(on_add = Self::require_driver)]
 pub struct Hinge {
     edge:         Edge,
     base_angle:   Angle,
@@ -59,6 +114,12 @@ pub struct Hinge {
 
 impl Hinge {
     /// Creates a hinge from its authored edge, resting endpoints, and pivot.
+    ///
+    /// A hinge that never reaches a world moves nothing and harms nothing, so
+    /// construction asks only whether the authored values describe a hinge.
+    /// Whether anything will actually pose it is settled where that becomes
+    /// answerable — when the component is inserted, by an `on_add` hook that
+    /// rejects a world [`HingePlugin`] never reached.
     ///
     /// Both [`Angle`] endpoints are finite by construction, so only the edge
     /// and the pivot displacement are validated here.
@@ -87,6 +148,31 @@ impl Hinge {
             folded_angle,
             pivot_offset,
         })
+    }
+
+    /// Rejects a hinge entering a world that holds nothing to pose it.
+    ///
+    /// Every route a hinge takes into a world ends in this insertion —
+    /// [`Self::try_new`] followed by an insert, [`Self::resting`] through
+    /// arrangement materialization, a scene, a clone — so this is the one
+    /// place a missing [`HingePlugin`] is reported, and it names the entity
+    /// that would otherwise have carried a pose nobody ever wrote.
+    ///
+    /// # Panics
+    ///
+    /// Panics when [`Pintle`] is absent, which happens only when the
+    /// application added no [`HingePlugin`]. That is a wiring mistake fixed
+    /// once at startup, never a runtime condition an application can recover
+    /// from, and the alternative is the silence this hook exists to end.
+    fn require_driver(world: DeferredWorld<'_>, context: HookContext) {
+        assert!(
+            world.get_resource::<Pintle>().is_some(),
+            "entity {} received a Hinge in an app with no HingePlugin, so the \
+             hinge driver is unregistered and this hinge would hold an \
+             unwritten pose forever. Add hana_valence::HingePlugin, or \
+             ArrangementPlugin, which adds it.",
+            context.entity,
+        );
     }
 
     /// Creates the unfolded hinge one validated plan connection starts from.
@@ -228,21 +314,23 @@ impl From<FoldEvaluationError> for HingePoseSkip {
     fn from(_: FoldEvaluationError) -> Self { Self::UnrepresentableAngle }
 }
 
-/// Marks a hinge whose unavailable pose [`hinge_to_pose`] already reported.
+/// Marks a hinge whose unavailable pose the hinge driver already reported.
 ///
 /// The library inserts this on the offending entity and removes it once that
 /// entity poses successfully, which is how one authoring mistake warns once.
-/// Keeping the flag on the entity rather than in a system-local set means
-/// despawning forgets it, so an application that respawns misauthored hinges
-/// retains nothing per spawn. Applications may query it to list the hinges
-/// currently holding a stale pose; they should not insert or remove it.
+/// Keeping the flag on the entity rather than in a system-local set means a
+/// despawn drops it along with the entity, so an application that respawns
+/// misauthored hinges accumulates nothing per spawn. Applications may query it
+/// to list the hinges currently holding a stale pose; they should not insert or
+/// remove it.
 #[derive(Component, Clone, Copy, Debug)]
 pub struct HingePoseReported;
 
 /// Writes each hinge's current rotation and pivot compensation into [`AnchorPose`].
 ///
-/// [`crate::ArrangementPlugin`] is this system's sole registrar; it runs in
-/// [`crate::AnchorSystems::AnimatePose`] before [`crate::resolve_anchors`].
+/// [`HingePlugin`] is this system's sole registrar; it runs in
+/// [`AnchorSystems::HingeToPose`], nested inside
+/// [`AnchorSystems::AnimatePose`], before [`crate::resolve_anchors`].
 ///
 /// A hinge whose entity is tracked by a retained [`FoldSequencePlayback`] takes
 /// its angle from the eased fraction that playback cached for it in `Update`.
@@ -265,7 +353,7 @@ pub struct HingePoseReported;
 /// [`FoldEvaluationError`], so a held fold leaves its cached state unchanged
 /// and this system either recomputes the same pose from the last resolved
 /// fraction or, with none resolved yet, writes no pose at all.
-pub fn hinge_to_pose(
+fn hinge_to_pose(
     mut commands: Commands,
     system_tick: SystemChangeTick,
     mut fractions: Local<FoldFractionScratch>,
@@ -360,6 +448,7 @@ mod tests {
 
     use super::Hinge;
     use super::HingeError;
+    use super::Pintle;
     use super::hinge_to_pose;
     use crate::AnchorFrame;
     use crate::AnchorPose;
@@ -463,7 +552,7 @@ mod tests {
 
     #[test]
     fn a_nonzero_base_angle_poses_without_a_fold_sequence() {
-        let mut world = resolve::world_with_diagnostics();
+        let mut world = hinge_world();
         let entity = spawn_hinged(&mut world, hinge(top_edge(), BASE_ANGLE, Vec3::ZERO));
 
         run_hinge_driver(&mut world);
@@ -478,7 +567,7 @@ mod tests {
 
     #[test]
     fn endpoint_order_flips_the_rotation_sense() {
-        let mut world = resolve::world_with_diagnostics();
+        let mut world = hinge_world();
         let forward = spawn_hinged(&mut world, hinge(top_edge(), FOLD_ANGLE, Vec3::ZERO));
         let reversed = spawn_hinged(
             &mut world,
@@ -503,7 +592,7 @@ mod tests {
 
     #[test]
     fn pivot_compensation_is_zero_while_the_member_rests_at_base() {
-        let mut world = resolve::world_with_diagnostics();
+        let mut world = hinge_world();
         let away_from_base = hinge(top_edge(), BASE_ANGLE, PIVOT_OFFSET)
             .refolded(angle(FOLD_ANGLE), Displacement::from(PIVOT_OFFSET));
         let at_base = spawn_hinged(&mut world, hinge(top_edge(), BASE_ANGLE, PIVOT_OFFSET));
@@ -529,7 +618,7 @@ mod tests {
 
     #[test]
     fn the_edge_axis_is_converted_into_the_source_anchor_frame() {
-        let mut world = resolve::world_with_diagnostics();
+        let mut world = hinge_world();
         let target = resolve::spawn_quad(&mut world, Transform::default());
         let unframed = spawn_framed_hinge(&mut world, target, Quat::IDENTITY);
         let framed = spawn_framed_hinge(&mut world, target, Quat::from_rotation_z(FOLD_ANGLE));
@@ -554,7 +643,7 @@ mod tests {
 
     #[test]
     fn unavailable_state_preserves_pose_and_authoring_then_resumes_on_repair() {
-        let mut world = resolve::world_with_diagnostics();
+        let mut world = hinge_world();
         let target = resolve::spawn_quad(&mut world, Transform::default());
         let authored = hinge(top_edge(), FOLD_ANGLE, PIVOT_OFFSET);
 
@@ -627,7 +716,7 @@ mod tests {
 
     #[test]
     fn an_entity_without_a_hinge_receives_no_pose_write() {
-        let mut world = resolve::world_with_diagnostics();
+        let mut world = hinge_world();
         let unhinged = resolve::spawn_quad(&mut world, Transform::default());
         world
             .entity_mut(unhinged)
@@ -636,6 +725,14 @@ mod tests {
         run_hinge_driver(&mut world);
 
         assert_eq!(pose(&world, unhinged), unchanged_pose());
+    }
+
+    /// A world already carrying the pintle [`HingePlugin`] would have issued,
+    /// so these tests insert hinges without building an `App`.
+    fn hinge_world() -> World {
+        let mut world = resolve::world_with_diagnostics();
+        world.insert_resource(Pintle::installed());
+        world
     }
 
     fn spawn_hinged(world: &mut World, hinge: Hinge) -> Entity {

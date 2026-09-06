@@ -37,7 +37,7 @@ struct RetiredPrecomposeImage {
     frames: u8,
 }
 
-/// Camera that should be reactivated after its render target has propagated.
+/// Camera queued for reactivation once its render target has propagated.
 #[derive(Debug)]
 struct PendingPrecomposeCamera {
     entity: Entity,
@@ -51,20 +51,21 @@ impl PanelPrecomposeCache {
         self.entries.get(&element_idx)
     }
 
-    /// Mutable access to the entry map for reconcile systems.
+    /// Returns the entry map for reconcile systems to write into.
     pub(crate) const fn entries_mut(&mut self) -> &mut HashMap<usize, PrecomposeCacheEntry> {
         &mut self.entries
     }
 
-    /// Keeps an old render target alive until the render world has observed the
-    /// camera pointing at the replacement.
+    /// Holds an old render target handle so it outlives the camera's switch to the
+    /// replacement image. [`Self::drain_ready_retired_images`] releases it on the second
+    /// frame after retirement.
     pub(crate) fn retire_image(&mut self, handle: Handle<Image>) {
         self.retired_images
             .push(RetiredPrecomposeImage { handle, frames: 0 });
     }
 
-    /// Defers camera activation until a newly assigned image target can resolve
-    /// to a nonzero viewport.
+    /// Queues a camera for activation on the second frame after this call, by which
+    /// point its newly assigned image target resolves to a nonzero viewport.
     pub(crate) fn defer_camera_activation(&mut self, entity: Entity) {
         self.pending_activations
             .retain(|pending| pending.entity != entity);

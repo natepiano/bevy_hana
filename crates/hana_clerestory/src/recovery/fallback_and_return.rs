@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use bevy::prelude::On;
 use bevy::prelude::ResMut;
 use bevy::prelude::Resource;
+use hana_rigging::prelude::DeviceKey;
 use hana_rigging::prelude::RetireRole;
 use hana_rigging::prelude::RoleKey;
 
@@ -22,6 +23,13 @@ pub(crate) enum WindowFallbackRecoveryPhase {
     OnFallbackDisplay,
     /// The requested display returned and the compositor is settling the window there.
     SettlingOnRequestedDisplay,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WindowFallbackRecoveryProgress {
+    NotRecovering,
+    Recovering(WindowFallbackRecoveryPhase),
 }
 
 /// Private per-role state for the window behavior layered on `ReapplyOnReturn`.
@@ -56,35 +64,55 @@ impl WindowFallbackRecoveryState {
     pub(super) fn retire(&mut self, role: &RoleKey) { self.phases.remove(role); }
 
     #[cfg(test)]
-    pub(crate) fn phase(&self, role: &RoleKey) -> Option<WindowFallbackRecoveryPhase> {
-        self.phases.get(role).copied()
+    pub(crate) fn phase(&self, role: &RoleKey) -> WindowFallbackRecoveryProgress {
+        self.phases.get(role).copied().map_or(
+            WindowFallbackRecoveryProgress::NotRecovering,
+            WindowFallbackRecoveryProgress::Recovering,
+        )
     }
 }
 
-/// Geometry a window came to rest at after the stranded-display fallback revealed it.
+/// Display and placement baselines that distinguish fallback settling from a user move.
 ///
-/// A role whose saved display is absent keeps its binding pointed at that display, so the window
-/// still returns when the display does. The price is that the role never becomes ready, and
-/// `write_established_window_configurations` writes nothing for a role that is not ready: while
-/// the window is stranded, nothing the user does to it is saved. Moving the window is how the user
-/// overrides that pending return, and this is what tells such a move apart from the fallback's own
-/// placement.
-///
-/// The baseline is deliberately not the geometry the fallback requested. A compositor is free to
-/// nudge a window it has just been handed, and reading that nudge as a move would throw away the
-/// saved display the instant the window appeared. The baseline is the first geometry observed
-/// twice in a row — the window at rest, wherever it actually landed.
+/// Placement readback is display-relative: neither its device nor its geometry can answer the
+/// movement question alone. One role therefore owns one entry containing both observations.
 #[derive(Default, Resource)]
-pub(crate) struct StrandedWindowPlacements {
-    entries: HashMap<RoleKey, StrandedWindowPlacement>,
+pub(crate) struct StrandedWindowMovementBaselines {
+    entries: HashMap<RoleKey, StrandedWindowMovementBaseline>,
 }
 
-/// Progress towards a baseline for one stranded window.
-enum StrandedWindowPlacement {
-    /// Revealed, but not yet seen at the same geometry on two consecutive observations.
-    Settling(Option<EstablishedWindowPlacement>),
-    /// Geometry the window settled at; a later difference is the user moving it.
-    AtRest(EstablishedWindowPlacement),
+enum StrandedWindowMovementBaseline {
+    /// Neither a display nor a placement observation has arrived yet.
+    AwaitingDisplayAndPlacement,
+    /// A display observation arrived before any placement observation.
+    AwaitingPlacementObservation { display: DeviceKey },
+    /// A placement observation arrived before any display observation.
+    AwaitingDisplay {
+        placement: EstablishedWindowPlacement,
+    },
+    /// One placement observation was recorded; a matching next one confirms it.
+    AwaitingConfirmation {
+        display:   DeviceKey,
+        placement: EstablishedWindowPlacement,
+    },
+    /// Where the window settled; a later difference is the user moving it.
+    Confirmed {
+        display:   DeviceKey,
+        placement: EstablishedWindowPlacement,
+    },
+}
+
+/// Relationship between a stranded window's live display and its recorded baseline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StrandedWindowDisplayObservation {
+    /// The role has no stranded-window movement baseline.
+    NotTracked,
+    /// This is the first exact live display observed for the stranded window.
+    BaselineRecorded,
+    /// The window remains on the exact live display previously observed under it.
+    MatchesBaseline,
+    /// The window now occupies a different exact live display.
+    DiffersFromBaseline,
 }
 
 /// What one readback of a stranded window says about who put it where it sits.
@@ -96,19 +124,80 @@ pub(crate) enum StrandedWindowObservation {
     Moved,
 }
 
-impl StrandedWindowPlacements {
+impl StrandedWindowMovementBaselines {
     /// Start tracking a role whose window the fallback has just revealed.
     pub(crate) fn begin(&mut self, role: RoleKey) {
-        self.entries
-            .insert(role, StrandedWindowPlacement::Settling(None));
+        self.entries.insert(
+            role,
+            StrandedWindowMovementBaseline::AwaitingDisplayAndPlacement,
+        );
+    }
+
+    /// Restart placement tracking while retaining any exact live-display baseline.
+    pub(crate) fn restart_placement(&mut self, role: RoleKey) {
+        let baseline = self
+            .entries
+            .entry(role)
+            .or_insert(StrandedWindowMovementBaseline::AwaitingDisplayAndPlacement);
+        match baseline {
+            StrandedWindowMovementBaseline::AwaitingDisplayAndPlacement
+            | StrandedWindowMovementBaseline::AwaitingPlacementObservation { .. } => {},
+            StrandedWindowMovementBaseline::AwaitingDisplay { .. } => {
+                *baseline = StrandedWindowMovementBaseline::AwaitingDisplayAndPlacement;
+            },
+            StrandedWindowMovementBaseline::AwaitingConfirmation { display, .. }
+            | StrandedWindowMovementBaseline::Confirmed { display, .. } => {
+                *baseline = StrandedWindowMovementBaseline::AwaitingPlacementObservation {
+                    display: display.clone(),
+                };
+            },
+        }
     }
 
     /// Whether no role is currently stranded, so per-window readback can be skipped entirely.
     #[must_use]
     pub(crate) fn is_empty(&self) -> bool { self.entries.is_empty() }
 
+    /// Record or compare the exact live display currently under a stranded window.
+    pub(crate) fn observe_display(
+        &mut self,
+        role: &RoleKey,
+        device: &DeviceKey,
+    ) -> StrandedWindowDisplayObservation {
+        let Some(entry) = self.entries.get_mut(role) else {
+            return StrandedWindowDisplayObservation::NotTracked;
+        };
+        match entry {
+            StrandedWindowMovementBaseline::AwaitingDisplayAndPlacement => {
+                *entry = StrandedWindowMovementBaseline::AwaitingPlacementObservation {
+                    display: device.clone(),
+                };
+                StrandedWindowDisplayObservation::BaselineRecorded
+            },
+            StrandedWindowMovementBaseline::AwaitingDisplay { placement } => {
+                *entry = StrandedWindowMovementBaseline::AwaitingConfirmation {
+                    display:   device.clone(),
+                    placement: placement.clone(),
+                };
+                StrandedWindowDisplayObservation::BaselineRecorded
+            },
+            StrandedWindowMovementBaseline::AwaitingPlacementObservation { display }
+            | StrandedWindowMovementBaseline::AwaitingConfirmation { display, .. }
+            | StrandedWindowMovementBaseline::Confirmed { display, .. }
+                if display == device =>
+            {
+                StrandedWindowDisplayObservation::MatchesBaseline
+            },
+            StrandedWindowMovementBaseline::AwaitingPlacementObservation { .. }
+            | StrandedWindowMovementBaseline::AwaitingConfirmation { .. }
+            | StrandedWindowMovementBaseline::Confirmed { .. } => {
+                StrandedWindowDisplayObservation::DiffersFromBaseline
+            },
+        }
+    }
+
     /// Fold one live readback into a role's baseline and report what it means.
-    pub(crate) fn observe(
+    pub(crate) fn observe_placement(
         &mut self,
         role: &RoleKey,
         live: &EstablishedWindowPlacement,
@@ -116,40 +205,57 @@ impl StrandedWindowPlacements {
         let Some(entry) = self.entries.get_mut(role) else {
             return StrandedWindowObservation::Unmoved;
         };
-        let settled = matches!(
-            entry,
-            StrandedWindowPlacement::Settling(Some(observed)) if observed == live
-        );
         match entry {
-            StrandedWindowPlacement::Settling(_) if settled => {
-                *entry = StrandedWindowPlacement::AtRest(live.clone());
+            StrandedWindowMovementBaseline::AwaitingDisplayAndPlacement => {
+                *entry = StrandedWindowMovementBaseline::AwaitingDisplay {
+                    placement: live.clone(),
+                };
                 StrandedWindowObservation::Unmoved
             },
-            StrandedWindowPlacement::Settling(observed) => {
-                *observed = Some(live.clone());
+            StrandedWindowMovementBaseline::AwaitingPlacementObservation { display } => {
+                *entry = StrandedWindowMovementBaseline::AwaitingConfirmation {
+                    display:   display.clone(),
+                    placement: live.clone(),
+                };
                 StrandedWindowObservation::Unmoved
             },
-            StrandedWindowPlacement::AtRest(at_rest) if at_rest == live => {
+            StrandedWindowMovementBaseline::AwaitingConfirmation { display, placement }
+                if placement == live =>
+            {
+                *entry = StrandedWindowMovementBaseline::Confirmed {
+                    display:   display.clone(),
+                    placement: live.clone(),
+                };
                 StrandedWindowObservation::Unmoved
             },
-            StrandedWindowPlacement::AtRest(_) => StrandedWindowObservation::Moved,
+            StrandedWindowMovementBaseline::AwaitingDisplay { placement }
+            | StrandedWindowMovementBaseline::AwaitingConfirmation { placement, .. } => {
+                placement.clone_from(live);
+                StrandedWindowObservation::Unmoved
+            },
+            StrandedWindowMovementBaseline::Confirmed { placement, .. } if placement == live => {
+                StrandedWindowObservation::Unmoved
+            },
+            StrandedWindowMovementBaseline::Confirmed { .. } => StrandedWindowObservation::Moved,
         }
     }
 
-    /// Stop tracking a role, whether its window was adopted, retired, or carried home.
+    /// Stop tracking a role, whether its window was adopted, retired, or moved back to its saved
+    /// display.
     pub(crate) fn forget(&mut self, role: &RoleKey) { self.entries.remove(role); }
 
-    #[cfg(test)]
+    /// Whether the role still awaits either a settled fallback placement or a user move.
+    #[must_use]
     pub(crate) fn is_tracked(&self, role: &RoleKey) -> bool { self.entries.contains_key(role) }
 }
 
 pub(super) fn on_retire_role(
     retire_role: On<RetireRole>,
     mut state: ResMut<WindowFallbackRecoveryState>,
-    mut stranded: ResMut<StrandedWindowPlacements>,
+    mut baselines: ResMut<StrandedWindowMovementBaselines>,
 ) {
     state.retire(&retire_role.role);
-    stranded.forget(&retire_role.role);
+    baselines.forget(&retire_role.role);
 }
 
 #[cfg(test)]
@@ -162,23 +268,23 @@ mod tests {
     use bevy::prelude::App;
     use bevy::prelude::Component;
     use bevy::prelude::Entity;
+    use bevy::prelude::IVec2;
     use bevy::prelude::Reflect;
     use bevy::prelude::ReflectComponent;
+    use bevy::prelude::UVec2;
     use bevy::prelude::World;
     use hana_rigging::WaitingWork;
+    use hana_rigging::prelude::Applied;
+    use hana_rigging::prelude::ApplyContext;
     use hana_rigging::prelude::ApplyDeadline;
-    use hana_rigging::prelude::ApplyPermit;
     use hana_rigging::prelude::AttachmentPath;
-    use hana_rigging::prelude::AttemptId;
-    use hana_rigging::prelude::AttemptOutcome;
-    use hana_rigging::prelude::AttemptProgress;
+    use hana_rigging::prelude::AttemptInvalidation;
+    use hana_rigging::prelude::AttemptRef;
     use hana_rigging::prelude::AuthoritativeReporterCoverage;
-    use hana_rigging::prelude::Binding;
-    use hana_rigging::prelude::BindingEntities;
-    use hana_rigging::prelude::BindingEntityLookup;
+    use hana_rigging::prelude::BindingAuthoring;
+    use hana_rigging::prelude::BindingPolicy;
     use hana_rigging::prelude::Bindings;
     use hana_rigging::prelude::Capabilities;
-    use hana_rigging::prelude::CaptureOutcome;
     use hana_rigging::prelude::Claim;
     use hana_rigging::prelude::CoveredDeviceIdentitySpace;
     use hana_rigging::prelude::DeviceDescriptor;
@@ -191,10 +297,14 @@ mod tests {
     use hana_rigging::prelude::DeviceScan;
     use hana_rigging::prelude::DiscoveryCadence;
     use hana_rigging::prelude::DiscoveryWork;
-    use hana_rigging::prelude::DriverId;
+    use hana_rigging::prelude::DriverCleanupRoleEntity;
+    use hana_rigging::prelude::DriverCompletion;
     use hana_rigging::prelude::EndpointDriver;
+    use hana_rigging::prelude::EndpointDriverRegistration;
     use hana_rigging::prelude::EndpointId;
-    use hana_rigging::prelude::LastKnownGoodConfiguration;
+    use hana_rigging::prelude::EstablishedContext;
+    use hana_rigging::prelude::LiveRoleChange;
+    use hana_rigging::prelude::LiveRoleChanged;
     use hana_rigging::prelude::MainThreadDiscoveryJob;
     use hana_rigging::prelude::OnAbort;
     use hana_rigging::prelude::OnSessionLoss;
@@ -208,19 +318,98 @@ mod tests {
     use hana_rigging::prelude::ReportedSerial;
     use hana_rigging::prelude::ReporterCoverage;
     use hana_rigging::prelude::ReporterRegistration;
-    use hana_rigging::prelude::RequestedConfiguration;
     use hana_rigging::prelude::RetryOn;
     use hana_rigging::prelude::RiggingAppExt;
     use hana_rigging::prelude::RiggingPlugin;
-    use hana_rigging::prelude::RoleAvailable;
-    use hana_rigging::prelude::RoleAwaiting;
-    use hana_rigging::prelude::RoleState;
+    use hana_rigging::prelude::RoleKey;
+    use hana_rigging::prelude::RoleStatus;
+    use hana_rigging::prelude::RoleStatusView;
     use hana_rigging::prelude::SchemeName;
+    use hana_rigging::prelude::SessionRef;
+    use hana_rigging::prelude::SessionReleaseCause;
+    use hana_rigging::prelude::TargetResolution;
+    use hana_rigging::prelude::TargetResolutionContext;
+    use hana_rigging::prelude::WaitingStatusView;
+    use hana_rigging::prelude::register_binding;
 
     use super::*;
+    use crate::persistence::EstablishedWindowPosition;
+    use crate::persistence::SavedWindowMode;
     use crate::recovery::RecoveryPlugin;
 
     const FRAME_CEILING: usize = 32;
+
+    fn placement(logical_x: i32) -> EstablishedWindowPlacement {
+        EstablishedWindowPlacement {
+            position:          EstablishedWindowPosition::Restorable {
+                logical_offset: IVec2::new(logical_x, 20),
+            },
+            logical_size:      UVec2::new(800, 600),
+            saved_window_mode: SavedWindowMode::Windowed,
+        }
+    }
+
+    #[test]
+    fn display_first_arrival_builds_one_confirmed_movement_baseline() -> Result<(), String> {
+        let role = RoleKey::new("window:managed:display-first")
+            .map_err(|error| format!("failed to create role: {error}"))?;
+        let display = display_key("display-first")?;
+        let baseline = placement(10);
+        let moved = placement(30);
+        let mut baselines = StrandedWindowMovementBaselines::default();
+
+        baselines.begin(role.clone());
+        assert_eq!(
+            baselines.observe_display(&role, &display),
+            StrandedWindowDisplayObservation::BaselineRecorded
+        );
+        assert_eq!(
+            baselines.observe_placement(&role, &baseline),
+            StrandedWindowObservation::Unmoved
+        );
+        assert_eq!(
+            baselines.observe_placement(&role, &baseline),
+            StrandedWindowObservation::Unmoved
+        );
+        assert_eq!(
+            baselines.observe_placement(&role, &moved),
+            StrandedWindowObservation::Moved
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn placement_first_arrival_builds_one_confirmed_movement_baseline() -> Result<(), String> {
+        let role = RoleKey::new("window:managed:placement-first")
+            .map_err(|error| format!("failed to create role: {error}"))?;
+        let display = display_key("placement-first")?;
+        let other_display = display_key("placement-first-other")?;
+        let baseline = placement(10);
+        let mut baselines = StrandedWindowMovementBaselines::default();
+
+        baselines.begin(role.clone());
+        assert_eq!(
+            baselines.observe_placement(&role, &baseline),
+            StrandedWindowObservation::Unmoved
+        );
+        assert_eq!(
+            baselines.observe_display(&role, &display),
+            StrandedWindowDisplayObservation::BaselineRecorded
+        );
+        assert_eq!(
+            baselines.observe_placement(&role, &baseline),
+            StrandedWindowObservation::Unmoved
+        );
+        assert_eq!(
+            baselines.observe_display(&role, &display),
+            StrandedWindowDisplayObservation::MatchesBaseline
+        );
+        assert_eq!(
+            baselines.observe_display(&role, &other_display),
+            StrandedWindowDisplayObservation::DiffersFromBaseline
+        );
+        Ok(())
+    }
 
     #[derive(Clone, Component, Debug, PartialEq, Eq, Reflect)]
     #[reflect(Component, PartialEq)]
@@ -236,34 +425,58 @@ mod tests {
 
     impl EndpointDriver for TestWindowDriver {
         type Configuration = TestWindowConfiguration;
+        type Target = ();
 
-        fn capture(
+        fn resolve_target(
             &mut self,
             _: &mut World,
-            _: &DeviceEndpoint,
-        ) -> CaptureOutcome<Self::Configuration> {
-            CaptureOutcome::Read(TestWindowConfiguration(7))
+            _: &TargetResolutionContext<'_>,
+            _: &Self::Configuration,
+        ) -> TargetResolution<Self::Target> {
+            TargetResolution::Reached(())
         }
 
         fn start_apply(
             &mut self,
             _: &mut World,
-            endpoint: &DeviceEndpoint,
+            context: ApplyContext<'_, Self::Configuration>,
             configuration: &Self::Configuration,
-            _: AttemptId,
-            _: ApplyPermit,
+            (): Self::Target,
         ) {
             self.0
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(AppliedConfiguration {
-                    device: endpoint.device.clone(),
+                    device: context.target().endpoint().device.clone(),
                     value:  configuration.0,
                 });
+            context
+                .into_completion()
+                .finish(DriverCompletion::Succeeded(Applied::DiffersFromDispatched(
+                    TestWindowConfiguration(7),
+                )));
         }
 
-        fn poll(&mut self, _: &mut World, _: AttemptId) -> AttemptProgress {
-            AttemptProgress::Finished(AttemptOutcome::Succeeded)
+        fn established(&mut self, _: &mut World, _: EstablishedContext<'_, Self::Configuration>) {}
+
+        fn cancel_apply(
+            &mut self,
+            _: &mut World,
+            _: &RoleKey,
+            _: DriverCleanupRoleEntity,
+            _: AttemptRef,
+            _: AttemptInvalidation,
+        ) {
+        }
+
+        fn release_session(
+            &mut self,
+            _: &mut World,
+            _: &RoleKey,
+            _: DriverCleanupRoleEntity,
+            _: SessionRef,
+            _: SessionReleaseCause,
+        ) {
         }
     }
 
@@ -291,19 +504,33 @@ mod tests {
         available: Vec<RoleKey>,
     }
 
-    fn record_awaiting(role_awaiting: On<RoleAwaiting>, mut facts: ResMut<RecoveryFacts>) {
-        facts.awaiting.push(role_awaiting.role.clone());
-    }
-
-    fn record_available(role_available: On<RoleAvailable>, mut facts: ResMut<RecoveryFacts>) {
-        facts.available.push(role_available.role.clone());
+    fn record_role_availability(
+        live_role_changed: On<LiveRoleChanged>,
+        mut facts: ResMut<RecoveryFacts>,
+    ) {
+        let LiveRoleChange::Status { from, to } = &live_role_changed.change else {
+            return;
+        };
+        let was_waiting = matches!(
+            from.view(),
+            RoleStatusView::Waiting(WaitingStatusView::Reporter(_))
+        );
+        let is_waiting = matches!(
+            to.view(),
+            RoleStatusView::Waiting(WaitingStatusView::Reporter(_))
+        );
+        match (was_waiting, is_waiting) {
+            (false, true) => facts.awaiting.push(live_role_changed.role.clone()),
+            (true, false) => facts.available.push(live_role_changed.role.clone()),
+            (false, false) | (true, true) => {},
+        }
     }
 
     struct RecoveryHarness {
         app:      App,
         reported: Arc<Mutex<Vec<DeviceKey>>>,
         applied:  Arc<Mutex<Vec<AppliedConfiguration>>>,
-        driver:   DriverId,
+        driver:   EndpointDriverRegistration<TestWindowConfiguration>,
     }
 
     impl RecoveryHarness {
@@ -313,8 +540,7 @@ mod tests {
                 .add_plugins((RiggingPlugin, RecoveryPlugin))
                 .register_device_scheme(display_scheme()?)
                 .init_resource::<RecoveryFacts>()
-                .add_observer(record_awaiting)
-                .add_observer(record_available);
+                .add_observer(record_role_availability);
             let reported = Arc::new(Mutex::new(Vec::new()));
             app.add_device_reporter(
                 DisplayReporter(Arc::clone(&reported)),
@@ -327,6 +553,7 @@ mod tests {
                             kind: DeviceKind::Display,
                         },
                     )),
+                    std::time::Duration::from_secs(10),
                 ),
             );
             let applied = Arc::new(Mutex::new(Vec::new()));
@@ -349,16 +576,16 @@ mod tests {
             let role = RoleKey::new(role_name)
                 .map_err(|error| format!("failed to create recovery role: {error}"))?;
             let device_key = display_key(device_name)?;
-            self.app
-                .world_mut()
-                .resource_mut::<Bindings>()
-                .register(test_binding(
+            register_binding(
+                self.app.world_mut(),
+                test_binding(
                     role.clone(),
                     device_key.clone(),
                     self.driver,
                     recovery_policy,
-                ))
-                .map_err(|error| format!("failed to register recovery binding: {error}"))?;
+                ),
+            )
+            .map_err(|error| format!("failed to register recovery binding: {error}"))?;
             Ok((role, device_key))
         }
 
@@ -375,25 +602,28 @@ mod tests {
             }
         }
 
-        fn reach_role_state(
-            &mut self,
-            role: &RoleKey,
-            role_state: RoleState,
-        ) -> Result<(), String> {
+        fn reach_established(&mut self, role: &RoleKey) -> Result<(), String> {
             for _ in 0..FRAME_CEILING {
-                if self
+                let role_entity = self
                     .app
                     .world()
                     .resource::<Bindings>()
-                    .binding(role)
-                    .is_ok_and(|binding| binding.state == role_state)
-                {
+                    .role_entity(role)
+                    .ok();
+                if role_entity.is_some_and(|entity| {
+                    self.app
+                        .world()
+                        .get::<RoleStatus>(entity)
+                        .is_some_and(|status| {
+                            matches!(status.view(), RoleStatusView::Established { .. })
+                        })
+                }) {
                     return Ok(());
                 }
                 self.app.update();
             }
             Err(format!(
-                "role {role:?} did not reach {role_state:?} within {FRAME_CEILING} frames"
+                "role {role:?} did not become established within {FRAME_CEILING} frames"
             ))
         }
 
@@ -426,12 +656,11 @@ mod tests {
         }
 
         fn binding_entity(&self, role: &RoleKey) -> Result<Entity, String> {
-            match self.app.world().resource::<BindingEntities>().entity(role) {
-                BindingEntityLookup::Registered(entity) => Ok(entity),
-                BindingEntityLookup::Unregistered => {
-                    Err(format!("role {role:?} has no registered binding entity"))
-                },
-            }
+            self.app
+                .world()
+                .resource::<Bindings>()
+                .role_entity(role)
+                .map_err(|_| format!("role {role:?} has no registered binding entity"))
         }
 
         fn clear_applied(&self) {
@@ -489,34 +718,34 @@ mod tests {
             claim:                  Claim::NotApplicable,
             capabilities:           Capabilities::new(),
             serial:                 ReportedSerial::NotExposedByUnit,
-            platform_device_handle: PlatformDeviceHandle::PlatformReportedNothing,
+            platform_device_handle: PlatformDeviceHandle::PlatformHasNoConcept,
             attachment:             AttachmentPath::PlatformHasNoConcept,
-            descriptor:             DeviceDescriptor::PlatformReportedNothing,
+            descriptor:             DeviceDescriptor::PlatformHasNoConcept,
         }
     }
 
     fn test_binding(
         role: RoleKey,
         device_key: DeviceKey,
-        driver: DriverId,
+        driver: EndpointDriverRegistration<TestWindowConfiguration>,
         recovery_policy: RecoveryPolicy,
-    ) -> Binding {
-        Binding {
+    ) -> BindingAuthoring<TestWindowConfiguration> {
+        BindingAuthoring::new(
             role,
-            endpoint: DeviceEndpoint {
+            DeviceEndpoint {
                 device: device_key,
                 id:     EndpointId::Whole,
             },
             driver,
-            recovery: recovery_policy,
-            retry: RetryOn::NewRevision,
-            on_abort: OnAbort::default(),
-            on_loss: OnSessionLoss::default(),
-            state: RoleState::Waiting,
-            requested: RequestedConfiguration::new(TestWindowConfiguration(3)),
-            last_known_good: LastKnownGoodConfiguration::known(TestWindowConfiguration(7)),
-            apply_deadline: ApplyDeadline::ProcessDefault,
-        }
+            TestWindowConfiguration(3),
+            BindingPolicy::new(
+                recovery_policy,
+                RetryOn::NewRevision,
+                OnAbort::default(),
+                OnSessionLoss::default(),
+                ApplyDeadline::ProcessDefault,
+            ),
+        )
     }
 
     fn observe_policy(
@@ -526,26 +755,24 @@ mod tests {
         let (role, device_key) =
             harness.bind("window:managed:policy", "policy-display", recovery_policy)?;
         harness.report(std::slice::from_ref(&device_key));
-        harness.reach_role_state(&role, RoleState::Ready)?;
+        harness.reach_established(&role)?;
         harness.clear_applied();
 
         harness.report(&[]);
         let expected_work = match recovery_policy {
             RecoveryPolicy::ReapplyOnReturn => WaitingWork::RestorationOwed,
-            RecoveryPolicy::Forget | RecoveryPolicy::Retain | RecoveryPolicy::ReapplyOnRequest => {
-                WaitingWork::ApplicationRequestOwed
-            },
+            RecoveryPolicy::ReapplyOnRequest => WaitingWork::ReapplyRequestOwed,
+            RecoveryPolicy::Forget => WaitingWork::RegistrationOwed,
         };
         harness.reach_waiting_work(&role, expected_work)?;
         let (waiting_work, last_known_good) = {
             let bindings = harness.app.world().resource::<Bindings>();
-            let last_known_good = if matches!(
-                &bindings
-                    .binding(&role)
-                    .map_err(|error| format!("recovery binding disappeared: {error}"))?
-                    .last_known_good,
-                LastKnownGoodConfiguration::Known(_)
-            ) {
+            let last_known_good = if bindings
+                .binding(&role)
+                .map_err(|error| format!("recovery binding disappeared: {error}"))?
+                .last_known_good()
+                .is_ok()
+            {
                 LastKnownGoodStatus::Known
             } else {
                 LastKnownGoodStatus::NotEstablished
@@ -558,7 +785,7 @@ mod tests {
             RecoveryPolicy::ReapplyOnReturn => {
                 harness.reach_apply(&device_key)?;
             },
-            RecoveryPolicy::Forget | RecoveryPolicy::Retain | RecoveryPolicy::ReapplyOnRequest => {
+            RecoveryPolicy::Forget | RecoveryPolicy::ReapplyOnRequest => {
                 harness.advance(FRAME_CEILING);
             },
         }
@@ -572,30 +799,25 @@ mod tests {
     #[test]
     fn recovery_policies_keep_distinct_departure_and_return_behavior() -> Result<(), String> {
         let forget = observe_policy(RecoveryPolicy::Forget)?;
-        let retain = observe_policy(RecoveryPolicy::Retain)?;
         let reapply_on_request = observe_policy(RecoveryPolicy::ReapplyOnRequest)?;
         let reapply_on_return = observe_policy(RecoveryPolicy::ReapplyOnReturn)?;
 
+        // Every row differs from every other row in at least one column, which is what the name of
+        // this test claims and what an enum of policies is for. A variant whose row duplicated
+        // another's would produce the same behavior as that other variant, leaving the difference
+        // between the two only in the documentation.
         assert_eq!(
             forget,
             RecoveryPolicyObservation {
-                waiting_work:    WaitingWork::ApplicationRequestOwed,
+                waiting_work:    WaitingWork::RegistrationOwed,
                 last_known_good: LastKnownGoodStatus::NotEstablished,
-                return_apply:    Vec::new(),
-            }
-        );
-        assert_eq!(
-            retain,
-            RecoveryPolicyObservation {
-                waiting_work:    WaitingWork::ApplicationRequestOwed,
-                last_known_good: LastKnownGoodStatus::Known,
                 return_apply:    Vec::new(),
             }
         );
         assert_eq!(
             reapply_on_request,
             RecoveryPolicyObservation {
-                waiting_work:    WaitingWork::ApplicationRequestOwed,
+                waiting_work:    WaitingWork::ReapplyRequestOwed,
                 last_known_good: LastKnownGoodStatus::Known,
                 return_apply:    Vec::new(),
             }
@@ -625,8 +847,8 @@ mod tests {
             RecoveryPolicy::ReapplyOnRequest,
         )?;
         harness.report(&[first_device.clone(), second_device.clone()]);
-        harness.reach_role_state(&first_role, RoleState::Ready)?;
-        harness.reach_role_state(&second_role, RoleState::Ready)?;
+        harness.reach_established(&first_role)?;
+        harness.reach_established(&second_role)?;
         let first_entity = harness.binding_entity(&first_role)?;
         let second_entity = harness.binding_entity(&second_role)?;
         harness.clear_applied();
@@ -638,14 +860,14 @@ mod tests {
         assert!(harness.applied_values(&first_device).is_empty());
 
         harness.report(std::slice::from_ref(&second_device));
-        harness.reach_waiting_work(&first_role, WaitingWork::ApplicationRequestOwed)?;
+        harness.reach_waiting_work(&first_role, WaitingWork::ReapplyRequestOwed)?;
         assert_eq!(
             harness
                 .app
                 .world()
                 .resource::<Bindings>()
                 .waiting_work(&first_role),
-            WaitingWork::ApplicationRequestOwed
+            WaitingWork::ReapplyRequestOwed
         );
         harness.report(&[first_device.clone(), second_device.clone()]);
         harness.advance(4);
@@ -708,11 +930,15 @@ mod tests {
             .resource::<WindowFallbackRecoveryState>();
         assert_eq!(
             state.phase(&first_role),
-            Some(WindowFallbackRecoveryPhase::MissingLiveMonitor)
+            WindowFallbackRecoveryProgress::Recovering(
+                WindowFallbackRecoveryPhase::MissingLiveMonitor
+            )
         );
         assert_eq!(
             state.phase(&second_role),
-            Some(WindowFallbackRecoveryPhase::MissingLiveMonitor)
+            WindowFallbackRecoveryProgress::Recovering(
+                WindowFallbackRecoveryPhase::MissingLiveMonitor
+            )
         );
 
         harness.report(std::slice::from_ref(&first_device));
@@ -730,10 +956,15 @@ mod tests {
             .app
             .world()
             .resource::<WindowFallbackRecoveryState>();
-        assert_eq!(state.phase(&first_role), None);
+        assert_eq!(
+            state.phase(&first_role),
+            WindowFallbackRecoveryProgress::NotRecovering
+        );
         assert_eq!(
             state.phase(&second_role),
-            Some(WindowFallbackRecoveryPhase::MissingLiveMonitor)
+            WindowFallbackRecoveryProgress::Recovering(
+                WindowFallbackRecoveryPhase::MissingLiveMonitor
+            )
         );
         {
             let bindings = harness.app.world().resource::<Bindings>();
@@ -742,15 +973,9 @@ mod tests {
         }
 
         harness.advance(2);
-        let binding_entities = harness.app.world().resource::<BindingEntities>();
-        assert_eq!(
-            binding_entities.entity(&first_role),
-            BindingEntityLookup::Unregistered
-        );
-        assert!(matches!(
-            binding_entities.entity(&second_role),
-            BindingEntityLookup::Registered(_)
-        ));
+        let bindings = harness.app.world().resource::<Bindings>();
+        assert!(bindings.role_entity(&first_role).is_err());
+        assert!(bindings.role_entity(&second_role).is_ok());
 
         harness.report(std::slice::from_ref(&second_device));
         harness.advance(6);
@@ -764,6 +989,75 @@ mod tests {
                 .binding(&second_role)
                 .is_ok()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_retirement_clears_every_window_recovery_policy_and_baseline() -> Result<(), String>
+    {
+        let mut harness = RecoveryHarness::new()?;
+        for (suffix, recovery_policy) in [
+            ("forget", RecoveryPolicy::Forget),
+            ("request", RecoveryPolicy::ReapplyOnRequest),
+            ("return", RecoveryPolicy::ReapplyOnReturn),
+        ] {
+            let (role, device) = harness.bind(
+                &format!("window:managed:{suffix}"),
+                &format!("{suffix}-display"),
+                recovery_policy,
+            )?;
+            harness
+                .app
+                .world_mut()
+                .resource_mut::<WindowFallbackRecoveryState>()
+                .mark_missing(role.clone());
+            harness
+                .app
+                .world_mut()
+                .resource_mut::<StrandedWindowMovementBaselines>()
+                .begin(role.clone());
+            harness
+                .app
+                .world_mut()
+                .resource_mut::<StrandedWindowMovementBaselines>()
+                .observe_display(&role, &device);
+
+            harness
+                .app
+                .world_mut()
+                .trigger(RetireRole { role: role.clone() });
+
+            assert!(
+                harness
+                    .app
+                    .world()
+                    .resource::<Bindings>()
+                    .binding(&role)
+                    .is_err()
+            );
+            assert_eq!(
+                harness
+                    .app
+                    .world()
+                    .resource::<WindowFallbackRecoveryState>()
+                    .phase(&role),
+                WindowFallbackRecoveryProgress::NotRecovering
+            );
+            assert!(
+                !harness
+                    .app
+                    .world()
+                    .resource::<StrandedWindowMovementBaselines>()
+                    .is_tracked(&role)
+            );
+            assert!(
+                !harness
+                    .app
+                    .world()
+                    .resource::<StrandedWindowMovementBaselines>()
+                    .is_tracked(&role)
+            );
+        }
         Ok(())
     }
 }

@@ -39,7 +39,8 @@ impl Default for TraceState {
     }
 }
 
-/// Shared ordering authority for observations from one probe process.
+/// Collects the [`TraceRecord`]s of one probe process, stamping each with the next sequence
+/// number and a timestamp taken from a single start point. Clones share one record list.
 #[derive(Clone, Default, Resource)]
 pub(crate) struct ProbeTrace(Arc<Mutex<TraceState>>);
 

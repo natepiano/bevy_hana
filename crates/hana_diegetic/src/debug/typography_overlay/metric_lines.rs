@@ -31,12 +31,12 @@ use crate::layout::DrawOverflow;
 use crate::layout::El;
 use crate::layout::LayoutBuilder;
 use crate::layout::LayoutTree;
-use crate::layout::LineMetricsSnapshot;
 use crate::layout::PanelCircle;
 use crate::layout::PanelDraw;
 use crate::layout::PanelLine;
 use crate::layout::PanelPoint;
 use crate::layout::PanelShape;
+use crate::layout::ShapedLineMetrics;
 use crate::panel::DiegeticPanel;
 use crate::render::ComputedWorldText;
 use crate::render::HairlineFade;
@@ -158,7 +158,7 @@ fn spawn_metric_guide_panel(
 
 fn metric_line_specs(
     font_metrics: &FontMetrics,
-    line_metrics: &LineMetricsSnapshot,
+    line_metrics: &ShapedLineMetrics,
     overlay: &TypographyOverlay,
     anchor_y: f32,
     scale: f32,
@@ -385,7 +385,7 @@ fn build_metric_guide_tree(
 /// order.
 fn metric_line_labels(
     font_metrics: &FontMetrics,
-    line_metrics: &LineMetricsSnapshot,
+    line_metrics: &ShapedLineMetrics,
 ) -> Vec<(&'static str, f32)> {
     let baseline_y = line_metrics.baseline;
     let ascent_y = baseline_y - line_metrics.ascent;

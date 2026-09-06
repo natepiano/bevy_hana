@@ -744,7 +744,8 @@ impl SdfBatch {
         }
     }
 
-    /// World-space union from clipped record corners using the R14 recipe.
+    /// World-space union of every live record's clipped mesh corners, each
+    /// corner transformed by that record's world matrix.
     #[must_use]
     fn world_bounds(&self) -> Option<(Vec3, Vec3)> {
         let mut min = Vec3::MAX;
@@ -1010,7 +1011,8 @@ fn sdf_batch_alpha_mode(alpha: BatchAlphaMode, shadow: VisualShadow) -> AlphaMod
 
 /// Extra `clip_depth_nudge` layer-units to push the SDF fill away from the camera,
 /// non-zero only for the depth-buffer regime (`Opaque`/`Mask`). Transparent and
-/// OIT fills order through their sort/list levers, so they get zero.
+/// OIT fills order through `ScreenDepthBias`/`OitDepthOffset` instead, so they
+/// get zero.
 #[must_use]
 fn opaque_fill_depth_push(alpha: BatchAlphaMode, shadow: VisualShadow) -> f32 {
     match sdf_batch_alpha_mode(alpha, shadow) {
@@ -1109,7 +1111,7 @@ pub(super) enum SdfRecordRouting {
 
 impl SdfRecordRouting {
     /// Maps an `SdfRoleAppend` that drops its record to the cause, or `None`
-    /// when the role appended a row or was simply unauthored.
+    /// when the role appended a row or was unauthored.
     const fn from_dropped_role(role: &SdfRoleAppend) -> Option<Self> {
         match role {
             SdfRoleAppend::Held => Some(Self::MaterialPending),

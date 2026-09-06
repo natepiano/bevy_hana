@@ -115,9 +115,9 @@ pub struct ArrangementPlan<S> {
 ///
 /// A provider authors at most one sequence per plan, and most providers author
 /// none: an arrangement is a connection forest first, and folding it is a
-/// separate decision. `Unauthored` is that ordinary case, not a missing value
-/// somebody forgot to supply, so materialization writes no fold sequence and
-/// the arrangement materializes exactly as it would without this field.
+/// separate decision. `Unauthored` is that ordinary case: materialization
+/// writes no fold sequence and the arrangement materializes exactly as it would
+/// without this field.
 /// `Authored` carries the one resolved sequence
 /// [`ArrangementProvider::with_fold_sequence`](super::ArrangementProvider::with_fold_sequence)
 /// or
@@ -144,7 +144,7 @@ impl<S> ArrangementPlan<S> {
     /// retained diagnostics, or rollback. An error returns before a plan is
     /// produced and leaves all supplied values unchanged.
     ///
-    /// `Edge` validation intentionally stops at unequal endpoints. This method
+    /// `Edge` validation stops at unequal endpoints: this method
     /// has no [`crate::ResolvedAnchorGeometry`], so endpoint presence,
     /// separation, and usable-axis checks remain owned by
     /// [`crate::ResolvedAnchorGeometry::try_new`]. `Angle` is already finite
@@ -351,8 +351,8 @@ where
     /// Retains purpose-specific provider knowledge for one selected alternative.
     ///
     /// `C` is the provider's own capability type, such as
-    /// [`crate::WindingClearance`]. A later recipe asks for the concrete type
-    /// it requires, so one selection holds at most one value per capability
+    /// [`crate::WindingClearance`]. A later recipe looks its value up by
+    /// concrete type, so one selection holds at most one value per capability
     /// type. This association never inspects the invariants inside `C`: a
     /// capability that has invariants enforces them in its own constructor
     /// before reaching this method.
@@ -422,7 +422,8 @@ pub enum ArrangementError {
         /// Entity that cannot represent more than one logical member.
         member_entity: Entity,
     },
-    /// A caller deliberately reported that no existing entity can represent a listed member.
+    /// A caller reported [`MemberBinding::Missing`](super::MemberBinding::Missing)
+    /// for a listed member.
     #[error("logical arrangement member {member} has no bound entity")]
     MissingMemberBinding {
         /// `Debug` representation of the member for which binding failed.
@@ -446,7 +447,7 @@ pub enum ArrangementError {
         /// Foreign relationship target entity.
         target_entity: Entity,
     },
-    /// A connection tried to attach a member to itself.
+    /// A connection named one member as both its source and its target.
     #[error("arrangement connection {member_entity:?} cannot target itself")]
     SelfTarget {
         /// Source entity that also appeared as its target.
@@ -564,7 +565,7 @@ pub enum ArrangementError {
         /// Member whose assigned pivot coordinates were not finite.
         member_entity: Entity,
     },
-    /// A recipe tried to replace an endpoint away from the shared base endpoint.
+    /// A recipe named a member whose folded endpoint already differs from its base endpoint.
     #[error("member {member_entity:?} is not resting at its base endpoint")]
     FoldRecipeAwayFromBase {
         /// Member already carrying a distinct folded endpoint.

@@ -1,4 +1,4 @@
-//! Which side of the keyboard owns the keystrokes routing sees.
+//! Whether keystrokes route to keymap commands or to a text field that owns the keyboard.
 
 use std::any::TypeId;
 use std::sync::Arc;
@@ -59,10 +59,11 @@ pub enum KeyboardRelease {
 /// the keys still down, the same reset a keymap reload performs, so a key held
 /// across the transition cannot stay logically pressed after it.
 ///
-/// Both variants are `#[non_exhaustive]` so that the token cannot be sidestepped
-/// from outside this crate: a consumer reaches either state through
-/// [`Self::take_for_text_entry`] or [`Self::release`], both of which refuse a
-/// handover the caller does not hold, and never by assigning a variant directly.
+/// Both variants are `#[non_exhaustive]` so the [`KeyboardOwner`] check cannot be
+/// bypassed from outside this crate: a consumer reaches either state through
+/// [`Self::take_for_text_entry`] or [`Self::release`], both of which return
+/// `HeldByAnother` when the caller is not the party holding the keyboard, and
+/// never by assigning a variant directly.
 #[derive(Clone, Debug, Eq, PartialEq, Resource)]
 pub enum KeystrokeRouting {
     /// Every compiled binding routes.
@@ -73,9 +74,9 @@ pub enum KeystrokeRouting {
     ///
     /// The exemption covers keystrokes the compiled keymap matches. It does not
     /// reach the bare-modifier held bindings
-    /// `activate_modifier_family_held_bindings` drives, which stand down
-    /// entirely while the field owns the keyboard — a held modifier is never the
-    /// command that closes a field.
+    /// `activate_modifier_family_held_bindings` drives, which it never
+    /// activates while the field owns the keyboard — a held modifier is never
+    /// the command that closes a field.
     #[non_exhaustive]
     TextEntry {
         /// The party that took the keyboard, and the only one that can hand it

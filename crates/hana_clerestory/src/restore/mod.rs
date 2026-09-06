@@ -1,6 +1,8 @@
 //! Window restore startup, target state, and settle verification.
 
 mod restore_attempt;
+#[cfg(test)]
+mod settle_regression_tests;
 mod settle_state;
 mod target_position;
 mod winit_info;
@@ -17,9 +19,9 @@ use bevy::time::Virtual;
 use hana_rigging::prelude::RiggingSystems;
 pub(crate) use restore_attempt::RestorePreparation;
 pub(crate) use restore_attempt::RestorePreparationSource;
-pub(crate) use restore_attempt::WindowApplyConfiguration;
-pub(crate) use restore_attempt::clear_finished_restore_preparations;
+pub(crate) use restore_attempt::WindowRestoreAttempt;
 pub(crate) use restore_attempt::prepare_driver_restore_targets;
+pub(crate) use restore_attempt::remove_window_restore_work;
 pub(crate) use settle_state::check_restore_settling;
 pub(crate) use target_position::FullscreenRestoreState;
 pub(crate) use target_position::MonitorScaleStrategy;
@@ -31,7 +33,7 @@ use target_position::ObservedScaleInputs;
 ))]
 pub(crate) use target_position::TargetPosition;
 pub(crate) use target_position::WindowRestoreState;
-pub(crate) use target_position::restore_windows;
+pub(crate) use target_position::place_window_at_saved_geometry;
 #[cfg(test)]
 pub(crate) use winit_info::InjectedWinitWindows;
 #[cfg(all(target_os = "linux", feature = "workaround-winit-4445"))]
@@ -43,7 +45,6 @@ pub(crate) use x11_position_fix::reapply_compensated_position;
 
 use crate::ClerestoryUpdateSet;
 use crate::ClerestoryWindowDriverSet;
-use crate::driver;
 #[cfg(target_os = "macos")]
 use crate::macos_tabbing_fix;
 pub(crate) struct RestorePlugin;
@@ -73,11 +74,9 @@ impl Plugin for RestorePlugin {
             (
                 target_position::capture_scale_inputs,
                 (
-                    driver::discard_finished_window_attempt_results,
-                    clear_finished_restore_preparations,
                     prepare_driver_restore_targets,
                     ApplyDeferred,
-                    restore_windows,
+                    place_window_at_saved_geometry,
                     check_restore_settling,
                     ApplyDeferred,
                 )

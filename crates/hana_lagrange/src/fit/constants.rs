@@ -12,7 +12,7 @@ pub(super) const DEFAULT_FIT_MARGIN: f32 = 0.1;
 /// Minimum screen-space extent before treating a dimension as degenerate (edge-on).
 /// Below this threshold the dimension is ignored for fit purposes.
 pub(super) const DEGENERATE_EXTENT_THRESHOLD: f32 = 1e-6;
-/// Initial best-guess radius as a multiple of the object radius (2x).
+/// Radius the search starts from, as a multiple of the object radius (2x).
 pub(super) const INITIAL_RADIUS_MULTIPLIER: f32 = 2.0;
 /// Maximum allowed margin value.
 pub(super) const MAX_MARGIN: f32 = 0.9999;
@@ -24,7 +24,9 @@ pub(super) const MAX_RADIUS_MULTIPLIER: f32 = 100.0;
 pub(super) const MIN_MARGIN: f32 = 0.0;
 /// Minimum search radius as a fraction of the object radius (0.1x).
 pub(super) const MIN_RADIUS_MULTIPLIER: f32 = 0.1;
-/// Convergence tolerance (0.1% of search range).
+/// Binary search stops once the remaining radius bracket `max_radius -
+/// min_radius` is narrower than this. Absolute, in world units — not a
+/// fraction of the searched range.
 pub(super) const TOLERANCE: f32 = 0.001;
 
 // fit dimension labels (used in debug log output of find_constraining_margin)

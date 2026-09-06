@@ -91,10 +91,12 @@ pub(super) fn native_window_exists(
 
 /// Token indicating X11 frame extent compensation is complete (W6 workaround).
 ///
-/// This component gates `restore_windows` - the restore system cannot process
-/// a window until this token exists on the entity. On Linux X11 with W6 workaround
-/// enabled, this ensures frame extents are queried and position is compensated
-/// before restore proceeds. On other platforms/configurations, the token is
-/// inserted during driver target preparation since no compensation is needed.
+/// This component gates `place_window_at_saved_geometry` - the placement system cannot process
+/// a window until this token exists on the entity. A windowed restore on Linux X11 with the
+/// W6 workaround enabled receives the token from `compensate_target_position`, once
+/// `_NET_FRAME_EXTENTS` yields the title bar height to subtract from the saved position.
+/// A fullscreen restore has no title bar to subtract, and every other platform reports frame
+/// coordinates already, so driver target preparation inserts the token directly for both.
+/// [`Platform::awaits_frame_compensation`](crate::Platform) draws that line.
 #[derive(Component)]
 pub(crate) struct X11FrameCompensated;

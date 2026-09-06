@@ -1,0 +1,18 @@
+error[E0308]: arguments to this function are incorrect
+  --> tests/compile_fail/continuous_flow_intervals_cannot_be_exchanged.rs:22:13
+   |
+22 |     let _ = continuous_flow_expectation(maximum_datum_gap, first_datum_timeout);
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^ -----------------  ------------------- expected `MaximumDatumGap`, found `FirstDatumTimeout`
+   |                                         |
+   |                                         expected `FirstDatumTimeout`, found `MaximumDatumGap`
+   |
+note: function defined here
+  --> tests/compile_fail/continuous_flow_intervals_cannot_be_exchanged.rs:7:4
+   |
+ 7 | fn continuous_flow_expectation(
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: swap these arguments
+   |
+22 -     let _ = continuous_flow_expectation(maximum_datum_gap, first_datum_timeout);
+22 +     let _ = continuous_flow_expectation(first_datum_timeout, maximum_datum_gap);
+   |

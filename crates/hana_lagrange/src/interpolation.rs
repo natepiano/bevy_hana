@@ -86,7 +86,8 @@ mod lerp_and_snap_f32_tests {
 
     #[test]
     fn does_not_snap_if_smoothness_is_one() {
-        // Smoothness of one results in the value not changing, so it doesn't make sense to snap
+        // Smoothness of one leaves the value unchanged, so the `smoothness < 1.0`
+        // guard skips the snap branch.
         let out = lerp_and_snap_f32(1.9991, 2.0, 1.0, 1.0);
         assert_eq!(out, 1.9991);
     }
@@ -122,7 +123,8 @@ mod lerp_and_snap_position_tests {
 
     #[test]
     fn does_not_snap_if_smoothness_is_one() {
-        // Smoothness of one results in the value not changing, so it doesn't make sense to snap
+        // Smoothness of one leaves the value unchanged, so the `smoothness < 1.0`
+        // guard skips the snap branch.
         let out = lerp_and_snap_position(Position(Vec3::X * 0.9991), Position(Vec3::X), 1.0, 1.0);
         assert_eq!(out, Position(Vec3::X * 0.9991));
     }

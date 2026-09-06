@@ -456,10 +456,14 @@ fn hinge_label_style(accent: Color) -> TextStyle {
 
 #[cfg(test)]
 mod tests {
+    use bevy::ecs::change_detection::DetectChanges;
+    use bevy::prelude::App;
+    use bevy::prelude::Update;
     use hana_valence::AnchorPose;
     use hana_valence::AnchoredTo;
     use hana_valence::Arrangement;
     use hana_valence::Hinge;
+    use hana_valence::HingePlugin;
     use hana_valence::Member;
     use hana_valence::Members;
 
@@ -477,7 +481,10 @@ mod tests {
         let mut chain = AnchorChain::default();
         chain.add_tile();
         let mut app = App::new();
-        app.insert_resource(chain)
+        // Every `Hinge` insertion demands the driver plugin, so a test app
+        // that skipped it would fail exactly the way a real app does.
+        app.add_plugins(HingePlugin)
+            .insert_resource(chain)
             .insert_resource(HingeChain::default())
             .insert_resource(ActiveCapability {
                 index: HINGE_CHAIN_INDEX,

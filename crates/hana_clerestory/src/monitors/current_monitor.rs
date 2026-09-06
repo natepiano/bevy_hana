@@ -17,7 +17,6 @@ use bevy::prelude::Has;
 use bevy::prelude::IVec2;
 use bevy::prelude::Insert;
 use bevy::prelude::On;
-use bevy::prelude::Or;
 use bevy::prelude::Query;
 use bevy::prelude::Reflect;
 use bevy::prelude::ReflectComponent;
@@ -46,13 +45,12 @@ use crate::constants::MONITOR_SOURCE_EXISTING;
 use crate::constants::MONITOR_SOURCE_FALLBACK;
 use crate::constants::MONITOR_SOURCE_POSITION;
 use crate::constants::MONITOR_SOURCE_WINIT;
-use crate::restore::RestorePreparation;
+use crate::restore::WindowRestoreAttempt;
 
 /// Component storing the current monitor and effective window mode.
 ///
-/// This is the single source of truth for which monitor a window is on and its
-/// effective display mode. Updated automatically by the plugin's unified monitor
-/// detection system.
+/// This is what the crate reads to find which monitor a window is on and which display mode
+/// is in effect. `update_current_monitor` maintains it every frame.
 ///
 /// The `effective_window_mode` field reflects what the user actually sees, even when
 /// `window.mode` is stale (e.g., macOS green button fullscreen reports `Windowed`).
@@ -74,18 +72,38 @@ pub struct CurrentMonitor {
     pub effective_window_mode: WindowMode,
 }
 
+/// Bevy monitor entity that supplied a managed window's current monitor observation.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CurrentMonitorEntity(Entity);
+
+impl CurrentMonitorEntity {
+    pub(crate) const fn new(entity: Entity) -> Self { Self(entity) }
+
+    pub(crate) const fn entity(self) -> Entity { self.0 }
+}
+
 impl Deref for CurrentMonitor {
     type Target = MonitorDescriptor;
 
     fn deref(&self) -> &Self::Target { &self.descriptor }
 }
 
+/// Which of the two managed windows this is, so gaining or losing `PrimaryWindow` reselects the
+/// monitor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WindowRegistration {
-    Unmanaged,
     Primary,
-    Managed,
-    PrimaryAndManaged,
+    Secondary,
+}
+
+impl From<bool> for WindowRegistration {
+    fn from(primary: bool) -> Self {
+        if primary {
+            Self::Primary
+        } else {
+            Self::Secondary
+        }
+    }
 }
 
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
@@ -160,22 +178,26 @@ pub(crate) fn install_current_monitor_from_association(
             &Window,
             &OnMonitor,
             Option<&CurrentMonitor>,
+            Option<&CurrentMonitorEntity>,
             Has<PrimaryWindow>,
-            Has<ManagedWindow>,
         ),
-        Or<(With<PrimaryWindow>, With<ManagedWindow>)>,
+        With<ManagedWindow>,
     >,
     monitors: Res<Monitors>,
     mut commands: Commands,
 ) {
-    let Ok((window, on_monitor, existing, primary, managed)) = windows.get(insert.entity) else {
+    let Ok((window, on_monitor, existing, existing_entity, primary)) = windows.get(insert.entity)
+    else {
         return;
     };
     let Some(current_monitor) = current_monitor_from_association(window, on_monitor, &monitors)
     else {
         return;
     };
-    if !current_monitor_changed(existing, &current_monitor) {
+    let current_monitor_entity = CurrentMonitorEntity::new(on_monitor.0);
+    if !current_monitor_changed(existing, &current_monitor)
+        && existing_entity == Some(&current_monitor_entity)
+    {
         return;
     }
 
@@ -186,15 +208,10 @@ pub(crate) fn install_current_monitor_from_association(
         current_monitor.scale,
         current_monitor.effective_window_mode,
     );
-    let registration = match (primary, managed) {
-        (true, false) => WindowRegistration::Primary,
-        (false, true) => WindowRegistration::Managed,
-        (true, true) => WindowRegistration::PrimaryAndManaged,
-        (false, false) => WindowRegistration::Unmanaged,
-    };
     commands.entity(insert.entity).insert((
         current_monitor,
-        MonitorSelectionInputs::from_window(window, registration),
+        current_monitor_entity,
+        MonitorSelectionInputs::from_window(window, WindowRegistration::from(primary)),
     ));
 }
 
@@ -226,13 +243,12 @@ pub(crate) fn exact_monitor_association(
 }
 
 pub(super) fn remove_current_monitors_for_empty_topology(world: &mut World) {
-    let mut query = world.query_filtered::<Entity, (
-        With<CurrentMonitor>,
-        Or<(With<PrimaryWindow>, With<ManagedWindow>)>,
-    )>();
+    let mut query = world.query_filtered::<Entity, (With<CurrentMonitor>, With<ManagedWindow>)>();
     let entities: Vec<_> = query.iter(world).collect();
     for entity in entities {
-        world.entity_mut(entity).remove::<CurrentMonitor>();
+        world
+            .entity_mut(entity)
+            .remove::<(CurrentMonitor, CurrentMonitorEntity)>();
     }
 }
 
@@ -253,13 +269,13 @@ pub(crate) fn update_current_monitor(
             Entity,
             &Window,
             Option<&CurrentMonitor>,
+            Option<&CurrentMonitorEntity>,
             Option<&MonitorSelectionInputs>,
             Option<&OnMonitor>,
             Has<PrimaryWindow>,
-            Has<ManagedWindow>,
-            Has<RestorePreparation>,
+            Has<WindowRestoreAttempt>,
         ),
-        Or<(With<PrimaryWindow>, With<ManagedWindow>)>,
+        With<ManagedWindow>,
     >,
     monitors: Res<Monitors>,
     #[cfg(test)] mut injected_source: Option<ResMut<InjectedCurrentMonitorSource>>,
@@ -270,20 +286,23 @@ pub(crate) fn update_current_monitor(
     }
 
     let topology_changed = monitors.is_changed();
-    for (entity, window, existing, previous_inputs, on_monitor, primary, managed, restoring) in
-        &windows
+    for (
+        entity,
+        window,
+        existing,
+        existing_entity,
+        previous_inputs,
+        on_monitor,
+        primary,
+        restoring,
+    ) in &windows
     {
         if restoring {
             continue;
         }
 
-        let registration = match (primary, managed) {
-            (true, false) => WindowRegistration::Primary,
-            (false, true) => WindowRegistration::Managed,
-            (true, true) => WindowRegistration::PrimaryAndManaged,
-            (false, false) => WindowRegistration::Unmanaged,
-        };
-        let current_inputs = MonitorSelectionInputs::from_window(window, registration);
+        let current_inputs =
+            MonitorSelectionInputs::from_window(window, WindowRegistration::from(primary));
         let exact_association =
             on_monitor
                 .zip(existing)
@@ -291,6 +310,7 @@ pub(crate) fn update_current_monitor(
                     exact_monitor_association(on_monitor, current_monitor, &monitors).is_some()
                 });
         if existing.is_some()
+            && existing_entity.is_some()
             && previous_inputs == Some(&current_inputs)
             && (!topology_changed || exact_association)
         {
@@ -324,6 +344,24 @@ pub(crate) fn update_current_monitor(
         };
 
         let effective_window_mode = compute_effective_window_mode(window, &descriptor, &monitors);
+        let monitor_entity = on_monitor
+            .filter(|on_monitor| {
+                monitors.iter().any(|monitor| {
+                    monitor.entity == on_monitor.0 && monitor.descriptor == &descriptor
+                })
+            })
+            .map_or_else(
+                || {
+                    monitors
+                        .iter()
+                        .find(|monitor| monitor.descriptor == &descriptor)
+                        .map(|monitor| monitor.entity)
+                },
+                |on_monitor| Some(on_monitor.0),
+            );
+        let Some(monitor_entity) = monitor_entity else {
+            continue;
+        };
 
         let current_monitor = CurrentMonitor {
             descriptor,
@@ -339,6 +377,10 @@ pub(crate) fn update_current_monitor(
                 source, descriptor.index, descriptor.scale, effective_window_mode
             );
             entity_commands.insert(current_monitor);
+        }
+        let current_monitor_entity = CurrentMonitorEntity::new(monitor_entity);
+        if existing_entity != Some(&current_monitor_entity) {
+            entity_commands.insert(current_monitor_entity);
         }
         entity_commands.insert(current_inputs);
     }
@@ -583,6 +625,7 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(monitors_with(monitor_0()))
             .init_resource::<InjectedCurrentMonitorSource>()
+            .add_observer(crate::mark_primary_window_as_managed)
             .add_systems(Update, update_current_monitor);
         let entity = app
             .world_mut()

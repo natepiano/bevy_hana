@@ -21,8 +21,9 @@ use crate::layout::render::RenderCommand;
 /// dimensions in layout units. The layout engine calls this during sizing to
 /// determine how much space text elements need.
 ///
-/// Takes [`TextMeasure`] (a generic-free extraction from [`TextStyle`](crate::TextStyle)) to
-/// avoid leaking the typestate generic into the measurement function.
+/// Takes [`TextMeasure`] — the measurement-relevant subset of
+/// [`TextStyle`](crate::TextStyle) — so the callback does not depend on that
+/// type's render and cascade fields.
 ///
 /// Uses `Arc` so the function can be shared across threads and cloned cheaply
 /// (e.g. stored in a Bevy `Resource` and cloned to create `LayoutEngine` instances).
@@ -69,8 +70,9 @@ pub struct ComputedLayout {
 /// let result = engine.compute(&tree, 800.0, 600.0, 1.0);
 /// ```
 ///
-/// The layout result keeps a complete render-command stream. Render-side
-/// systems decide which commands are visible in the current viewport.
+/// The layout result keeps the complete render-command stream, including
+/// commands whose bounds fall outside the viewport. Clipping happens
+/// render-side, from the scissor commands in the stream.
 pub struct LayoutEngine {
     measure_text: MeasureTextFn,
 }
@@ -85,7 +87,6 @@ impl LayoutEngine {
     /// Returns a list of render commands in draw order, and the computed layout
     /// for each element (indexed by element index).
     #[must_use]
-    /// Computes layout for the given tree within the specified viewport dimensions.
     ///
     /// `font_scale` converts font sizes from font units to layout units.
     /// When font and layout units are the same, pass `1.0`.
@@ -113,8 +114,8 @@ impl LayoutEngine {
         sizing::size_along_axis(tree, &mut computed, root, Axis::X, viewport_width);
 
         // Phase 2: Re-wrap text elements within their resolved widths.
-        // This may change text heights (more lines), so we re-propagate Y
-        // and re-size along Y afterwards — but only if wrapping actually changed sizes.
+        // This may change text heights (more lines), so Y is re-propagated and
+        // re-sized afterwards — but only when wrapping actually changed sizes.
         let (wrapped, text_sizes_changed) =
             wrapping::rewrap_text_elements(tree, &mut computed, &self.measure_text, font_scale);
         if text_sizes_changed {
@@ -140,7 +141,7 @@ impl LayoutEngine {
         }
     }
 
-    /// Initialize leaf element dimensions from text measurement and fixed sizing rules.
+    /// Initializes leaf element dimensions from text measurement and fixed sizing rules.
     fn initialize_leaf_sizes(
         &self,
         tree: &LayoutTree,

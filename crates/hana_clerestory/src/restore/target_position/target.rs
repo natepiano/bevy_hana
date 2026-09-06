@@ -2,7 +2,6 @@ use bevy::prelude::Component;
 use bevy::prelude::IVec2;
 use bevy::prelude::Reflect;
 use bevy::prelude::ReflectComponent;
-use bevy::prelude::Timer;
 use bevy::prelude::UVec2;
 #[cfg(test)]
 use bevy::prelude::debug;
@@ -14,6 +13,9 @@ use hana_kana::ToU32;
 use super::strategy::FullscreenRestoreState;
 use super::strategy::MonitorScaleStrategy;
 use crate::Platform;
+use crate::deadline::OperatingSystemWorkDeadline;
+use crate::events::ExpectedLogicalPosition;
+use crate::events::ExpectedPhysicalPosition;
 use crate::monitors::CurrentMonitorIndex;
 use crate::monitors::MonitorDescriptor;
 use crate::persistence::EstablishedWindowPlacement;
@@ -27,8 +29,8 @@ use crate::persistence::SavedWindowMode;
 use crate::persistence::UnrebasedDesktopPosition;
 use crate::restore::settle_state::SettleState;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum PreparedWindowPosition {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Reflect)]
+pub(crate) enum SavedWindowPlacementDecision {
     #[cfg(test)]
     /// Resolved from a persisted monitor-relative offset. Clamped on macOS.
     PersistedOffset {
@@ -48,7 +50,7 @@ pub(super) enum PreparedWindowPosition {
     },
     CompositorControlled,
 }
-impl PreparedWindowPosition {
+impl SavedWindowPlacementDecision {
     #[must_use]
     const fn meaning(self, platform: Platform) -> PreparedPositionMeaning {
         if !platform.position_available() {
@@ -88,28 +90,28 @@ pub(crate) enum PreparedPositionMeaning {
 ///
 /// A [`PersistedPosition::MonitorOffset`] is already scale-independent and rebases directly. An
 /// [`PersistedPosition::Unrebased`] entry is a pre-v3 absolute desktop coordinate whose origin
-/// depended on the layout at save time; it is validated before it is trusted.
+/// depended on the layout at save time; [`rebase_legacy_position`] validates it before it is used.
 #[must_use]
 #[cfg(test)]
 fn prepare_persisted_position(
     persisted_position: PersistedPosition,
     logical_size: UVec2,
     target_info: &MonitorDescriptor,
-) -> PreparedWindowPosition {
+) -> SavedWindowPlacementDecision {
     let logical_offset = match persisted_position {
         PersistedPosition::MonitorOffset(logical_offset) => logical_offset,
         PersistedPosition::Unrebased(unrebased) => {
             match rebase_legacy_position(unrebased, logical_size, target_info) {
                 Some(logical_offset) => logical_offset,
-                None => return PreparedWindowPosition::DiscardedLegacy,
+                None => return SavedWindowPlacementDecision::DiscardedLegacy,
             }
         },
         PersistedPosition::Unpositioned => {
-            return PreparedWindowPosition::NotSaved;
+            return SavedWindowPlacementDecision::NotSaved;
         },
     };
 
-    PreparedWindowPosition::PersistedOffset {
+    SavedWindowPlacementDecision::PersistedOffset {
         physical_position: target_info.physical_from_logical_offset(logical_offset),
         logical_position:  target_info.logical_from_logical_offset(logical_offset),
     }
@@ -120,17 +122,17 @@ fn prepare_persisted_position(
 fn prepare_established_position(
     placement: &EstablishedWindowPlacement,
     target_monitor: &MonitorDescriptor,
-) -> PreparedWindowPosition {
+) -> SavedWindowPlacementDecision {
     match placement.restorable_position(target_monitor) {
         RestorableWindowPosition::Restorable {
             physical_position,
             logical_position,
-        } => PreparedWindowPosition::Restorable {
+        } => SavedWindowPlacementDecision::Restorable {
             physical_position,
             logical_position,
         },
         RestorableWindowPosition::CompositorControlled => {
-            PreparedWindowPosition::CompositorControlled
+            SavedWindowPlacementDecision::CompositorControlled
         },
     }
 }
@@ -230,29 +232,22 @@ pub(crate) fn monitor_contains_physical_point(
         && physical_point.cmplt(far_corner).all()
 }
 
-/// Holds the target window state during the restore process.
+/// The target window state, held on the window entity for the duration of a restore.
 ///
-/// Values converted from saved state are stored as `IVec2`, `UVec2`,
-/// `WindowMode`, and scale factors during loading, before restore logic reads
-/// them.
+/// The saved record is converted into these typed fields — `IVec2`, `UVec2`,
+/// `WindowMode`, and scale factors — while the target is prepared, before any restore
+/// system reads them.
 ///
 /// Dimensions stored here are **inner** (content area only), matching what
-/// Bevy's `Window.resolution` represents and what we save to the state file.
-/// Outer dimensions (including title bar) are only used during loading for
+/// Bevy's `Window.resolution` represents and what the state file records.
+/// Outer dimensions (including title bar) are used only during preparation, for
 /// clamping calculations.
 #[derive(Component, Reflect)]
 #[reflect(Component)]
 #[type_path = "hana_clerestory::restore"]
 pub(crate) struct TargetPosition {
-    /// Final clamped position (adjusted to fit within target monitor).
-    /// None on Wayland where clients can't access window position.
-    pub(in crate::restore) physical_position:      Option<IVec2>,
-    /// Logical position of the restored corner, as the desktop numbers it at `target_scale`.
-    /// Preserved for event reporting.
-    ///
-    /// `None` on Wayland (no position is ever saved), when the saved state held none, or when a
-    /// pre-v3 saved coordinate was discarded because it no longer lands on its monitor.
-    pub(in crate::restore) logical_position:       Option<IVec2>,
+    /// Whether saved coordinates should be applied, and both coordinates when they should.
+    pub(super) placement_decision:                 SavedWindowPlacementDecision,
     /// Target size in physical pixels (content area, excluding window decoration).
     pub(in crate::restore) physical_size:          UVec2,
     /// Target size in logical pixels from the saved state.
@@ -266,42 +261,51 @@ pub(crate) struct TargetPosition {
     /// Window mode to restore.
     pub(in crate::restore) saved_window_mode:      SavedWindowMode,
     /// Target monitor index for fullscreen restore.
-    /// On non-Wayland platforms, this could be derived from position, but Wayland
-    /// doesn't provide window position, so we store it explicitly.
+    /// On non-Wayland platforms this is derivable from the position; Wayland reports no
+    /// window position, so the index is stored explicitly.
     pub(in crate::restore) monitor_index:          CurrentMonitorIndex,
-    /// Fullscreen restore state (DX12/DXGI workaround).
-    pub(super) fullscreen_restore_state:           Option<FullscreenRestoreState>,
-    /// Deadline for the macOS `FullscreenRestoreState::MoveWindowedToTarget` phase. Set on the
-    /// first frame in that phase and cleared when it ends.
+    /// Fullscreen-specific progress that is absent only when no fullscreen step remains.
+    pub(super) fullscreen_restore_progress:        FullscreenRestoreProgress,
+    /// Settling state. Once `try_apply_restore` has run, this holds the observation of what
+    /// the compositor and winit report back, until those values stop changing.
     ///
-    /// The phase ends when `CurrentMonitor` reports the windowed window on `monitor_index`.
-    /// Arrival is not guaranteed: winit drops a `WindowPosition::Centered` whose
-    /// `MonitorSelection::Index` it cannot resolve, so the requested move can silently never
-    /// happen. This timer bounds the wait so the fullscreen mode is applied — and the window
-    /// revealed — instead of the phase re-requesting the move forever while the window is hidden.
-    pub(super) fullscreen_move_wait:               Option<Timer>,
-    /// Deadline for the cross-DPI `WindowRestoreState::WaitingForScaleChange` phase. Set when the
-    /// initial move enters that phase and cleared once the phase ends.
-    ///
-    /// The phase completes on winit's `WindowScaleFactorChanged`, or on the window arriving at a
-    /// monitor already at `target_scale`. Neither signal is guaranteed: a move that crosses no DPI
-    /// boundary produces no transition, and a target that no longer matches any monitor never
-    /// arrives at all. This timer bounds the wait so such a restore finishes visibly instead of
-    /// leaving the window hidden forever.
-    pub(super) scale_change_wait:                  Option<Timer>,
-    /// Settling state. When set, `try_apply_restore` has completed and we're waiting
-    /// for the compositor/winit to deliver stable, matching state.
-    ///
-    /// Uses a two-timer approach:
+    /// Two timers run at once:
     /// - **Stability timer** (200ms): resets whenever any compared value changes between frames.
     ///   Fires `WindowRestored` when all values have been stable for 200ms.
-    /// - **Total timeout** (2s): hard deadline. If values never stabilize for 200ms continuously,
-    ///   fires `WindowRestoreMismatch` with whatever state exists at timeout.
+    /// - **Total timeout** (2s): hard deadline. If values never stay stable for 200ms
+    ///   continuously, fires `WindowRestoreMismatch` with whatever state exists at timeout.
     ///
-    /// This handles transient Wayland `wl_surface.enter`/`wl_surface.leave`
-    /// reports where `current_monitor()` briefly returns the wrong monitor during
+    /// The stability timer absorbs transient Wayland `wl_surface.enter`/`wl_surface.leave`
+    /// reports, where `current_monitor()` briefly returns a different monitor during
     /// fullscreen transitions.
-    pub(in crate::restore) settle_state:           Option<SettleState>,
+    pub(in crate::restore) window_settle_progress: WindowSettleProgress,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Reflect)]
+pub(crate) enum FullscreenRestoreProgress {
+    /// No fullscreen-specific step prevents normal geometry application.
+    ReadyForGeometry,
+    /// This fullscreen-specific step is still running.
+    Advancing(FullscreenRestoreState),
+    /// The fullscreen step finished and normal geometry application may continue.
+    Completed,
+}
+
+/// Whether the windowed move has been requested yet, and if so what bounds it.
+#[derive(Clone, Debug, PartialEq, Eq, Reflect)]
+pub(crate) enum FullscreenMoveDeadline {
+    /// The move has not been requested yet, so nothing is being waited on.
+    NotRequested,
+    /// The move was requested; this bounds how long the operating system gets.
+    Awaiting(OperatingSystemWorkDeadline),
+}
+
+#[derive(Clone, Debug, Reflect)]
+pub(crate) enum WindowSettleProgress {
+    /// Geometry application has not started compositor settling yet.
+    NotStarted,
+    /// The compositor's resulting window state is being observed for stability.
+    Settling(SettleState),
 }
 
 impl TargetPosition {
@@ -312,16 +316,87 @@ impl TargetPosition {
     /// Position compensated for scale factor differences.
     ///
     /// Multiplies physical position by the ratio to account for winit dividing by launch scale.
-    /// Returns None if position is not available (Wayland).
     #[must_use]
-    pub(super) fn compensated_position(&self) -> Option<IVec2> {
+    pub(super) fn compensated_position(&self) -> ExpectedPhysicalPosition {
         let ratio = self.ratio();
-        self.physical_position.map(|position| {
-            IVec2::new(
-                (f64::from(position.x) * ratio).to_i32(),
-                (f64::from(position.y) * ratio).to_i32(),
-            )
-        })
+        match self.physical_position() {
+            ExpectedPhysicalPosition::Specified(position) => {
+                ExpectedPhysicalPosition::Specified(IVec2::new(
+                    (f64::from(position.x) * ratio).to_i32(),
+                    (f64::from(position.y) * ratio).to_i32(),
+                ))
+            },
+            position => position,
+        }
+    }
+
+    #[must_use]
+    pub(in crate::restore) const fn physical_position(&self) -> ExpectedPhysicalPosition {
+        match self.placement_decision {
+            #[cfg(test)]
+            SavedWindowPlacementDecision::PersistedOffset {
+                physical_position, ..
+            } => ExpectedPhysicalPosition::Specified(physical_position),
+            SavedWindowPlacementDecision::Restorable {
+                physical_position, ..
+            } => ExpectedPhysicalPosition::Specified(physical_position),
+            SavedWindowPlacementDecision::CompositorControlled => {
+                ExpectedPhysicalPosition::PlatformCannotPosition
+            },
+            #[cfg(test)]
+            SavedWindowPlacementDecision::NotSaved => ExpectedPhysicalPosition::NotSaved,
+            #[cfg(test)]
+            SavedWindowPlacementDecision::DiscardedLegacy => {
+                ExpectedPhysicalPosition::DiscardedLegacy
+            },
+        }
+    }
+
+    #[must_use]
+    pub(in crate::restore) const fn logical_position(&self) -> ExpectedLogicalPosition {
+        match self.placement_decision {
+            #[cfg(test)]
+            SavedWindowPlacementDecision::PersistedOffset {
+                logical_position, ..
+            } => ExpectedLogicalPosition::Specified(logical_position),
+            SavedWindowPlacementDecision::Restorable {
+                logical_position, ..
+            } => ExpectedLogicalPosition::Specified(logical_position),
+            SavedWindowPlacementDecision::CompositorControlled => {
+                ExpectedLogicalPosition::PlatformCannotPosition
+            },
+            #[cfg(test)]
+            SavedWindowPlacementDecision::NotSaved => ExpectedLogicalPosition::NotSaved,
+            #[cfg(test)]
+            SavedWindowPlacementDecision::DiscardedLegacy => {
+                ExpectedLogicalPosition::DiscardedLegacy
+            },
+        }
+    }
+
+    /// Subtract the X11 window-frame top from the saved physical position.
+    ///
+    /// X11 reports the client-area origin where the frame origin belongs, so an
+    /// uncompensated save/restore cycle walks the window down by the title bar height
+    /// every time. Decisions that carry no coordinate have nothing to compensate.
+    #[cfg(all(target_os = "linux", feature = "workaround-winit-4445"))]
+    pub(in crate::restore) const fn compensate_physical_position(
+        &mut self,
+        physical_frame_top: i32,
+    ) {
+        match &mut self.placement_decision {
+            SavedWindowPlacementDecision::Restorable {
+                physical_position, ..
+            } => physical_position.y -= physical_frame_top,
+            #[cfg(test)]
+            SavedWindowPlacementDecision::PersistedOffset {
+                physical_position, ..
+            } => physical_position.y -= physical_frame_top,
+            SavedWindowPlacementDecision::CompositorControlled => {},
+            #[cfg(test)]
+            SavedWindowPlacementDecision::NotSaved
+            | SavedWindowPlacementDecision::DiscardedLegacy => {},
+        }
     }
 
     /// Size compensated for scale factor differences.
@@ -337,15 +412,15 @@ impl TargetPosition {
     }
 }
 
-/// Durable record of a restore's launch context and chosen strategy.
+/// Durable record of a restore's launch context and the strategy it ran.
 ///
 /// Unlike [`TargetPosition`], this is **not** removed when the restore settles —
-/// it persists so a test can read, via BRP, which monitor the window actually
-/// launched on and which [`MonitorScaleStrategy`] ran. The launch monitor is
-/// environmental on macOS (the OS picks the spawn display), so a cross-DPI test
-/// can silently degrade into a same-scale restore; asserting these fields makes
-/// `RestoreDiagnostics` expose that same-scale fallback through BRP assertions.
-#[derive(Component, Clone, Copy, Debug, Reflect)]
+/// it stays on the entity so a test can read, via BRP, which monitor the window actually
+/// launched on and which [`MonitorScaleStrategy`] ran. On macOS the launch monitor is
+/// whichever display the OS spawns the window on, so a cross-DPI test can silently
+/// degrade into a same-scale restore; these fields let the test see that degradation and
+/// fail on it.
+#[derive(Component, Clone, Debug, Reflect)]
 #[reflect(Component)]
 #[type_path = "hana_clerestory::restore"]
 pub(crate) struct RestoreDiagnostics {
@@ -365,7 +440,7 @@ fn compute_target_position(
     logical_size: UVec2,
     saved_window_mode: &SavedWindowMode,
     target_info: &MonitorDescriptor,
-    prepared_window_position: PreparedWindowPosition,
+    prepared_window_position: SavedWindowPlacementDecision,
     physical_decoration: UVec2,
     starting_scale: f64,
     platform: Platform,
@@ -384,9 +459,9 @@ fn compute_target_position(
     let physical_outer_width = physical_width + physical_decoration.x;
     #[cfg(test)]
     let physical_outer_height = physical_height + physical_decoration.y;
-    let (physical_position, logical_position) = match prepared_window_position {
+    let placement_decision = match prepared_window_position {
         #[cfg(test)]
-        PreparedWindowPosition::PersistedOffset {
+        SavedWindowPlacementDecision::PersistedOffset {
             physical_position,
             logical_position,
         } => {
@@ -398,20 +473,20 @@ fn compute_target_position(
                 physical_outer_height,
                 platform,
             );
-            (Some(physical_position), Some(logical_position))
+            SavedWindowPlacementDecision::Restorable {
+                physical_position,
+                logical_position,
+            }
         },
-        PreparedWindowPosition::Restorable {
-            physical_position,
-            logical_position,
-        } => (Some(physical_position), Some(logical_position)),
-        PreparedWindowPosition::CompositorControlled => (None, None),
+        decision @ (SavedWindowPlacementDecision::Restorable { .. }
+        | SavedWindowPlacementDecision::CompositorControlled) => decision,
         #[cfg(test)]
-        PreparedWindowPosition::NotSaved | PreparedWindowPosition::DiscardedLegacy => (None, None),
+        decision @ (SavedWindowPlacementDecision::NotSaved
+        | SavedWindowPlacementDecision::DiscardedLegacy) => decision,
     };
 
     TargetPosition {
-        physical_position,
-        logical_position,
+        placement_decision,
         physical_size: UVec2::new(physical_width, physical_height),
         logical_size,
         target_scale,
@@ -419,12 +494,12 @@ fn compute_target_position(
         monitor_scale_strategy: platform.scale_strategy(starting_scale, target_scale),
         saved_window_mode: saved_window_mode.clone(),
         monitor_index: target_info.index,
-        fullscreen_restore_state: saved_window_mode
-            .is_fullscreen()
-            .then_some(platform.fullscreen_restore_state()),
-        fullscreen_move_wait: None,
-        scale_change_wait: None,
-        settle_state: None,
+        fullscreen_restore_progress: if saved_window_mode.is_fullscreen() {
+            FullscreenRestoreProgress::Advancing(platform.fullscreen_restore_state())
+        } else {
+            FullscreenRestoreProgress::ReadyForGeometry
+        },
+        window_settle_progress: WindowSettleProgress::NotStarted,
     }
 }
 
@@ -452,7 +527,7 @@ pub(crate) fn compute_established_target_position(
 fn compute_persisted_target_position(
     saved_window_state: &PersistedWindowState,
     target_info: &MonitorDescriptor,
-    prepared_window_position: PreparedWindowPosition,
+    prepared_window_position: SavedWindowPlacementDecision,
     physical_decoration: UVec2,
     starting_scale: f64,
     platform: Platform,
@@ -476,8 +551,8 @@ fn compute_persisted_target_position(
 /// On macOS, clamps to monitor bounds because macOS may resize/reposition windows
 /// that extend beyond the screen. macOS does not allow windows to span monitors.
 ///
-/// On Windows and Linux, windows can legitimately span multiple monitors,
-/// so we preserve the exact saved position without clamping.
+/// On Windows and Linux a window can span multiple monitors, so the saved position is
+/// applied exactly, without clamping.
 #[must_use]
 #[cfg(test)]
 fn clamp_position_to_monitor(
@@ -521,7 +596,7 @@ fn clamp_position_to_monitor(
 #[allow(clippy::panic, reason = "tests should panic on unexpected values")]
 mod tests {
     use super::*;
-    use crate::persistence::PersistedPanelIdentityV4;
+    use crate::persistence::PersistedDisplayIdentityV4;
     use crate::persistence::PersistedWindowTargetV5;
 
     const MONITOR_SIZE: UVec2 = UVec2::new(2_560, 1_440);
@@ -535,7 +610,7 @@ mod tests {
     fn saved_state(position: PersistedPosition) -> PersistedWindowState {
         PersistedWindowState {
             target: PersistedWindowTargetV5::AwaitingLegacyEvidence(
-                PersistedPanelIdentityV4::Anonymous,
+                PersistedDisplayIdentityV4::Anonymous,
             ),
             position,
             logical_width: 800,
@@ -590,8 +665,12 @@ mod tests {
             Platform::Windows,
         );
 
-        assert_eq!(target.physical_position, Some(IVec2::new(-6_700, 120)));
-        let Some(physical_position) = target.physical_position else {
+        assert_eq!(
+            target.physical_position(),
+            ExpectedPhysicalPosition::Specified(IVec2::new(-6_700, 120))
+        );
+        let ExpectedPhysicalPosition::Specified(physical_position) = target.physical_position()
+        else {
             panic!("a monitor offset always resolves to a position")
         };
         assert!(
@@ -620,8 +699,8 @@ mod tests {
                         (f64::from(logical_offset.y) * scale).round().to_i32(),
                     );
                 assert_eq!(
-                    target.physical_position,
-                    Some(expected),
+                    target.physical_position(),
+                    ExpectedPhysicalPosition::Specified(expected),
                     "origin {origin} at scale {scale}"
                 );
                 assert!(
@@ -647,7 +726,7 @@ mod tests {
         let captured = compute_persisted_target_position(
             &saved_state(PersistedPosition::Unpositioned),
             &target_info,
-            PreparedWindowPosition::Restorable {
+            SavedWindowPlacementDecision::Restorable {
                 physical_position: target_info.physical_from_logical_offset(logical_offset),
                 logical_position:  target_info.logical_from_logical_offset(logical_offset),
             },
@@ -656,8 +735,8 @@ mod tests {
             Platform::Windows,
         );
 
-        assert_eq!(persisted.physical_position, captured.physical_position);
-        assert_eq!(persisted.logical_position, captured.logical_position);
+        assert_eq!(persisted.physical_position(), captured.physical_position());
+        assert_eq!(persisted.logical_position(), captured.logical_position());
     }
 
     /// The restore is sized and placed by the monitor it is going *to*, never the one the app
@@ -694,8 +773,8 @@ mod tests {
             "800x600 logical belongs to the target monitor at scale 2.0, not the launch monitor at {starting_scale}"
         );
         assert_eq!(
-            target.physical_position,
-            Some(IVec2::new(-6_640, 160)),
+            target.physical_position(),
+            ExpectedPhysicalPosition::Specified(IVec2::new(-6_640, 160)),
             "the offset scales by the target monitor, so the launch scale cannot move the window"
         );
         assert_ne!(
@@ -715,7 +794,10 @@ mod tests {
 
         let target = target_for(position, &target_info, Platform::Windows);
 
-        assert_eq!(target.physical_position, Some(IVec2::new(-6_760, 80)));
+        assert_eq!(
+            target.physical_position(),
+            ExpectedPhysicalPosition::Specified(IVec2::new(-6_760, 80))
+        );
     }
 
     /// Only the target monitor's own scale changed: its origin did not move, the division
@@ -729,7 +811,10 @@ mod tests {
         let target = target_for(position, &live_monitor, Platform::Windows);
 
         // offset = -6760 - round(-6880 / 1.0) = 120, then rebased at the live scale.
-        assert_eq!(target.physical_position, Some(IVec2::new(-6_700, 120)));
+        assert_eq!(
+            target.physical_position(),
+            ExpectedPhysicalPosition::Specified(IVec2::new(-6_700, 120))
+        );
     }
 
     /// A neighbouring monitor's scale change moved this monitor's origin, so the saved
@@ -743,13 +828,19 @@ mod tests {
 
         let target = target_for(position, &live_monitor, Platform::Windows);
 
-        assert_eq!(prepared, PreparedWindowPosition::DiscardedLegacy);
+        assert_eq!(prepared, SavedWindowPlacementDecision::DiscardedLegacy);
         assert_eq!(
             prepared.meaning(Platform::Windows),
             PreparedPositionMeaning::DiscardedLegacy
         );
-        assert_eq!(target.physical_position, None);
-        assert_eq!(target.logical_position, None);
+        assert_eq!(
+            target.physical_position(),
+            ExpectedPhysicalPosition::DiscardedLegacy
+        );
+        assert_eq!(
+            target.logical_position(),
+            ExpectedLogicalPosition::DiscardedLegacy
+        );
     }
 
     /// `Unpositioned` carries no coordinate on any platform.
@@ -768,7 +859,7 @@ mod tests {
             Platform::Windows,
         );
 
-        assert_eq!(prepared, PreparedWindowPosition::NotSaved);
+        assert_eq!(prepared, SavedWindowPlacementDecision::NotSaved);
         assert_eq!(
             prepared.meaning(Platform::Windows),
             PreparedPositionMeaning::NotSaved
@@ -777,8 +868,11 @@ mod tests {
             prepared.meaning(Platform::Wayland),
             PreparedPositionMeaning::PlatformCannotPosition
         );
-        assert_eq!(target.physical_position, None);
-        assert_eq!(target.logical_position, None);
+        assert_eq!(
+            target.physical_position(),
+            ExpectedPhysicalPosition::NotSaved
+        );
+        assert_eq!(target.logical_position(), ExpectedLogicalPosition::NotSaved);
     }
     /// A window deliberately straddling a monitor boundary keeps its position. Its top-left
     /// corner sits on the *neighbouring* monitor while the window belongs to this one, which is
@@ -798,7 +892,10 @@ mod tests {
 
         let target = target_for(position, &target_info, Platform::Windows);
 
-        assert_eq!(target.physical_position, Some(corner));
+        assert_eq!(
+            target.physical_position(),
+            ExpectedPhysicalPosition::Specified(corner)
+        );
     }
 
     /// Overhanging the far edge is equally legitimate, for the same reason: the 800x600 window
@@ -811,6 +908,9 @@ mod tests {
 
         let target = target_for(position, &target_info, Platform::Windows);
 
-        assert_eq!(target.physical_position, Some(corner));
+        assert_eq!(
+            target.physical_position(),
+            ExpectedPhysicalPosition::Specified(corner)
+        );
     }
 }

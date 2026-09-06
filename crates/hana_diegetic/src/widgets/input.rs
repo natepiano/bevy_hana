@@ -110,7 +110,8 @@ impl Plugin for WidgetInputPlugin {
     }
 }
 
-/// Per-window source of desired widget input configuration.
+/// Per-window selection of the widget input bindings [`WidgetInputPlugin`]
+/// installs.
 #[derive(Component, Clone, Debug, Default, PartialEq, Reflect)]
 #[reflect(Component, Default)]
 #[require(WidgetInputModeInitialized)]

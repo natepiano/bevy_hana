@@ -1,0 +1,49 @@
+[package]
+authors.workspace    = true
+categories           = ["game-development"]
+description          = "Startup disk-asset loading, completion tracking, and failure reporting for Bevy."
+edition.workspace    = true
+homepage             = "https://github.com/natepiano/hana/tree/main/crates/hana_lading"
+keywords             = ["assets", "bevy", "loading"]
+license.workspace    = true
+name                 = "hana_lading"
+publish              = false
+readme               = "README.md"
+repository.workspace = true
+version.workspace    = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bevy_app   = { workspace = true }
+bevy_asset = { workspace = true }
+bevy_ecs   = { workspace = true }
+tracing    = { workspace = true }
+
+[dev-dependencies]
+bevy = { workspace = true, features = [
+  "bevy_asset",
+  "bevy_image",
+  "bevy_state",
+  "png",
+] }
+fairy_dust.workspace = true
+hana_diegetic.workspace = true
+hana_lagrange.workspace = true
+
+[[example]]
+name = "catastrophic_failure"
+path = "examples/catastrophic_failure.rs"
+
+[[example]]
+name = "degraded_failure"
+path = "examples/degraded_failure.rs"
+
+[[example]]
+name = "successful_loading"
+path = "examples/successful_loading.rs"
+
+[[test]]
+name = "startup_loading"
+path = "tests/startup_loading/main.rs"

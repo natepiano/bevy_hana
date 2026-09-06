@@ -94,7 +94,8 @@ pub enum TextAlign {
 
 /// How the visible glyph renders.
 ///
-/// Controls the text shader's coverage computation. Both modes use
+/// Controls the text shader's coverage computation. Neither mode sets the alpha
+/// mode: that resolves through the `TextAlpha` cascade, whose default is
 /// `AlphaMode::Blend` for smooth anti-aliased edges. Discriminants are
 /// `#[repr(u32)]` and explicit because they map directly to shader
 /// constants in `analytic_path.wgsl`; the compile-time assertions below keep
@@ -125,11 +126,10 @@ impl From<GlyphRenderMode> for u32 {
 
 /// Whether glyphs cast a shadow.
 ///
-/// The visible glyph mesh casts its own coverage-silhouette shadow
-/// directly. For a shadow with
-/// no visible fill (ghost text), spawn a `Cast` glyph and set its fill
-/// color alpha to `0`: the color pass paints nothing while the shadow
-/// pass still writes the full letter silhouette.
+/// The visible glyph mesh casts its own coverage-silhouette shadow directly.
+/// For a shadow with no visible fill (ghost text), spawn a `Cast` glyph and
+/// set its fill color alpha to `0`: the color pass paints nothing while the
+/// shadow pass still writes the full letter silhouette.
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Reflect)]
 #[reflect(Resource)]
 pub enum GlyphShadowMode {
@@ -159,8 +159,7 @@ pub enum ShadowCasting {
 ///
 /// On a transparent panel the front and back faces are both viewable, so
 /// `FrontOnly` and `BackOnly` author labels visible from one side only.
-/// Back-only glyphs read mirror-reversed when viewed from behind; a future
-/// reverse-text feature flips them to read correctly.
+/// Back-only glyphs read mirror-reversed when viewed from behind.
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Reflect)]
 #[reflect(Resource)]
 pub enum Sidedness {
@@ -689,8 +688,9 @@ impl TextStyle {
     ///
     /// A bare `f32` records no unit (`None`) and resolves from the contextual
     /// `FontUnit` cascade attribute; an explicit `Px`/`Pt`/`Mm`/`In` records
-    /// its unit and always wins. Used by the `WorldText` / `ScreenText`
-    /// builders, whose `.size(..)` takes any `Into<Dimension>`.
+    /// its unit, which takes precedence over the cascade. Used by the
+    /// `WorldText` / `ScreenText` builders, whose `.size(..)` takes any
+    /// `Into<Dimension>`.
     pub fn set_dimension(&mut self, size: impl Into<Dimension>) {
         let dimension = size.into();
         self.size = dimension.value;
@@ -737,11 +737,11 @@ impl TextStyle {
 
     /// Returns a copy prepared for text shaping at the given anchor.
     ///
-    /// Forces [`TextAlign::Left`] and clears the unit / alpha-mode authoring
-    /// fields (those route through the cascade). The two
-    /// contexts differ only in anchor: world text uses [`Anchor::TopLeft`] (the
-    /// command origin), layout-engine text uses [`Anchor::Center`].
-    /// Crate-internal helper.
+    /// Forces [`TextAlign::Left`] and resets the unit, alpha-mode, and HDR
+    /// coverage-bias fields to [`Cascade::Inherit`], since those three route
+    /// through the cascade. The two contexts differ only in anchor: world text
+    /// uses [`Anchor::TopLeft`] (the command origin), layout-engine text uses
+    /// [`Anchor::Center`].
     #[must_use]
     pub fn for_shaping(&self, anchor: Anchor) -> Self {
         Self {
@@ -756,8 +756,9 @@ impl TextStyle {
 
     /// Extracts measurement-relevant fields as a [`TextMeasure`].
     ///
-    /// Used by [`MeasureTextFn`](crate::layout::MeasureTextFn) — no generic
-    /// parameter, no infection into the layout engine.
+    /// Used by [`MeasureTextFn`](crate::layout::MeasureTextFn), which receives
+    /// only the measurement fields and none of the render or cascade
+    /// authoring.
     #[must_use]
     pub const fn as_measure(&self) -> TextMeasure {
         TextMeasure {
@@ -915,8 +916,8 @@ impl TextStyle {
 /// The subset of text properties needed for measurement.
 ///
 /// Extracted from [`TextStyle`] via [`as_measure()`](TextStyle::as_measure).
-/// This is what [`MeasureTextFn`](crate::layout::MeasureTextFn) receives — no
-/// generic parameter, no infection into the layout engine.
+/// This is what [`MeasureTextFn`](crate::layout::MeasureTextFn) receives; the
+/// render and cascade fields of [`TextStyle`] never reach the layout engine.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TextMeasure {
     /// Font identifier.
@@ -966,10 +967,10 @@ pub struct TextDimensions {
 
 // ── Shader discriminant assertions ──────────────────────────────────────────
 //
-// These compile-time assertions ensure that `GlyphRenderMode` discriminants
-// stay in sync with the `render_mode` constants in `analytic_path.wgsl` (and the
-// matching `RenderMode` variants). If you add or reorder variants, update
-// the shader constants to match and adjust these assertions.
+// These compile-time assertions pin the `GlyphRenderMode` discriminants to the
+// values the `render_mode` constants in `analytic_path.wgsl` use (and the
+// matching `RenderMode` variants). Adding or reordering a variant means updating
+// the shader constants to match and adjusting these assertions.
 
 const _: () = assert!(GlyphRenderMode::Text.discriminant() == 1);
 const _: () = assert!(GlyphRenderMode::PunchOut.discriminant() == 2);

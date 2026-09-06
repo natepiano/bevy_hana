@@ -82,7 +82,7 @@ pub(crate) const CASCADE_COUNT: usize = 4;
 // from landing exactly on the minimum.
 pub(crate) const CASCADE_FIRST_BOUND_HEADROOM: f32 = 0.001;
 // Far bound of the first (high-resolution) cascade as a fraction of the fitted
-// `maximum_distance`. 0.2 matches the proven 12/60 split.
+// `maximum_distance`. 0.2 is the 12/60 split.
 pub(crate) const CASCADE_FIRST_BOUND_RATIO: f32 = 0.2;
 pub(crate) const CASCADE_FIRST_FAR_BOUND: f32 = 6.0;
 // Auto-fit cascade: once the scene's geometry exists, the key light's cascade
@@ -246,10 +246,10 @@ pub(crate) const RADIUS: Px = Px(12.0);
 
 // typography
 /// Canonical HUD body / label size. Used by `fairy_dust` panels and re-exported
-/// for ad-hoc panels that want to match the built-in look.
+/// so ad-hoc panels can match the built-in look.
 pub const LABEL_SIZE: Pt = Pt(11.0);
 /// Canonical HUD title size. Used by `fairy_dust` panels and re-exported
-/// for ad-hoc panels that want to match the built-in look.
+/// so ad-hoc panels can match the built-in look.
 pub const TITLE_SIZE: Pt = Pt(14.0);
 
 // unclamp

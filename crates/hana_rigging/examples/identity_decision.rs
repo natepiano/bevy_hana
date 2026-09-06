@@ -5,12 +5,13 @@
 //! the second reports a different panel at the same attachment, which is what makes the kernel ask.
 //! `A`, `R`, and `D` answer the standing question — adopt the candidate, refuse it for good, or
 //! leave it for later. The panel on the right shows the role's binding, the register, and the units
-//! the kernel currently believes are present, so every answer is visible in all three at once.
+//! the kernel has recorded as present, so every answer is visible in all three at once.
 //!
 //! The chips are keyboard affordances rather than clickable buttons: `docs/fairy_dust/`
 //! `canonical-example.md` records per-chip mouse activation as unimplemented, and a hand-rolled
 //! click target would be example-local styling the guide asks examples not to invent.
 
+use std::collections::HashMap;
 use std::error::Error;
 
 use bevy::prelude::App;
@@ -18,6 +19,7 @@ use bevy::prelude::Assets;
 use bevy::prelude::Commands;
 use bevy::prelude::Component;
 use bevy::prelude::Entity;
+use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::KeyCode;
 use bevy::prelude::Local;
 use bevy::prelude::Query;
@@ -48,19 +50,22 @@ use fairy_dust::example_cube_on_ground;
 use hana_diegetic::DiegeticPanelCommands;
 use hana_diegetic::FontRegistry;
 use hana_lagrange::OrbitCamPreset;
+use hana_rigging::prelude::Applied;
+use hana_rigging::prelude::ApplyContext;
 use hana_rigging::prelude::ApplyDeadline;
-use hana_rigging::prelude::ApplyPermit;
 use hana_rigging::prelude::AttachmentPath;
-use hana_rigging::prelude::AttemptId;
-use hana_rigging::prelude::AttemptOutcome;
-use hana_rigging::prelude::AttemptProgress;
+use hana_rigging::prelude::AttemptCompletion;
+use hana_rigging::prelude::AttemptInvalidation;
+use hana_rigging::prelude::AttemptRef;
 use hana_rigging::prelude::AuthoritativeReporterCoverage;
-use hana_rigging::prelude::Binding;
+use hana_rigging::prelude::BindingAuthoring;
+use hana_rigging::prelude::BindingPolicy;
 use hana_rigging::prelude::Bindings;
-use hana_rigging::prelude::CaptureOutcome;
 use hana_rigging::prelude::ConfiguredDevice;
 use hana_rigging::prelude::ConfiguredDeviceMode;
+use hana_rigging::prelude::ConfiguredDeviceName;
 use hana_rigging::prelude::CoveredDeviceIdentitySpace;
+use hana_rigging::prelude::DeviceAccessError;
 use hana_rigging::prelude::DeviceEndpoint;
 use hana_rigging::prelude::DeviceIdSource;
 use hana_rigging::prelude::DeviceKey;
@@ -69,13 +74,15 @@ use hana_rigging::prelude::DeviceResolution;
 use hana_rigging::prelude::Devices;
 use hana_rigging::prelude::DiscoveryCadence;
 use hana_rigging::prelude::DiscoveryControl;
+use hana_rigging::prelude::DriverCleanupRoleEntity;
+use hana_rigging::prelude::DriverCompletion;
 use hana_rigging::prelude::EndpointDriver;
-use hana_rigging::prelude::EndpointId;
+use hana_rigging::prelude::EndpointDriverRegistration;
+use hana_rigging::prelude::EstablishedContext;
 use hana_rigging::prelude::HardwareInventory;
 use hana_rigging::prelude::IdentityAnswer;
 use hana_rigging::prelude::IdentityDecisions;
 use hana_rigging::prelude::IdentityQuestionLookup;
-use hana_rigging::prelude::LastKnownGoodConfiguration;
 use hana_rigging::prelude::OnAbort;
 use hana_rigging::prelude::OnSessionLoss;
 use hana_rigging::prelude::RecoveryPolicy;
@@ -84,13 +91,19 @@ use hana_rigging::prelude::ReporterActivation;
 use hana_rigging::prelude::ReporterCoverage;
 use hana_rigging::prelude::ReporterId;
 use hana_rigging::prelude::ReporterRegistration;
-use hana_rigging::prelude::RequestedConfiguration;
 use hana_rigging::prelude::RetryOn;
 use hana_rigging::prelude::RiggingAppExt;
 use hana_rigging::prelude::RiggingPlugin;
+use hana_rigging::prelude::RiggingSystems;
 use hana_rigging::prelude::RoleKey;
-use hana_rigging::prelude::RoleState;
 use hana_rigging::prelude::SchemeName;
+use hana_rigging::prelude::SessionDatumArrivalEvidence;
+use hana_rigging::prelude::SessionLease;
+use hana_rigging::prelude::SessionRef;
+use hana_rigging::prelude::SessionReleaseCause;
+use hana_rigging::prelude::TargetResolution;
+use hana_rigging::prelude::TargetResolutionContext;
+use hana_rigging::prelude::register_binding;
 use hana_rigging_scripted::ScriptedDevice;
 use hana_rigging_scripted::ScriptedReporter;
 use hana_rigging_scripted::ScriptedScan;
@@ -141,49 +154,283 @@ const DESCRIPTION_LINES: [&str; 6] = [
 
 /// What the example needs to reach the scripted reporter and the one role it drives.
 #[derive(Resource)]
-struct ScriptedRig {
+pub struct ScriptedRig {
     reporter: ReporterId,
     role:     RoleKey,
+}
+
+impl ScriptedRig {
+    /// Borrow the role whose established-session state the headless behavior test reads.
+    #[cfg(test)]
+    pub const fn role(&self) -> &RoleKey { &self.role }
 }
 
 /// Marks the panel this example rewrites as the register changes.
 #[derive(Component)]
 struct RegisterStatusPanel;
 
+/// Rows retained after the identity status panel has rendered at least once.
+#[derive(Default)]
+enum DisplayedStatusRows {
+    /// The panel has not rendered identity rows yet.
+    #[default]
+    NotRendered,
+    /// The panel last rendered these identity rows.
+    Rendered(Vec<String>),
+}
+
 /// Placement the scripted role asks its driver for, standing in for a window position.
-#[derive(Component, Reflect)]
+#[derive(Clone, Component, Reflect)]
 #[reflect(Component)]
 struct PanelPlacement {
     slot: u32,
 }
 
-/// Driver that reports every apply converged, so nothing here turns on driver behaviour.
+struct PendingConvergingApply {
+    configuration: PanelPlacement,
+    completion:    AttemptCompletion<PanelPlacement>,
+}
+
+/// Applying and completion-queued panel attempts, both keyed by kernel attempt reference.
+#[derive(Default)]
+struct PanelAttemptStore {
+    applying:          HashMap<AttemptRef, PendingConvergingApply>,
+    completion_queued: HashMap<AttemptRef, PanelPlacement>,
+}
+
+/// Number of panel attempts in each driver-owned lifecycle state.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PanelAttemptStoreCounts {
+    /// Attempts whose one-use completion authority has not been resolved yet.
+    pub applying:          usize,
+    /// Attempts whose dispatched configuration is waiting for establishment.
+    pub completion_queued: usize,
+}
+
+/// Lease and established configuration retained for one panel role.
+struct EstablishedPanelSession {
+    lease:         SessionLease<PanelPlacement>,
+    configuration: PanelPlacement,
+}
+
+/// Result of pairing a kernel session lease with its dispatched panel configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PanelSessionEstablishment {
+    /// The driver retained the lease and established configuration in one role-keyed entry.
+    LeaseAndConfigurationRetained,
+    /// The attempt configuration was missing, so the lease reported loss and was not retained.
+    MissingAttemptReported,
+}
+
+/// Test observation of the most recent session-establishment callback result.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PanelSessionEstablishmentObservation {
+    /// No session-establishment callback has run.
+    #[default]
+    NotObserved,
+    /// The callback returned this establishment result.
+    Observed(PanelSessionEstablishment),
+}
+
+/// Driver-owned authorities and configurations for the role shown by the walkthrough.
+#[derive(Default, Resource)]
+pub struct ConvergingDriverState {
+    attempts:                  PanelAttemptStore,
+    established:               HashMap<RoleKey, EstablishedPanelSession>,
+    #[cfg(test)]
+    establishment_observation: PanelSessionEstablishmentObservation,
+}
+
+impl ConvergingDriverState {
+    fn retain_panel_session(
+        &mut self,
+        role: RoleKey,
+        attempt: AttemptRef,
+        lease: SessionLease<PanelPlacement>,
+    ) -> PanelSessionEstablishment {
+        let establishment = match self.attempts.completion_queued.remove(&attempt) {
+            None => {
+                lease.report_loss(DeviceAccessError::Transport {
+                    detail: format!(
+                        "panel attempt {} was accepted without its dispatched configuration",
+                        attempt.get()
+                    ),
+                });
+                PanelSessionEstablishment::MissingAttemptReported
+            },
+            Some(configuration) => {
+                if let Some(replaced) = self.established.insert(
+                    role,
+                    EstablishedPanelSession {
+                        lease,
+                        configuration,
+                    },
+                ) {
+                    let detail = format!(
+                        "a panel role received a replacement lease before releasing slot {}",
+                        replaced.configuration.slot
+                    );
+                    replaced
+                        .lease
+                        .report_loss(DeviceAccessError::Transport { detail });
+                }
+                PanelSessionEstablishment::LeaseAndConfigurationRetained
+            },
+        };
+        #[cfg(test)]
+        {
+            self.establishment_observation =
+                PanelSessionEstablishmentObservation::Observed(establishment);
+        }
+        establishment
+    }
+}
+
+/// Driver that applies the exact requested value, resolves its completion, and retains the
+/// resulting session lease until the kernel releases it.
 struct ConvergingDriver;
 
 impl EndpointDriver for ConvergingDriver {
     type Configuration = PanelPlacement;
+    type Target = ();
 
-    fn capture(
+    fn resolve_target(
         &mut self,
         _: &mut World,
-        _: &DeviceEndpoint,
-    ) -> CaptureOutcome<Self::Configuration> {
-        CaptureOutcome::Read(PanelPlacement { slot: 1 })
+        _: &TargetResolutionContext<'_>,
+        _: &Self::Configuration,
+    ) -> TargetResolution<Self::Target> {
+        TargetResolution::Reached(())
     }
 
     fn start_apply(
         &mut self,
-        _: &mut World,
-        _: &DeviceEndpoint,
-        _: &Self::Configuration,
-        _: AttemptId,
-        _: ApplyPermit,
+        world: &mut World,
+        context: ApplyContext<'_, Self::Configuration>,
+        configuration: &Self::Configuration,
+        (): Self::Target,
     ) {
+        let attempt = context.attempt();
+        let completion = context.into_completion();
+        world
+            .resource_mut::<ConvergingDriverState>()
+            .attempts
+            .applying
+            .insert(
+                attempt,
+                PendingConvergingApply {
+                    configuration: configuration.clone(),
+                    completion,
+                },
+            );
     }
 
-    fn poll(&mut self, _: &mut World, _: AttemptId) -> AttemptProgress {
-        AttemptProgress::Finished(AttemptOutcome::Succeeded)
+    fn established(
+        &mut self,
+        world: &mut World,
+        context: EstablishedContext<'_, Self::Configuration>,
+    ) {
+        let role = context.role().clone();
+        let attempt = context.attempt();
+        let lease = context.into_lease(SessionDatumArrivalEvidence::NoDatumObserved);
+        world
+            .resource_mut::<ConvergingDriverState>()
+            .retain_panel_session(role, attempt, lease);
     }
+
+    fn cancel_apply(
+        &mut self,
+        world: &mut World,
+        _: &RoleKey,
+        _: DriverCleanupRoleEntity,
+        attempt: AttemptRef,
+        _: AttemptInvalidation,
+    ) {
+        let mut state = world.resource_mut::<ConvergingDriverState>();
+        drop(state.attempts.applying.remove(&attempt));
+        let _ = state.attempts.completion_queued.remove(&attempt);
+    }
+
+    fn release_session(
+        &mut self,
+        world: &mut World,
+        role: &RoleKey,
+        _: DriverCleanupRoleEntity,
+        session: SessionRef,
+        _: SessionReleaseCause,
+    ) {
+        let mut state = world.resource_mut::<ConvergingDriverState>();
+        let matches_session = state
+            .established
+            .get(role)
+            .is_some_and(|established| established.lease.session_ref() == session);
+        if matches_session
+            && let Some(EstablishedPanelSession {
+                lease,
+                configuration: _,
+            }) = state.established.remove(role)
+        {
+            drop(lease);
+        }
+    }
+}
+
+/// Finish every exact configuration the driver retained during the preceding apply phase.
+pub fn finish_converging_applies(mut state: ResMut<ConvergingDriverState>) {
+    let attempts = std::mem::take(&mut state.attempts.applying);
+    for (
+        attempt,
+        PendingConvergingApply {
+            configuration,
+            completion,
+        },
+    ) in attempts
+    {
+        state
+            .attempts
+            .completion_queued
+            .insert(attempt, configuration);
+        completion.finish(DriverCompletion::Succeeded(Applied::AsDispatched));
+    }
+}
+
+/// Remove configurations after their completions are queued so the next callback reports loss.
+#[cfg(test)]
+pub fn discard_completed_panel_attempts(world: &mut World) {
+    world
+        .resource_mut::<ConvergingDriverState>()
+        .attempts
+        .completion_queued
+        .clear();
+}
+
+/// Read the most recent establishment callback result for the headless behavior test.
+#[cfg(test)]
+pub fn establishment_observation(world: &World) -> PanelSessionEstablishmentObservation {
+    world
+        .resource::<ConvergingDriverState>()
+        .establishment_observation
+}
+
+/// Count attempts in each driver-owned lifecycle state for headless failure diagnostics.
+#[cfg(test)]
+pub fn attempt_store_counts(world: &World) -> PanelAttemptStoreCounts {
+    let attempts = &world.resource::<ConvergingDriverState>().attempts;
+    PanelAttemptStoreCounts {
+        applying:          attempts.applying.len(),
+        completion_queued: attempts.completion_queued.len(),
+    }
+}
+
+/// Report whether one role retains its session lease and established configuration together.
+#[cfg(test)]
+pub fn retains_lease_and_configuration(world: &World, role: &RoleKey) -> bool {
+    world
+        .resource::<ConvergingDriverState>()
+        .established
+        .contains_key(role)
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -232,67 +479,109 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Keep the interactive entry reachable when this example is included by an integration test.
+#[cfg(test)]
+pub fn interactive_example_entry() -> Result<(), Box<dyn Error>> { main() }
+
 /// Install the kernel, the scripted reporter, and the one role the walkthrough drives.
 ///
 /// Registration happens against `&mut App` rather than through a Fairy Dust helper so the calls
 /// read the same way in an application that never depended on Fairy Dust.
-fn install_kernel(app: &mut App) -> Result<ScriptedRig, Box<dyn Error>> {
-    let saved = reported_key(DeviceKind::HidPanel, PANEL_SCHEME, SAVED_PANEL)?;
-    let candidate = reported_key(DeviceKind::HidPanel, PANEL_SCHEME, CANDIDATE_PANEL)?;
-    let third = reported_key(DeviceKind::HidPanel, PANEL_SCHEME, THIRD_PANEL)?;
+///
+/// # Errors
+///
+/// Returns an error when a walkthrough panel's reported identity cannot be keyed.
+pub fn install_kernel(app: &mut App) -> Result<ScriptedRig, Box<dyn Error>> {
+    let saved = reported_key(DeviceKind::ControlSurface, PANEL_SCHEME, SAVED_PANEL)?;
+    let candidate = reported_key(DeviceKind::ControlSurface, PANEL_SCHEME, CANDIDATE_PANEL)?;
+    let third = reported_key(DeviceKind::ControlSurface, PANEL_SCHEME, THIRD_PANEL)?;
 
-    app.add_plugins(RiggingPlugin)
-        .register_device_scheme(SchemeName::new(PANEL_SCHEME)?);
-
-    let reporter = app.add_device_reporter(
-        ScriptedReporter::new(vec![
-            ScriptedScan::Complete(vec![at_shared_attachment(saved.clone())?]),
+    install_kernel_with_reporter_scans(
+        app,
+        saved.clone(),
+        vec![
+            ScriptedScan::Complete(vec![at_shared_attachment(saved)?]),
             ScriptedScan::Complete(vec![at_shared_attachment(candidate)?]),
             ScriptedScan::Complete(vec![at_shared_attachment(third)?]),
-        ]),
+        ],
+    )
+}
+
+/// Install the example driver with a reporter that keeps the saved panel present.
+#[cfg(test)]
+pub fn install_saved_panel_kernel(app: &mut App) -> Result<ScriptedRig, Box<dyn Error>> {
+    let saved = reported_key(DeviceKind::ControlSurface, PANEL_SCHEME, SAVED_PANEL)?;
+    install_kernel_with_reporter_scans(
+        app,
+        saved.clone(),
+        vec![ScriptedScan::Complete(vec![at_shared_attachment(saved)?])],
+    )
+}
+
+fn install_kernel_with_reporter_scans(
+    app: &mut App,
+    saved: DeviceKey,
+    reporter_scans: Vec<ScriptedScan>,
+) -> Result<ScriptedRig, Box<dyn Error>> {
+    app.add_plugins(RiggingPlugin)
+        .register_device_scheme(SchemeName::new(PANEL_SCHEME)?)
+        .init_resource::<ConvergingDriverState>()
+        .add_systems(
+            Update,
+            finish_converging_applies.after(RiggingSystems::Apply),
+        );
+
+    app.world_mut()
+        .resource_mut::<HardwareInventory>()
+        .configure(ConfiguredDevice {
+            key:  saved.clone(),
+            mode: ConfiguredDeviceMode::Managed,
+            name: ConfiguredDeviceName::NeverDerived,
+        });
+
+    let reporter = app.add_device_reporter(
+        ScriptedReporter::new(reporter_scans),
         ReporterRegistration::optional(
             DiscoveryCadence::OnDemand,
             ReporterActivation::Enabled,
             ReporterCoverage::EstablishesAbsence(AuthoritativeReporterCoverage::one(
                 CoveredDeviceIdentitySpace::ReportedScheme {
-                    kind:   DeviceKind::HidPanel,
+                    kind:   DeviceKind::ControlSurface,
                     scheme: SchemeName::new(PANEL_SCHEME)?,
                 },
             )),
+            std::time::Duration::from_secs(10),
         ),
     );
 
     let driver = app.add_endpoint_driver(ConvergingDriver);
     let role = RoleKey::new(PANEL_ROLE)?;
-    app.world_mut()
-        .resource_mut::<Bindings>()
-        .register(Binding {
-            role: role.clone(),
-            endpoint: DeviceEndpoint {
-                device: saved.clone(),
-                id:     EndpointId::Whole,
-            },
-            driver,
-            recovery: RecoveryPolicy::ReapplyOnReturn,
-            retry: RetryOn::NewRevision,
-            on_abort: OnAbort::default(),
-            on_loss: OnSessionLoss::default(),
-            state: RoleState::default(),
-            requested: RequestedConfiguration::new(PanelPlacement { slot: 1 }),
-            last_known_good: LastKnownGoodConfiguration::default(),
-            apply_deadline: ApplyDeadline::ProcessDefault,
-        })?;
-    app.world_mut()
-        .resource_mut::<HardwareInventory>()
-        .configure(ConfiguredDevice {
-            key:  saved,
-            mode: ConfiguredDeviceMode::Managed,
-        });
+    register_binding(app.world_mut(), panel_binding(role.clone(), saved, driver))?;
 
     Ok(ScriptedRig { reporter, role })
 }
 
-/// One scripted unit reported at the attachment the whole walkthrough turns on.
+fn panel_binding(
+    role: RoleKey,
+    device: DeviceKey,
+    driver: EndpointDriverRegistration<PanelPlacement>,
+) -> BindingAuthoring<PanelPlacement> {
+    BindingAuthoring::new(
+        role,
+        DeviceEndpoint::whole(device),
+        driver,
+        PanelPlacement { slot: 1 },
+        BindingPolicy::new(
+            RecoveryPolicy::ReapplyOnReturn,
+            RetryOn::NewRevision,
+            OnAbort::default(),
+            OnSessionLoss::default(),
+            ApplyDeadline::ProcessDefault,
+        ),
+    )
+}
+
+/// One scripted unit reported at the attachment every scan in this walkthrough shares.
 fn at_shared_attachment(device_key: DeviceKey) -> Result<ScriptedDevice, Box<dyn Error>> {
     Ok(
         ScriptedDevice::present(device_key).with_attachment(AttachmentPath::Reported(
@@ -316,8 +605,9 @@ fn reject_candidate(identity_decisions: ResMut<IdentityDecisions>, rig: Res<Scri
 }
 
 fn defer_question(mut identity_decisions: ResMut<IdentityDecisions>, rig: Res<ScriptedRig>) {
-    let Some(candidate) = standing_candidate(&identity_decisions, &rig.role) else {
-        return;
+    let candidate = match standing_candidate(&identity_decisions, &rig.role) {
+        StandingCandidateLookup::Candidate(candidate) => candidate,
+        StandingCandidateLookup::NoStandingQuestion => return,
     };
     identity_decisions.defer(&rig.role, &candidate);
 }
@@ -331,8 +621,9 @@ fn answer_standing_question(
     role: &RoleKey,
     identity_answer: IdentityAnswer,
 ) {
-    let Some(candidate) = standing_candidate(&identity_decisions, role) else {
-        return;
+    let candidate = match standing_candidate(&identity_decisions, role) {
+        StandingCandidateLookup::Candidate(candidate) => candidate,
+        StandingCandidateLookup::NoStandingQuestion => return,
     };
     let outcome = identity_decisions.answer(role, &candidate, identity_answer);
     info!(
@@ -341,10 +632,23 @@ fn answer_standing_question(
     );
 }
 
-fn standing_candidate(identity_decisions: &IdentityDecisions, role: &RoleKey) -> Option<DeviceKey> {
+/// Candidate lookup for the one identity question currently standing for a role.
+enum StandingCandidateLookup {
+    /// A standing question names this candidate device.
+    Candidate(DeviceKey),
+    /// The role has no standing identity question.
+    NoStandingQuestion,
+}
+
+fn standing_candidate(
+    identity_decisions: &IdentityDecisions,
+    role: &RoleKey,
+) -> StandingCandidateLookup {
     match identity_decisions.question(role) {
-        IdentityQuestionLookup::Pending(question) => Some(question.candidate.clone()),
-        IdentityQuestionLookup::NoQuestion => None,
+        IdentityQuestionLookup::Pending(question) => {
+            StandingCandidateLookup::Candidate(question.candidate.clone())
+        },
+        IdentityQuestionLookup::NoQuestion => StandingCandidateLookup::NoStandingQuestion,
     }
 }
 
@@ -370,19 +674,21 @@ fn spawn_status_panel(
     }
 }
 
-/// Rewrite the status panel whenever the three things it reports stop agreeing with the display.
+/// Rewrite the status panel whenever any of its rows differs from the one currently displayed.
 fn refresh_status_panel(
     bindings: Res<Bindings>,
     devices: Res<Devices>,
     identity_decisions: Res<IdentityDecisions>,
     rig: Res<ScriptedRig>,
     panels: Query<Entity, With<RegisterStatusPanel>>,
-    mut displayed: Local<Option<Vec<String>>>,
+    mut displayed: Local<DisplayedStatusRows>,
     mut commands: Commands,
     fonts: Res<FontRegistry>,
 ) {
     let rows = status_rows(&bindings, &devices, &identity_decisions, &rig.role);
-    if displayed.as_ref() == Some(&rows) {
+    if let DisplayedStatusRows::Rendered(displayed_rows) = &*displayed
+        && displayed_rows == &rows
+    {
         return;
     }
     for panel in &panels {
@@ -393,10 +699,10 @@ fn refresh_status_panel(
             warn!("failed to replace the identity-decision status panel: {error}");
         }
     }
-    *displayed = Some(rows);
+    *displayed = DisplayedStatusRows::Rendered(rows);
 }
 
-/// The five values the panel reports, in the order the sections read them.
+/// The six values the panel reports, in the order the sections read them.
 fn status_rows(
     bindings: &Bindings,
     devices: &Devices,

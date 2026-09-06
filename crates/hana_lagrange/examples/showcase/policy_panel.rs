@@ -180,8 +180,8 @@ pub(crate) fn spawn_policy_panel(
 }
 
 /// Rebuilds the panel tree when the policy values change or the window resizes.
-/// The flash tick pokes `PolicyDisplay` when a highlight ends, so reading the
-/// live `KeyFlash` here keeps the key colors in step.
+/// `tick_key_flash` calls `set_changed` on `PolicyDisplay` when a highlight
+/// ends, so reading the live `KeyFlash` here keeps the key colors in step.
 pub(crate) fn rebuild_policy_panel(
     display: Res<PolicyDisplay>,
     flash: Res<KeyFlash>,

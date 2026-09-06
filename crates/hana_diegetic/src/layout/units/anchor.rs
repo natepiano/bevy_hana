@@ -1,8 +1,8 @@
 use bevy::prelude::Reflect;
 
-/// `Anchor` point for standalone text positioning.
+/// Placement point for standalone text.
 ///
-/// Determines which point of the text block's bounding box is placed
+/// Selects which point of the text block's bounding box is placed
 /// at the entity's [`Transform`](bevy::prelude::Transform) position.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Reflect)]
 pub enum Anchor {

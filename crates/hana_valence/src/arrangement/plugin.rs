@@ -1,12 +1,9 @@
 use bevy_app::App;
 use bevy_app::Plugin;
-use bevy_app::PostUpdate;
 use bevy_asset::AssetPlugin;
-use bevy_ecs::schedule::IntoScheduleConfigs;
 use bevy_scene::ScenePlugin;
 
-use crate::AnchorSystems;
-use crate::hinge_to_pose;
+use crate::HingePlugin;
 
 /// Installs scene support required by arrangement construction commands.
 ///
@@ -16,11 +13,13 @@ use crate::hinge_to_pose;
 /// [`ScenePlugin`] only when it is absent, so composing it directly or through
 /// [`crate::FoldPlugin`] never duplicates scene registration.
 ///
-/// This plugin owns arrangement construction and materialization support, and
-/// it is the sole registrar of [`hinge_to_pose`]: every hinge is created by
-/// arrangement materialization, so hinge-to-pose conversion belongs to the same
-/// plugin. It deliberately does not add anchor providers, anchor resolution,
-/// transform propagation, or application-specific arrangement systems.
+/// This plugin owns arrangement construction and materialization support. It
+/// adds [`HingePlugin`] when that is absent, because every materialized
+/// arrangement writes hinges and those hinges need their driver. Add
+/// [`HingePlugin`] alone when hinges are authored by hand and no arrangement is
+/// spawned: it needs neither assets nor scenes. This plugin adds no anchor
+/// providers, no anchor resolution, no transform propagation, and no
+/// application-specific arrangement systems.
 #[derive(Default)]
 pub struct ArrangementPlugin;
 
@@ -33,6 +32,8 @@ impl Plugin for ArrangementPlugin {
         if !app.is_plugin_added::<ScenePlugin>() {
             app.add_plugins(ScenePlugin);
         }
-        app.add_systems(PostUpdate, hinge_to_pose.in_set(AnchorSystems::AnimatePose));
+        if !app.is_plugin_added::<HingePlugin>() {
+            app.add_plugins(HingePlugin);
+        }
     }
 }

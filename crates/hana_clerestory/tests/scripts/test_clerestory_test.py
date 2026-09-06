@@ -49,7 +49,7 @@ class FakeClock:
 class CaseResultTests(unittest.TestCase):
     def test_unavailable_case_cannot_become_passed(self) -> None:
         result = CaseResult(
-            case_id="needs-panel",
+            case_id="needs-display",
             interaction=Interaction.OPERATOR_ACTION,
             evidence=Evidence.PHYSICAL,
             availability=Availability.UNAVAILABLE,
@@ -194,7 +194,7 @@ class FakeHardwareCommand:
 @final
 class FakeHardwareProfile:
     def __init__(self, inventory_counts: list[int]) -> None:
-        self.name = "fake panel"
+        self.name = "fake display"
         self.target_matcher = "fake"
         self.minimum_on_seconds = 0.0
         self.minimum_off_seconds = 0.0
@@ -312,6 +312,62 @@ class ReconnectAssertionTests(unittest.TestCase):
 
         self.assertFalse(assertions["no-duplicate-automatic-keys"].passed)
         self.assertFalse(assertions["no-recovery-mismatch"].passed)
+
+    def test_missing_restore_only_window_fails_fallback_retention(self) -> None:
+        evidence = CycleEvidence(
+            before={},
+            fallback={"windows": []},
+            returned={"windows": [], "terminal_failure": "absent"},
+            records=[],
+            initial_verified_id="MonitorId(1)",
+        )
+
+        assertion = next(
+            assertion
+            for assertion in generic_cycle_assertions(evidence)
+            if assertion.name == "restore-only-stayed-on-fallback"
+        )
+
+        self.assertFalse(assertion.passed)
+        self.assertIn("absent from the fallback snapshot", assertion.detail)
+
+    def test_restore_only_window_passes_when_monitor_signature_is_unchanged(self) -> None:
+        fallback_monitor = {
+            "identity": "Verified(MonitorId(0))",
+            "index": 0,
+            "physical_position": [0, 0],
+        }
+        returned_monitor = dict(fallback_monitor)
+        evidence = CycleEvidence(
+            before={},
+            fallback={
+                "windows": [
+                    {
+                        "key": "hotplug-restore-only",
+                        "current_monitor": fallback_monitor,
+                    }
+                ]
+            },
+            returned={
+                "windows": [
+                    {
+                        "key": "hotplug-restore-only",
+                        "current_monitor": returned_monitor,
+                    }
+                ],
+                "terminal_failure": "absent",
+            },
+            records=[],
+            initial_verified_id="MonitorId(1)",
+        )
+
+        assertion = next(
+            assertion
+            for assertion in generic_cycle_assertions(evidence)
+            if assertion.name == "restore-only-stayed-on-fallback"
+        )
+
+        self.assertTrue(assertion.passed)
 
 
 class RunReportTests(unittest.TestCase):

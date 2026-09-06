@@ -1,29 +1,34 @@
 use bevy::prelude::Reflect;
 
+use super::target::FullscreenMoveDeadline;
+use crate::deadline::OperatingSystemWorkDeadline;
 use crate::restore::RestorePreparationSource;
 
 /// State for `MonitorScaleStrategy::HigherToLower` (high→low DPI restore).
 ///
-/// When restoring from a high-DPI to low-DPI monitor, we must set position BEFORE size
-/// because Bevy's `changed_windows` system processes size changes before position changes.
-/// If we set both together, the window resizes first while still at the old position,
-/// temporarily extending into the wrong monitor and triggering a macOS
-/// `WindowScaleFactorChanged` event before the final position is applied.
+/// A high-DPI to low-DPI restore applies position BEFORE size, because Bevy's
+/// `changed_windows` system processes size changes before position changes. Applying both in
+/// one frame resizes the window while it still sits at the old position, so it extends into
+/// the wrong monitor and macOS emits a `WindowScaleFactorChanged` event before the final
+/// position is applied.
 ///
-/// By moving a 1x1 window to the final position first, we ensure the window is already
-/// at the correct location when we later apply size in `ApplySize`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Reflect)]
+/// Moving a 1x1 window to the final position first puts the window at the target location
+/// before `ApplySize` applies the size.
+#[derive(Debug, Clone, PartialEq, Eq, Reflect)]
 pub(crate) enum WindowRestoreState {
     /// Initial state: window needs to be moved to the target monitor to trigger a scale change.
-    /// Handled by `restore_windows` after driver target preparation, which calls
+    /// Handled by `place_window_at_saved_geometry` after driver target preparation, which calls
     /// `apply_initial_move` and transitions to `WaitingForScaleChange`.
     NeedInitialMove,
     /// Position applied with compensation, waiting for `ScaleChanged` message.
     WaitingForScaleChange {
         /// Kernel attempt that began this transition.
-        source: RestorePreparationSource,
+        source:   RestorePreparationSource,
+        /// Hard bound on waiting for the operating system's scale transition.
+        deadline: OperatingSystemWorkDeadline,
     },
-    /// Scale changed, ready to apply final size (position already set in phase 1).
+    /// Scale changed, ready to apply the final size; the position was already applied during
+    /// `NeedInitialMove`.
     ApplySize,
 }
 
@@ -42,12 +47,15 @@ pub(crate) enum WindowRestoreState {
 /// `FullscreenRestoreState::ApplyMode`; setting fullscreen mode in the same
 /// frame as position can make the compositor briefly apply fullscreen and then
 /// revert it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Reflect)]
+#[derive(Debug, Clone, PartialEq, Eq, Reflect)]
 pub(crate) enum FullscreenRestoreState {
     /// Ask `AppKit` to leave the current fullscreen Space before changing monitor.
     LeaveFullscreen,
     /// Keep moving the windowed macOS window until it reaches the target monitor.
-    MoveWindowedToTarget,
+    MoveWindowedToTarget {
+        /// Whether the move has been requested, and the deadline once it has.
+        deadline: FullscreenMoveDeadline,
+    },
     /// Move window to target monitor position. Skipped on Wayland (no position).
     MoveToMonitor,
     /// Wait for compositor to process the position change (1 frame).
@@ -116,7 +124,7 @@ pub(super) enum NativeFullscreenState {
 ///   via `WindowRestoreState` to avoid size clamping:
 ///   1. Move a 1x1 window to final position (compensated) to trigger scale change
 ///   2. After scale changes, apply size without compensation
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Reflect)]
+#[derive(Debug, Clone, PartialEq, Eq, Reflect)]
 pub(crate) enum MonitorScaleStrategy {
     /// Same scale - apply position and size directly.
     ApplyUnchanged,

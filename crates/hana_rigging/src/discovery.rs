@@ -4,7 +4,9 @@ use std::time::Duration;
 use bevy::ecs::reflect::ReflectResource;
 use bevy::prelude::Reflect;
 use bevy::prelude::Resource;
+use bevy::reflect::ReflectSerialize;
 use bevy::tasks::IoTaskPool;
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::DeviceAccessError;
@@ -14,12 +16,13 @@ use crate::DeviceKind;
 use crate::DiscoveryProgress;
 use crate::ReporterId;
 use crate::SchemeName;
+use crate::StartupRequirement;
 
 const DEFAULT_MAX_COMPLETIONS_PER_FRAME: usize = 2;
 const DEFAULT_MAX_CONCURRENT_JOBS: usize = 2;
 const DEFAULT_PROGRESS_AFTER: Duration = Duration::from_millis(500);
 
-/// Scheduling policy that decides when a reporter becomes eligible for one discovery run.
+/// Scheduling policy for when a reporter becomes eligible for one discovery run.
 #[derive(Clone, Debug, PartialEq, Eq, Reflect)]
 pub enum DiscoveryCadence {
     /// The application must request every run, such as probing a USB bus from a refresh button.
@@ -35,6 +38,14 @@ pub enum DiscoveryCadence {
         /// Minimum time between one reporter's submitted discovery jobs.
         interval: Duration,
     },
+}
+
+/// A prerequisite that prevented a reporter from enumerating its complete set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Reflect)]
+#[reflect(Serialize)]
+pub enum ReporterDeferral {
+    /// Monitor topology has not completed the observation that display discovery depends on.
+    WaitingForTopology,
 }
 
 /// Whether an optional reporter is currently permitted to discover hardware.
@@ -94,6 +105,10 @@ impl AuthoritativeReporterCoverage {
     }
 
     fn covers(&self, device_key: &DeviceKey) -> bool { self.identity_space.covers(device_key) }
+
+    pub(crate) const fn identity_space(&self) -> &CoveredDeviceIdentitySpace {
+        &self.identity_space
+    }
 }
 
 /// One durable identity space a successful complete reporter scan can enumerate.
@@ -151,27 +166,27 @@ impl CoveredDeviceIdentitySpace {
 #[derive(Clone, Reflect)]
 #[reflect(opaque)]
 pub struct ReporterRegistration {
-    cadence:             DiscoveryCadence,
-    startup_requirement: StartupRequirement,
-    activation:          ReporterActivation,
-    coverage:            ReporterCoverage,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StartupRequirement {
-    Required,
-    Optional,
+    cadence:                  DiscoveryCadence,
+    startup_requirement:      StartupRequirement,
+    activation:               ReporterActivation,
+    coverage:                 ReporterCoverage,
+    first_complete_set_bound: Duration,
 }
 
 impl ReporterRegistration {
     /// Require an enabled reporter's first successful complete result before hardware is ready.
     #[must_use]
-    pub const fn required(cadence: DiscoveryCadence, coverage: ReporterCoverage) -> Self {
+    pub const fn required(
+        cadence: DiscoveryCadence,
+        coverage: ReporterCoverage,
+        first_complete_set_bound: Duration,
+    ) -> Self {
         Self {
             cadence,
             startup_requirement: StartupRequirement::Required,
             activation: ReporterActivation::Enabled,
             coverage,
+            first_complete_set_bound,
         }
     }
 
@@ -181,12 +196,14 @@ impl ReporterRegistration {
         cadence: DiscoveryCadence,
         activation: ReporterActivation,
         coverage: ReporterCoverage,
+        first_complete_set_bound: Duration,
     ) -> Self {
         Self {
             cadence,
             startup_requirement: StartupRequirement::Optional,
             activation,
             coverage,
+            first_complete_set_bound,
         }
     }
 
@@ -197,6 +214,10 @@ impl ReporterRegistration {
     pub(crate) const fn cadence(&self) -> &DiscoveryCadence { &self.cadence }
 
     pub(crate) const fn coverage(&self) -> &ReporterCoverage { &self.coverage }
+
+    pub(crate) const fn first_complete_set_bound(&self) -> Duration {
+        self.first_complete_set_bound
+    }
 }
 
 /// Runtime control surface for reporter activation and explicit discovery triggers.
@@ -436,16 +457,19 @@ impl DiscoveryLimits {
     }
 
     /// Change the number of background jobs a later admission pass may submit.
+    #[cfg(feature = "test-support")]
     pub const fn set_max_concurrent_jobs(&mut self, max_concurrent_jobs: NonZeroUsize) {
         self.max_concurrent_jobs = max_concurrent_jobs;
     }
 
     /// Change the number of completed whole sets a later collect pass may accept.
+    #[cfg(feature = "test-support")]
     pub const fn set_max_completions_per_frame(&mut self, max_completions_per_frame: NonZeroUsize) {
         self.max_completions_per_frame = max_completions_per_frame;
     }
 
     /// Change when UI event integration may treat a running job as long-running.
+    #[cfg(feature = "test-support")]
     pub const fn set_progress_after(&mut self, progress_after: Duration) {
         self.progress_after = progress_after;
     }
@@ -463,7 +487,7 @@ fn effective_discovery_job_capacity(
 
 /// Scheduler failure that is separate from a reporter's device-access failure.
 #[derive(Clone, Debug, PartialEq, Eq, Error, Reflect)]
-pub enum DiscoverySchedulerError {
+pub(crate) enum DiscoverySchedulerError {
     /// A background reporter became due before Bevy initialized the global I/O task pool.
     #[error("Bevy IoTaskPool is not initialized")]
     IoTaskPoolUnavailable,
@@ -471,7 +495,7 @@ pub enum DiscoverySchedulerError {
 
 /// Current scheduler health retained for diagnostics while reporters are registered.
 #[derive(Clone, Debug, PartialEq, Eq, Reflect)]
-pub enum DiscoverySchedulerState {
+pub(crate) enum DiscoverySchedulerState {
     /// Background work can use Bevy's I/O pool when a reporter becomes due.
     Available,
     /// A due background reporter could not start because the application has not installed the
@@ -485,12 +509,12 @@ pub enum DiscoverySchedulerState {
 /// Latest retained state for all registered reporters and startup discovery.
 #[derive(Resource, Reflect)]
 #[reflect(Resource)]
-pub struct DiscoveryStatus {
+pub(crate) struct DiscoveryStatus {
     /// Whether every required reporter has produced the successful whole set startup needs.
-    pub startup:   StartupDiscoveryState,
+    pub(crate) startup:   StartupDiscoveryState,
     /// Whether the scheduler can start background work on the application's I/O task pool.
-    pub scheduler: DiscoverySchedulerState,
-    reporters:     Vec<ReporterStatusRecord>,
+    pub(crate) scheduler: DiscoverySchedulerState,
+    reporters:            Vec<ReporterStatusRecord>,
 }
 
 #[derive(Reflect)]
@@ -533,7 +557,7 @@ impl DiscoveryStatus {
     /// # Errors
     ///
     /// Returns `DiscoveryStatusError::ReporterNotRegistered` when `reporter` has no status entry.
-    pub fn reporter_status(
+    pub(crate) fn reporter_status(
         &self,
         reporter: ReporterId,
     ) -> Result<&ReporterDiscoveryStatus, DiscoveryStatusError> {
@@ -558,7 +582,7 @@ impl DiscoveryStatus {
 
 /// Retained outcome lookup failure for application user interfaces and diagnostics.
 #[derive(Debug, Error, PartialEq, Eq)]
-pub enum DiscoveryStatusError {
+pub(crate) enum DiscoveryStatusError {
     /// Application code addressed an identifier that no `add_device_reporter` call issued.
     #[error("device reporter `{reporter:?}` has no discovery status")]
     ReporterNotRegistered {
@@ -569,18 +593,18 @@ pub enum DiscoveryStatusError {
 
 /// Per-reporter activity and the previous accepted outcome retained across later runs.
 #[derive(Clone, Debug, PartialEq, Eq, Reflect)]
-pub struct ReporterDiscoveryStatus {
+pub(crate) struct ReporterDiscoveryStatus {
     /// What the scheduler is doing with this reporter right now.
-    pub activity:          ReporterActivity,
+    pub(crate) activity:          ReporterActivity,
     /// Most recent accepted whole-set result or failure, preserved while the reporter runs again.
-    pub last_outcome:      LastDiscoveryOutcome,
-    /// Number of whole-set completion batches this reporter has finished accepting.
-    pub completed_batches: u64,
+    pub(crate) last_outcome:      LastDiscoveryOutcome,
+    /// Number of discovery runs this reporter has finished accepting.
+    pub(crate) completed_batches: u64,
 }
 
 /// Current scheduler activity for one reporter without bare optional progress fields.
 #[derive(Clone, Debug, PartialEq, Eq, Reflect)]
-pub enum ReporterActivity {
+pub(crate) enum ReporterActivity {
     /// Application policy disabled this optional reporter, so it cannot enter a due list.
     Disabled,
     /// The reporter is eligible only when its cadence, dirty flag, or explicit request says so.
@@ -603,9 +627,18 @@ pub enum ReporterActivity {
 
 /// Previous whole-set result or failure that stays visible while reporter activity changes.
 #[derive(Clone, Debug, PartialEq, Eq, Reflect)]
-pub enum LastDiscoveryOutcome {
+pub(crate) enum LastDiscoveryOutcome {
     /// No whole-set result has been accepted since this reporter was registered.
     NotCompleted,
+    /// The reporter is waiting for a prerequisite and retains its preceding complete set.
+    Deferred {
+        /// Batch whose discovery run reached the prerequisite.
+        batch:    DiscoveryBatchId,
+        /// Time when the current uninterrupted deferral began.
+        since:    crate::RiggingRuntimeTime,
+        /// Typed prerequisite that must complete before discovery can produce a complete set.
+        deferral: ReporterDeferral,
+    },
     /// The reporter's complete set was accepted and its registry revision advanced.
     Succeeded {
         /// Batch that supplied the accepted complete set.
@@ -623,6 +656,15 @@ pub enum LastDiscoveryOutcome {
         duration: Duration,
         /// Reporter error preserved for recovery policy and user diagnostics.
         error:    DeviceAccessError,
+    },
+    /// The reporter cannot run on this platform and remains stopped until explicit control input.
+    Unsupported {
+        /// Batch whose discovery run reported the unsupported platform integration.
+        batch: DiscoveryBatchId,
+        /// Classified platform failure that stopped the reporter.
+        error: DeviceAccessError,
+        /// Time when the reporter entered its current stopped state.
+        since: crate::RiggingRuntimeTime,
     },
 }
 
@@ -656,6 +698,14 @@ pub enum CompletedDiscoveryOutcome {
         /// acceptance delay is excluded, because it measures the kernel's own admission budget
         /// rather than how long the hardware took to answer.
         duration: Duration,
+    },
+    /// The reporter reached a prerequisite that prevents a complete set, so its preceding set
+    /// stays current.
+    Deferred {
+        /// Time from this reporter's submission until the prerequisite was reported.
+        duration: Duration,
+        /// Typed prerequisite that must complete before discovery can produce a complete set.
+        deferral: ReporterDeferral,
     },
     /// The reporter could not establish its whole set, so its preceding set stays current.
     Failed {
@@ -712,9 +762,10 @@ pub(crate) struct DiscoveryTransitionJournal {
 impl DiscoveryTransitionJournal {
     /// Append one transition unless this frame has already produced everything it can.
     ///
-    /// The bound is passed in by the scheduler because only it knows how many reporters are
-    /// registered. A refused append is not lost work: reaching the bound means the event stage has
-    /// not run since these transitions were recorded, so nothing is listening for another one.
+    /// The bound is passed in by the scheduler because `discovery_transition_capacity` computes it
+    /// from the registered reporter count, which lives in the reporter registry and not here. A
+    /// refused append is not lost work: reaching the bound means the event stage has not run since
+    /// these transitions were recorded, so nothing is listening for another one.
     pub(crate) fn record(&mut self, capacity: usize, discovery_transition: DiscoveryTransition) {
         if self.transitions.len() >= capacity {
             return;
@@ -881,6 +932,7 @@ mod tests {
         let registration = ReporterRegistration::required(
             DiscoveryCadence::OnDemand,
             ReporterCoverage::MatchingEvidenceOnly,
+            std::time::Duration::from_secs(10),
         );
         assert!(matches!(
             registration.coverage(),
@@ -908,6 +960,7 @@ mod tests {
         let registration = ReporterRegistration::required(
             DiscoveryCadence::OnDemand,
             ReporterCoverage::MatchingEvidenceOnly,
+            std::time::Duration::from_secs(10),
         );
         let mut discovery_control = DiscoveryControl::default();
         discovery_control.register(reporter, &registration);
@@ -952,6 +1005,7 @@ mod tests {
         let reporter_registration = ReporterRegistration::required(
             DiscoveryCadence::OnDemand,
             ReporterCoverage::MatchingEvidenceOnly,
+            std::time::Duration::from_secs(10),
         );
         assert!(matches!(
             reporter_registration.reflect_ref(),

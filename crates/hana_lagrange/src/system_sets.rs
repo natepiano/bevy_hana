@@ -9,7 +9,7 @@ use bevy_enhanced_input::prelude::EnhancedInputSystems;
 /// Public schedule phases for camera input processing.
 ///
 /// App-authored manual camera input writers should run in
-/// `CameraInputPhase::WriteManual`.
+/// [`CameraInputPhase::WriteManual`].
 #[derive(SystemSet, Debug, Hash, PartialEq, Eq, Clone)]
 pub enum CameraInputPhase {
     /// Library-owned preparation before enhanced-input context evaluation.

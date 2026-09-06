@@ -102,8 +102,8 @@ pub(crate) struct OrbitCamPanEngagedAction;
 #[action_output(bool)]
 pub(crate) struct OrbitCamZoomEngagedAction;
 
-/// Slow (gated) orbit motion — routed separately so the active speed falls out
-/// of which motion action is firing.
+/// Slow (gated) orbit motion. It is its own action so the reported speed comes
+/// from which of the two orbit actions fired.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, InputAction, Reflect)]
 #[action_output(Vec2)]
 pub(crate) struct OrbitCamOrbitSlowAction;

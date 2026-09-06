@@ -1,0 +1,15 @@
+error[E0382]: use of moved value: `completion`
+  --> tests/compile_fail/attempt_completion_cannot_finish_twice.rs:12:5
+   |
+10 | fn finish_twice(completion: AttemptCompletion<Configuration>) {
+   |                 ---------- move occurs because `completion` has type `AttemptCompletion<Configuration>`, which does not implement the `Copy` trait
+11 |     completion.finish(DriverCompletion::Succeeded(Applied::AsDispatched));
+   |                ---------------------------------------------------------- `completion` moved due to this method call
+12 |     completion.finish(DriverCompletion::Succeeded(Applied::AsDispatched));
+   |     ^^^^^^^^^^ value used here after move
+   |
+note: `AttemptCompletion::<Configuration>::finish` takes ownership of the receiver `self`, which moves `completion`
+  --> src/contract.rs
+   |
+   |     pub fn finish(self, completion: DriverCompletion<Configuration>) {
+   |                   ^^^^

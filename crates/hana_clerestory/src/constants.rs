@@ -20,6 +20,9 @@ pub(crate) const FIRST_DUPLICATE_SUFFIX: u32 = 2;
 pub(crate) const MANAGED_WINDOW_NAME_SEPARATOR: &str = "-";
 
 // monitor discovery
+#[cfg(any(test, feature = "test"))]
+pub(crate) const DISPLAY_TEST_ENUMERATION_FAILURE: &str =
+    "the display test adapter failed the scripted enumeration";
 /// Longest the rigging kernel waits before re-enumerating displays when no operating-system
 /// display-configuration notification has arrived.
 ///
@@ -33,7 +36,7 @@ pub(crate) const MONITOR_DISCOVERY_BACKSTOP: Duration = Duration::from_secs(1);
 /// Directory the kernel populates with one `card<N>-<connector>` entry per DRM connector.
 #[cfg(target_os = "linux")]
 pub(crate) const DRM_CLASS_DIRECTORY: &str = "/sys/class/drm";
-/// File inside a DRM connector directory holding that panel's raw EDID block.
+/// File inside a DRM connector directory holding that display's raw EDID block.
 #[cfg(target_os = "linux")]
 pub(crate) const DRM_CONNECTOR_EDID_FILE: &str = "edid";
 /// Separates the card name from the connector name in a DRM connector directory name, as in
@@ -43,21 +46,21 @@ pub(crate) const DRM_CONNECTOR_EDID_FILE: &str = "edid";
 /// the directory name.
 #[cfg(target_os = "linux")]
 pub(crate) const DRM_CONNECTOR_NAME_SEPARATOR: char = '-';
-/// Hashed ahead of a connector name by `QualifiedEvidence::stable_bytes`, so a `PanelFingerprint`
+/// Hashed ahead of a connector name by `QualifiedEvidence::stable_bytes`, so a `DisplayFingerprint`
 /// built from a connector can never equal one built from an EDID block.
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) const DRM_INTERNAL_CONNECTOR_EVIDENCE_TAG: &[u8] = b"drm-internal-connector:";
-/// DRM connector-name prefixes whose panel is built into the machine rather than plugged into it.
+/// DRM connector-name prefixes whose display is built into the machine rather than plugged into it.
 ///
-/// `eDP` and `LVDS` carry laptop panels; `DSI` and `DPI` carry panels wired straight to the board.
-/// Nothing else can ever appear on these connectors, so the connector name identifies the panel
-/// and not merely the port it occupies. Every other connector type is a socket that accepts any
-/// display, where the same name would name a different panel after a replug.
+/// `eDP` and `LVDS` carry laptop displays; `DSI` and `DPI` carry displays wired straight to the
+/// board. Nothing else can ever appear on these connectors, so the connector name identifies the
+/// display and not merely the port it occupies. Every other connector type is a socket that accepts
+/// any display, where the same name would name a different display after a replug.
 ///
 /// Each prefix includes [`DRM_CONNECTOR_NAME_SEPARATOR`] so that `DP-1` cannot match `DPI-`.
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) const DRM_INTERNAL_CONNECTOR_PREFIXES: [&str; 4] = ["DPI-", "DSI-", "LVDS-", "eDP-"];
-/// Shared identity scheme for serial values published in a panel's EDID.
+/// Shared identity scheme for serial values published in a display's EDID.
 pub(crate) const EDID_SERIAL_SCHEME: &str = "edid-serial";
 /// FNV-1a 64-bit offset basis, fixed by the algorithm's specification.
 pub(crate) const FNV_1A_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -66,7 +69,7 @@ pub(crate) const FNV_1A_PRIME: u64 = 0x0000_0100_0000_01b3;
 /// Length of a `ColorSync` display UUID, fixed by `CFUUIDBytes`.
 #[cfg(target_os = "macos")]
 pub(crate) const MACOS_DISPLAY_UUID_BYTES: usize = 16;
-/// `RandR` output property carrying a panel's EDID block.
+/// `RandR` output property carrying a display's EDID block.
 #[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) const X11_EDID_PROPERTY_NAME: &[u8] = b"EDID";
 
@@ -82,7 +85,7 @@ pub(crate) const PRIMARY_MONITOR_INDEX: usize = 0;
 pub(crate) const MONITOR_PROBE_TARGET: &str = "hana_clerestory::monitor_probe";
 
 // persisted state
-pub(crate) const CURRENT_STATE_VERSION: u8 = 5;
+pub(crate) const CURRENT_STATE_VERSION: u8 = 6;
 pub(crate) const PRIMARY_WINDOW_KEY: &str = "primary";
 /// Header comment prepended to the RON file to document the coordinate contract.
 pub(crate) const RON_HEADER: &str = "\
@@ -127,15 +130,25 @@ pub(crate) const SETTLE_TIMEOUT_SECS: f32 = 2.0;
 pub(crate) const MILLIS_PER_SECOND: f32 = 1000.0;
 
 // window reveal
-/// Maximum duration (in seconds) a hidden primary window waits for a live display that can satisfy
-/// its saved target before it is revealed on the display it launched on.
+/// Maximum duration (in seconds) each hidden managed window's `SavedDisplayRevealWait` waits for
+/// a live display that can satisfy its saved target before revealing that window on the display
+/// where it launched.
 ///
 /// A saved display that is not plugged in never resolves, so the kernel issues no restore attempt
 /// and the startup hide is never lifted. Without a deadline the window stays hidden for the whole
 /// session. On expiry the saved geometry is fitted onto the live display and the window is
-/// revealed, leaving the persisted target untouched so a normal restore still moves it once that
-/// display returns.
+/// revealed, leaving the persisted target untouched so a normal restore can still move it once
+/// that display returns.
 pub(crate) const EXACT_DISPLAY_WAIT_TIMEOUT_SECS: f32 = SETTLE_TIMEOUT_SECS;
+
+/// How often (in seconds) a window still hidden past [`EXACT_DISPLAY_WAIT_TIMEOUT_SECS`] restates
+/// why it is waiting.
+///
+/// Two placement decisions keep waiting after that deadline expires: the kernel is mid-apply, and
+/// a saved configuration whose display is live so placement is still expected to arrive. Neither
+/// is bounded, so a placement that never arrives leaves the window hidden for the whole session
+/// with nothing written to say so. The first overdue frame reports immediately and later ones
+/// report on this cadence, which keeps a permanent wait visible without writing a line per frame.
 
 // windows display-config acquisition
 #[cfg(target_os = "windows")]

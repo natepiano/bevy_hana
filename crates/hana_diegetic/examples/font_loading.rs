@@ -102,7 +102,7 @@ const NOTO_SANS_REGULAR_FONT_ASSET_PATH: &str = "fonts/NotoSans-Regular.ttf";
 #[derive(Resource, Default)]
 struct FontCount(usize);
 
-/// Keeps font handles alive so Bevy doesn't unload the assets.
+/// Holds the loaded font handles so Bevy does not unload the assets.
 #[derive(Resource, Default)]
 struct FontHandles(Vec<Handle<Font>>);
 
@@ -239,7 +239,9 @@ fn build_status_panel(text: &str) -> LayoutTree {
     builder.build()
 }
 
-/// Observer: fires when a font is successfully registered.
+/// Spawns a `DiegeticText` sample label in the newly registered font, stacked
+/// one [`LINE_SPACING`] above the previous one, and retitles the status panel
+/// with the running count.
 fn on_font_registered(
     trigger: On<FontRegistered>,
     mut font_count: ResMut<FontCount>,
@@ -282,7 +284,7 @@ fn on_font_registered(
     );
 }
 
-/// Observer: fires when a font fails to load.
+/// Replaces the status panel with the failed font's path and logs the error.
 fn on_font_load_failed(
     trigger: On<FontLoadFailed>,
     panels: Query<Entity, With<StatusPanel>>,

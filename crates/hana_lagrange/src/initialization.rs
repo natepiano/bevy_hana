@@ -13,7 +13,7 @@ pub enum Initialization {
     FromPose,
     /// Initialized; the controller drives the camera operations directly.
     ///
-    /// Spawn a camera already `Active` to skip init and smoothly animate in from
-    /// the default pose to whatever targets you set.
+    /// Spawn a camera already `Active` to skip both start-pose paths above and
+    /// ease in from the default pose to whatever targets you set.
     Active,
 }

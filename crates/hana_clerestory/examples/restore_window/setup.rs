@@ -22,6 +22,7 @@ use bevy::window::PrimaryWindow;
 use bevy::window::WindowRef;
 use bevy::window::WindowResolution;
 use hana_clerestory::ManagedWindow;
+use hana_clerestory::ManagedWindowName;
 
 use super::constants::FONT_SIZE;
 use super::constants::MANAGED_WINDOW_NAME_PREFIX;
@@ -72,7 +73,7 @@ pub(crate) fn on_spawn_managed_window(
             resolution: WindowResolution::new(SECONDARY_WINDOW_WIDTH, SECONDARY_WINDOW_HEIGHT),
             ..default()
         },
-        ManagedWindow { name: name.clone() },
+        ManagedWindowName(name.clone()),
     ));
 
     info!("[restore_window] Spawned managed window \"{name}\"");

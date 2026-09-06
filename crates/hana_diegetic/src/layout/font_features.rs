@@ -84,9 +84,9 @@ impl FontFeatures {
 
     /// Converts to parley font feature settings.
     ///
-    /// Returns a `Vec` of `(tag_bytes, value)` pairs. Only features
-    /// with explicit overrides are included — the shaper's defaults
-    /// handle everything else.
+    /// Returns a `Vec` of `(tag_bytes, value)` pairs. Only features with an
+    /// explicit override are included; every other feature is left at the
+    /// shaper's default.
     #[must_use]
     pub fn to_parley_settings(&self) -> Vec<([u8; 4], u16)> {
         let mut settings = Vec::new();

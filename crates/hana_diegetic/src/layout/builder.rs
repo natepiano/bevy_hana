@@ -1005,8 +1005,8 @@ impl<L, Role> El<L, Role> {
     /// Scrolls children vertically by `scrollback` logical px measured from the
     /// bottom and clips overflow.
     ///
-    /// `0` pins to the bottom, so a log following a growing tail needs no
-    /// knowledge of its content height; increasing `scrollback` walks upward.
+    /// `0` pins to the bottom, so a log following a growing tail never has to
+    /// supply its content height; increasing `scrollback` walks upward.
     /// Clamped during positioning to `[0, content - viewport]`.
     pub const fn scroll_y_from_end(mut self, scrollback: f32) -> Self {
         self.common.scroll_offset.y = scrollback;
@@ -1613,11 +1613,11 @@ pub struct LayoutBuilder {
     tree:         LayoutTree,
     /// Stack of parent indices for nesting.
     parent_stack: Vec<usize>,
-    /// Per-build counter that mints [`PanelElementId::Auto`] ids for unnamed text
+    /// Per-build counter that assigns [`PanelElementId::Auto`] ids to unnamed text
     /// runs in build order. It starts at `0` for every builder, so auto ids are
-    /// stable only within one build (`set_tree` rebuilds restart it) and never
-    /// persisted or compared across panels — the positional identity an unnamed
-    /// run keeps from the old `(element_idx, command_index)` reuse key.
+    /// stable only within one build (`set_tree` rebuilds restart it) and are
+    /// never persisted or compared across panels: an auto id records a run's
+    /// position in build order, not a durable identity.
     next_auto_id: u32,
 }
 
@@ -1686,7 +1686,7 @@ pub trait AcceptsElement<Role: ElementRole>: private::BuilderSealed {
     where
         Self: 'a;
 
-    /// Passes the crate-minted child scope associated with `Role` to `children`.
+    /// Passes the crate-created child scope associated with `Role` to `children`.
     #[doc(hidden)]
     fn with_child_builder<'a>(
         child_scope: private::ChildScope<'a>,
@@ -1795,9 +1795,8 @@ impl LayoutBuilder {
     /// - a tree where the computed root bounds should reflect the visible panel rather than an
     ///   invisible outer viewport.
     ///
-    /// Note that this only changes the layout tree structure. It does not
-    /// remove the need for higher-level code to decide how layout units map to
-    /// world space.
+    /// This only changes the layout tree structure. Higher-level code still
+    /// sets how layout units map to world space.
     #[must_use]
     pub fn with_root<L>(el: El<L, LayoutOnly>) -> Self
     where
@@ -1848,9 +1847,9 @@ impl LayoutBuilder {
     /// parent, so nested calls to `.with(...)` or `.text(...)` add descendants
     /// inside it. When the closure returns, the parent stack is restored.
     ///
-    /// In other words, `.with(...)` always creates another node in the tree.
-    /// It does not modify the existing root element; choose that root up front
-    /// with [`Self::new`] or [`Self::with_root`].
+    /// `.with(...)` always creates another node in the tree. It does not modify
+    /// the existing root element; choose that root up front with [`Self::new`]
+    /// or [`Self::with_root`].
     pub fn with<L, Role>(
         &mut self,
         el: El<L, Role>,
@@ -1883,7 +1882,7 @@ impl LayoutBuilder {
     /// of their own. Use [`Self::with`] when you want to create another nested
     /// container instead of a text leaf.
     ///
-    /// The run is given a builder-minted [`PanelElementId::Auto`] id unless the
+    /// The run is given a builder-assigned [`PanelElementId::Auto`] id unless the
     /// declaration supplies [`Text::id`].
     pub fn text<Role>(&mut self, text: impl Into<Text<Role>>) -> &mut Self
     where
@@ -1894,7 +1893,7 @@ impl LayoutBuilder {
         self
     }
 
-    /// Mints the next build-order [`PanelElementId::Auto`] id for an unnamed run.
+    /// Takes the next build-order [`PanelElementId::Auto`] id for an unnamed run.
     const fn take_auto_id(&mut self) -> PanelElementId {
         let id = PanelElementId::auto(self.next_auto_id);
         self.next_auto_id += 1;

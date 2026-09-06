@@ -102,7 +102,7 @@ struct ShowcasePanel;
 #[derive(Component)]
 struct GroundPlane;
 
-/// Keeps font handles alive so Bevy doesn't unload the assets.
+/// Holds the loaded font handles so Bevy does not unload the assets.
 #[derive(Resource, Default)]
 struct FontHandles(Vec<Handle<Font>>);
 

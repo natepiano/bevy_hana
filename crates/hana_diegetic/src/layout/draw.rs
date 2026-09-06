@@ -37,7 +37,7 @@ impl PanelDraw {
         }
     }
 
-    /// Sets how this draw layer handles output outside the owning element.
+    /// Sets whether draw output outside the owning element's box is clipped.
     #[must_use]
     pub const fn overflow(mut self, overflow: DrawOverflow) -> Self {
         self.overflow = overflow;

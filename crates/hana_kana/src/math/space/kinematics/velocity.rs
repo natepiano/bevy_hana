@@ -23,7 +23,8 @@ semantic_newtype::semantic_newtype!(
     /// let frame_velocity = velocity * time_delta;
     /// assert!((frame_velocity.x - 0.16).abs() < 1e-6);
     /// ```
-    Velocity, Vec3
+    Velocity,
+    Vec3
 );
 
 #[cfg(test)]

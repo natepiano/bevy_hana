@@ -5,9 +5,9 @@ use crate::ReportedId;
 /// The operating system's process-local identifier for a unit, retained only while this process
 /// is running.
 ///
-/// `PlatformDeviceHandle` distinguishes a platform that has no identifier for a device category
+/// [`PlatformDeviceHandle`] distinguishes a platform that has no identifier for a device category
 /// from a platform API that normally provides one but returned no value for this unit. Neither case
-/// is a durable identity or a substitute for `crate::DeviceKey`.
+/// is a durable identity or a substitute for [`DeviceKey`](crate::DeviceKey).
 #[derive(Clone, PartialEq, Eq, Debug, Reflect)]
 pub enum PlatformDeviceHandle {
     /// The platform supplied an identifier such as a `CGDirectDisplayID` or an `IOKit` registry
@@ -24,7 +24,7 @@ pub enum PlatformDeviceHandle {
 /// Where a provider observes a unit attached, such as a USB port path, display slot, or network
 /// node address.
 ///
-/// `AttachmentPath` is reconciliation evidence for detecting a displaced unit. Its absence is an
+/// [`AttachmentPath`] is reconciliation evidence for detecting a displaced unit. Its absence is an
 /// enum because a device category without attachment paths differs from a scan that failed to
 /// report a path on a platform that supports them.
 #[derive(Clone, PartialEq, Eq, Debug, Reflect)]
@@ -43,7 +43,7 @@ pub enum AttachmentPath {
 /// reconciliation diagnostics.
 ///
 /// The descriptor alone never identifies a unit: identical webcams often publish the same three
-/// strings. `DeviceDescriptor` retains whether the platform cannot express descriptors at all or
+/// strings. [`DeviceDescriptor`] retains whether the platform cannot express descriptors at all or
 /// merely returned none for this scan, preventing those distinct observations from becoming an
 /// empty string.
 #[derive(Clone, PartialEq, Eq, Debug, Reflect)]

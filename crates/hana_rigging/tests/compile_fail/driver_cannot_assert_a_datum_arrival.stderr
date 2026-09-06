@@ -1,0 +1,24 @@
+error[E0603]: tuple variant `ObservedAt` is private
+  --> tests/compile_fail/driver_cannot_assert_a_datum_arrival.rs:33:34
+   |
+33 |     SessionDatumArrivalEvidence::ObservedAt(observed_at)
+   |                                  ^^^^^^^^^^ private tuple variant
+   |
+note: the tuple variant `ObservedAt` is defined here
+  --> src/flow.rs
+   |
+   |     #[non_exhaustive]
+   |     ----------------- cannot be constructed because it is `#[non_exhaustive]`
+   |     ObservedAt(Instant),
+   |     ^^^^^^^^^^
+
+error[E0624]: method `record_datum_arrival` is private
+  --> tests/compile_fail/driver_cannot_assert_a_datum_arrival.rs:28:11
+   |
+28 |     lease.record_datum_arrival();
+   |           ^^^^^^^^^^^^^^^^^^^^ private method
+   |
+  ::: src/contract.rs
+   |
+   |     fn record_datum_arrival(&self) {
+   |     ------------------------------ private method defined here

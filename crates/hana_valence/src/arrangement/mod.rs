@@ -102,16 +102,17 @@ impl FromWorld for Member {
 /// relationship is inserted, replaced, or removed. The collection exposes
 /// only ordered read access through its inherent API; applications should
 /// create, retarget, or remove a [`Member`] component instead of mutating this
-/// collection directly. It intentionally provides no ordinary `Clone`,
+/// collection directly. The type derives no `Clone`,
 /// [`Reflect`](bevy_reflect::Reflect), or
-/// [`FromReflect`](bevy_reflect::FromReflect) route. Bevy's public
+/// [`FromReflect`](bevy_reflect::FromReflect) impl, so none of those offer a
+/// route to a second copy. Bevy's public
 /// [`RelationshipTarget`](bevy_ecs::relationship::RelationshipTarget) trait
-/// necessarily retains its documented
+/// still carries its documented
 /// [`collection_mut_risky`](bevy_ecs::relationship::RelationshipTarget::collection_mut_risky)
 /// and
 /// [`from_collection_risky`](bevy_ecs::relationship::RelationshipTarget::from_collection_risky)
-/// maintenance escape hatches; using either can violate the reverse
-/// collection invariant.
+/// maintenance methods; calling either can break the reverse-collection
+/// invariant.
 ///
 /// Iteration follows Bevy's current relationship order. That order is useful
 /// when a caller needs enumeration, but it does not express physical parentage
@@ -136,9 +137,9 @@ impl Members {
 /// Result of looking up an existing entity for one provider logical member.
 ///
 /// `Bound` supplies the entity that will receive [`Member`] during successful
-/// materialization. `Missing` is a deliberate binding failure: it means the
-/// provider's listed member has no entity to bind, rather than an optional
-/// member that may be skipped. [`ArrangementCommandsExt::spawn_arrangement_from_members`]
+/// materialization. `Missing` is a binding failure, not an optional member that
+/// may be skipped: the provider listed the member and the lookup produced no
+/// entity for it. [`ArrangementCommandsExt::spawn_arrangement_from_members`]
 /// consumes every result before it inserts any relationship and rejects this
 /// state with [`ArrangementError::MissingMemberBinding`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

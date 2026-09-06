@@ -13,7 +13,8 @@ use super::NoCapability;
 use super::WindingClearance;
 use crate::ArrangementConnection;
 
-/// Half a turn, the direction an accordion reverses at every second group.
+/// Half a turn, the default accordion offset whose sign every second group
+/// reverses.
 ///
 /// Constructed in a `const` so an unrepresentable value is a compile error
 /// rather than a silent zero-radian fold.
@@ -221,8 +222,8 @@ impl FoldRecipe for Coil {
 /// per member. Where that layer lands is a property of the wrap, so this recipe
 /// scales the provider's displacement by the member's position in the winding
 /// order: the first connection carries one layer, the second two, and so on. A
-/// negative offset winds the other way, which mirrors the canonical positive
-/// clearance rather than asking the provider for a second value.
+/// negative offset winds the other way, which negates the canonical positive
+/// clearance instead of taking a second value from the provider.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Wrap {
     /// Signed angular displacement applied at every selected connection.

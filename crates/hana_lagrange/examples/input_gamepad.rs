@@ -329,8 +329,8 @@ fn update_face_labels(
         .iter()
         .find(|gamepad| gamepad_has_input(gamepad))
         .or_else(|| gamepads.iter().next());
-    // The engine's resolved speed is the single source of truth for "Slow" —
-    // the example never re-reads the rb/lb gate buttons itself.
+    // The face reads the engine's resolved speed for "Slow"; the example never
+    // re-reads the rb/lb gate buttons itself.
     let orbit_cam_interaction_state = cameras.iter().next().copied().unwrap_or_default();
 
     let orbit = held_content(

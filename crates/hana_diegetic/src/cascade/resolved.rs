@@ -36,7 +36,7 @@ macro_rules! cascade_root_resource {
 
 macro_rules! cascade_attribute {
     // Joins an already-declared value type (one whose own name is the
-    // attribute, e.g. `AntiAlias`) to the cascade instead of minting a wrapper
+    // attribute, e.g. `AntiAlias`) to the cascade instead of creating a wrapper
     // struct. The type must derive `Resource`, `Copy`, `PartialEq`, `Debug`,
     // and `Reflect`.
     (existing $name:ident, default = $default:expr) => {
@@ -60,7 +60,7 @@ macro_rules! cascade_attribute {
         }
     };
 
-    // Mints the wrapper struct, which doubles as its own root resource.
+    // Creates the wrapper struct, which doubles as its own root resource.
     ($(#[$meta:meta])* $name:ident($value:ty), default = $default:expr, eq) => {
         $(#[$meta])*
         ///
@@ -131,8 +131,8 @@ impl HdrTextCoverageBias {
 
     /// Value sent to `PathRenderRecord::text_coverage_bias`.
     ///
-    /// The public authored value is intentionally plain `f32` so it can be
-    /// tuned live, including through reflection. The shader path clamps it to a
+    /// The public authored value is a plain `f32` so it can be tuned live,
+    /// including through reflection. The shader path clamps it to a
     /// bounded signed transfer and treats non-finite input as no compensation.
     #[must_use]
     pub(crate) fn shader_value(self) -> f32 {

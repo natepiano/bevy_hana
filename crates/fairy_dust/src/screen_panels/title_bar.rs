@@ -171,7 +171,7 @@ impl From<String> for TitleBarControl {
 
 /// Resource-level sugar for one-resource / one-chip title-bar activation.
 pub trait TitleChipActivation {
-    /// Returns whether the chip should be highlighted.
+    /// Returns the [`ControlActivation`] this value gives its chip.
     fn activation(&self) -> ControlActivation;
 }
 

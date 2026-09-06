@@ -1,6 +1,6 @@
 //! A headless downstream application that runs once to publish a default keymap and JSON Schema.
 //!
-//! This demonstrates one application-owned state dimension. The `with_app_name`,
+//! Demonstrates one application-owned state dimension. The `with_app_name`,
 //! `with_defaults`, and `with_state_dimension` builder calls publish the companion files and
 //! declare the complete vocabulary JSONC predicates may use. The example exits after one frame;
 //! it exists to publish the default document and schema rather than to handle input.

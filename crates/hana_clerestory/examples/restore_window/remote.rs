@@ -10,6 +10,7 @@ use bevy_remote::RemotePlugin;
 use bevy_remote::http::RemoteHttpPlugin;
 use hana_clerestory::Monitors;
 use serde::Serialize;
+use serde::Serializer;
 use serde_json::Value;
 
 use super::constants::TEST_HTTP_PORT_ENVIRONMENT_VARIABLE;
@@ -37,22 +38,19 @@ impl From<bool> for Presence {
     fn from(present: bool) -> Self { if present { Self::Present } else { Self::Absent } }
 }
 
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "only the macOS query can tell fullscreen from windowed"
+    )
+)]
 #[derive(Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum NativeFullscreen {
     Fullscreen,
     Windowed,
     Unavailable,
-}
-
-impl From<Option<bool>> for NativeFullscreen {
-    fn from(state: Option<bool>) -> Self {
-        match state {
-            Some(true) => Self::Fullscreen,
-            Some(false) => Self::Windowed,
-            None => Self::Unavailable,
-        }
-    }
 }
 
 #[derive(Serialize)]
@@ -65,15 +63,69 @@ struct TestWindowSnapshot {
 #[derive(Serialize)]
 struct TestMonitorSnapshot {
     entity:                  u64,
-    name:                    Option<String>,
+    name:                    TestMonitorName,
     index:                   usize,
     scale:                   f64,
-    refresh_rate_millihertz: Option<u32>,
+    refresh_rate_millihertz: TestMonitorRefreshRate,
     physical_position:       [i32; 2],
     physical_size:           [u32; 2],
 }
 
-fn monitor_snapshot(In(_params): In<Option<Value>>, world: &mut World) -> BrpResult {
+enum TestMonitorName {
+    Reported(String),
+    Unavailable,
+}
+
+impl From<Option<String>> for TestMonitorName {
+    fn from(name: Option<String>) -> Self { name.map_or(Self::Unavailable, Self::Reported) }
+}
+
+impl Serialize for TestMonitorName {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Reported(name) => serializer.serialize_some(name),
+            Self::Unavailable => serializer.serialize_none(),
+        }
+    }
+}
+
+enum TestMonitorRefreshRate {
+    Reported(u32),
+    Unavailable,
+}
+
+impl From<Option<u32>> for TestMonitorRefreshRate {
+    fn from(refresh_rate: Option<u32>) -> Self {
+        refresh_rate.map_or(Self::Unavailable, Self::Reported)
+    }
+}
+
+impl Serialize for TestMonitorRefreshRate {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Reported(refresh_rate) => serializer.serialize_some(refresh_rate),
+            Self::Unavailable => serializer.serialize_none(),
+        }
+    }
+}
+
+enum RemoteRequestParameters {
+    Provided,
+    Omitted,
+}
+
+impl From<Option<Value>> for RemoteRequestParameters {
+    fn from(params: Option<Value>) -> Self { params.map_or(Self::Omitted, |_| Self::Provided) }
+}
+
+fn monitor_snapshot(In(params): In<Option<Value>>, world: &mut World) -> BrpResult {
+    let _: RemoteRequestParameters = params.into();
     let values: Vec<_> = world
         .resource::<Monitors>()
         .iter()
@@ -82,11 +134,14 @@ fn monitor_snapshot(In(_params): In<Option<Value>>, world: &mut World) -> BrpRes
             let native_monitor = world.get::<bevy::window::Monitor>(entity);
             TestMonitorSnapshot {
                 entity:                  entity.to_bits(),
-                name:                    native_monitor.and_then(|monitor| monitor.name.clone()),
+                name:                    native_monitor
+                    .and_then(|monitor| monitor.name.clone())
+                    .into(),
                 index:                   info.index.adapter_value(),
                 scale:                   info.scale,
                 refresh_rate_millihertz: native_monitor
-                    .and_then(|monitor| monitor.refresh_rate_millihertz),
+                    .and_then(|monitor| monitor.refresh_rate_millihertz)
+                    .into(),
                 physical_position:       [info.physical_position.x, info.physical_position.y],
                 physical_size:           [info.physical_size.x, info.physical_size.y],
             }
@@ -96,7 +151,8 @@ fn monitor_snapshot(In(_params): In<Option<Value>>, world: &mut World) -> BrpRes
         .map_err(bevy_remote::BrpError::internal)
 }
 
-fn window_snapshot(In(_params): In<Option<Value>>, world: &mut World) -> BrpResult {
+fn window_snapshot(In(params): In<Option<Value>>, world: &mut World) -> BrpResult {
+    let _: RemoteRequestParameters = params.into();
     let mut primary = world.query_filtered::<(Entity, &Window), With<PrimaryWindow>>();
     let (entity, window) = primary
         .single(world)
@@ -104,7 +160,7 @@ fn window_snapshot(In(_params): In<Option<Value>>, world: &mut World) -> BrpResu
     serde_json::to_value(TestWindowSnapshot {
         mode:              format!("{:?}", window.mode),
         decorated:         window.decorations.into(),
-        native_fullscreen: native_fullscreen(entity).into(),
+        native_fullscreen: native_fullscreen(entity),
     })
     .map_err(bevy_remote::BrpError::internal)
 }
@@ -117,14 +173,15 @@ pub(super) fn http_plugin() -> RemoteHttpPlugin {
     RemoteHttpPlugin::default().with_port(port)
 }
 
-fn shutdown(In(_params): In<Option<Value>>, world: &mut World) -> BrpResult {
+fn shutdown(In(params): In<Option<Value>>, world: &mut World) -> BrpResult {
+    let _: RemoteRequestParameters = params.into();
     world.write_message(AppExit::Success);
     serde_json::to_value(serde_json::json!({ "accepted": true }))
         .map_err(bevy_remote::BrpError::internal)
 }
 
 #[cfg(target_os = "macos")]
-fn native_fullscreen(entity: Entity) -> Option<bool> {
+fn native_fullscreen(entity: Entity) -> NativeFullscreen {
     use bevy::winit::WINIT_WINDOWS;
     use objc2_app_kit::NSView;
     use objc2_app_kit::NSWindowStyleMask;
@@ -132,17 +189,50 @@ fn native_fullscreen(entity: Entity) -> Option<bool> {
     use raw_window_handle::RawWindowHandle;
 
     WINIT_WINDOWS.with_borrow(|winit_windows| {
-        let winit_window = winit_windows.get_window(entity)?;
-        let handle = winit_window.window_handle().ok()?;
+        let Some(winit_window) = winit_windows.get_window(entity) else {
+            return NativeFullscreen::Unavailable;
+        };
+        let Ok(handle) = winit_window.window_handle() else {
+            return NativeFullscreen::Unavailable;
+        };
         let RawWindowHandle::AppKit(appkit_handle) = handle.as_raw() else {
-            return None;
+            return NativeFullscreen::Unavailable;
         };
         // SAFETY: `ns_view` comes from the live winit window handle above.
         let ns_view: &NSView = unsafe { appkit_handle.ns_view.cast().as_ref() };
-        let window = ns_view.window()?;
-        Some(window.styleMask().contains(NSWindowStyleMask::FullScreen))
+        let Some(window) = ns_view.window() else {
+            return NativeFullscreen::Unavailable;
+        };
+        if window.styleMask().contains(NSWindowStyleMask::FullScreen) {
+            NativeFullscreen::Fullscreen
+        } else {
+            NativeFullscreen::Windowed
+        }
     })
 }
 
 #[cfg(not(target_os = "macos"))]
-const fn native_fullscreen(_entity: Entity) -> Option<bool> { None }
+const fn native_fullscreen(_: Entity) -> NativeFullscreen { NativeFullscreen::Unavailable }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_monitor_snapshot_keeps_unavailable_fields_as_null() -> Result<(), serde_json::Error> {
+        let test_monitor_snapshot = TestMonitorSnapshot {
+            entity:                  1,
+            name:                    TestMonitorName::Unavailable,
+            index:                   0,
+            scale:                   1.0,
+            refresh_rate_millihertz: TestMonitorRefreshRate::Unavailable,
+            physical_position:       [0, 0],
+            physical_size:           [1_920, 1_080],
+        };
+
+        let value = serde_json::to_value(test_monitor_snapshot)?;
+        assert!(value["name"].is_null());
+        assert!(value["refresh_rate_millihertz"].is_null());
+        Ok(())
+    }
+}

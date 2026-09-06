@@ -4,11 +4,11 @@ use hana_rigging::prelude::ReportedId;
 #[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
 use super::MonitorIdentificationError;
 
-/// Durable panel identity carried by one structurally valid EDID.
+/// Durable display identity carried by one structurally valid EDID.
 #[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(in crate::monitors) enum EdidIdentityEvidence {
-    /// Serial value published by the panel in either EDID serial field.
+    /// Serial value published by the display in either EDID serial field.
     ReportedSerial(ReportedId),
     /// Complete validated EDID used only when neither serial field supplies a usable value.
     Descriptor(Vec<u8>),

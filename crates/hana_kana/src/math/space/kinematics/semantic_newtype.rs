@@ -14,7 +14,8 @@
 /// - `into_inner(self) -> InnerType`
 /// - `Add`, `Sub`, `Mul<f32>`, `Div<f32>`, `Neg` (all return `Self`)
 /// - `AddAssign`, `SubAssign`, `MulAssign<f32>`, `DivAssign<f32>`
-/// - `Add<InnerType>`, `Sub<InnerType>` for mixing with raw Bevy values
+/// - `Add<InnerType>`, `AddAssign<InnerType>`, `Sub<InnerType>`, `SubAssign<InnerType>` for mixing
+///   with raw Bevy values
 /// - `distance`, `distance_squared`, `lerp` accepting `impl Into<Self>`
 macro_rules! semantic_newtype {
     (

@@ -69,10 +69,12 @@ pub enum SequenceEasingSample {
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq, Reflect)]
 #[reflect(opaque)]
 pub enum SequenceEasingError {
-    /// The scope spans more than one stage, so the curve must map the unit
-    /// interval onto itself without reversing or overshooting.
+    /// The scope remaps progress onto the sequence position axis, so the curve
+    /// must map the unit interval onto itself without reversing or
+    /// overshooting. An output outside `0..=1` selects a position outside the
+    /// resolved range, and a decreasing output runs the scope backward.
     #[error(
-        "a curve easing more than one stage must be bounded and monotonic, but it \
+        "a curve remapping a scope's progress must be bounded and monotonic, but it \
          overshoots or reverses"
     )]
     MappingNotBoundedMonotonic,
@@ -142,6 +144,16 @@ enum AuthoredEasing {
     Suppressed,
 }
 
+/// Whether the caller places this scope's eased output back on the sequence
+/// position axis.
+///
+/// [`SequenceScope::Stage`] eases that one stage's output, so an overshooting
+/// or reversing curve lands in value space and stays inside the stage. Every
+/// other scope — [`SequenceScope::WholeSequence`] and every
+/// [`SequenceScope::StageRange`], one stage wide or many — converts the eased
+/// output back into a position within the resolved range, so the same curve
+/// would select a position the scope does not cover. The requirement follows
+/// from the remapping, not from the number of stages the scope spans.
 const fn scope_remaps_progress(scope: SequenceScope) -> bool {
     match scope {
         SequenceScope::Stage(_) => false,
@@ -164,6 +176,7 @@ mod tests {
     use crate::easing::EasingCurve;
     use crate::easing::EasingInput;
     use crate::easing::EasingOutput;
+    use crate::sequence::stages::SequenceStageId;
     use crate::sequence::stages::SequenceStages;
 
     const HALFWAY: f32 = 0.5;
@@ -184,13 +197,21 @@ mod tests {
         SequenceEasingSampler.sample(scope, easing, progress)
     }
 
-    fn one_stage_scope() -> SequenceScope {
-        let stages = SequenceStages::new([Duration::from_secs(1), Duration::from_secs(1)]);
-        SequenceScope::Stage(
-            stages
-                .stage_id(0)
-                .expect("a two stage description has an ordinal zero"),
-        )
+    fn first_stage_id() -> SequenceStageId {
+        SequenceStages::new([Duration::from_secs(1), Duration::from_secs(1)])
+            .stage_id(0)
+            .expect("a two stage description has an ordinal zero")
+    }
+
+    fn stage_scope() -> SequenceScope { SequenceScope::Stage(first_stage_id()) }
+
+    /// A range whose ends name the same stage, so it covers exactly one stage.
+    fn one_stage_range_scope() -> SequenceScope {
+        let stage_id = first_stage_id();
+        SequenceScope::StageRange {
+            first: stage_id,
+            last:  stage_id,
+        }
     }
 
     #[test]
@@ -232,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn a_multi_stage_scope_rejects_an_overshooting_curve() {
+    fn a_whole_sequence_scope_rejects_an_overshooting_curve() {
         assert_eq!(
             sample(
                 SequenceScope::WholeSequence,
@@ -244,9 +265,9 @@ mod tests {
     }
 
     #[test]
-    fn a_one_stage_scope_accepts_an_overshooting_curve() {
+    fn a_stage_scope_eases_its_output_with_an_overshooting_curve() {
         let sampled = sample(
-            one_stage_scope(),
+            stage_scope(),
             &SequenceEasing::ReplacedBy(Easing::Bevy(EaseFunction::BackInOut)),
             0.25,
         );
@@ -255,6 +276,20 @@ mod tests {
             panic!("an anticipating curve eases a single stage");
         };
         assert!(eased < 0.0, "BackInOut anticipates below zero at 0.25");
+    }
+
+    /// A range remaps progress onto the position axis however few stages it
+    /// covers, so a one stage range holds to the bound a lone stage does not.
+    #[test]
+    fn a_one_stage_range_rejects_an_overshooting_curve() {
+        assert_eq!(
+            sample(
+                one_stage_range_scope(),
+                &SequenceEasing::ReplacedBy(Easing::Bevy(EaseFunction::BackInOut)),
+                0.25,
+            ),
+            SequenceEasingSample::CurveRejected(SequenceEasingError::MappingNotBoundedMonotonic)
+        );
     }
 
     #[test]

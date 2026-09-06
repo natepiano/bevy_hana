@@ -301,7 +301,7 @@ const ACCENT_YELLOW: Color = Color::srgb(0.95, 0.78, 0.24);
 const ACCENT_RED: Color = Color::srgb(0.95, 0.34, 0.30);
 // Over-bright warm readout. Base color is a material-table value, so boosting it
 // past 1.0 keeps the run in the Shared group's single batch (unlike `Unlit`,
-// which the plan classifies as a pipeline splitter).
+// which splits the pipeline).
 const EMISSIVE_WARM: Color = Color::linear_rgb(3.6, 2.3, 0.2);
 // Sharp cool-white glint. `metallic` is a material-table value, so this row stays
 // in the Shared group's single batch. Kept at full range (<=1.0) so it reads as a
@@ -320,8 +320,6 @@ const TEXT_EMISSIVE_GAIN: f32 = 1.8;
 const ALPHA_CELL_BG: Color = Color::WHITE;
 const ALPHA_CELL_INK: Color = Color::BLACK;
 const ALPHA_CELL_CAPTION: Color = Color::BLACK;
-// Previous HDR-path shader compensation for this cell:
-// const ALPHA_CELL_HDR_TEXT_COVERAGE_BIAS: f32 = 2.0;
 
 // The alpha modes the center-left selector cycles through, in letter-key order
 // (A..G). The selected mode is applied to the SDF panel's fills and
@@ -1889,8 +1887,8 @@ fn ledger_upload_explainer(builder: &mut LayoutBuilder, perf: &DiegeticPerfStats
 // One table row: a fixed-width left label cell plus three right-aligned numeric
 // cells colored by family (text/shape/sdf).
 // A GROW spacer between the left label and the right-aligned number columns:
-// the label hugs its content on the left, the spacer eats the slack, and the
-// fixed-width number cells share a right edge across every row.
+// the label hugs its content on the left, the spacer absorbs the remaining
+// width, and the fixed-width number cells share a right edge across every row.
 fn ledger_spacer(builder: &mut LayoutBuilder) {
     builder.with(
         El::new().width(Sizing::GROW).height(Sizing::FIT),
@@ -2359,7 +2357,7 @@ fn build_shape_panel(materials: &ShapePanelMaterialHandles) -> LayoutTree {
 // Draws real images through the batch path (`LayoutBuilder::image`). Every card
 // samples the same texture, so post-key they route into ONE image batch — the
 // tint varies per record but stays in-batch. This is the runtime confirmation
-// that batched images render before the legacy entity path is retired.
+// that batched images render.
 fn build_image_panel(image: Handle<Image>) -> LayoutTree {
     let mut builder = panel_root();
     panel_header(
@@ -2598,7 +2596,7 @@ fn material_group_spacer(builder: &mut LayoutBuilder) {
 
 // Each case stacks a muted caption above its value. The value owns the full
 // group width and wraps, so the long divergent-group strings cannot clip at the
-// card edge the way a fixed-label-width row did.
+// card edge the way they would in a row with a fixed-width label column.
 fn material_case_block_with_style(
     builder: &mut LayoutBuilder,
     label: &str,
@@ -2660,10 +2658,6 @@ fn divergent_group(
 fn divergent_alpha_case(builder: &mut LayoutBuilder, alpha: AlphaMode) {
     let caption_style = material_caption_style(ALPHA_CELL_CAPTION);
     let value_style = material_value_style(ALPHA_CELL_INK).with_alpha_mode(alpha);
-    // Previous HDR-path shader compensation, replaced by LDR precompose:
-    // let caption_style =
-    //     caption_style.with_hdr_text_coverage_bias(ALPHA_CELL_HDR_TEXT_COVERAGE_BIAS);
-    // let value_style = value_style.with_hdr_text_coverage_bias(ALPHA_CELL_HDR_TEXT_COVERAGE_BIAS);
 
     divergent_text_precomposed_case_shell(
         builder,

@@ -61,7 +61,7 @@ pub enum PanelBuildError {
     /// reused across either kind is a build error.
     #[error("duplicate panel element id `{0}`")]
     DuplicateElementId(PanelElementId),
-    /// A widget used a builder-minted auto id instead of a stable authored id.
+    /// A widget used a builder-assigned auto id instead of a stable authored id.
     #[error("widget `{0}` requires a named panel element id")]
     WidgetRequiresNamedId(PanelElementId),
     /// A widget is inside a subtree rendered through precomposition.
@@ -157,7 +157,7 @@ impl<Space> WidgetEntity<Space> {
     pub(super) const fn expected_space(&self) -> PanelSpace { self.space }
 }
 
-/// Read-only lookup that mints typed identities for live panels.
+/// Read-only lookup that produces typed identities for live panels.
 #[derive(SystemParam)]
 pub struct PanelEntityReader<'w, 's> {
     panels: Query<'w, 's, &'static DiegeticPanel>,
@@ -263,7 +263,7 @@ pub(super) struct BuilderData {
 /// (`Fit` / `Percent` / `Grow`) start at `0.0` and resolve later — they
 /// do *not* trip this check.
 ///
-/// # `Sizing` escape-hatch footgun on world panels
+/// # The `Sizing` escape hatch bypasses the world-panel guard
 ///
 /// Every value type routes to the engine's [`Sizing`] enum via
 /// [`PanelSizing::to_sizing`](super::sizing::PanelSizing::to_sizing).
@@ -607,10 +607,9 @@ impl DiegeticPanelBuilder<Screen, NeedsSize> {
     }
 }
 
-/// Initial panel width/height to stash in [`BuilderData`]. For `Fixed` we know
-/// the exact value; for any dynamic [`Sizing`] we use `0.0` as a placeholder
-/// that the screen-space system resolves each frame against the window and
-/// the layout result.
+/// Initial panel width/height to store in [`BuilderData`]. A `Fixed` sizing carries
+/// the exact value; any dynamic [`Sizing`] starts at `0.0`, which the screen-space
+/// system resolves each frame against the window and the layout result.
 const fn initial_panel_size(s: Sizing) -> f32 {
     match s {
         Sizing::Fixed(d) => d.value,
@@ -622,7 +621,7 @@ const fn initial_panel_size(s: Sizing) -> f32 {
 /// or `None` if the sizing carries only unit-less dimensions.
 ///
 /// `Sizing::Fixed(Dimension { unit: Some(u), .. })` yields `Some(u)`;
-/// `Sizing::Fit { min, max }` prefers `min.unit` over `max.unit`;
+/// `Sizing::Fit { min, max }` returns `min.unit` when it is set, `max.unit` otherwise;
 /// `Sizing::Percent` has no backing dimension and yields `None`.
 const fn sizing_unit(s: Sizing) -> Option<Unit> {
     match s {
@@ -784,8 +783,8 @@ impl<S: sealed::CanBuild> DiegeticPanelBuilder<World, S> {
     /// `Percent` / `Grow` are compile-rejected for world panels via
     /// [`PanelSizing<World>`](super::sizing::PanelSizing); a caller that
     /// routes them in via [`Sizing`] (the escape hatch) gets them clamped
-    /// to the resolved dimensions — a `debug_assert!` flags the footgun
-    /// in debug builds.
+    /// to the resolved dimensions, and a `debug_assert!` in this method
+    /// fires in debug builds.
     ///
     /// # Errors
     ///
@@ -916,7 +915,7 @@ impl<S: sealed::CanBuild> DiegeticPanelBuilder<Screen, S> {
         if let Some(ref mut tree) = self.data.tree {
             // The layout engine's two passes (bottom-up `propagate_fit_sizes`
             // and top-down `size_along_axis`) already resolve `Fit` roots to
-            // their natural content size, so we route each Sizing variant to
+            // their natural content size, so each `Sizing` variant routes to
             // the matching root kind here. `Percent` routes to an unbounded
             // `Grow` at the root because `resolve_screen_axis` has already
             // pre-multiplied the panel width by the percent fraction — the
@@ -1294,7 +1293,7 @@ mod tests {
 
     #[test]
     fn many_unnamed_runs_never_collide() {
-        // Auto ids are minted per build; eight unnamed runs must not read as a
+        // Auto ids are assigned per build; eight unnamed runs must not read as a
         // duplicate.
         let result = DiegeticPanel::world()
             .size(Mm(50.0), Mm(30.0))

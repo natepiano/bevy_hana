@@ -26,6 +26,7 @@ use std::env::VarError;
 use std::env::var;
 use std::io::Error;
 use std::io::ErrorKind;
+use std::path::PathBuf;
 
 use bevy::pbr::PbrPlugin;
 use bevy::prelude::App;
@@ -55,22 +56,43 @@ use input::KeyboardInputMode;
 use input::SelectedVideoModes;
 use setup::WindowCounter;
 
-fn optional_environment_value(name: &str) -> std::io::Result<Option<String>> {
-    match var(name) {
-        Ok(value) => Ok(Some(value)),
-        Err(VarError::NotPresent) => Ok(None),
-        Err(VarError::NotUnicode(_)) => Err(Error::new(
-            ErrorKind::InvalidInput,
-            format!("{name} must contain Unicode text"),
-        )),
-    }
+enum LaunchMonitorRequest {
+    CenterOn(String),
+    Unspecified,
+}
+
+enum LaunchPositionRequest {
+    At(String),
+    Unspecified,
+}
+
+enum LaunchSizeRequest {
+    Dimensions(String),
+    Unspecified,
+}
+
+enum InitialWindowResolution {
+    Configured(WindowResolution),
+    BevyDefault,
+}
+
+enum WindowPersistencePath {
+    Supplied(PathBuf),
+    ApplicationDefault,
+}
+
+fn invalid_unicode_environment_value(name: &str) -> Error {
+    Error::new(
+        ErrorKind::InvalidInput,
+        format!("{name} must contain Unicode text"),
+    )
 }
 
 fn parse_launch_position(
-    monitor: Option<&str>,
-    position: Option<&str>,
+    monitor: LaunchMonitorRequest,
+    position: LaunchPositionRequest,
 ) -> std::io::Result<WindowPosition> {
-    if let Some(position) = position {
+    if let LaunchPositionRequest::At(position) = position {
         let (x, y) = position.split_once(',').ok_or_else(|| {
             Error::new(
                 ErrorKind::InvalidInput,
@@ -91,31 +113,51 @@ fn parse_launch_position(
         })?;
         return Ok(WindowPosition::At(IVec2::new(x, y)));
     }
-    monitor.map_or(Ok(WindowPosition::Automatic), |value| {
-        let monitor_index = value.parse::<usize>().map_err(|error| {
-            Error::new(
-                ErrorKind::InvalidInput,
-                format!("invalid {TEST_LAUNCH_MONITOR_ENVIRONMENT_VARIABLE}: {error}"),
-            )
-        })?;
-        Ok(WindowPosition::Centered(MonitorSelection::Index(
-            monitor_index,
-        )))
-    })
+    match monitor {
+        LaunchMonitorRequest::Unspecified => Ok(WindowPosition::Automatic),
+        LaunchMonitorRequest::CenterOn(monitor) => {
+            let monitor_index = monitor.parse::<usize>().map_err(|error| {
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid {TEST_LAUNCH_MONITOR_ENVIRONMENT_VARIABLE}: {error}"),
+                )
+            })?;
+            Ok(WindowPosition::Centered(MonitorSelection::Index(
+                monitor_index,
+            )))
+        },
+    }
+}
+
+fn launch_monitor_request() -> std::io::Result<LaunchMonitorRequest> {
+    match var(TEST_LAUNCH_MONITOR_ENVIRONMENT_VARIABLE) {
+        Ok(monitor) => Ok(LaunchMonitorRequest::CenterOn(monitor)),
+        Err(VarError::NotPresent) => Ok(LaunchMonitorRequest::Unspecified),
+        Err(VarError::NotUnicode(_)) => Err(invalid_unicode_environment_value(
+            TEST_LAUNCH_MONITOR_ENVIRONMENT_VARIABLE,
+        )),
+    }
+}
+
+fn launch_position_request() -> std::io::Result<LaunchPositionRequest> {
+    match var(TEST_LAUNCH_POSITION_ENVIRONMENT_VARIABLE) {
+        Ok(position) => Ok(LaunchPositionRequest::At(position)),
+        Err(VarError::NotPresent) => Ok(LaunchPositionRequest::Unspecified),
+        Err(VarError::NotUnicode(_)) => Err(invalid_unicode_environment_value(
+            TEST_LAUNCH_POSITION_ENVIRONMENT_VARIABLE,
+        )),
+    }
 }
 
 fn test_launch_position() -> std::io::Result<WindowPosition> {
-    parse_launch_position(
-        optional_environment_value(TEST_LAUNCH_MONITOR_ENVIRONMENT_VARIABLE)?.as_deref(),
-        optional_environment_value(TEST_LAUNCH_POSITION_ENVIRONMENT_VARIABLE)?.as_deref(),
-    )
+    parse_launch_position(launch_monitor_request()?, launch_position_request()?)
 }
 
 /// Parse `CLERESTORY_TEST_LAUNCH_SIZE` (physical `width,height`) into a window resolution.
-/// Returns `None` when unset, keeping Bevy's default window size for non-cross-DPI cases.
-fn parse_launch_size(value: Option<&str>) -> std::io::Result<Option<WindowResolution>> {
-    let Some(value) = value else {
-        return Ok(None);
+/// `InitialWindowResolution::BevyDefault` keeps Bevy's window size for non-cross-DPI cases.
+fn parse_launch_size(value: LaunchSizeRequest) -> std::io::Result<InitialWindowResolution> {
+    let LaunchSizeRequest::Dimensions(value) = value else {
+        return Ok(InitialWindowResolution::BevyDefault);
     };
     let (width, height) = value.split_once(',').ok_or_else(|| {
         Error::new(
@@ -135,23 +177,44 @@ fn parse_launch_size(value: Option<&str>) -> std::io::Result<Option<WindowResolu
             format!("invalid {TEST_LAUNCH_SIZE_ENVIRONMENT_VARIABLE} height: {error}"),
         )
     })?;
-    Ok(Some(WindowResolution::new(width, height)))
+    Ok(InitialWindowResolution::Configured(WindowResolution::new(
+        width, height,
+    )))
 }
 
-fn test_launch_size() -> std::io::Result<Option<WindowResolution>> {
-    parse_launch_size(optional_environment_value(TEST_LAUNCH_SIZE_ENVIRONMENT_VARIABLE)?.as_deref())
+fn test_launch_size() -> std::io::Result<InitialWindowResolution> {
+    let launch_size_request = match var(TEST_LAUNCH_SIZE_ENVIRONMENT_VARIABLE) {
+        Ok(launch_size) => LaunchSizeRequest::Dimensions(launch_size),
+        Err(VarError::NotPresent) => LaunchSizeRequest::Unspecified,
+        Err(VarError::NotUnicode(_)) => {
+            return Err(invalid_unicode_environment_value(
+                TEST_LAUNCH_SIZE_ENVIRONMENT_VARIABLE,
+            ));
+        },
+    };
+    parse_launch_size(launch_size_request)
+}
+
+fn window_persistence_path() -> std::io::Result<WindowPersistencePath> {
+    match var(TEST_PERSISTENCE_PATH_ENVIRONMENT_VARIABLE) {
+        Ok(path) => Ok(WindowPersistencePath::Supplied(PathBuf::from(path))),
+        Err(VarError::NotPresent) => Ok(WindowPersistencePath::ApplicationDefault),
+        Err(VarError::NotUnicode(_)) => Err(invalid_unicode_environment_value(
+            TEST_PERSISTENCE_PATH_ENVIRONMENT_VARIABLE,
+        )),
+    }
 }
 
 fn main() -> std::io::Result<()> {
     let launch_position = test_launch_position()?;
     let launch_size = test_launch_size()?;
-    let persistence_path = optional_environment_value(TEST_PERSISTENCE_PATH_ENVIRONMENT_VARIABLE)?;
+    let window_persistence_path = window_persistence_path()?;
     let mut primary_window = Window {
         title: PRIMARY_WINDOW_TITLE.into(),
         position: launch_position,
         ..default()
     };
-    if let Some(resolution) = launch_size {
+    if let InitialWindowResolution::Configured(resolution) = launch_size {
         primary_window.resolution = resolution;
     }
     let mut app = App::new();
@@ -170,10 +233,13 @@ fn main() -> std::io::Result<()> {
                 ..default()
             }),
     );
-    if let Some(persistence_path) = persistence_path {
-        app.add_plugins(WindowManagerPlugin::with_path(persistence_path));
-    } else {
-        app.add_plugins(WindowManagerPlugin);
+    match window_persistence_path {
+        WindowPersistencePath::Supplied(persistence_path) => {
+            app.add_plugins(WindowManagerPlugin::with_path(persistence_path));
+        },
+        WindowPersistencePath::ApplicationDefault => {
+            app.add_plugins(WindowManagerPlugin);
+        },
     }
     app.add_plugins(remote::plugin())
         .add_plugins(remote::http_plugin())
@@ -221,7 +287,11 @@ mod tests {
     fn absent_launch_monitor_keeps_automatic_positioning() {
         // `io::Error` is not `PartialEq`, so unwrap and compare the `WindowPosition` itself.
         assert_eq!(
-            parse_launch_position(None, None).unwrap(),
+            parse_launch_position(
+                LaunchMonitorRequest::Unspecified,
+                LaunchPositionRequest::Unspecified,
+            )
+            .unwrap(),
             WindowPosition::Automatic,
         );
     }
@@ -229,7 +299,11 @@ mod tests {
     #[test]
     fn launch_monitor_centers_the_initial_window_on_that_monitor() {
         assert_eq!(
-            parse_launch_position(Some("2"), None).unwrap(),
+            parse_launch_position(
+                LaunchMonitorRequest::CenterOn("2".into()),
+                LaunchPositionRequest::Unspecified,
+            )
+            .unwrap(),
             WindowPosition::Centered(MonitorSelection::Index(2)),
         );
     }
@@ -237,26 +311,41 @@ mod tests {
     #[test]
     fn explicit_launch_position_takes_precedence_over_monitor_centering() {
         assert_eq!(
-            parse_launch_position(Some("2"), Some("-1200,80")).unwrap(),
+            parse_launch_position(
+                LaunchMonitorRequest::CenterOn("2".into()),
+                LaunchPositionRequest::At("-1200,80".into()),
+            )
+            .unwrap(),
             WindowPosition::At(IVec2::new(-1200, 80)),
         );
     }
 
     #[test]
     fn absent_launch_size_keeps_default_resolution() {
-        assert!(parse_launch_size(None).unwrap().is_none());
+        assert!(matches!(
+            parse_launch_size(LaunchSizeRequest::Unspecified).unwrap(),
+            InitialWindowResolution::BevyDefault
+        ));
     }
 
     #[test]
-    fn explicit_launch_size_sets_the_window_resolution() {
-        let resolution = parse_launch_size(Some("640,480")).unwrap().unwrap();
+    fn explicit_launch_size_sets_the_window_resolution() -> Result<(), String> {
+        let initial_window_resolution =
+            parse_launch_size(LaunchSizeRequest::Dimensions("640,480".into()))
+                .map_err(|error| error.to_string())?;
+        let InitialWindowResolution::Configured(resolution) = initial_window_resolution else {
+            return Err(String::from(
+                "explicit launch size did not produce a resolution",
+            ));
+        };
         assert_eq!(resolution.physical_width(), 640);
         assert_eq!(resolution.physical_height(), 480);
+        Ok(())
     }
 
     #[test]
     fn malformed_launch_size_is_an_error() {
-        assert!(parse_launch_size(Some("640")).is_err());
-        assert!(parse_launch_size(Some("640,abc")).is_err());
+        assert!(parse_launch_size(LaunchSizeRequest::Dimensions("640".into())).is_err());
+        assert!(parse_launch_size(LaunchSizeRequest::Dimensions("640,abc".into())).is_err());
     }
 }

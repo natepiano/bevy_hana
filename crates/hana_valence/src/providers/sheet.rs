@@ -76,8 +76,8 @@ pub(super) fn fold_groups_from_lines(
 /// `layer_thickness` along `+Z`, in its own source-local frame. Where a layer
 /// lands in the stack is a property of the wrapping recipe, which reads group
 /// order for it, not of this source-local value. Every group member receives a
-/// displacement, so [`WindingClearance::try_new`] sees complete coverage and no
-/// foreign member.
+/// displacement, so the coverage [`WindingClearance::try_new`] checks is
+/// complete and names no foreign member.
 ///
 /// # Errors
 ///

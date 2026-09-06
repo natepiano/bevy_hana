@@ -45,8 +45,9 @@ use crate::render::draw_order::DrawOrder;
 use crate::render::world_text::TextContent;
 
 /// A reused panel-text child plus the components reification compares incoming
-/// values against before deciding whether to write. The references borrow the
-/// `existing_children` query for one reification pass.
+/// values against; a component is written back only when the incoming value
+/// differs. The references borrow the `existing_runs` query for one reification
+/// pass.
 #[derive(Clone, Copy)]
 struct ReusableChild<'a> {
     entity:                 Entity,
@@ -81,7 +82,8 @@ type PendingTextChild = (
 /// Resolves the panel's text render commands into per-child reification inputs,
 /// assigning each its run `id` (from the tree, auto fallback when absent) and a
 /// per-run `line_index` so the reuse key is the content-stable `(id, line_index)`
-/// rather than the former positional `(element_idx, command_index)`.
+/// rather than a positional `(element_idx, command_index)` pair that a sibling
+/// reorder would shift.
 fn collect_text_commands(
     panel: &DiegeticPanel,
     commands: &[RenderCommand],
@@ -264,7 +266,7 @@ pub(super) fn reify_text_entities(
                 line_index: *line_index,
                 element_idx: *element_idx,
                 draw_ordinal: draw_depth.draw_order_index(),
-                depth_bias: draw_depth.clip_depth_nudge().get(),
+                clip_depth_nudge: draw_depth.clip_depth_nudge().get(),
                 oit_depth_offset: draw_depth.oit_depth_offset().get(),
                 bounds: *bounds,
                 scale_x,
@@ -816,7 +818,7 @@ mod tests {
                     line_index:       line,
                     element_idx:      7,
                     draw_ordinal:     line,
-                    depth_bias:       line.to_f32() * LAYER_DEPTH_BIAS,
+                    clip_depth_nudge: line.to_f32() * LAYER_DEPTH_BIAS,
                     oit_depth_offset: 0.0,
                     bounds:           BoundingBox {
                         x:      0.0,
@@ -1146,7 +1148,7 @@ mod tests {
         let first_before = before["first"];
 
         // Insert an auto sibling ahead of "first". The named run's key is
-        // `(Named("keep"), 0)` — id-stable, so it keeps its entity (TR-D). The
+        // `(Named("keep"), 0)` — id-stable, so it keeps its entity. The
         // auto ids are positional: "inserted" takes `Auto(0)` and reuses the old
         // entity, so "first" shifts to `Auto(1)` and lands on a fresh entity —
         // content identity does not follow an auto run across the edit.
@@ -1214,7 +1216,7 @@ mod tests {
         // Rewrite the byte-identical string through the public edit path.
         // `TextEdit::set_text` read-compares before taking the `&mut DiegeticPanel`
         // borrow, so an unchanged string never dirties the panel, never relayouts,
-        // and so `MeasureTextFn` fires zero more times (TR-L).
+        // and so `MeasureTextFn` fires zero more times.
         let wrote = app
             .world_mut()
             .run_system_once(move |mut text: PanelText| text.set_sole_text(panel, "Hi"))

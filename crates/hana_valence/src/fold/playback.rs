@@ -46,11 +46,11 @@ use crate::Hinge;
 
 /// What one sequence currently holds for one member's eased travel.
 ///
-/// The two non-eased states are deliberately distinct, because they ask
-/// [`crate::hinge_to_pose`] for opposite things: an untracked member has no
-/// authored travel at all and rests at its base endpoint, while an unresolved
-/// one has authored travel whose fraction this update could not produce and
-/// must keep the pose it already has.
+/// The two non-eased states are distinct because the hinge driver does
+/// opposite things with them: an untracked member has no authored travel at all
+/// and is posed at its base endpoint, while an unresolved one has authored
+/// travel whose fraction this update could not produce and is skipped, so it
+/// keeps the pose it already has.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FoldMemberFraction {
     /// No retained sequence stages the member, so it rests at its base
@@ -201,7 +201,7 @@ impl FoldSequencePlayback {
 /// What every retained fold sequence holds for its staged members this frame.
 ///
 /// This is the batched form of [`FoldSequencePlayback::member_fraction`], with
-/// the same states and the same absence rule. [`crate::hinge_to_pose`] keeps
+/// the same states and the same absence rule. The hinge driver keeps
 /// one as a system-local scratch value and reloads it each run, so the
 /// per-member lookup costs one pass over live sequences and reuses its
 /// allocation.
@@ -320,7 +320,7 @@ impl MemberStage {
 /// Which easing path rejected one producer's external curve.
 #[derive(Clone, Copy, Debug)]
 enum RejectedCurveUse {
-    /// The curve was asked to ease a multi-stage scope and cannot.
+    /// The curve was used to ease a multi-stage scope and was rejected there.
     MultiStageScope,
     /// The curve eased the output of one selected stage and produced no
     /// usable value there.
@@ -452,7 +452,7 @@ pub(super) fn apply_fold_movement(
 /// This is the fold domain's single evaluator. It owns every
 /// [`FoldEvaluationError`], holds the current pose in each case rather than
 /// substituting a fallback curve, and caches its output so
-/// [`crate::hinge_to_pose`] can recompute the pose from the live [`Hinge`] in
+/// The hinge driver can recompute the pose from the live [`Hinge`] in
 /// `PostUpdate`.
 pub(super) fn evaluate_fold_sequences(
     sequence_commands: SequenceCommands,

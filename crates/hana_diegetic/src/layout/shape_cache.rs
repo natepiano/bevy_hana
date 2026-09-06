@@ -59,11 +59,11 @@ pub struct ShapedGlyph {
     pub advance:   f32,
 }
 
-/// Snapshot of parley's per-line metrics, captured during text shaping.
+/// Parley's per-line metrics, recorded during text shaping.
 ///
 /// All values are in layout units (Y-down coordinate system).
 #[derive(Clone, Copy, Debug)]
-pub struct LineMetricsSnapshot {
+pub struct ShapedLineMetrics {
     /// Typographic ascent for this line.
     pub ascent:   f32,
     /// Typographic descent for this line.
@@ -82,7 +82,7 @@ pub struct ShapedTextRun {
     /// The shaped glyphs in order.
     pub glyphs:       Vec<ShapedGlyph>,
     /// Per-line metrics from parley, captured during shaping.
-    pub line_metrics: Vec<LineMetricsSnapshot>,
+    pub line_metrics: Vec<ShapedLineMetrics>,
 }
 
 /// Cache key: hash of the text string + the full `TextMeasure` identity.
@@ -131,7 +131,8 @@ impl ShapedCacheKey {
 /// `'static` measure closure; the renderer's text shaper (run + measurement
 /// halves) holds it as a `Res`. All methods take `&self` and lock internally, so
 /// an insert through any handle is visible to every other handle, so the layout
-/// pass neither copies the maps each frame nor discards the misses it computes.
+/// pass neither copies the maps each frame nor throws away the measurements it
+/// computes on a miss.
 #[derive(Resource, Clone, Default)]
 pub struct ShapedTextCache {
     inner: Arc<Mutex<ShapedTextCacheMaps>>,

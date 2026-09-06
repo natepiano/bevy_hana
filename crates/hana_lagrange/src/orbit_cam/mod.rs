@@ -197,10 +197,9 @@ pub enum OrbitCamUpdateRequest {
 
 /// Tags an entity as capable of panning and orbiting.
 ///
-/// Provides a way to configure the camera's behaviour and controls. The camera's
-/// driven state lives in three [`Operation`]s — `orbit` (yaw/pitch), `pan`
-/// (focus), and `zoom` (radius) — each pairing a smoothed current/target value
-/// with its sensitivity, damping, and limit.
+/// The camera's driven state lives in three [`Operation`]s — `orbit`
+/// (yaw/pitch), `pan` (focus), and `zoom` (radius) — each pairing a smoothed
+/// current/target value with its sensitivity, damping, and limit.
 ///
 /// Use preset constructors such as [`OrbitCam::blender_like`] for default-pose
 /// input modes. Preset bundle constructors and pose constructors stay separate;

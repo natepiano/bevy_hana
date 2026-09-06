@@ -1,8 +1,13 @@
-#[cfg(test)]
+use std::any::type_name;
+use std::collections::HashMap;
 use std::time::Duration;
 use std::time::Instant;
 
 use bevy::app::App;
+use bevy::ecs::reflect::AppTypeRegistry;
+use bevy::ecs::relationship::Relationship;
+use bevy::log::info;
+use bevy::prelude::Entity;
 use bevy::prelude::Reflect;
 use bevy::prelude::Resource;
 use bevy::prelude::World;
@@ -10,92 +15,96 @@ use bevy::tasks::IoTaskPool;
 use bevy::tasks::Task;
 use bevy::tasks::block_on;
 use bevy::tasks::poll_once;
+use bevy::time::Real;
+use bevy::time::Time;
 
+use crate::BatchRef;
+use crate::CapabilityProjectionFailure;
+use crate::CapabilityProjectionStatus;
+use crate::DeviceAccessErrorView;
 use crate::DeviceReporter;
 use crate::DeviceScan;
 use crate::DiscoveryBatchId;
 use crate::DiscoveryCadence;
 use crate::DiscoveryControl;
-use crate::DiscoveryLimits;
 use crate::DiscoveryProgress;
 use crate::DiscoveryProgressSender;
+use crate::DiscoveryProgressView;
 use crate::DiscoverySchedulerState;
 use crate::DiscoveryStatus;
 use crate::DiscoveryWork;
 use crate::DriverContractError;
+use crate::FirstCompleteSetStatus;
 use crate::LastDiscoveryOutcome;
+use crate::PreviousSuccess;
 use crate::RegisteredSchemes;
 use crate::ReportAcceptanceProjection;
 use crate::ReporterActivation;
 use crate::ReporterActivity;
+use crate::ReporterActivityView;
 use crate::ReporterCoverage;
+use crate::ReporterDeferral;
 use crate::ReporterDiscoveryStatus;
+use crate::ReporterHealth;
 use crate::ReporterId;
+use crate::ReporterOutcomeHealth;
 use crate::ReporterRegistration;
-use crate::RoleState;
+use crate::ReporterResume;
+use crate::RiggingRuntimeClock;
+use crate::RiggingRuntimeTime;
 use crate::SchemeName;
-use crate::StartApplyRequest;
 use crate::StartupDiscoveryState;
-use crate::binding::CaptureRequest;
-use crate::binding::PollRequest;
+use crate::StartupRequirement;
+use crate::WaitTiming;
+use crate::binding::RiggingRoleRelationshipRepairs;
+use crate::capabilities::CapabilitySource;
 use crate::contract::DiscoveryProgressReceiver;
 use crate::contract::DriverEntry;
+use crate::contract::DriverReports;
 use crate::contract::EndpointDriver;
+use crate::contract::EndpointDriverRegistration;
+use crate::contract::ErasedTarget;
 use crate::contract::PendingDiscoveryProgress;
+use crate::contract::SessionDatumArrivalReceiver;
 use crate::discovery;
 use crate::discovery::CompletedDiscoveryOutcome;
 use crate::discovery::DiscoveryDirtyState;
+use crate::discovery::DiscoveryLimits;
 use crate::discovery::DiscoveryRequest;
 use crate::discovery::DiscoveryTransition;
 use crate::discovery::DiscoveryTransitionJournal;
-use crate::discovery::StartupRequirement;
+use crate::presence;
 use crate::presence::DeviceSet;
+use crate::presence::RetainedSetChange;
+use crate::reporter_health;
+use crate::reporter_health::ReporterFailureRun;
+use crate::reporter_health::ReporterLogState;
+use crate::reporter_health::SuccessfulReportContext;
 
 /// Process-local driver handle that the driver registry issues in registration order.
 ///
 /// `DriverId` has no public constructor because a binding receives it from
-/// `RiggingAppExt::add_endpoint_driver`; allowing app code or a driver to mint one could route an
-/// apply to a different registered implementation.
+/// `RiggingAppExt::add_endpoint_driver`; allowing app code or a driver to fabricate one could route
+/// an apply to a different registered implementation.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Reflect)]
 #[reflect(opaque)]
 pub struct DriverId(pub(crate) u32);
 
-/// Proof that the kernel authorized an endpoint apply and selected its permitted purpose.
+/// Proof that the kernel authorized an endpoint apply.
 ///
-/// The private `Purpose` cases and the private constructors prevent a driver from manufacturing
-/// permission for a device whose identity did not authorize it. `#[reflect(opaque)]` extends that
-/// boundary to reflection: a dynamic reflected tuple cannot construct this token.
+/// The private field and constructor prevent a driver from manufacturing permission for a device
+/// whose identity did not authorize it. `#[reflect(opaque)]` extends that boundary to reflection:
+/// a dynamic reflected tuple cannot construct this token.
 #[derive(Clone, Copy, Debug, Reflect)]
 #[reflect(opaque)]
-pub struct ApplyPermit(Purpose);
-
-#[derive(Clone, Copy, Debug, Reflect)]
-enum Purpose {
-    /// The kernel may authorize a device with proven or authored identity for its bound work.
-    InService,
-    /// The kernel may authorize a device with restore-only identity to receive prior state only.
-    RestoreOnly,
-}
+pub struct ApplyPermit(());
 
 impl ApplyPermit {
-    /// Report whether this token permits use for the device's current application role.
-    ///
-    /// A driver whose restore operation differs from in-service work checks this before choosing
-    /// its hardware command; a driver with one command path can ignore the distinction.
-    #[must_use]
-    pub const fn allows_in_service_use(self) -> bool { matches!(self.0, Purpose::InService) }
-
-    /// Mint the token that permits a device to be put in service.
+    /// Create the token that permits an authorized device operation.
     ///
     /// Crate-private because `Devices::authorize_service` is the only in-service decision point; a
-    /// driver that could mint one would be claiming an authorization the kernel never granted.
-    pub(crate) const fn in_service() -> Self { Self(Purpose::InService) }
-
-    /// Mint the weaker token that permits returning a saved configuration and nothing else.
-    ///
-    /// Crate-private for the same reason as `Self::in_service`: `Devices::authorize_restore` is the
-    /// only caller that has checked presence, claim, and verdict first.
-    pub(crate) const fn restore_only() -> Self { Self(Purpose::RestoreOnly) }
+    /// driver that could fabricate one would be claiming an authorization the kernel never granted.
+    pub(crate) const fn authorized() -> Self { Self(()) }
 }
 
 /// Whether a reporter can supply an accepted complete device set to reconciliation.
@@ -117,22 +126,33 @@ enum ReporterDeviceSetState<'a> {
     Available(&'a DeviceSet),
 }
 
+/// Whether an accepted complete set still needs one reconciliation pass.
+#[derive(Default)]
+enum ReporterReconciliationRequest {
+    /// Reconciliation has consumed every accepted complete set.
+    #[default]
+    Settled,
+    /// At least one complete set was accepted after the preceding reconciliation pass.
+    AcceptedCompleteSet,
+}
+
 /// Erased reporter implementations and their registry-owned discovery state.
 ///
 /// The collect system borrows this resource out of `World` before it calls
 /// `DeviceReporter::discover` or runs a returned `MainThreadDiscoveryJob`. The world-free reporter
 /// method, the absent registry during main-thread enumeration, and the background job's sendable
 /// closure prevent every discovery boundary from accessing its own registration.
-#[derive(Resource, Default)]
+#[derive(Default, Resource)]
 pub(crate) struct Reporters {
-    entries:    Vec<ReporterEntry>,
-    next_batch: u64,
-    next_id:    u32,
-    changed:    Vec<ReporterId>,
-    failures:   Vec<ReporterFailure>,
+    entries:                Vec<ReporterEntry>,
+    next_batch:             u64,
+    next_id:                u32,
+    changed:                Vec<ReporterId>,
+    reconciliation_request: ReporterReconciliationRequest,
 }
 
 impl Reporters {
+    #[cfg(test)]
     fn add<Reporter>(
         &mut self,
         reporter: Reporter,
@@ -152,15 +172,44 @@ impl Reporters {
         reporter_id
     }
 
+    fn add_published<Reporter>(
+        &mut self,
+        world: &mut World,
+        reporter: Reporter,
+        reporter_registration: ReporterRegistration,
+        registered_at: RiggingRuntimeTime,
+    ) -> ReporterId
+    where
+        Reporter: DeviceReporter,
+    {
+        let reporter_id = ReporterId(self.next_id);
+        self.next_id += 1;
+        let reporter_health = ReporterHealth::at_registration(
+            reporter_id,
+            type_name::<Reporter>().to_owned(),
+            &reporter_registration,
+            registered_at,
+        );
+        let reporter_entity = world.spawn(reporter_health.clone()).id();
+        self.entries.push(
+            ReporterEntry::new(reporter, reporter_id, reporter_registration)
+                .with_published_health(reporter_entity, reporter_health),
+        );
+
+        reporter_id
+    }
+
     pub(crate) fn collect(
         &mut self,
         world: &mut World,
+        now: Instant,
         discovery_control: &mut DiscoveryControl,
         discovery_limits: &DiscoveryLimits,
         discovery_status: &mut DiscoveryStatus,
         journal: &mut DiscoveryTransitionJournal,
     ) {
-        let now = Instant::now();
+        let runtime_clock = *world.resource::<RiggingRuntimeClock>();
+        let runtime_time = runtime_clock.time_at(now);
         let capacity =
             discovery::discovery_transition_capacity(self.entries.len(), discovery_limits);
         self.poll_running(now);
@@ -173,9 +222,15 @@ impl Reporters {
             capacity,
         );
         self.refresh_startup(discovery_status, journal, capacity);
-        self.sync_activation(discovery_control);
+        self.sync_activation(discovery_control, runtime_time);
         self.queue_due(now, discovery_control, discovery_status);
-        self.admit(world, discovery_control, discovery_limits, discovery_status);
+        self.admit(
+            world,
+            now,
+            discovery_control,
+            discovery_limits,
+            discovery_status,
+        );
         self.refresh_startup(discovery_status, journal, capacity);
         self.refresh_activity(now, discovery_limits, discovery_status, journal, capacity);
     }
@@ -207,19 +262,21 @@ impl Reporters {
 
     /// Report whether any reporter has completed a scan since the last reconcile pass.
     ///
-    /// The reconcile pass asks this before it decides to merge, so the queue is left in place for
+    /// The reconcile pass asks this before merging, so the queue is left in place for
     /// `Self::take_changed_reporters` to drain once the merge is actually going to happen.
-    pub(crate) const fn any_reporter_changed(&self) -> bool { !self.changed.is_empty() }
+    pub(crate) const fn any_reporter_changed(&self) -> bool {
+        matches!(
+            self.reconciliation_request,
+            ReporterReconciliationRequest::AcceptedCompleteSet
+        )
+    }
 
     pub(crate) fn take_changed_reporters(&mut self) -> Vec<ReporterId> {
+        self.reconciliation_request = ReporterReconciliationRequest::Settled;
         std::mem::take(&mut self.changed)
     }
 
-    pub(crate) fn take_reporter_failures(&mut self) -> Vec<ReporterFailure> {
-        std::mem::take(&mut self.failures)
-    }
-
-    /// Report every registered reporter with the cadence it promised and what it can contribute to
+    /// Report every registered reporter with the cadence it declared and what it can contribute to
     /// the current reconcile pass.
     ///
     /// Reconciliation borrows retained sets through this iterator instead of copying them, so the
@@ -229,25 +286,30 @@ impl Reporters {
         self.entries
             .iter()
             .map(|reporter_entry| RegisteredReporter {
-                reporter:     reporter_entry.reporter_id,
-                cadence:      reporter_entry.registration.cadence(),
-                coverage:     reporter_entry.registration.coverage(),
-                contribution: match &reporter_entry.latest_set {
+                reporter:                 reporter_entry.reporter_id,
+                activation:               reporter_entry.activation(),
+                cadence:                  reporter_entry.registration.cadence(),
+                first_complete_set_bound: reporter_entry.registration.first_complete_set_bound(),
+                coverage:                 reporter_entry.registration.coverage(),
+                contribution:             match &reporter_entry.latest_set {
                     RetainedDeviceSet::NotCompleted => {
                         ReporterContribution::AwaitingFirstCompleteSet
                     },
                     RetainedDeviceSet::Complete {
+                        batch,
                         device_set,
-                        completed_at,
+                        freshness_anchor,
+                        ..
                     } => ReporterContribution::Completed {
+                        batch: *batch,
                         device_set,
-                        completed_at: *completed_at,
+                        freshness_anchor: *freshness_anchor,
                     },
                 },
             })
     }
 
-    /// Move one reporter's retained completion time backwards so a test can reach the freshness
+    /// Move one reporter's retained freshness anchor backwards so a test can reach the freshness
     /// lease without advancing a clock or sleeping.
     #[cfg(test)]
     pub(crate) fn backdate_completion(&mut self, reporter: ReporterId, by: Duration) {
@@ -255,9 +317,11 @@ impl Reporters {
             if reporter_entry.reporter_id != reporter {
                 continue;
             }
-            if let RetainedDeviceSet::Complete { completed_at, .. } = &mut reporter_entry.latest_set
+            if let RetainedDeviceSet::Complete {
+                freshness_anchor, ..
+            } = &mut reporter_entry.latest_set
             {
-                *completed_at -= by;
+                *freshness_anchor -= by;
             }
         }
     }
@@ -265,7 +329,7 @@ impl Reporters {
     fn poll_running(&mut self, now: Instant) {
         for reporter_entry in &mut self.entries {
             reporter_entry.drain_progress();
-            reporter_entry.poll(now);
+            reporter_entry.collect_finished_run(now);
         }
     }
 
@@ -278,6 +342,23 @@ impl Reporters {
         journal: &mut DiscoveryTransitionJournal,
         capacity: usize,
     ) {
+        let runtime_clock = *world.resource::<RiggingRuntimeClock>();
+        let completed =
+            self.completed_in_acceptance_order(discovery_limits.max_completions_per_frame().get());
+        for index in completed {
+            self.accept_reporter_completion(
+                index,
+                world,
+                discovery_control,
+                discovery_status,
+                journal,
+                capacity,
+                runtime_clock,
+            );
+        }
+    }
+
+    fn completed_in_acceptance_order(&self, maximum: usize) -> Vec<usize> {
         let mut completed = Vec::new();
         for (index, reporter_entry) in self.entries.iter().enumerate() {
             match reporter_entry.completion_time() {
@@ -288,90 +369,145 @@ impl Reporters {
             }
         }
         completed.sort_by_key(|(_, optional, completed_at)| (*optional, *completed_at));
-
-        for (index, _, _) in completed
+        completed
             .into_iter()
-            .take(discovery_limits.max_completions_per_frame().get())
-        {
-            let reporter_entry = &mut self.entries[index];
-            let reporter_id = reporter_entry.reporter_id;
-            let completed_discovery = match reporter_entry
-                .take_completed(discovery_control.activation(reporter_id))
-            {
-                ReporterCompletionAcceptance::NoCompletedResult => continue,
+            .take(maximum)
+            .map(|(index, _, _)| index)
+            .collect()
+    }
+
+    fn accept_reporter_completion(
+        &mut self,
+        index: usize,
+        world: &mut World,
+        discovery_control: &DiscoveryControl,
+        discovery_status: &mut DiscoveryStatus,
+        journal: &mut DiscoveryTransitionJournal,
+        transition_capacity: usize,
+        runtime_clock: RiggingRuntimeClock,
+    ) {
+        let Self {
+            entries,
+            changed,
+            reconciliation_request,
+            ..
+        } = self;
+        let reporter_entry = &mut entries[index];
+        let reporter_id = reporter_entry.reporter_id;
+        let completed_discovery =
+            match reporter_entry.take_completed(discovery_control.activation(reporter_id)) {
+                ReporterCompletionAcceptance::NoCompletedResult => return,
                 ReporterCompletionAcceptance::Accepted(completed_discovery) => completed_discovery,
             };
 
-            let Ok(reporter_discovery_status) = discovery_status.reporter_status_mut(reporter_id)
-            else {
-                continue;
-            };
-            let successful_scan = match SuccessfulDeviceScan::from_scan(completed_discovery.scan) {
-                Ok(successful_scan) => successful_scan,
-                Err(error) => {
-                    reporter_discovery_status.completed_batches += 1;
-                    let duration = completed_discovery
-                        .completed_at
-                        .duration_since(completed_discovery.started_at);
-                    reporter_discovery_status.last_outcome = LastDiscoveryOutcome::Failed {
-                        batch: completed_discovery.batch,
-                        duration,
-                        error: error.clone(),
-                    };
-                    journal.record(
-                        capacity,
-                        DiscoveryTransition::Finished {
-                            batch:    completed_discovery.batch,
-                            reporter: reporter_id,
-                            outcome:  CompletedDiscoveryOutcome::Failed {
-                                duration,
-                                error: error.clone(),
-                            },
-                        },
-                    );
-                    self.failures.push(ReporterFailure {
-                        reporter: reporter_id,
-                        error,
-                    });
-                    reporter_entry.schedule_after_completion(completed_discovery.completed_at);
-                    continue;
-                },
-            };
-
-            let SuccessfulDeviceScan {
-                devices,
-                projection,
-            } = successful_scan;
-            reporter_entry.latest_set = RetainedDeviceSet::Complete {
-                device_set:   DeviceSet { devices },
-                completed_at: completed_discovery.completed_at,
-            };
-            self.changed.push(reporter_id);
-            projection.publish(world);
-            reporter_discovery_status.completed_batches += 1;
-            let duration = completed_discovery
-                .completed_at
-                .duration_since(completed_discovery.started_at);
-            reporter_discovery_status.last_outcome = LastDiscoveryOutcome::Succeeded {
-                batch: completed_discovery.batch,
-                duration,
-            };
-            journal.record(
-                capacity,
-                DiscoveryTransition::Finished {
-                    batch:    completed_discovery.batch,
-                    reporter: reporter_id,
-                    outcome:  CompletedDiscoveryOutcome::Succeeded { duration },
-                },
-            );
-            reporter_entry.schedule_after_completion(completed_discovery.completed_at);
+        let Ok(reporter_discovery_status) = discovery_status.reporter_status_mut(reporter_id)
+        else {
+            return;
+        };
+        let accepted_completion = AcceptedReporterCompletion {
+            reporter: reporter_id,
+            batch: completed_discovery.batch,
+            accepted_at: completed_discovery.accepted_at,
+            duration: completed_discovery.measured_work_time,
+            completed_runtime_time: runtime_clock.time_at(completed_discovery.accepted_at),
+            failure_run_time: runtime_clock.time_at(completed_discovery.accepted_at),
+            previous_success: reporter_entry.previous_success(runtime_clock),
+            transition_capacity,
+        };
+        match CompletedDeviceScan::from(completed_discovery.scan) {
+            CompletedDeviceScan::Deferred(deferral) => accept_deferred_scan(
+                reporter_entry,
+                reporter_discovery_status,
+                journal,
+                deferral,
+                accepted_completion,
+            ),
+            CompletedDeviceScan::Failed(error) => accept_failed_scan(
+                reporter_entry,
+                reporter_discovery_status,
+                journal,
+                world,
+                error,
+                accepted_completion,
+            ),
+            CompletedDeviceScan::Complete(successful_scan) => accept_complete_scan(
+                reporter_entry,
+                reporter_discovery_status,
+                changed,
+                reconciliation_request,
+                journal,
+                world,
+                successful_scan,
+                accepted_completion,
+            ),
         }
     }
 
-    fn sync_activation(&mut self, discovery_control: &DiscoveryControl) {
+    fn sync_activation(
+        &mut self,
+        discovery_control: &DiscoveryControl,
+        runtime_time: RiggingRuntimeTime,
+    ) {
         for reporter_entry in &mut self.entries {
             let reporter_id = reporter_entry.reporter_id;
-            reporter_entry.sync_activation(discovery_control.activation(reporter_id));
+            reporter_entry.sync_activation(discovery_control.activation(reporter_id), runtime_time);
+        }
+    }
+
+    pub(crate) fn write_health(
+        &mut self,
+        world: &mut World,
+        now: Instant,
+        runtime_clock: RiggingRuntimeClock,
+    ) {
+        let runtime_time = runtime_clock.time_at(now);
+        for reporter_entry in &mut self.entries {
+            reporter_entry
+                .health
+                .set_activity(reporter_entry.health_activity(runtime_clock));
+            if reporter_entry
+                .health
+                .cross_first_complete_set_deadline(runtime_time)
+            {
+                let decision = reporter_entry
+                    .log_state
+                    .first_complete_set_overdue_decision();
+                let roles_waiting = reporter_health::roles_waiting_on(
+                    world.resource::<crate::Bindings>(),
+                    reporter_entry.health.identity().reporter_ref,
+                );
+                reporter_health::log_first_complete_set_overdue(
+                    &reporter_entry.health,
+                    decision,
+                    &roles_waiting,
+                );
+            }
+
+            reporter_entry.publish_health(world);
+        }
+    }
+
+    pub(crate) fn record_capability_projection_failures(
+        &mut self,
+        world: &mut World,
+        failures: impl IntoIterator<Item = (ReporterId, CapabilityProjectionFailure)>,
+    ) {
+        let mut failures_by_reporter: HashMap<ReporterId, Vec<CapabilityProjectionFailure>> =
+            HashMap::new();
+        for (reporter, failure) in failures {
+            failures_by_reporter
+                .entry(reporter)
+                .or_default()
+                .push(failure);
+        }
+        for reporter_entry in &mut self.entries {
+            let Some(failures) = failures_by_reporter.remove(&reporter_entry.reporter_id) else {
+                continue;
+            };
+            reporter_entry
+                .health
+                .record_capability_projection_failures(failures);
+            reporter_entry.publish_health(world);
         }
     }
 
@@ -416,6 +552,7 @@ impl Reporters {
     fn admit(
         &mut self,
         world: &mut World,
+        now: Instant,
         discovery_control: &DiscoveryControl,
         discovery_limits: &DiscoveryLimits,
         discovery_status: &mut DiscoveryStatus,
@@ -435,9 +572,10 @@ impl Reporters {
             }
 
             let reporter_entry = &mut self.entries[index];
-            reporter_entry.prepare(world);
+            reporter_entry.prepare_at(world, now);
             self.start_prepared_background(
                 index,
+                now,
                 discovery_control,
                 discovery_limits,
                 discovery_status,
@@ -457,6 +595,7 @@ impl Reporters {
             }
             self.start_prepared_background(
                 index,
+                now,
                 discovery_control,
                 discovery_limits,
                 discovery_status,
@@ -467,6 +606,7 @@ impl Reporters {
     fn start_prepared_background(
         &mut self,
         index: usize,
+        now: Instant,
         discovery_control: &DiscoveryControl,
         discovery_limits: &DiscoveryLimits,
         discovery_status: &mut DiscoveryStatus,
@@ -480,7 +620,7 @@ impl Reporters {
         if self.running_count() >= Self::effective_capacity(discovery_limits, discovery_status) {
             return;
         }
-        self.entries[index].start_prepared_background();
+        self.entries[index].start_prepared_background(now);
     }
 
     fn effective_capacity(
@@ -523,7 +663,8 @@ impl Reporters {
             else {
                 continue;
             };
-            if let LastDiscoveryOutcome::Failed { error, .. } =
+            if let LastDiscoveryOutcome::Failed { error, .. }
+            | LastDiscoveryOutcome::Unsupported { error, .. } =
                 &reporter_discovery_status.last_outcome
             {
                 discovery_status.startup = StartupDiscoveryState::BlockedByFailure {
@@ -641,8 +782,10 @@ impl Reporters {
                     match discovery_status.reporter_status(reporter_entry.reporter_id) {
                         Ok(ReporterDiscoveryStatus {
                             last_outcome:
-                                LastDiscoveryOutcome::Succeeded { batch, .. }
-                                | LastDiscoveryOutcome::Failed { batch, .. },
+                                LastDiscoveryOutcome::Deferred { batch, .. }
+                                | LastDiscoveryOutcome::Succeeded { batch, .. }
+                                | LastDiscoveryOutcome::Failed { batch, .. }
+                                | LastDiscoveryOutcome::Unsupported { batch, .. },
                             ..
                         }) => (*batch, BatchMembership::Finished),
                         _ => continue,
@@ -728,59 +871,57 @@ fn record_startup_edge(
     );
 }
 
-/// Failure queue entry retained for reconciliation and later user-interface event emission.
-#[expect(
-    dead_code,
-    reason = "reconciliation drains each failure so the queue stays bounded; a failed scan retains \
-              the reporter's preceding whole set, so the payload here is for the user-interface \
-              events a later phase emits"
-)]
-pub(crate) struct ReporterFailure {
-    reporter: ReporterId,
-    error:    crate::DeviceAccessError,
-}
-
-/// One registered reporter as reconciliation reads it: its handle, its promised cadence, and what
+/// One registered reporter as reconciliation reads it: its handle, its declared cadence, and what
 /// it can contribute right now.
 pub(crate) struct RegisteredReporter<'a> {
-    pub(crate) reporter:     ReporterId,
-    pub(crate) cadence:      &'a DiscoveryCadence,
+    pub(crate) reporter:                 ReporterId,
+    pub(crate) activation:               ReporterActivation,
+    pub(crate) cadence:                  &'a DiscoveryCadence,
+    pub(crate) first_complete_set_bound: Duration,
     /// What this reporter's omission of a durable key is worth, which decides whether a complete
     /// set without an authored unit proves the unit is gone or proves nothing at all.
-    pub(crate) coverage:     &'a ReporterCoverage,
-    pub(crate) contribution: ReporterContribution<'a>,
+    pub(crate) coverage:                 &'a ReporterCoverage,
+    pub(crate) contribution:             ReporterContribution<'a>,
 }
 
 /// What one registered reporter offers the current reconcile pass.
 ///
-/// The retained set and the instant its scan completed travel together because they are recorded
-/// together: a failed scan retains the preceding set and leaves this completion time where it was,
-/// which is exactly what the freshness lease has to measure against.
+/// The kernel schedules completions, stamps reporter health, and judges retained-set freshness on
+/// the frame clock. Scan duration is measured separately from that frame instant, and a failed scan
+/// retains the preceding set and its freshness anchor.
 pub(crate) enum ReporterContribution<'a> {
     /// The reporter has never completed a scan. It contributes no devices and is never stale by
     /// the clock: it is starting up, not late.
     AwaitingFirstCompleteSet,
-    /// The reporter's latest accepted whole set, with the real-time instant that scan completed.
+    /// The reporter's latest accepted whole set and the instant used by its freshness lease.
     Completed {
-        device_set:   &'a DeviceSet,
-        completed_at: Instant,
+        batch:            BatchRef,
+        device_set:       &'a DeviceSet,
+        freshness_anchor: Instant,
     },
 }
 
 struct ReporterEntry {
-    reporter:     Box<dyn DeviceReporter>,
-    reporter_id:  ReporterId,
-    registration: ReporterRegistration,
-    latest_set:   RetainedDeviceSet,
-    next_due:     NextDue,
-    state:        ReporterRunState,
+    reporter:        Box<dyn DeviceReporter>,
+    reporter_id:     ReporterId,
+    registration:    ReporterRegistration,
+    latest_set:      RetainedDeviceSet,
+    next_due:        NextDue,
+    state:           ReporterRunState,
+    reporter_entity: Entity,
+    health:          ReporterHealth,
+    failure_run:     ReporterFailureRun,
+    log_state:       ReporterLogState,
 }
 
 enum RetainedDeviceSet {
     NotCompleted,
     Complete {
-        device_set:   DeviceSet,
-        completed_at: Instant,
+        batch:                 BatchRef,
+        device_set:            DeviceSet,
+        completed_at:          Instant,
+        freshness_anchor:      Instant,
+        capability_projection: CapabilityProjectionStatus,
     },
 }
 
@@ -795,10 +936,9 @@ enum ReporterRunState {
         rerun: RerunRequest,
     },
     Queued {
-        batch:     DiscoveryBatchId,
-        queued_at: Instant,
-        rerun:     RerunRequest,
-        pending:   PendingDiscovery,
+        batch:   DiscoveryBatchId,
+        rerun:   RerunRequest,
+        pending: PendingDiscovery,
     },
     Running {
         task:                        Task<DeviceScan>,
@@ -808,14 +948,19 @@ enum ReporterRunState {
         progress:                    DiscoveryProgress,
         rerun:                       RerunRequest,
     },
+    Unsupported {
+        error: crate::DeviceAccessError,
+        since: RiggingRuntimeTime,
+    },
 }
 
 enum PendingDiscovery {
     Admission,
     Background(crate::DiscoveryJob),
     Completed {
-        scan:         DeviceScan,
-        completed_at: Instant,
+        scan:               DeviceScan,
+        accepted_at:        Instant,
+        measured_work_time: Duration,
     },
 }
 
@@ -826,10 +971,10 @@ enum RerunRequest {
 }
 
 struct CompletedDiscovery {
-    scan:         DeviceScan,
-    batch:        DiscoveryBatchId,
-    started_at:   Instant,
-    completed_at: Instant,
+    scan:               DeviceScan,
+    batch:              DiscoveryBatchId,
+    accepted_at:        Instant,
+    measured_work_time: Duration,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -843,38 +988,325 @@ enum ReporterCompletionAcceptance {
     Accepted(CompletedDiscovery),
 }
 
-/// Successful whole-set data normalized from the two public `DeviceScan` complete paths.
-struct SuccessfulDeviceScan {
-    devices:    Vec<crate::DeviceRecord>,
-    projection: SuccessfulReportProjection,
+/// One completed reporter result normalized from the public `DeviceScan` paths.
+enum CompletedDeviceScan {
+    Complete(SuccessfulDeviceScan),
+    Deferred(ReporterDeferral),
+    Failed(crate::DeviceAccessError),
 }
 
-impl SuccessfulDeviceScan {
-    fn from_scan(scan: DeviceScan) -> Result<Self, crate::DeviceAccessError> {
+impl From<DeviceScan> for CompletedDeviceScan {
+    fn from(scan: DeviceScan) -> Self {
         match scan {
-            DeviceScan::Complete(devices) => Ok(Self {
+            DeviceScan::Complete(devices) => Self::Complete(SuccessfulDeviceScan {
                 devices,
                 projection: SuccessfulReportProjection::KernelStateOnly,
             }),
             DeviceScan::CompleteWithProjection {
                 devices,
                 report_acceptance_projection,
-            } => Ok(Self {
+            } => Self::Complete(SuccessfulDeviceScan {
                 devices,
                 projection: SuccessfulReportProjection::IntegrationState(
                     report_acceptance_projection,
                 ),
             }),
-            DeviceScan::Failed(error) => Err(error),
+            DeviceScan::Deferred(reporter_deferral) => Self::Deferred(reporter_deferral),
+            DeviceScan::Failed(error) => Self::Failed(error),
         }
     }
 }
 
-/// Whether accepting one successful report also publishes integration-owned state.
+/// Successful whole-set data normalized from the two public `DeviceScan` complete paths.
+struct SuccessfulDeviceScan {
+    devices:    Vec<crate::DeviceRecord>,
+    projection: SuccessfulReportProjection,
+}
+
+struct AcceptedReporterCompletion {
+    reporter:               ReporterId,
+    batch:                  DiscoveryBatchId,
+    accepted_at:            Instant,
+    duration:               Duration,
+    completed_runtime_time: RiggingRuntimeTime,
+    failure_run_time:       RiggingRuntimeTime,
+    previous_success:       PreviousSuccess,
+    transition_capacity:    usize,
+}
+
+fn accept_deferred_scan(
+    reporter_entry: &mut ReporterEntry,
+    reporter_status: &mut ReporterDiscoveryStatus,
+    journal: &mut DiscoveryTransitionJournal,
+    deferral: ReporterDeferral,
+    completion: AcceptedReporterCompletion,
+) {
+    reporter_entry.failure_run.end();
+    reporter_status.completed_batches += 1;
+    let since = match &reporter_status.last_outcome {
+        LastDiscoveryOutcome::Deferred {
+            since,
+            deferral: preceding_deferral,
+            ..
+        } if *preceding_deferral == deferral => *since,
+        _ => {
+            reporter_health::log_reporter_deferral(
+                &reporter_entry.health,
+                BatchRef::from_batch_id(completion.batch),
+                completion.duration,
+                deferral,
+            );
+            completion.completed_runtime_time
+        },
+    };
+    reporter_status.last_outcome = LastDiscoveryOutcome::Deferred {
+        batch: completion.batch,
+        since,
+        deferral,
+    };
+    reporter_entry
+        .health
+        .set_outcome(ReporterOutcomeHealth::Deferred { since, deferral });
+    journal.record(
+        completion.transition_capacity,
+        DiscoveryTransition::Finished {
+            batch:    completion.batch,
+            reporter: completion.reporter,
+            outcome:  CompletedDiscoveryOutcome::Deferred {
+                duration: completion.duration,
+                deferral,
+            },
+        },
+    );
+    reporter_entry.schedule_after_completion(completion.accepted_at);
+}
+
+fn accept_failed_scan(
+    reporter_entry: &mut ReporterEntry,
+    reporter_status: &mut ReporterDiscoveryStatus,
+    journal: &mut DiscoveryTransitionJournal,
+    world: &World,
+    error: crate::DeviceAccessError,
+    completion: AcceptedReporterCompletion,
+) {
+    reporter_status.completed_batches += 1;
+    let unsupported = matches!(&error, crate::DeviceAccessError::Unsupported { .. });
+    reporter_status.last_outcome = if unsupported {
+        LastDiscoveryOutcome::Unsupported {
+            batch: completion.batch,
+            error: error.clone(),
+            since: completion.completed_runtime_time,
+        }
+    } else {
+        LastDiscoveryOutcome::Failed {
+            batch:    completion.batch,
+            duration: completion.duration,
+            error:    error.clone(),
+        }
+    };
+    let error_view = DeviceAccessErrorView::from(&error);
+    if unsupported {
+        let decision = reporter_entry
+            .failure_run
+            .finish_as_unsupported(&error_view);
+        reporter_entry
+            .health
+            .set_outcome(ReporterOutcomeHealth::Unsupported {
+                error: error_view.clone(),
+                since: completion.completed_runtime_time,
+            });
+        let roles_waiting = reporter_health::roles_waiting_on(
+            world.resource::<crate::Bindings>(),
+            reporter_entry.health.identity().reporter_ref,
+        );
+        reporter_health::log_unsupported_reporter_failure(
+            &reporter_entry.health,
+            BatchRef::from_batch_id(completion.batch),
+            completion.duration,
+            &error_view,
+            decision,
+            &roles_waiting,
+        );
+    } else {
+        let accepted_failure_run = reporter_entry.failure_run.accept_failure(
+            error_view,
+            completion.failure_run_time,
+            completion.previous_success,
+        );
+        reporter_entry
+            .health
+            .set_outcome(ReporterOutcomeHealth::Failing {
+                batch:    BatchRef::from_batch_id(completion.batch),
+                duration: completion.duration,
+                run:      accepted_failure_run.status,
+            });
+        let roles_waiting = reporter_health::roles_waiting_on(
+            world.resource::<crate::Bindings>(),
+            reporter_entry.health.identity().reporter_ref,
+        );
+        reporter_health::log_reporter_failure(
+            &reporter_entry.health,
+            accepted_failure_run.decisions,
+            &roles_waiting,
+        );
+    }
+    journal.record(
+        completion.transition_capacity,
+        DiscoveryTransition::Finished {
+            batch:    completion.batch,
+            reporter: completion.reporter,
+            outcome:  CompletedDiscoveryOutcome::Failed {
+                duration: completion.duration,
+                error:    error.clone(),
+            },
+        },
+    );
+    if unsupported {
+        reporter_entry.stop_unsupported(error, completion.completed_runtime_time);
+    } else {
+        reporter_entry.schedule_after_completion(completion.accepted_at);
+    }
+}
+
+fn accept_complete_scan(
+    reporter_entry: &mut ReporterEntry,
+    reporter_status: &mut ReporterDiscoveryStatus,
+    changed: &mut Vec<ReporterId>,
+    reconciliation_request: &mut ReporterReconciliationRequest,
+    journal: &mut DiscoveryTransitionJournal,
+    world: &mut World,
+    successful_scan: SuccessfulDeviceScan,
+    completion: AcceptedReporterCompletion,
+) {
+    let successful_report_context = match reporter_entry.health.outcome() {
+        ReporterOutcomeHealth::Deferred { .. }
+        | ReporterOutcomeHealth::Failing { .. }
+        | ReporterOutcomeHealth::Unsupported { .. } => SuccessfulReportContext::Recovery,
+        ReporterOutcomeHealth::NotCompleted | ReporterOutcomeHealth::Succeeded { .. } => {
+            SuccessfulReportContext::Ordinary
+        },
+    };
+    let SuccessfulDeviceScan {
+        mut devices,
+        projection,
+    } = successful_scan;
+    let record_count = devices.len();
+    let capability_projection =
+        retain_projectable_capabilities(world, completion.reporter, &mut devices);
+    let retained_set_change = match &reporter_entry.latest_set {
+        RetainedDeviceSet::NotCompleted => RetainedSetChange::Changed,
+        RetainedDeviceSet::Complete { device_set, .. } => {
+            presence::retained_set_change(&device_set.devices, &devices)
+        },
+    };
+    reporter_entry.latest_set = RetainedDeviceSet::Complete {
+        batch:                 BatchRef::from_batch_id(completion.batch),
+        device_set:            DeviceSet { devices },
+        completed_at:          completion.accepted_at,
+        freshness_anchor:      completion.accepted_at,
+        capability_projection: capability_projection.clone(),
+    };
+    *reconciliation_request = ReporterReconciliationRequest::AcceptedCompleteSet;
+    if retained_set_change == RetainedSetChange::Changed {
+        changed.push(completion.reporter);
+    }
+    projection.publish(world);
+    reporter_status.completed_batches += 1;
+    reporter_status.last_outcome = LastDiscoveryOutcome::Succeeded {
+        batch:    completion.batch,
+        duration: completion.duration,
+    };
+    if matches!(
+        reporter_entry.health.first_complete_set(),
+        FirstCompleteSetStatus::Waiting(_)
+    ) {
+        reporter_entry
+            .health
+            .set_first_complete_set(FirstCompleteSetStatus::Completed {
+                batch: BatchRef::from_batch_id(completion.batch),
+                at:    completion.completed_runtime_time,
+            });
+    }
+    reporter_entry
+        .health
+        .set_outcome(ReporterOutcomeHealth::Succeeded {
+            batch: BatchRef::from_batch_id(completion.batch),
+            completed_at: completion.completed_runtime_time,
+            duration: completion.duration,
+            records: record_count,
+            capability_projection,
+        });
+    reporter_entry.health.set_retained_records(record_count);
+    reporter_entry.failure_run.end();
+    let decisions = reporter_entry.log_state.accepted_success_decisions(
+        retained_set_change,
+        record_count,
+        successful_report_context,
+    );
+    let roles_waiting = reporter_health::roles_waiting_on(
+        world.resource::<crate::Bindings>(),
+        reporter_entry.health.identity().reporter_ref,
+    );
+    reporter_health::log_reporter_success(&reporter_entry.health, decisions, &roles_waiting);
+    journal.record(
+        completion.transition_capacity,
+        DiscoveryTransition::Finished {
+            batch:    completion.batch,
+            reporter: completion.reporter,
+            outcome:  CompletedDiscoveryOutcome::Succeeded {
+                duration: completion.duration,
+            },
+        },
+    );
+    reporter_entry.schedule_after_completion(completion.accepted_at);
+}
+
+fn retain_projectable_capabilities(
+    world: &World,
+    reporter: ReporterId,
+    devices: &mut [crate::DeviceRecord],
+) -> CapabilityProjectionStatus {
+    let app_type_registry = world.get_resource::<AppTypeRegistry>();
+    let failures = match app_type_registry {
+        Some(app_type_registry) => {
+            let type_registry = app_type_registry.read();
+            devices
+                .iter_mut()
+                .enumerate()
+                .flat_map(|(record_index, device_record)| {
+                    device_record.capabilities.retain_projectable(
+                        CapabilitySource {
+                            reporter,
+                            record_index,
+                        },
+                        &type_registry,
+                    )
+                })
+                .collect()
+        },
+        None => devices
+            .iter_mut()
+            .enumerate()
+            .flat_map(|(record_index, device_record)| {
+                device_record
+                    .capabilities
+                    .retain_without_type_registry(CapabilitySource {
+                        reporter,
+                        record_index,
+                    })
+            })
+            .collect(),
+    };
+
+    CapabilityProjectionStatus::from_failures(failures)
+}
+
+/// How accepting one successful report publishes integration-owned state.
 enum SuccessfulReportProjection {
     /// This reporter result changes only the kernel's retained device set.
     KernelStateOnly,
-    /// This reporter result also owns one integration-state update.
+    /// This reporter result owns one integration-state update published whenever the set is
+    /// accepted, whether or not its retained records changed.
     IntegrationState(ReportAcceptanceProjection),
 }
 
@@ -890,6 +1322,30 @@ impl SuccessfulReportProjection {
 }
 
 impl ReporterEntry {
+    fn publish_health(&mut self, world: &mut World) {
+        let health_changed = world
+            .get::<ReporterHealth>(self.reporter_entity)
+            .is_none_or(|published| published != &self.health);
+        if !health_changed {
+            return;
+        }
+        if let Some(mut published) = world.get_mut::<ReporterHealth>(self.reporter_entity) {
+            *published = self.health.clone();
+        } else {
+            self.reporter_entity = world.spawn(self.health.clone()).id();
+        }
+    }
+
+    const fn activation(&self) -> ReporterActivation {
+        match &self.state {
+            ReporterRunState::Disabled => ReporterActivation::Disabled,
+            ReporterRunState::Idle { .. }
+            | ReporterRunState::Queued { .. }
+            | ReporterRunState::Running { .. }
+            | ReporterRunState::Unsupported { .. } => ReporterActivation::Enabled,
+        }
+    }
+
     fn new<Reporter>(
         reporter: Reporter,
         reporter_id: ReporterId,
@@ -904,6 +1360,12 @@ impl ReporterEntry {
             },
             ReporterActivation::Disabled => ReporterRunState::Disabled,
         };
+        let health = ReporterHealth::at_registration(
+            reporter_id,
+            type_name::<Reporter>().to_owned(),
+            &registration,
+            RiggingRuntimeTime::from_elapsed(Duration::ZERO),
+        );
         Self {
             reporter: Box::new(reporter),
             reporter_id,
@@ -911,7 +1373,17 @@ impl ReporterEntry {
             latest_set: RetainedDeviceSet::NotCompleted,
             next_due: NextDue::NotScheduled,
             state,
+            reporter_entity: Entity::PLACEHOLDER,
+            health,
+            failure_run: ReporterFailureRun::default(),
+            log_state: ReporterLogState::default(),
         }
+    }
+
+    fn with_published_health(mut self, reporter_entity: Entity, health: ReporterHealth) -> Self {
+        self.reporter_entity = reporter_entity;
+        self.health = health;
+        self
     }
 
     fn is_required(&self) -> bool {
@@ -921,13 +1393,14 @@ impl ReporterEntry {
     const fn completion_time(&self) -> ReporterCompletionTime {
         match &self.state {
             ReporterRunState::Queued {
-                pending: PendingDiscovery::Completed { completed_at, .. },
+                pending: PendingDiscovery::Completed { accepted_at, .. },
                 ..
-            } => ReporterCompletionTime::CompletedAt(*completed_at),
+            } => ReporterCompletionTime::CompletedAt(*accepted_at),
             ReporterRunState::Disabled
             | ReporterRunState::Idle { .. }
             | ReporterRunState::Queued { .. }
-            | ReporterRunState::Running { .. } => ReporterCompletionTime::NoCompletedResult,
+            | ReporterRunState::Running { .. }
+            | ReporterRunState::Unsupported { .. } => ReporterCompletionTime::NoCompletedResult,
         }
     }
 
@@ -935,9 +1408,14 @@ impl ReporterEntry {
         let state = std::mem::replace(&mut self.state, ReporterRunState::Disabled);
         let ReporterRunState::Queued {
             batch,
-            queued_at,
             rerun,
-            pending: PendingDiscovery::Completed { scan, completed_at },
+            pending:
+                PendingDiscovery::Completed {
+                    scan,
+                    accepted_at,
+                    measured_work_time,
+                },
+            ..
         } = state
         else {
             self.state = state;
@@ -951,8 +1429,8 @@ impl ReporterEntry {
         ReporterCompletionAcceptance::Accepted(CompletedDiscovery {
             scan,
             batch,
-            started_at: queued_at,
-            completed_at,
+            accepted_at,
+            measured_work_time,
         })
     }
 
@@ -964,17 +1442,42 @@ impl ReporterEntry {
         };
     }
 
-    fn sync_activation(&mut self, activation: ReporterActivation) {
+    fn stop_unsupported(&mut self, error: crate::DeviceAccessError, since: RiggingRuntimeTime) {
+        self.next_due = NextDue::NotScheduled;
+        self.state = ReporterRunState::Unsupported { error, since };
+    }
+
+    fn sync_activation(
+        &mut self,
+        activation: ReporterActivation,
+        runtime_time: RiggingRuntimeTime,
+    ) {
         match (activation, &self.state) {
             (ReporterActivation::Enabled, ReporterRunState::Disabled) => {
+                self.restart_first_complete_set_bound(runtime_time);
                 self.state = ReporterRunState::Idle {
                     rerun: RerunRequest::NotRequested,
                 };
             },
             (ReporterActivation::Disabled, ReporterRunState::Running { .. })
             | (ReporterActivation::Enabled, _) => {},
-            (ReporterActivation::Disabled, _) => self.state = ReporterRunState::Disabled,
+            (ReporterActivation::Disabled, _) => {
+                self.health.transition_to_disabled(runtime_time);
+                self.state = ReporterRunState::Disabled;
+            },
         }
+    }
+
+    const fn restart_first_complete_set_bound(&mut self, runtime_time: RiggingRuntimeTime) {
+        if !matches!(
+            self.health.first_complete_set(),
+            FirstCompleteSetStatus::Waiting(WaitTiming::Unbounded { .. })
+        ) {
+            return;
+        }
+
+        self.health.begin_first_complete_set_bound(runtime_time);
+        self.log_state.restart_first_complete_set_bound();
     }
 
     fn record_due_signal(
@@ -983,6 +1486,22 @@ impl ReporterEntry {
         requested: DiscoveryRequest,
         dirty: DiscoveryDirtyState,
     ) -> bool {
+        if let ReporterRunState::Unsupported { error, since } = &self.state {
+            if matches!(requested, DiscoveryRequest::Requested) {
+                info!(
+                    "[hana_rigging] explicitly retrying reporter {:?}, stopped at {:?} after \
+                     {error:?}",
+                    self.reporter_id,
+                    since.elapsed()
+                );
+                self.state = ReporterRunState::Idle {
+                    rerun: RerunRequest::NotRequested,
+                };
+                return true;
+            }
+            return false;
+        }
+
         let cadence_due = matches!(self.next_due, NextDue::At(deadline) if deadline <= now);
         let signalled = matches!(requested, crate::discovery::DiscoveryRequest::Requested)
             || matches!(dirty, crate::discovery::DiscoveryDirtyState::Dirty)
@@ -1008,7 +1527,9 @@ impl ReporterEntry {
 
                 false
             },
-            ReporterRunState::Queued { .. } | ReporterRunState::Disabled => false,
+            ReporterRunState::Queued { .. }
+            | ReporterRunState::Disabled
+            | ReporterRunState::Unsupported { .. } => false,
         }
     }
 
@@ -1018,7 +1539,6 @@ impl ReporterEntry {
         }
         self.state = ReporterRunState::Queued {
             batch,
-            queued_at,
             rerun: RerunRequest::NotRequested,
             pending: PendingDiscovery::Admission,
         };
@@ -1034,15 +1554,24 @@ impl ReporterEntry {
         )
     }
 
-    fn prepare(&mut self, world: &mut World) {
+    #[cfg(test)]
+    fn prepare(&mut self, world: &mut World) { self.prepare_at(world, Instant::now()); }
+
+    fn prepare_at(&mut self, world: &mut World, scheduled_at: Instant) {
         let discovery_work = self.reporter.discover();
         let ReporterRunState::Queued { pending, .. } = &mut self.state else {
             return;
         };
         *pending = match discovery_work {
-            DiscoveryWork::Immediate(main_thread_discovery_job) => PendingDiscovery::Completed {
-                scan:         main_thread_discovery_job.run(world),
-                completed_at: Instant::now(),
+            DiscoveryWork::Immediate(main_thread_discovery_job) => {
+                let started = Instant::now();
+                let scan = main_thread_discovery_job.run(world);
+                let measured_work_time = started.elapsed();
+                PendingDiscovery::Completed {
+                    scan,
+                    accepted_at: scheduled_at,
+                    measured_work_time,
+                }
             },
             DiscoveryWork::Background(discovery_job) => PendingDiscovery::Background(discovery_job),
         };
@@ -1058,7 +1587,9 @@ impl ReporterEntry {
         )
     }
 
-    fn start_prepared_background(&mut self) { self.start_prepared_background_with(Instant::now); }
+    fn start_prepared_background(&mut self, started_at: Instant) {
+        self.start_prepared_background_with(|| started_at);
+    }
 
     fn start_prepared_background_with(&mut self, sample_started_at: impl FnOnce() -> Instant) {
         let state = std::mem::replace(&mut self.state, ReporterRunState::Disabled);
@@ -1103,12 +1634,13 @@ impl ReporterEntry {
         }
     }
 
-    fn poll(&mut self, now: Instant) {
+    fn collect_finished_run(&mut self, now: Instant) {
         let is_complete = match &mut self.state {
             ReporterRunState::Running { task, .. } => block_on(poll_once(task)),
             ReporterRunState::Disabled
             | ReporterRunState::Idle { .. }
-            | ReporterRunState::Queued { .. } => None,
+            | ReporterRunState::Queued { .. }
+            | ReporterRunState::Unsupported { .. } => None,
         };
         let Some(scan) = is_complete else {
             return;
@@ -1125,13 +1657,14 @@ impl ReporterEntry {
             self.state = state;
             return;
         };
+        let measured_work_time = now.saturating_duration_since(started_at);
         self.state = ReporterRunState::Queued {
             batch,
-            queued_at: started_at,
             rerun,
             pending: PendingDiscovery::Completed {
                 scan,
-                completed_at: now,
+                accepted_at: now,
+                measured_work_time,
             },
         };
     }
@@ -1141,7 +1674,9 @@ impl ReporterEntry {
     fn activity(&self, now: Instant) -> ReporterActivity {
         match &self.state {
             ReporterRunState::Disabled => ReporterActivity::Disabled,
-            ReporterRunState::Idle { .. } => ReporterActivity::Idle,
+            ReporterRunState::Idle { .. } | ReporterRunState::Unsupported { .. } => {
+                ReporterActivity::Idle
+            },
             ReporterRunState::Queued { batch, .. } => ReporterActivity::Queued { batch: *batch },
             ReporterRunState::Running {
                 batch,
@@ -1152,6 +1687,44 @@ impl ReporterEntry {
                 batch:    *batch,
                 elapsed:  now.duration_since(*started_at),
                 progress: progress.clone(),
+            },
+        }
+    }
+
+    fn health_activity(&self, runtime_clock: RiggingRuntimeClock) -> ReporterActivityView {
+        match &self.state {
+            ReporterRunState::Disabled => ReporterActivityView::Disabled,
+            ReporterRunState::Idle { .. } => ReporterActivityView::Idle,
+            ReporterRunState::Queued { batch, .. } => ReporterActivityView::Queued {
+                batch: BatchRef::from_batch_id(*batch),
+            },
+            ReporterRunState::Running {
+                batch,
+                started_at,
+                progress,
+                ..
+            } => ReporterActivityView::Running {
+                batch:      BatchRef::from_batch_id(*batch),
+                started_at: runtime_clock.time_at(*started_at),
+                progress:   DiscoveryProgressView::from(progress),
+            },
+            ReporterRunState::Unsupported { since, .. } => ReporterActivityView::Stopped {
+                since:        *since,
+                resumes_when: ReporterResume::ExplicitRequestOrEnable,
+            },
+        }
+    }
+
+    fn previous_success(&self, runtime_clock: RiggingRuntimeClock) -> PreviousSuccess {
+        match &self.latest_set {
+            RetainedDeviceSet::NotCompleted => PreviousSuccess::Never,
+            RetainedDeviceSet::Complete {
+                completed_at,
+                capability_projection,
+                ..
+            } => PreviousSuccess::At {
+                completed_at:          runtime_clock.time_at(*completed_at),
+                capability_projection: capability_projection.clone(),
             },
         }
     }
@@ -1202,98 +1775,85 @@ impl Drivers {
         driver_id
     }
 
-    /// Ask one registered driver to capture its endpoint configuration through erased dispatch.
-    ///
-    /// Kernel capture systems call this inside `World::resource_scope` after checking endpoint
-    /// presence and in-flight attempts. The driver contract owns those checks, so callers outside
-    /// the kernel should use their own endpoint state instead.
-    ///
-    /// # Errors
-    ///
-    /// Returns `DriverContractError::DriverNotRegistered` when `driver_id` is not in this
-    /// process's registry, or another `DriverContractError` when erased dispatch cannot recover
-    /// the typed driver boundary.
-    pub(crate) fn capture(
+    pub(crate) fn resolve_target(
         &mut self,
         world: &mut World,
-        capture_request: CaptureRequest<'_>,
-    ) -> Result<crate::CaptureOutcome<crate::LastKnownGoodConfiguration>, crate::DriverContractError>
-    {
-        let CaptureRequest {
-            role: _,
-            driver,
-            endpoint,
-        } = capture_request;
+        driver: DriverId,
+        context: &crate::TargetResolutionContext<'_>,
+        configuration: &dyn Reflect,
+    ) -> Result<crate::TargetResolution<ErasedTarget>, DriverContractError> {
         self.get_mut(driver)
             .ok_or(DriverContractError::DriverNotRegistered { driver_id: driver })?
-            .capture(world, endpoint)
+            .resolve_target(world, context, configuration)
     }
 
-    /// Start one authorized endpoint apply through the driver selected by `driver_id`.
-    ///
-    /// Kernel attempt systems call this inside `World::resource_scope`; the `ApplyPermit` must be
-    /// the same token stored on that attempt, so a driver receives the exact authorization the
-    /// kernel recorded.
-    ///
-    /// # Errors
-    ///
-    /// Returns `DriverContractError::DriverNotRegistered` when `driver_id` is not in this
-    /// process's registry, or `DriverContractError::ConfigurationTypeMismatch` when the erased
-    /// configuration belongs to a different driver's concrete type.
     pub(crate) fn start_apply(
         &mut self,
         world: &mut World,
-        start_apply_request: StartApplyRequest<'_>,
-    ) -> Result<(), crate::DriverContractError> {
-        let StartApplyRequest {
-            binding,
-            configuration_source,
-            attempt,
-            permit,
-        } = start_apply_request;
-        let driver = binding.driver;
-        let start_apply_result = {
-            let endpoint = &binding.endpoint;
-            let configuration = configuration_source.configuration(binding).map_err(|_| {
-                DriverContractError::LastKnownGoodConfigurationUnavailable {
-                    role: binding.role.clone(),
-                }
-            })?;
-            self.get_mut(driver)
-                .ok_or(DriverContractError::DriverNotRegistered { driver_id: driver })?
-                .start_apply(world, endpoint, configuration, attempt, permit)
-        };
-        if start_apply_result.is_ok() {
-            binding.state = RoleState::Applying(attempt);
-        }
-
-        start_apply_result
-    }
-
-    /// Poll one in-flight apply through the driver selected by `driver_id`.
-    ///
-    /// Kernel attempt systems call this inside `World::resource_scope` after checking that the
-    /// attempt still addresses the same device and rigging revision.
-    ///
-    /// # Errors
-    ///
-    /// Returns `DriverContractError::DriverNotRegistered` when `driver_id` is not in this
-    /// process's registry, or another `DriverContractError` when erased dispatch cannot recover
-    /// the typed driver boundary.
-    pub(crate) fn poll(
-        &mut self,
-        world: &mut World,
-        poll_request: PollRequest<'_>,
-    ) -> Result<crate::AttemptProgress, crate::DriverContractError> {
-        let PollRequest {
-            role: _,
-            driver,
-            endpoint: _,
-            attempt,
-        } = poll_request;
+        driver: DriverId,
+        context: crate::TargetResolutionContext<'_>,
+        deadline: Instant,
+        permit: ApplyPermit,
+        attempt: crate::AttemptRef,
+        reports: &DriverReports,
+        configuration: &dyn Reflect,
+        target: ErasedTarget,
+    ) -> Result<(), DriverContractError> {
         self.get_mut(driver)
             .ok_or(DriverContractError::DriverNotRegistered { driver_id: driver })?
-            .poll(world, attempt)
+            .start_apply(
+                world,
+                context,
+                deadline,
+                permit,
+                attempt,
+                reports,
+                configuration,
+                target,
+            )
+    }
+
+    pub(crate) fn established(
+        &mut self,
+        world: &mut World,
+        driver: DriverId,
+        role: &crate::RoleKey,
+        role_entity: Entity,
+        attempt: crate::AttemptRef,
+        session: crate::SessionRef,
+        reports: &DriverReports,
+    ) -> Result<SessionDatumArrivalReceiver, DriverContractError> {
+        self.get_mut(driver)
+            .ok_or(DriverContractError::DriverNotRegistered { driver_id: driver })?
+            .established(world, role, role_entity, attempt, session, reports)
+    }
+
+    pub(crate) fn cancel_apply(
+        &mut self,
+        world: &mut World,
+        driver: DriverId,
+        role: &crate::RoleKey,
+        role_entity: crate::DriverCleanupRoleEntity,
+        attempt: crate::AttemptRef,
+        cause: crate::AttemptInvalidation,
+    ) -> Result<(), DriverContractError> {
+        self.get_mut(driver)
+            .ok_or(DriverContractError::DriverNotRegistered { driver_id: driver })?
+            .cancel_apply(world, role, role_entity, attempt, cause)
+    }
+
+    pub(crate) fn release_session(
+        &mut self,
+        world: &mut World,
+        driver: DriverId,
+        role: &crate::RoleKey,
+        role_entity: crate::DriverCleanupRoleEntity,
+        session: crate::SessionRef,
+        cause: crate::SessionReleaseCause,
+    ) -> Result<(), DriverContractError> {
+        self.get_mut(driver)
+            .ok_or(DriverContractError::DriverNotRegistered { driver_id: driver })?
+            .release_session(world, role, role_entity, session, cause)
     }
 
     fn get_mut(&mut self, driver_id: DriverId) -> Option<&mut DriverEntry> {
@@ -1323,9 +1883,20 @@ pub trait RiggingAppExt {
     ///
     /// This initializes `Drivers` itself, so adding a driver before `RiggingPlugin` does not make
     /// plugin insertion order control whether the driver can register.
-    fn add_endpoint_driver<Driver>(&mut self, driver: Driver) -> DriverId
+    fn add_endpoint_driver<Driver>(
+        &mut self,
+        driver: Driver,
+    ) -> EndpointDriverRegistration<Driver::Configuration>
     where
         Driver: EndpointDriver;
+
+    /// Register a client-to-role relationship for automatic role-entity recovery.
+    ///
+    /// When a live role entity is removed outside the kernel, the registered relationship target
+    /// identifies every client that must be retargeted to the replacement entity.
+    fn register_rigging_role_relationship<Source>(&mut self) -> &mut Self
+    where
+        Source: Relationship;
 
     /// Record a reportable device-identity scheme and return this app for further setup.
     ///
@@ -1347,11 +1918,23 @@ impl RiggingAppExt for App {
         self.init_resource::<DiscoveryControl>()
             .init_resource::<DiscoveryLimits>()
             .init_resource::<DiscoveryStatus>()
-            .init_resource::<Reporters>();
-        let reporter_id = self
+            .init_resource::<Reporters>()
+            .init_resource::<Time<Real>>();
+        let runtime_started_at = self.world().resource::<Time<Real>>().startup();
+        let runtime_clock = *self
             .world_mut()
-            .resource_mut::<Reporters>()
-            .add(reporter, reporter_registration.clone());
+            .get_resource_or_insert_with(|| RiggingRuntimeClock::starting_at(runtime_started_at));
+        let registered_at = runtime_clock.time_at(runtime_started_at);
+        let reporter_id =
+            self.world_mut()
+                .resource_scope::<Reporters, _>(|world, mut reporters| {
+                    reporters.add_published(
+                        world,
+                        reporter,
+                        reporter_registration.clone(),
+                        registered_at,
+                    )
+                });
         self.world_mut()
             .resource_mut::<DiscoveryControl>()
             .register(reporter_id, &reporter_registration);
@@ -1362,13 +1945,32 @@ impl RiggingAppExt for App {
         reporter_id
     }
 
-    fn add_endpoint_driver<Driver>(&mut self, driver: Driver) -> DriverId
+    fn add_endpoint_driver<Driver>(
+        &mut self,
+        driver: Driver,
+    ) -> EndpointDriverRegistration<Driver::Configuration>
     where
         Driver: EndpointDriver,
     {
-        self.world_mut()
+        let driver_id = self
+            .world_mut()
             .get_resource_or_insert_with(Drivers::new)
-            .add(driver)
+            .add(driver);
+        EndpointDriverRegistration::new(driver_id)
+    }
+
+    fn register_rigging_role_relationship<Source>(&mut self) -> &mut Self
+    where
+        Source: Relationship,
+    {
+        self.world_mut().register_component::<Source>();
+        self.world_mut()
+            .register_component::<Source::RelationshipTarget>();
+        self.init_resource::<RiggingRoleRelationshipRepairs>();
+        self.world_mut()
+            .resource_mut::<RiggingRoleRelationshipRepairs>()
+            .register::<Source>();
+        self
     }
 
     fn register_device_scheme(&mut self, name: SchemeName) -> &mut Self {
@@ -1403,6 +2005,7 @@ mod tests {
     use std::time::Duration;
     use std::time::Instant;
 
+    use bevy::MinimalPlugins;
     use bevy::app::App;
     use bevy::app::Plugin;
     use bevy::ecs::reflect::ReflectComponent;
@@ -1414,13 +2017,14 @@ mod tests {
     use bevy::reflect::tuple_struct::DynamicTupleStruct;
     use bevy::tasks::IoTaskPool;
     use bevy::tasks::TaskPoolBuilder;
+    use bevy::time::Real;
+    use bevy::time::Time;
+    use bevy::time::TimeUpdateStrategy;
 
     use super::ApplyPermit;
     use super::DriverId;
-    use super::Drivers;
     use super::NextDue;
     use super::PendingDiscovery;
-    use super::Purpose;
     use super::ReporterCompletionAcceptance;
     use super::ReporterCompletionTime;
     use super::ReporterDeviceSetState;
@@ -1431,19 +2035,16 @@ mod tests {
     use super::RerunRequest;
     use super::RetainedDeviceSet;
     use super::RiggingAppExt;
-    use crate::ApplyDeadline;
+    use crate::Applied;
+    use crate::ApplyContext;
     use crate::AttachmentPath;
-    use crate::AttemptId;
-    use crate::AttemptOutcome;
-    use crate::AttemptProgress;
-    use crate::Binding;
-    use crate::Bindings;
+    use crate::AttemptInvalidation;
+    use crate::AttemptRef;
     use crate::Capabilities;
-    use crate::CaptureOutcome;
     use crate::Claim;
     use crate::DeviceAccessError;
+    use crate::DeviceAccessErrorView;
     use crate::DeviceDescriptor;
-    use crate::DeviceEndpoint;
     use crate::DeviceIdSource;
     use crate::DeviceKey;
     use crate::DeviceKind;
@@ -1458,17 +2059,15 @@ mod tests {
     use crate::DiscoveryProgress;
     use crate::DiscoveryStatus;
     use crate::DiscoveryWork;
+    use crate::DriverCleanupRoleEntity;
+    use crate::DriverCompletion;
     use crate::EndpointDriver;
-    use crate::EndpointId;
-    use crate::HardwareInventory;
+    use crate::EstablishedContext;
+    use crate::FirstCompleteSetStatus;
     use crate::LastDiscoveryOutcome;
-    use crate::LastKnownGoodConfiguration;
     use crate::MainThreadDiscoveryJob;
-    use crate::OnAbort;
-    use crate::OnSessionLoss;
     use crate::PlatformDeviceHandle;
     use crate::Presence;
-    use crate::RecoveryPolicy;
     use crate::RegisteredSchemes;
     use crate::ReportAcceptanceProjection;
     use crate::ReportedAs;
@@ -1478,24 +2077,371 @@ mod tests {
     use crate::ReporterActivation;
     use crate::ReporterActivity;
     use crate::ReporterCoverage;
+    use crate::ReporterDeferral;
+    use crate::ReporterOutcomeHealth;
     use crate::ReporterRegistration;
-    use crate::RequestedConfiguration;
-    use crate::RetryOn;
     use crate::RiggingPlugin;
     use crate::RiggingRevision;
+    use crate::RiggingRuntimeClock;
+    use crate::RiggingRuntimeTime;
     use crate::RoleKey;
-    use crate::RoleState;
     use crate::SchemeName;
+    use crate::SessionRef;
+    use crate::SessionReleaseCause;
     use crate::StartupDiscoveryState;
-    use crate::binding::RoleView;
-    use crate::binding::WaitingRole;
+    use crate::TargetResolution;
+    use crate::TargetResolutionContext;
+    use crate::WaitTiming;
     use crate::discovery;
     use crate::discovery::DiscoveryDirtyState;
     use crate::discovery::DiscoveryRequest;
     use crate::discovery::DiscoveryTransitionJournal;
     use crate::presence::DeviceSet;
+    use crate::reporter_health::FailureLogMilestoneIndex;
+    use crate::reporter_health::ReporterFailureRun;
+    use crate::reporter_health::ReporterLogDecision;
+    use crate::reporter_health::ReporterLogState;
 
     const BACKGROUND_RESULT_POLL_CEILING: usize = 256;
+
+    #[test]
+    fn reporter_registration_and_plugin_order_share_the_runtime_clock_anchor() {
+        let registration = || {
+            ReporterRegistration::required(
+                DiscoveryCadence::OnDemand,
+                ReporterCoverage::MatchingEvidenceOnly,
+                Duration::from_secs(10),
+            )
+        };
+
+        let mut reporter_first = App::new();
+        reporter_first.add_device_reporter(
+            SequenceReporter {
+                scans: VecDeque::new(),
+            },
+            registration(),
+        );
+        reporter_first.add_plugins(RiggingPlugin);
+        let reporter_first_started_at = reporter_first.world().resource::<Time<Real>>().startup();
+        let reporter_first_runtime_time = reporter_first
+            .world()
+            .resource::<RiggingRuntimeClock>()
+            .time_at(reporter_first_started_at);
+
+        let mut plugin_first = App::new();
+        plugin_first.add_plugins(RiggingPlugin);
+        plugin_first.add_device_reporter(
+            SequenceReporter {
+                scans: VecDeque::new(),
+            },
+            registration(),
+        );
+        let plugin_first_started_at = plugin_first.world().resource::<Time<Real>>().startup();
+        let plugin_first_runtime_time = plugin_first
+            .world()
+            .resource::<RiggingRuntimeClock>()
+            .time_at(plugin_first_started_at);
+
+        assert_eq!(reporter_first_runtime_time, plugin_first_runtime_time);
+        assert_eq!(
+            reporter_first_runtime_time,
+            RiggingRuntimeTime::from_elapsed(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn reporter_diagnostics_emit_failure_and_overdue_decisions_once_per_edge() {
+        let error = DeviceAccessErrorView::Transport {
+            detail: String::from("test reporter transport failure"),
+        };
+        let mut failure_run = ReporterFailureRun::default();
+        let mut log_state = ReporterLogState::default();
+
+        assert_eq!(
+            failure_run.accept_failure_at_elapsed(&error, Duration::ZERO),
+            crate::reporter_health::FailureLogDecisions {
+                error:     ReporterLogDecision::FirstFailure,
+                milestone: ReporterLogDecision::NoLog,
+            }
+        );
+        assert_eq!(
+            failure_run.accept_failure_at_elapsed(&error, Duration::ZERO),
+            crate::reporter_health::FailureLogDecisions {
+                error:     ReporterLogDecision::NoLog,
+                milestone: ReporterLogDecision::NoLog,
+            }
+        );
+        assert_eq!(
+            failure_run.accept_failure_at_elapsed(&error, Duration::from_secs(60)),
+            crate::reporter_health::FailureLogDecisions {
+                error:     ReporterLogDecision::NoLog,
+                milestone: ReporterLogDecision::FailureMilestone(
+                    FailureLogMilestoneIndex::OneMinute,
+                ),
+            }
+        );
+        assert_eq!(
+            failure_run.accept_failure_at_elapsed(&error, Duration::from_secs(60)),
+            crate::reporter_health::FailureLogDecisions {
+                error:     ReporterLogDecision::NoLog,
+                milestone: ReporterLogDecision::NoLog,
+            }
+        );
+        assert_eq!(
+            failure_run.last_logged_milestone(),
+            FailureLogMilestoneIndex::OneMinute
+        );
+        assert_eq!(
+            log_state.first_complete_set_overdue_decision(),
+            ReporterLogDecision::FirstCompleteSetOverdue
+        );
+        assert_eq!(
+            log_state.first_complete_set_overdue_decision(),
+            ReporterLogDecision::NoLog
+        );
+        log_state.restart_first_complete_set_bound();
+        assert_eq!(
+            log_state.first_complete_set_overdue_decision(),
+            ReporterLogDecision::FirstCompleteSetOverdue
+        );
+        assert_eq!(
+            log_state.most_recent_overdue_decision(),
+            ReporterLogDecision::FirstCompleteSetOverdue
+        );
+    }
+
+    #[test]
+    fn deferral_resets_the_failure_decision_run() {
+        let failure = || {
+            DeviceScan::Failed(DeviceAccessError::Transport {
+                detail: String::from("repeated test transport failure"),
+            })
+        };
+        let mut app = App::new();
+        app.add_plugins(RiggingPlugin);
+        let reporter = app.add_device_reporter(
+            SequenceReporter {
+                scans: VecDeque::from([
+                    failure(),
+                    DeviceScan::Deferred(ReporterDeferral::WaitingForTopology),
+                    failure(),
+                ]),
+            },
+            ReporterRegistration::required(
+                DiscoveryCadence::OnDemand,
+                ReporterCoverage::MatchingEvidenceOnly,
+                Duration::from_secs(10),
+            ),
+        );
+
+        update_until_completed_batches(&mut app, reporter, 1);
+        {
+            let reporters = app.world().resource::<Reporters>();
+            let reporter_entry = reporters
+                .entries
+                .iter()
+                .find(|entry| entry.reporter_id == reporter)
+                .expect("registered reporter must retain its log state");
+            assert_eq!(
+                reporter_entry.failure_run.most_recent_decisions(),
+                crate::reporter_health::FailureLogDecisions {
+                    error:     ReporterLogDecision::FirstFailure,
+                    milestone: ReporterLogDecision::NoLog,
+                }
+            );
+        }
+
+        app.world_mut()
+            .resource_mut::<DiscoveryControl>()
+            .request(reporter)
+            .expect("the registered reporter must accept a deferral run request");
+        update_until_completed_batches(&mut app, reporter, 2);
+        {
+            let reporters = app.world().resource::<Reporters>();
+            let reporter_entry = reporters
+                .entries
+                .iter()
+                .find(|entry| entry.reporter_id == reporter)
+                .expect("registered reporter must retain its log state");
+            assert_eq!(
+                reporter_entry.failure_run.most_recent_decisions(),
+                crate::reporter_health::FailureLogDecisions::default()
+            );
+        }
+
+        app.world_mut()
+            .resource_mut::<DiscoveryControl>()
+            .request(reporter)
+            .expect("the registered reporter must accept a second failure run request");
+        update_until_completed_batches(&mut app, reporter, 3);
+        let reporters = app.world().resource::<Reporters>();
+        let reporter_entry = reporters
+            .entries
+            .iter()
+            .find(|entry| entry.reporter_id == reporter)
+            .expect("registered reporter must retain its log state");
+        assert_eq!(
+            reporter_entry.failure_run.most_recent_decisions(),
+            crate::reporter_health::FailureLogDecisions {
+                error:     ReporterLogDecision::FirstFailure,
+                milestone: ReporterLogDecision::NoLog,
+            }
+        );
+    }
+
+    #[test]
+    fn one_minute_periodic_failure_run_emits_one_typed_milestone_decision() {
+        const FAILURES_AFTER_RUN_START: u64 = 60;
+        const REPORTER_CADENCE: Duration = Duration::from_secs(1);
+
+        let scans = (0..=FAILURES_AFTER_RUN_START + 1)
+            .map(|_| {
+                DeviceScan::Failed(DeviceAccessError::Transport {
+                    detail: String::from("one-minute test transport failure"),
+                })
+            })
+            .collect::<VecDeque<_>>();
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::ZERO))
+            .add_plugins(RiggingPlugin);
+        let reporter = app.add_device_reporter(
+            SequenceReporter { scans },
+            ReporterRegistration::required(
+                DiscoveryCadence::Periodic {
+                    interval: REPORTER_CADENCE,
+                },
+                ReporterCoverage::MatchingEvidenceOnly,
+                Duration::from_secs(30),
+            ),
+        );
+
+        update_until_completed_batches(&mut app, reporter, 1);
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(REPORTER_CADENCE));
+        update_until_completed_batches(&mut app, reporter, FAILURES_AFTER_RUN_START + 1);
+        {
+            let reporters = app.world().resource::<Reporters>();
+            let reporter_entry = reporters
+                .entries
+                .iter()
+                .find(|entry| entry.reporter_id == reporter)
+                .expect("registered reporter must retain its log state");
+            assert_eq!(
+                reporter_entry.failure_run.last_logged_milestone(),
+                FailureLogMilestoneIndex::OneMinute
+            );
+            assert_eq!(
+                reporter_entry.failure_run.most_recent_decisions(),
+                crate::reporter_health::FailureLogDecisions {
+                    error:     ReporterLogDecision::NoLog,
+                    milestone: ReporterLogDecision::FailureMilestone(
+                        FailureLogMilestoneIndex::OneMinute,
+                    ),
+                }
+            );
+            assert!(matches!(
+                reporter_entry.health.first_complete_set(),
+                FirstCompleteSetStatus::Waiting(WaitTiming::Overdue { .. })
+            ));
+        }
+
+        update_until_completed_batches(&mut app, reporter, FAILURES_AFTER_RUN_START + 2);
+        let reporters = app.world().resource::<Reporters>();
+        let reporter_entry = reporters
+            .entries
+            .iter()
+            .find(|entry| entry.reporter_id == reporter)
+            .expect("registered reporter must retain its log state");
+        assert_eq!(
+            reporter_entry.failure_run.last_logged_milestone(),
+            FailureLogMilestoneIndex::OneMinute
+        );
+        assert_eq!(
+            reporter_entry.failure_run.most_recent_decisions(),
+            crate::reporter_health::FailureLogDecisions::default()
+        );
+        assert!(matches!(
+            reporter_entry.health.outcome(),
+            ReporterOutcomeHealth::Failing { .. }
+        ));
+    }
+
+    #[test]
+    fn reenabled_reporter_emits_an_overdue_decision_for_the_restarted_bound() {
+        let first_complete_set_bound = Duration::from_secs(10);
+        let frame_past_bound = first_complete_set_bound + Duration::from_secs(1);
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::ZERO))
+            .add_plugins(RiggingPlugin);
+        let reporter = app.add_device_reporter(
+            SequenceReporter {
+                scans: VecDeque::from([
+                    DeviceScan::Deferred(ReporterDeferral::WaitingForTopology),
+                    DeviceScan::Deferred(ReporterDeferral::WaitingForTopology),
+                ]),
+            },
+            ReporterRegistration::optional(
+                DiscoveryCadence::OnDemand,
+                ReporterActivation::Enabled,
+                ReporterCoverage::MatchingEvidenceOnly,
+                first_complete_set_bound,
+            ),
+        );
+
+        update_until_completed_batches(&mut app, reporter, 1);
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(frame_past_bound));
+        app.update();
+        {
+            let reporters = app.world().resource::<Reporters>();
+            let reporter_entry = reporters
+                .entries
+                .iter()
+                .find(|entry| entry.reporter_id == reporter)
+                .expect("registered reporter must retain its log state");
+            assert_eq!(
+                reporter_entry.log_state.most_recent_overdue_decision(),
+                ReporterLogDecision::FirstCompleteSetOverdue
+            );
+        }
+
+        app.world_mut()
+            .resource_mut::<DiscoveryControl>()
+            .disable(reporter)
+            .expect("the registered optional reporter must accept disable");
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::ZERO));
+        app.update();
+        app.world_mut()
+            .resource_mut::<DiscoveryControl>()
+            .enable(reporter)
+            .expect("the registered optional reporter must accept re-enable");
+        app.update();
+        {
+            let reporters = app.world().resource::<Reporters>();
+            let reporter_entry = reporters
+                .entries
+                .iter()
+                .find(|entry| entry.reporter_id == reporter)
+                .expect("registered reporter must retain its log state");
+            assert_eq!(
+                reporter_entry.log_state.most_recent_overdue_decision(),
+                ReporterLogDecision::NoLog
+            );
+        }
+
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(frame_past_bound));
+        app.update();
+        let reporters = app.world().resource::<Reporters>();
+        let reporter_entry = reporters
+            .entries
+            .iter()
+            .find(|entry| entry.reporter_id == reporter)
+            .expect("registered reporter must retain its log state");
+        assert_eq!(
+            reporter_entry.log_state.most_recent_overdue_decision(),
+            ReporterLogDecision::FirstCompleteSetOverdue
+        );
+    }
 
     struct CountingReporter {
         scans: Arc<AtomicUsize>,
@@ -1505,6 +2451,17 @@ mod tests {
         fn discover(&mut self) -> DiscoveryWork {
             self.scans.fetch_add(1, Ordering::Relaxed);
             DiscoveryWork::Immediate(MainThreadDiscoveryJob::new(|_| {
+                DeviceScan::Complete(Vec::new())
+            }))
+        }
+    }
+
+    struct MeasuredImmediateReporter;
+
+    impl DeviceReporter for MeasuredImmediateReporter {
+        fn discover(&mut self) -> DiscoveryWork {
+            DiscoveryWork::Immediate(MainThreadDiscoveryJob::new(move |_| {
+                std::thread::sleep(Duration::from_millis(1));
                 DeviceScan::Complete(Vec::new())
             }))
         }
@@ -1811,6 +2768,23 @@ mod tests {
         &app.world().resource::<PublishedReportProjections>().0
     }
 
+    fn registered_reporter_status(
+        app: &App,
+        reporter: ReporterId,
+    ) -> &crate::ReporterDiscoveryStatus {
+        app.world()
+            .resource::<DiscoveryStatus>()
+            .reporter_status(reporter)
+            .expect("registered reporter must retain status")
+    }
+
+    fn install_frame_anchored_runtime_clock(world: &mut World) {
+        world.init_resource::<crate::Bindings>();
+        world.init_resource::<Time<Real>>();
+        let runtime_started_at = world.resource::<Time<Real>>().startup();
+        world.insert_resource(RiggingRuntimeClock::starting_at(runtime_started_at));
+    }
+
     fn request_reporter(app: &mut App, reporter: ReporterId) {
         app.world_mut()
             .resource_mut::<DiscoveryControl>()
@@ -1877,16 +2851,16 @@ mod tests {
     fn queue_completed_scan(
         reporter_entry: &mut ReporterEntry,
         batch: u64,
-        queued_at: Instant,
-        completed_at: Instant,
+        accepted_at: Instant,
+        measured_work_time: Duration,
     ) {
         reporter_entry.state = ReporterRunState::Queued {
-            batch: DiscoveryBatchId(batch),
-            queued_at,
-            rerun: RerunRequest::NotRequested,
+            batch:   DiscoveryBatchId(batch),
+            rerun:   RerunRequest::NotRequested,
             pending: PendingDiscovery::Completed {
                 scan: DeviceScan::Complete(Vec::new()),
-                completed_at,
+                accepted_at,
+                measured_work_time,
             },
         };
     }
@@ -1901,6 +2875,7 @@ mod tests {
                     world.resource_scope::<DiscoveryStatus, _>(|world, mut discovery_status| {
                         reporters.admit(
                             world,
+                            now,
                             &discovery_control,
                             &discovery_limits,
                             &mut discovery_status,
@@ -1922,7 +2897,7 @@ mod tests {
             .resource_scope::<Reporters, _>(|world, mut reporters| {
                 let now = Instant::now();
                 reporters.entries[reporter_index].drain_progress();
-                reporters.entries[reporter_index].poll(now);
+                reporters.entries[reporter_index].collect_finished_run(now);
                 let discovery_limits = world.resource::<DiscoveryLimits>().clone();
                 let (mut journal, capacity) = discarded_journal(&reporters, &discovery_limits);
                 world.resource_scope::<DiscoveryControl, _>(|world, discovery_control| {
@@ -1938,6 +2913,7 @@ mod tests {
                         reporters.refresh_startup(&mut discovery_status, &mut journal, capacity);
                         reporters.admit(
                             world,
+                            now,
                             &discovery_control,
                             &discovery_limits,
                             &mut discovery_status,
@@ -2004,6 +2980,7 @@ mod tests {
             ReporterRegistration::required(
                 DiscoveryCadence::OnDemand,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         )
     }
@@ -2019,6 +2996,7 @@ mod tests {
             ReporterRegistration::required(
                 DiscoveryCadence::OnDemand,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         )
     }
@@ -2088,7 +3066,7 @@ mod tests {
         const MAX_POLLS: usize = 10_000;
 
         for _ in 0..MAX_POLLS {
-            reporter_entry.poll(now);
+            reporter_entry.collect_finished_run(now);
             if matches!(
                 reporter_entry.completion_time(),
                 ReporterCompletionTime::CompletedAt(_)
@@ -2105,13 +3083,17 @@ mod tests {
     }
 
     fn expire_reporter_deadline(app: &mut App, reporter: ReporterId) {
+        let frame_instant = {
+            let time = app.world().resource::<Time<Real>>();
+            time.last_update().unwrap_or_else(|| time.startup())
+        };
         let mut reporters = app.world_mut().resource_mut::<Reporters>();
         let reporter_entry = reporters
             .entries
             .iter_mut()
             .find(|reporter_entry| reporter_entry.reporter_id == reporter)
             .expect("registered reporter must retain its scheduler entry");
-        reporter_entry.next_due = NextDue::At(Instant::now());
+        reporter_entry.next_due = NextDue::At(frame_instant);
     }
 
     fn assert_expired_deadline_supplies_one_background_run(cadence: DiscoveryCadence) {
@@ -2129,7 +3111,11 @@ mod tests {
                 runs: 0,
                 background_job_gate,
             },
-            ReporterRegistration::required(cadence, ReporterCoverage::MatchingEvidenceOnly),
+            ReporterRegistration::required(
+                cadence,
+                ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
+            ),
         );
 
         app.update();
@@ -2223,29 +3209,49 @@ mod tests {
 
     impl EndpointDriver for TestDriver {
         type Configuration = TestConfiguration;
+        type Target = ();
 
-        fn capture(
+        fn resolve_target(
             &mut self,
             _: &mut World,
-            _: &DeviceEndpoint,
-        ) -> CaptureOutcome<Self::Configuration> {
-            CaptureOutcome::ReadFailed(DeviceAccessError::Absent {
-                detail: String::from("test driver has no endpoint"),
-            })
+            _: &TargetResolutionContext<'_>,
+            _: &Self::Configuration,
+        ) -> TargetResolution<Self::Target> {
+            TargetResolution::Reached(())
         }
 
         fn start_apply(
             &mut self,
             _: &mut World,
-            _: &DeviceEndpoint,
+            context: ApplyContext<'_, Self::Configuration>,
             _: &Self::Configuration,
-            _: AttemptId,
-            _: ApplyPermit,
+            (): Self::Target,
+        ) {
+            context
+                .into_completion()
+                .finish(DriverCompletion::Succeeded(Applied::AsDispatched));
+        }
+
+        fn established(&mut self, _: &mut World, _: EstablishedContext<'_, Self::Configuration>) {}
+
+        fn cancel_apply(
+            &mut self,
+            _: &mut World,
+            _: &RoleKey,
+            _: DriverCleanupRoleEntity,
+            _: AttemptRef,
+            _: AttemptInvalidation,
         ) {
         }
 
-        fn poll(&mut self, _: &mut World, _: AttemptId) -> AttemptProgress {
-            AttemptProgress::Pending
+        fn release_session(
+            &mut self,
+            _: &mut World,
+            _: &RoleKey,
+            _: DriverCleanupRoleEntity,
+            _: SessionRef,
+            _: SessionReleaseCause,
+        ) {
         }
     }
 
@@ -2262,6 +3268,84 @@ mod tests {
     }
 
     #[test]
+    fn deferred_and_unsupported_reporters_remain_in_batch_counts_while_a_sibling_runs() {
+        initialize_io_task_pool();
+        let now = Instant::now();
+        let batch = DiscoveryBatchId(7);
+        let deferred = ReporterId(0);
+        let unsupported = ReporterId(1);
+        let running = ReporterId(2);
+        let mut reporters = Reporters::default();
+        let mut discovery_status = DiscoveryStatus::default();
+
+        for reporter in [deferred, unsupported] {
+            let registration = ReporterRegistration::required(
+                DiscoveryCadence::OnDemand,
+                ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
+            );
+            discovery_status.register(reporter, &registration);
+            reporters.entries.push(ReporterEntry::new(
+                SequenceReporter {
+                    scans: VecDeque::new(),
+                },
+                reporter,
+                registration,
+            ));
+        }
+        let running_registration = ReporterRegistration::required(
+            DiscoveryCadence::OnDemand,
+            ReporterCoverage::MatchingEvidenceOnly,
+            std::time::Duration::from_secs(10),
+        );
+        discovery_status.register(running, &running_registration);
+        reporters.entries.push(ReporterEntry::new(
+            CountingBackgroundReporter {
+                discoveries: Arc::new(AtomicUsize::new(0)),
+            },
+            running,
+            running_registration,
+        ));
+
+        let deferred_reporter_status = discovery_status
+            .reporter_status_mut(deferred)
+            .expect("registered reporter must retain status");
+        deferred_reporter_status.last_outcome = LastDiscoveryOutcome::Deferred {
+            batch,
+            since: RiggingRuntimeTime::from_elapsed(Duration::ZERO),
+            deferral: ReporterDeferral::WaitingForTopology,
+        };
+        deferred_reporter_status.completed_batches = 1;
+        let unsupported_error = DeviceAccessError::Unsupported {
+            detail: String::from("test platform has no reporter integration"),
+        };
+        let unsupported_reporter_status = discovery_status
+            .reporter_status_mut(unsupported)
+            .expect("registered reporter must retain status");
+        unsupported_reporter_status.last_outcome = LastDiscoveryOutcome::Unsupported {
+            batch,
+            error: unsupported_error.clone(),
+            since: RiggingRuntimeTime::from_elapsed(Duration::ZERO),
+        };
+        unsupported_reporter_status.completed_batches = 1;
+        reporters.entries[1].state = ReporterRunState::Unsupported {
+            error: unsupported_error,
+            since: RiggingRuntimeTime::from_elapsed(Duration::ZERO),
+        };
+        reporters.entries[2].queue(batch, now);
+        reporters.entries[2].prepare(&mut World::new());
+        reporters.entries[2].start_prepared_background_with(|| now);
+
+        let batch_counts = reporters.batch_counts(now, &discovery_status);
+        assert_eq!(batch_counts.len(), 1);
+        assert_eq!(batch_counts[0].batch, batch);
+        assert_eq!(batch_counts[0].completed, 2);
+        assert_eq!(batch_counts[0].total, 3);
+        assert_eq!(batch_counts[0].running, 1);
+        assert_eq!(batch_counts[0].queued, 0);
+    }
+
+    #[test]
     fn reporter_completion_types_name_absent_ready_and_accepted_transitions() {
         let started_at = Instant::now();
         let completed_at = started_at + Duration::from_secs(1);
@@ -2273,6 +3357,7 @@ mod tests {
             ReporterRegistration::required(
                 DiscoveryCadence::OnDemand,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
 
@@ -2292,12 +3377,12 @@ mod tests {
         ));
 
         reporter_entry.state = ReporterRunState::Queued {
-            batch:     DiscoveryBatchId(7),
-            queued_at: started_at,
-            rerun:     RerunRequest::Requested,
-            pending:   PendingDiscovery::Completed {
-                scan: DeviceScan::Complete(Vec::new()),
-                completed_at,
+            batch:   DiscoveryBatchId(7),
+            rerun:   RerunRequest::Requested,
+            pending: PendingDiscovery::Completed {
+                scan:               DeviceScan::Complete(Vec::new()),
+                accepted_at:        completed_at,
+                measured_work_time: Duration::from_secs(1),
             },
         };
         assert_eq!(
@@ -2315,8 +3400,11 @@ mod tests {
             return;
         };
         assert_eq!(completed_discovery.batch, DiscoveryBatchId(7));
-        assert_eq!(completed_discovery.started_at, started_at);
-        assert_eq!(completed_discovery.completed_at, completed_at);
+        assert_eq!(completed_discovery.accepted_at, completed_at);
+        assert_eq!(
+            completed_discovery.measured_work_time,
+            Duration::from_secs(1)
+        );
         assert!(matches!(
             completed_discovery.scan,
             DeviceScan::Complete(devices) if devices.is_empty()
@@ -2338,6 +3426,38 @@ mod tests {
     }
 
     #[test]
+    fn immediate_scan_separates_frame_acceptance_from_measured_work_time() {
+        let scheduled_at = Instant::now();
+        let mut reporter_entry = ReporterEntry::new(
+            MeasuredImmediateReporter,
+            ReporterId(0),
+            ReporterRegistration::required(
+                DiscoveryCadence::OnDemand,
+                ReporterCoverage::MatchingEvidenceOnly,
+                Duration::from_secs(10),
+            ),
+        );
+        reporter_entry.queue(DiscoveryBatchId(0), scheduled_at);
+
+        reporter_entry.prepare_at(&mut World::new(), scheduled_at);
+
+        assert!(matches!(
+            &reporter_entry.state,
+            ReporterRunState::Queued {
+                pending: PendingDiscovery::Completed { accepted_at, .. },
+                ..
+            } if *accepted_at == scheduled_at
+        ));
+        assert!(matches!(
+            &reporter_entry.state,
+            ReporterRunState::Queued {
+                pending: PendingDiscovery::Completed { measured_work_time, .. },
+                ..
+            } if !measured_work_time.is_zero()
+        ));
+    }
+
+    #[test]
     fn periodic_reporter_runs_again_after_accepting_its_previous_whole_set() {
         let scans = Arc::new(AtomicUsize::new(0));
         let mut app = App::new();
@@ -2351,6 +3471,7 @@ mod tests {
                     interval: Duration::ZERO,
                 },
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
 
@@ -2389,6 +3510,7 @@ mod tests {
             ReporterRegistration::required(
                 DiscoveryCadence::Periodic { interval },
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
 
@@ -2461,6 +3583,7 @@ mod tests {
             ReporterRegistration::required(
                 DiscoveryCadence::EventDriven { backstop },
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
 
@@ -2524,6 +3647,7 @@ mod tests {
             ReporterRegistration::required(
                 DiscoveryCadence::OnDemand,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
         app.add_device_reporter(
@@ -2533,6 +3657,7 @@ mod tests {
             ReporterRegistration::required(
                 DiscoveryCadence::OnDemand,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
 
@@ -2545,7 +3670,18 @@ mod tests {
     #[test]
     fn default_limit_holds_two_io_jobs_in_flight_and_queues_a_third() {
         initialize_io_task_pool();
-        assert_eq!(IoTaskPool::get().thread_num(), 4);
+        // The I/O pool is a process global: the first test to reach it fixes its thread count
+        // for the whole binary, and a test that installs Bevy's task pool plugin without
+        // calling `initialize_io_task_pool` first leaves that count sized from the host's
+        // cores. The capacity asserted here is what the rest of this test rests on, and it
+        // holds for any pool of three or more threads.
+        assert_eq!(
+            DiscoveryLimits::default()
+                .effective_max_concurrent_jobs()
+                .expect("test initializes the I/O task pool")
+                .get(),
+            2
+        );
         let mut app = App::new();
         app.add_plugins(RiggingPlugin);
         let (started_sender, started_receiver) = channel();
@@ -2568,6 +3704,7 @@ mod tests {
             ReporterRegistration::required(
                 DiscoveryCadence::OnDemand,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
         let second = app.add_device_reporter(
@@ -2577,6 +3714,7 @@ mod tests {
             ReporterRegistration::required(
                 DiscoveryCadence::OnDemand,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
         let third = app.add_device_reporter(
@@ -2586,6 +3724,7 @@ mod tests {
             ReporterRegistration::required(
                 DiscoveryCadence::OnDemand,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
 
@@ -2655,6 +3794,7 @@ mod tests {
             ReporterRegistration::required(
                 DiscoveryCadence::OnDemand,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
         let subject = app.add_device_reporter(
@@ -2664,6 +3804,7 @@ mod tests {
             ReporterRegistration::required(
                 DiscoveryCadence::OnDemand,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
 
@@ -2671,18 +3812,13 @@ mod tests {
         assert_eq!(wait_for_started_jobs(&started_receiver, 1), vec!["blocker"]);
         assert_no_additional_job_started(&started_receiver);
         {
-            let mut reporters = app.world_mut().resource_mut::<Reporters>();
+            let reporters = app.world().resource::<Reporters>();
             let subject_entry = reporters
                 .entries
-                .iter_mut()
+                .iter()
                 .find(|reporter_entry| reporter_entry.reporter_id == subject)
                 .expect("registered reporter must retain its scheduler entry");
             assert!(subject_entry.has_prepared_background());
-            if let ReporterRunState::Queued { queued_at, .. } = &mut subject_entry.state {
-                *queued_at = Instant::now()
-                    .checked_sub(progress_after * 2)
-                    .expect("test duration must fit before the current instant");
-            }
         }
 
         app.world_mut()
@@ -2737,6 +3873,7 @@ mod tests {
             ReporterRegistration::required(
                 DiscoveryCadence::OnDemand,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
         let second = app.add_device_reporter(
@@ -2746,6 +3883,7 @@ mod tests {
             ReporterRegistration::required(
                 DiscoveryCadence::OnDemand,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
 
@@ -2821,6 +3959,7 @@ mod tests {
             ReporterRegistration::required(
                 DiscoveryCadence::OnDemand,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
         let second = app.add_device_reporter(
@@ -2830,6 +3969,7 @@ mod tests {
             ReporterRegistration::required(
                 DiscoveryCadence::OnDemand,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
         let third = app.add_device_reporter(
@@ -2839,6 +3979,7 @@ mod tests {
             ReporterRegistration::required(
                 DiscoveryCadence::OnDemand,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
 
@@ -2907,6 +4048,7 @@ mod tests {
             ReporterRegistration::required(
                 DiscoveryCadence::OnDemand,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
         let optional = app.add_device_reporter(
@@ -2918,6 +4060,7 @@ mod tests {
                 DiscoveryCadence::OnDemand,
                 ReporterActivation::Enabled,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
 
@@ -3014,6 +4157,7 @@ mod tests {
                     interval: Duration::ZERO,
                 },
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
 
@@ -3035,7 +4179,7 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_drains_the_changed_set_and_failure_handoff_every_frame() {
+    fn failure_health_remains_readable_after_reconciliation() {
         let mut app = App::new();
         app.add_plugins(RiggingPlugin);
         let reporter_id = app.add_device_reporter(
@@ -3052,6 +4196,7 @@ mod tests {
                     interval: Duration::ZERO,
                 },
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
 
@@ -3059,15 +4204,13 @@ mod tests {
         app.update();
         app.update();
 
-        // The completed set and the later failure both reached reconciliation, which advanced the
-        // rigging revision and left neither queue holding work for a following frame.
+        // The completed set reached reconciliation and advanced the rigging revision. The later
+        // failure retained that set and added no device work for a following frame.
         assert_eq!(app.world().resource::<RiggingRevision>().get(), 1);
         let mut reporters = app.world_mut().resource_mut::<Reporters>();
         assert_eq!(reporters.take_changed_reporters(), Vec::new());
-        assert_eq!(reporters.take_reporter_failures().len(), 0);
 
-        // The failure's error stays legible after the queue drains, because the reporter's
-        // discovery status keeps it rather than the handoff queue.
+        // The reporter's discovery status retains the failure's error directly.
         assert!(matches!(
             app.world()
                 .resource::<DiscoveryStatus>()
@@ -3093,6 +4236,7 @@ mod tests {
                 DiscoveryCadence::OnDemand,
                 ReporterActivation::Disabled,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
 
@@ -3126,6 +4270,7 @@ mod tests {
             ReporterRegistration::required(
                 DiscoveryCadence::OnDemand,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
         let second = app.add_device_reporter(
@@ -3135,6 +4280,7 @@ mod tests {
             ReporterRegistration::required(
                 DiscoveryCadence::OnDemand,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
 
@@ -3177,18 +4323,20 @@ mod tests {
     }
 
     #[test]
-    fn completion_budget_preserves_actual_completion_clock_for_delayed_acceptance() {
+    fn completion_budget_preserves_frame_acceptance_time_and_measured_duration() {
         let scans = Arc::new(AtomicUsize::new(0));
         let cadence_interval = Duration::from_secs(10);
         let first_registration = ReporterRegistration::required(
             DiscoveryCadence::OnDemand,
             ReporterCoverage::MatchingEvidenceOnly,
+            std::time::Duration::from_secs(10),
         );
         let delayed_registration = ReporterRegistration::required(
             DiscoveryCadence::Periodic {
                 interval: cadence_interval,
             },
             ReporterCoverage::MatchingEvidenceOnly,
+            std::time::Duration::from_secs(10),
         );
         let mut reporters = Reporters::default();
         let first = reporters.add(
@@ -3207,17 +4355,22 @@ mod tests {
         let mut discovery_limits = DiscoveryLimits::default();
         discovery_limits.set_max_completions_per_frame(NonZeroUsize::MIN);
         let mut world = World::new();
+        install_frame_anchored_runtime_clock(&mut world);
 
-        let started_at = Instant::now();
-        let first_completed_at = started_at + Duration::from_secs(1);
-        let delayed_completed_at = started_at + Duration::from_secs(2);
-        let delayed_accepted_at = delayed_completed_at + Duration::from_secs(40);
-        queue_completed_scan(&mut reporters.entries[0], 0, started_at, first_completed_at);
+        let first_result_accepted_at = Instant::now() + Duration::from_secs(1);
+        let delayed_result_accepted_at = first_result_accepted_at + Duration::from_secs(1);
+        let later_frame_at = delayed_result_accepted_at + Duration::from_secs(40);
+        queue_completed_scan(
+            &mut reporters.entries[0],
+            0,
+            first_result_accepted_at,
+            Duration::from_secs(1),
+        );
         queue_completed_scan(
             &mut reporters.entries[1],
             1,
-            started_at,
-            delayed_completed_at,
+            delayed_result_accepted_at,
+            Duration::from_secs(2),
         );
 
         let (mut journal, capacity) = discarded_journal(&reporters, &discovery_limits);
@@ -3229,18 +4382,18 @@ mod tests {
             &mut journal,
             capacity,
         );
+        let first_status = discovery_status
+            .reporter_status(first)
+            .expect("registered reporter must retain status");
+        let delayed_status = discovery_status
+            .reporter_status(delayed)
+            .expect("registered reporter must retain status");
         assert!(matches!(
-            discovery_status
-                .reporter_status(first)
-                .expect("registered reporter must retain status")
-                .last_outcome,
+            first_status.last_outcome,
             LastDiscoveryOutcome::Succeeded { .. }
         ));
         assert!(matches!(
-            discovery_status
-                .reporter_status(delayed)
-                .expect("registered reporter must retain status")
-                .last_outcome,
+            delayed_status.last_outcome,
             LastDiscoveryOutcome::NotCompleted
         ));
 
@@ -3253,29 +4406,25 @@ mod tests {
             capacity,
         );
 
-        let expected_duration = delayed_completed_at.duration_since(started_at);
+        let expected_duration = Duration::from_secs(2);
+        let delayed_status = discovery_status
+            .reporter_status(delayed)
+            .expect("registered reporter must retain status");
         assert!(matches!(
-            discovery_status
-                .reporter_status(delayed)
-                .expect("registered reporter must retain status")
-                .last_outcome,
+            delayed_status.last_outcome,
             LastDiscoveryOutcome::Succeeded { duration, .. } if duration == expected_duration
         ));
-        assert_ne!(
-            expected_duration,
-            delayed_accepted_at.duration_since(started_at)
-        );
         assert!(matches!(
             &reporters.entries[1].latest_set,
             RetainedDeviceSet::Complete { completed_at, .. }
-                if *completed_at == delayed_completed_at
+                if *completed_at == delayed_result_accepted_at
         ));
         assert!(matches!(
             &reporters.entries[1].next_due,
-            NextDue::At(deadline) if *deadline == delayed_completed_at + cadence_interval
+            NextDue::At(deadline) if *deadline == delayed_result_accepted_at + cadence_interval
         ));
         assert!(reporters.entries[1].record_due_signal(
-            delayed_accepted_at,
+            later_frame_at,
             DiscoveryRequest::NotRequested,
             DiscoveryDirtyState::Clean,
         ));
@@ -3295,6 +4444,7 @@ mod tests {
             ReporterRegistration::required(
                 DiscoveryCadence::OnDemand,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
         let second = app.add_device_reporter(
@@ -3307,6 +4457,7 @@ mod tests {
                 DiscoveryCadence::OnDemand,
                 ReporterActivation::Disabled,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
 
@@ -3354,6 +4505,7 @@ mod tests {
             ReporterRegistration::required(
                 DiscoveryCadence::OnDemand,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
 
@@ -3392,7 +4544,7 @@ mod tests {
     }
 
     #[test]
-    fn background_report_projection_waits_for_exact_acceptance_and_failure_publishes_nothing() {
+    fn accepted_unchanged_report_publishes_projection_without_advancing_revision() {
         initialize_io_task_pool();
         let mut app = App::new();
         app.add_plugins(RiggingPlugin)
@@ -3401,13 +4553,14 @@ mod tests {
             ProjectedBackgroundReporter {
                 runs: VecDeque::from([
                     ProjectedBackgroundRun::Complete("owned"),
-                    ProjectedBackgroundRun::Complete("successor"),
+                    ProjectedBackgroundRun::Complete("unchanged"),
                     ProjectedBackgroundRun::Failed,
                 ]),
             },
             ReporterRegistration::required(
                 DiscoveryCadence::OnDemand,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
 
@@ -3423,16 +4576,13 @@ mod tests {
             "finishing producer work must not publish its acceptance projection"
         );
         assert_eq!(
-            app.world()
-                .resource::<DiscoveryStatus>()
-                .reporter_status(reporter)
-                .expect("the projected reporter should retain status")
-                .completed_batches,
+            registered_reporter_status(&app, reporter).completed_batches,
             0
         );
 
         app.update();
         assert_eq!(published_report_projections(&app), ["owned"]);
+        let revision_after_first_acceptance = *app.world().resource::<RiggingRevision>();
         let status = app
             .world()
             .resource::<DiscoveryStatus>()
@@ -3460,11 +4610,20 @@ mod tests {
             "a completed successor must remain unpublished before its acceptance"
         );
         app.update();
-        assert_eq!(published_report_projections(&app), ["owned", "successor"]);
+        assert_eq!(
+            published_report_projections(&app),
+            ["owned", "unchanged"],
+            "an accepted unchanged record set must publish its integration projection"
+        );
+        assert_eq!(
+            *app.world().resource::<RiggingRevision>(),
+            revision_after_first_acceptance,
+            "an unchanged record set must not advance kernel revision"
+        );
         app.update();
         assert_eq!(
             published_report_projections(&app),
-            ["owned", "successor"],
+            ["owned", "unchanged"],
             "accepted projections must be one-shot"
         );
 
@@ -3474,7 +4633,7 @@ mod tests {
             reporter_result_becomes_ready(&mut app, reporter),
             "the failed background result should become ready"
         );
-        assert_eq!(published_report_projections(&app), ["owned", "successor"]);
+        assert_eq!(published_report_projections(&app), ["owned", "unchanged"]);
         app.update();
 
         let status = app
@@ -3489,7 +4648,7 @@ mod tests {
         ));
         assert_eq!(
             published_report_projections(&app),
-            ["owned", "successor"],
+            ["owned", "unchanged"],
             "a failed scan must retain the preceding accepted integration state"
         );
     }
@@ -3518,6 +4677,7 @@ mod tests {
                 DiscoveryCadence::OnDemand,
                 ReporterActivation::Disabled,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
         let subject = app.add_device_reporter(
@@ -3531,6 +4691,7 @@ mod tests {
                 DiscoveryCadence::OnDemand,
                 ReporterActivation::Enabled,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
 
@@ -3597,6 +4758,7 @@ mod tests {
                 DiscoveryCadence::OnDemand,
                 ReporterActivation::Enabled,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
 
@@ -3675,6 +4837,7 @@ mod tests {
             ReporterRegistration::required(
                 DiscoveryCadence::OnDemand,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
 
@@ -3759,6 +4922,7 @@ mod tests {
             ReporterRegistration::required(
                 DiscoveryCadence::OnDemand,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
 
@@ -3822,6 +4986,7 @@ mod tests {
                 DiscoveryCadence::OnDemand,
                 ReporterActivation::Enabled,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
 
@@ -3869,6 +5034,7 @@ mod tests {
             ReporterRegistration::required(
                 DiscoveryCadence::OnDemand,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
         let second_reporter = app.add_device_reporter(
@@ -3876,6 +5042,7 @@ mod tests {
             ReporterRegistration::required(
                 DiscoveryCadence::OnDemand,
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
         let first_driver = app.add_endpoint_driver(TestDriver);
@@ -3906,6 +5073,7 @@ mod tests {
                     interval: Duration::ZERO,
                 },
                 ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
             ),
         );
 
@@ -3922,78 +5090,9 @@ mod tests {
     }
 
     #[test]
-    fn driver_registry_routes_each_erased_dispatch() -> Result<(), Box<dyn Error>> {
-        let mut app = App::new();
-        let driver_id = app.add_endpoint_driver(TestDriver);
-        let endpoint = display_endpoint()?;
-        let role = RoleKey::new("test-driver")?;
-        let mut bindings = Bindings::default();
-        let hardware_inventory = HardwareInventory::default();
-        bindings.register(Binding {
-            role: role.clone(),
-            endpoint,
-            driver: driver_id,
-            recovery: RecoveryPolicy::default(),
-            retry: RetryOn::NewRevision,
-            on_abort: OnAbort::default(),
-            on_loss: OnSessionLoss::default(),
-            state: RoleState::default(),
-            requested: RequestedConfiguration::new(TestConfiguration),
-            last_known_good: LastKnownGoodConfiguration::default(),
-            apply_deadline: ApplyDeadline::ProcessDefault,
-        })?;
-
-        let start_apply_request = match bindings.role_view(&role)? {
-            RoleView::Waiting(WaitingRole::Hardware(requesting_role)) => requesting_role
-                .start_requested_apply(
-                    AttemptId::default(),
-                    ApplyPermit::in_service(),
-                    &hardware_inventory,
-                )?,
-            _ => return Err("registered binding must begin waiting".into()),
-        };
-        let start = app
-            .world_mut()
-            .resource_scope::<Drivers, _>(|world, mut drivers| {
-                drivers.start_apply(world, start_apply_request)
-            });
-        let poll_request = match bindings.role_view(&role)? {
-            RoleView::Applying(applying_role) => applying_role.poll_request(&hardware_inventory)?,
-            _ => return Err("started apply must select applying role view".into()),
-        };
-        let poll = app
-            .world_mut()
-            .resource_scope::<Drivers, _>(|world, mut drivers| drivers.poll(world, poll_request));
-        match bindings.role_view(&role)? {
-            RoleView::Applying(mut applying_role) => {
-                applying_role.finish(AttemptOutcome::Succeeded);
-            },
-            _ => return Err("poll requires applying role view".into()),
-        }
-        let capture_request = match bindings.role_view(&role)? {
-            RoleView::Ready(ready_role) => ready_role.capture_request(&hardware_inventory)?,
-            _ => return Err("successful apply must make role ready".into()),
-        };
-        let capture = app
-            .world_mut()
-            .resource_scope::<Drivers, _>(|world, mut drivers| {
-                drivers.capture(world, capture_request)
-            });
-
-        assert!(matches!(
-            capture,
-            Ok(CaptureOutcome::ReadFailed(DeviceAccessError::Absent { .. }))
-        ));
-        assert_eq!(start, Ok(()));
-        assert!(matches!(poll, Ok(AttemptProgress::Pending)));
-
-        Ok(())
-    }
-
-    #[test]
     fn reflection_cannot_construct_apply_permit() {
         let mut dynamic_permit = DynamicTupleStruct::default();
-        dynamic_permit.insert(Purpose::InService);
+        dynamic_permit.insert(());
 
         assert!(ApplyPermit::from_reflect(&dynamic_permit).is_none());
     }
@@ -4004,12 +5103,6 @@ mod tests {
         dynamic_driver_id.insert(0_u32);
 
         assert!(DriverId::from_reflect(&dynamic_driver_id).is_none());
-    }
-
-    #[test]
-    fn apply_permit_reports_its_kernel_minted_purpose() {
-        assert!(ApplyPermit::in_service().allows_in_service_use());
-        assert!(!ApplyPermit::restore_only().allows_in_service_use());
     }
 
     #[test]
@@ -4071,18 +5164,5 @@ mod tests {
         second_registered_schemes.validate(&device_key)?;
 
         Ok(())
-    }
-
-    fn display_endpoint() -> Result<DeviceEndpoint, Box<dyn Error>> {
-        Ok(DeviceEndpoint {
-            device: DeviceKey {
-                kind: DeviceKind::Display,
-                id:   DeviceIdSource::Reported {
-                    scheme: SchemeName::new("edid-serial")?,
-                    value:  ReportedId::new("DELL-U2723QE-9J4K2H3")?,
-                },
-            },
-            id:     EndpointId::Whole,
-        })
     }
 }

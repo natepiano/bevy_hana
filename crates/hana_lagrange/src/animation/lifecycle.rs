@@ -58,8 +58,9 @@ pub(super) struct FreeFlightControllerOverrideRestoration {
 
 /// Restores damping after retained playback is removed.
 ///
-/// Replacing a definition leaves retained playback installed, so this observer
-/// does not expose a restore-and-recapture transition.
+/// This observer runs on removal of [`CameraSequencePlayback`]. Replacing a
+/// sequence definition leaves that component in place, so a replacement never
+/// restores damping and immediately recaptures it.
 pub(super) fn restore_retained_camera_state(
     remove: On<Remove, CameraSequencePlayback>,
     mut commands: Commands,

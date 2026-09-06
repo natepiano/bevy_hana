@@ -77,9 +77,10 @@ impl SavedPanelWorldState {
 
     /// Returns a world target on the saved panel plane.
     ///
-    /// The target intentionally leaves size unset so
+    /// The target leaves size unset so
     /// [`PanelProjectionParam::project_to_world`](super::PanelProjectionParam::project_to_world)
-    /// can derive a no-jump world size from the panel's current screen footprint.
+    /// derives the world size from the panel's current screen footprint, which keeps the
+    /// panel the same apparent size across the conversion.
     #[must_use]
     pub fn world_target(&self) -> PanelWorldTarget {
         PanelWorldTarget::default()

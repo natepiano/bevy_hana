@@ -298,11 +298,14 @@ impl FreeCam {
 
 /// The `FreeCam` pose restored by the home/reset action.
 ///
-/// Captured from the start pose on the first controller pass and initially provisional
-/// (see [`CameraHomePending`](crate::CameraHomePending)): a completed camera animation upgrades it
-/// to the settled landing pose, and the first genuine interaction locks it. Insert one before spawn
-/// to define a fixed custom home pose instead; an app-provided pose is authoritative and never
-/// upgraded.
+/// Captured from the start pose on the first controller pass and marked
+/// provisional with [`CameraHomePending`](crate::CameraHomePending). While that
+/// marker is present, an animation that runs to completion recaptures this pose
+/// from the settled landing pose, and a [`FreeCamInteractionStarted`] event
+/// removes the marker without recapturing, fixing the pose as it stands. Insert
+/// this component before spawn to define a fixed custom home pose; the
+/// controller then neither captures a pose nor adds the marker, so an
+/// app-provided pose is never replaced.
 #[derive(Component, Clone, Copy, Debug, PartialEq, Reflect)]
 #[reflect(Component)]
 pub struct FreeCamHomePose {

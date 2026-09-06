@@ -119,7 +119,7 @@ enum FoldStation {
     Folded,
 }
 
-/// What the fold controls last observed about one retained sequence.
+/// What the fold controls last recorded about one retained sequence.
 ///
 /// [`sync_fold_control_chips`] writes this in `PostUpdate` from
 /// [`FoldSequencePlayback`]. The input observers read it instead of playback

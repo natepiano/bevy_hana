@@ -80,8 +80,8 @@ pub(crate) const INFO_DIVIDER_PAD: f32 = 9.0;
 /// Alpha on the unselected panel's section title; `Tab` selects which panel the
 /// arrow keys move, and the selected title shows at full strength.
 pub(crate) const INFO_TITLE_DIM_ALPHA: f32 = 0.38;
-/// Highlight for the active direction glyph during an anchor transition; matches
-/// the title bar's active-control yellow for the title-bar highlight step.
+/// Highlight for the active direction glyph during an anchor transition: the same
+/// yellow the title bar uses for an active control.
 pub(crate) const INFO_LEGEND_ACTIVE: Color = Color::srgb(1.0, 0.9, 0.25);
 pub(crate) const MENU_HEADER_COLOR: Color = Color::srgba(0.72, 0.78, 0.88, 0.96);
 pub(crate) const MENU_IDLE_COLOR: Color = Color::srgba(0.78, 0.84, 0.94, 0.90);
@@ -208,8 +208,8 @@ pub(crate) const DEPTH_RATE_MM_PER_SEC: f32 = 95.0;
 /// for a coarse fast-move.
 pub(crate) const DEPTH_FAST_MULTIPLIER: f32 = 4.0;
 
-/// Fewest tiles the anchor chain may shrink to (`-`): a single anchored pair,
-/// the plain target + dependent the demo started as.
+/// Fewest tiles the anchor chain may shrink to (`-`): a single anchored pair —
+/// one target tile and one dependent.
 pub(crate) const ANCHOR_MIN_TILES: usize = 2;
 /// Most tiles the chain may grow to (`+`); shared by every mode, it bounds the
 /// cumulative depth fan, the fold link count, and the transparent draw-call count.

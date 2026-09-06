@@ -95,7 +95,7 @@ fn same_geometry(left: &ResolvedAnchorGeometry, right: &ResolvedAnchorGeometry) 
         && left.edges() == right.edges()
 }
 
-/// Builds fresh quad anchor geometry for `panel` in its local frame.
+/// Builds quad anchor geometry for `panel` in its local frame.
 pub(super) fn panel_anchor_geometry(
     panel: &DiegeticPanel,
 ) -> Result<ResolvedAnchorGeometry, GeometryError> {

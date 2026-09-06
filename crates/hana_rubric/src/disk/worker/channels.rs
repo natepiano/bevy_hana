@@ -253,7 +253,7 @@ fn discarded_diagnostics_diagnostic(discarded_diagnostics: usize) -> Diagnostic 
     )
 }
 
-/// Whether a delivered snapshot carries the bytes a test expects, where `None` expects the
+/// Whether a delivered snapshot carries `expected_contents`, where `None` stands for the
 /// confirmed absence of the user keymap file.
 #[cfg(test)]
 pub(super) fn contents_match(

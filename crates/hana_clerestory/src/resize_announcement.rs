@@ -2,7 +2,7 @@
 //!
 //! # Why this exists
 //!
-//! `bevy_render`'s `camera_system` decides *whether* a camera needs a new
+//! `bevy_render`'s `camera_system` takes *whether* a camera needs a new
 //! `physical_target_size` from the `WindowResized` / `WindowScaleFactorChanged` **message stream**,
 //! then reads the new size from the **live `Window` component**
 //! (`bevy_render/src/camera.rs`, `RenderTarget::get_render_target_info`). The two agree for an
@@ -10,13 +10,14 @@
 //!
 //! Restore writes `Window.resolution` directly
 //! (`restore/target_position/application.rs`) and winit echoes the resize back a frame later. For
-//! that one frame the component is ahead of the message stream, and `camera_system` concludes no
-//! camera on the window needs refreshing. Any camera admitted through the gate for an unrelated
-//! reason — an `is_added()` camera, a `Projection` some other system marked changed — still reads
-//! the live component and adopts the new size while its siblings keep the old one.
+//! that one frame the component is ahead of the message stream, so `camera_system` sees no resize
+//! message and refreshes no camera on the window. Any camera admitted through the gate for an
+//! unrelated reason — an `is_added()` camera, a `Projection` some other system marked changed —
+//! still reads the live component and adopts the new size while its siblings keep the old one.
 //!
-//! Two cameras on one window then disagree about `physical_target_size`. `prepare_view_targets`
-//! keys the shared main color texture on `(target, usages, format, msaa)` — not on size — so both
+//! Two cameras on one window then hold different `physical_target_size` values.
+//! `prepare_view_targets` keys the shared main color texture on
+//! `(target, usages, format, msaa)` — not on size — so both
 //! cameras receive one color texture sized for whichever was prepared first, while
 //! `prepare_core_3d_depth_textures` allocates each camera's depth texture at that camera's own
 //! size. The resulting render pass pairs mismatched attachments, wgpu rejects it, and the
@@ -29,11 +30,11 @@
 //! Both underlying defects are in `bevy_render` and are unchanged in 0.19.0, 0.19.1, and upstream
 //! `main`. This module removes the precondition they need; it does not fix them.
 //!
-//! # Why a guard rather than a funnel
+//! # Why this observes the component instead of routing every write
 //!
 //! [`announce_unpublished_resizes`] observes `Window.resolution` itself, so a resize written from a
 //! call site that does not exist yet is still announced. Routing every write through one helper
-//! would depend on each call site remembering to use it.
+//! would cover only the call sites that call it.
 
 use bevy::prelude::Commands;
 use bevy::prelude::Component;

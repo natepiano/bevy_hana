@@ -23,14 +23,14 @@ use crate::fit::geometry::FitAnchor;
 use crate::fit::geometry::FitError;
 use crate::fit::geometry::FitSolution;
 
-/// `HigherCameraRequestController` selects the camera family for facade preparation.
+/// The camera family a facade request prepares through.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum HigherCameraRequestController {
     Orbit,
     FreeFlight,
 }
 
-/// `CameraRequestPart` records whether one component needed by preparation is available.
+/// Whether one component preparation needs is present on the camera entity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CameraRequestPart {
     Available,
@@ -41,7 +41,7 @@ impl<T, E> From<Result<T, E>> for CameraRequestPart {
     fn from(result: Result<T, E>) -> Self { result.map_or(Self::Missing, |_| Self::Available) }
 }
 
-/// `HigherCameraRequestPreparation` is the authoritative result of one facade preparation.
+/// The outcome of one facade preparation.
 pub(super) enum HigherCameraRequestPreparation {
     /// Preparation produced the raw facade request consumed by retained admission.
     Prepared(PlayAnimation),

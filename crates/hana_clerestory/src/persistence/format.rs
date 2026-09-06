@@ -26,18 +26,26 @@
 //! | v3 | Monitor-relative positions plus the retired enumeration index |
 //! | v4 | Private `monitor_panel` fingerprints without reporter key strength |
 //! | v5 | Reporter-classified display keys or retained v4 evidence awaiting a live match |
+//! | v6 | v5 window state plus the complete per-role binding policy |
 
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Display;
 use std::fmt::Formatter;
+use std::time::Duration;
 
 use bevy::prelude::IVec2;
 use bevy::prelude::debug;
 use bevy::prelude::warn;
+use hana_rigging::prelude::ApplyDeadline;
+use hana_rigging::prelude::BindingPolicy;
 use hana_rigging::prelude::DeviceKey;
 use hana_rigging::prelude::DeviceKind;
+use hana_rigging::prelude::OnAbort;
+use hana_rigging::prelude::OnSessionLoss;
+use hana_rigging::prelude::RecoveryPolicy;
 use hana_rigging::prelude::RegisteredSchemes;
+use hana_rigging::prelude::RetryOn;
 use hana_rigging::prelude::RoleKey;
 use hana_rigging::prelude::RoleKeyError;
 use hana_rigging::prelude::UnregisteredSchemeError;
@@ -56,8 +64,11 @@ use super::constants::PERSISTED_STATE_VERSION_V1;
 use super::constants::PERSISTED_STATE_VERSION_V2;
 use super::constants::PERSISTED_STATE_VERSION_V3;
 use super::constants::PERSISTED_STATE_VERSION_V4;
-use super::window_state::PersistedPanelIdentityV4;
+use super::constants::PERSISTED_STATE_VERSION_V5;
+use super::window_state::LoadedBindingPolicy;
+use super::window_state::PersistedDisplayIdentityV4;
 use super::window_state::PersistedPosition;
+use super::window_state::PersistedWindowPlacement;
 use super::window_state::PersistedWindowState;
 use super::window_state::PersistedWindowTargetV5;
 use super::window_state::SavedFullscreenVideoMode;
@@ -68,8 +79,7 @@ use super::window_state::default_monitor_scale;
 use crate::constants::CURRENT_STATE_VERSION;
 use crate::constants::PRIMARY_WINDOW_KEY;
 use crate::constants::RON_HEADER;
-use crate::monitors::MonitorDeviceAssociation;
-use crate::monitors::MonitorDeviceKeyLookup;
+use crate::monitors::LiveDisplayEndpointLookup;
 
 /// Wire-only discriminator that keeps the primary window distinct from a managed window named
 /// `primary`.
@@ -122,9 +132,121 @@ impl Display for PersistedWindowRole {
 #[derive(Debug)]
 pub(crate) enum PersistedWindowStateDecodeOutcome {
     /// The envelope was structurally valid; semantically rejected entries were logged and omitted.
-    Decoded(HashMap<RoleKey, PersistedWindowState>),
+    Decoded(HashMap<RoleKey, PersistedWindowPlacement>),
     /// RON syntax or the enclosing version envelope was invalid, so the loader must preserve it.
     WholeFileRejected,
+}
+
+/// Versioned persistence form of the complete policy authored for one window role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedBindingPolicy {
+    recovery:        PersistedRecoveryPolicy,
+    retry:           PersistedRetryOn,
+    on_abort:        PersistedOnAbort,
+    on_session_loss: PersistedOnSessionLoss,
+    apply_deadline:  PersistedApplyDeadline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum PersistedRecoveryPolicy {
+    Forget,
+    ReapplyOnRequest,
+    ReapplyOnReturn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum PersistedRetryOn {
+    NewRevision,
+    Interval(Duration),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum PersistedOnAbort {
+    LeaveAsIs,
+    Revert,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum PersistedOnSessionLoss {
+    Recreate,
+    ReportOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum PersistedApplyDeadline {
+    ProcessDefault,
+    Authored(Duration),
+}
+
+impl From<BindingPolicy> for PersistedBindingPolicy {
+    fn from(binding_policy: BindingPolicy) -> Self {
+        Self {
+            recovery:        match binding_policy.recovery() {
+                RecoveryPolicy::Forget => PersistedRecoveryPolicy::Forget,
+                RecoveryPolicy::ReapplyOnRequest => PersistedRecoveryPolicy::ReapplyOnRequest,
+                RecoveryPolicy::ReapplyOnReturn => PersistedRecoveryPolicy::ReapplyOnReturn,
+            },
+            retry:           match binding_policy.retry() {
+                RetryOn::NewRevision => PersistedRetryOn::NewRevision,
+                RetryOn::Interval(interval) => PersistedRetryOn::Interval(interval),
+            },
+            on_abort:        match binding_policy.on_abort() {
+                OnAbort::LeaveAsIs => PersistedOnAbort::LeaveAsIs,
+                OnAbort::Revert => PersistedOnAbort::Revert,
+            },
+            on_session_loss: match binding_policy.on_session_loss() {
+                OnSessionLoss::Recreate => PersistedOnSessionLoss::Recreate,
+                OnSessionLoss::ReportOnly => PersistedOnSessionLoss::ReportOnly,
+            },
+            apply_deadline:  match binding_policy.apply_deadline() {
+                ApplyDeadline::ProcessDefault => PersistedApplyDeadline::ProcessDefault,
+                ApplyDeadline::Authored(apply_deadline) => {
+                    PersistedApplyDeadline::Authored(apply_deadline)
+                },
+            },
+        }
+    }
+}
+
+impl From<PersistedBindingPolicy> for BindingPolicy {
+    fn from(persisted: PersistedBindingPolicy) -> Self {
+        Self::new(
+            match persisted.recovery {
+                PersistedRecoveryPolicy::Forget => RecoveryPolicy::Forget,
+                PersistedRecoveryPolicy::ReapplyOnRequest => RecoveryPolicy::ReapplyOnRequest,
+                PersistedRecoveryPolicy::ReapplyOnReturn => RecoveryPolicy::ReapplyOnReturn,
+            },
+            match persisted.retry {
+                PersistedRetryOn::NewRevision => RetryOn::NewRevision,
+                PersistedRetryOn::Interval(interval) => RetryOn::Interval(interval),
+            },
+            match persisted.on_abort {
+                PersistedOnAbort::LeaveAsIs => OnAbort::LeaveAsIs,
+                PersistedOnAbort::Revert => OnAbort::Revert,
+            },
+            match persisted.on_session_loss {
+                PersistedOnSessionLoss::Recreate => OnSessionLoss::Recreate,
+                PersistedOnSessionLoss::ReportOnly => OnSessionLoss::ReportOnly,
+            },
+            match persisted.apply_deadline {
+                PersistedApplyDeadline::ProcessDefault => ApplyDeadline::ProcessDefault,
+                PersistedApplyDeadline::Authored(apply_deadline) => {
+                    ApplyDeadline::Authored(apply_deadline)
+                },
+            },
+        )
+    }
+}
+
+/// Current v6 entry written on every normal save.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedEntryV6 {
+    #[serde(rename = "key")]
+    persisted_role: PersistedWindowRole,
+    #[serde(rename = "state")]
+    window_state:   PersistedWindowState,
+    #[serde(rename = "policy")]
+    binding_policy: PersistedBindingPolicy,
 }
 
 /// Result of translating a v4 target into v5's reporter-key authority.
@@ -133,7 +255,7 @@ pub(crate) enum PersistedWindowIdentityMigrationOutcome {
     /// Fresh reporter evidence identified one exact kernel display key.
     Resolved(DeviceKey),
     /// No unique compatible live report exists yet, so preserve the v4 evidence for a later scan.
-    AwaitingLiveEvidence(PersistedPanelIdentityV4),
+    AwaitingLiveEvidence,
     /// Fresh evidence named an invalid persistence key and this entry cannot be retained safely.
     Rejected(PersistedWindowIdentityMigrationFailure),
 }
@@ -156,7 +278,7 @@ pub(crate) enum PersistedWindowIdentityMigrationFailure {
     },
 }
 
-/// Current v5 entry written on every normal save.
+/// Frozen v5 entry retained only to decode already-written files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedEntryV5 {
     #[serde(rename = "key")]
@@ -181,7 +303,7 @@ struct PersistedWindowStateV4 {
     logical_width:     u32,
     logical_height:    u32,
     #[serde(default, rename = "monitor_panel")]
-    monitor_panel:     PersistedPanelIdentityV4,
+    monitor_display:   PersistedDisplayIdentityV4,
     #[serde(rename = "mode")]
     saved_window_mode: SavedWindowModeV4,
     #[serde(default)]
@@ -220,7 +342,7 @@ struct PersistedWindowStateV3 {
     logical_height:    u32,
     monitor_index:     usize,
     #[serde(default, rename = "monitor_panel")]
-    monitor_panel:     PersistedPanelIdentityV4,
+    monitor_display:   PersistedDisplayIdentityV4,
     #[serde(rename = "mode")]
     saved_window_mode: SavedWindowModeV4,
     #[serde(default)]
@@ -311,14 +433,27 @@ struct VersionProbe {
     version: u8,
 }
 
+/// Reads a `PersistedWindowRole` from a rejected `RawValue` so `decode_entries` can name its
+/// window.
+#[derive(Deserialize)]
+struct RejectedEntryRoleProbe {
+    #[serde(rename = "key")]
+    persisted_role: PersistedWindowRole,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RejectedEntryRoleEvidence {
+    Known(PersistedWindowRole),
+    Unavailable,
+}
+
 /// Decode a file into live v5 state without rewriting it.
 pub(super) fn decode(
     contents: &str,
-    association: &MonitorDeviceAssociation,
     registered_schemes: &RegisteredSchemes,
 ) -> PersistedWindowStateDecodeOutcome {
     let Ok(version_probe) = from_str::<VersionProbe>(contents) else {
-        return decode_legacy_single_window(contents, association, registered_schemes);
+        return decode_legacy_single_window(contents);
     };
 
     let envelope = match version_probe.version {
@@ -341,11 +476,12 @@ pub(super) fn decode(
     }
 
     match envelope.version {
-        PERSISTED_STATE_VERSION_V1 => decode_v1(envelope.entries, association, registered_schemes),
-        PERSISTED_STATE_VERSION_V2 => decode_v2(envelope.entries, association, registered_schemes),
-        PERSISTED_STATE_VERSION_V3 => decode_v3(envelope.entries, association, registered_schemes),
-        PERSISTED_STATE_VERSION_V4 => decode_v4(envelope.entries, association, registered_schemes),
-        CURRENT_STATE_VERSION => decode_v5(envelope.entries, registered_schemes),
+        PERSISTED_STATE_VERSION_V1 => decode_v1(envelope.entries),
+        PERSISTED_STATE_VERSION_V2 => decode_v2(envelope.entries),
+        PERSISTED_STATE_VERSION_V3 => decode_v3(envelope.entries),
+        PERSISTED_STATE_VERSION_V4 => decode_v4(envelope.entries),
+        PERSISTED_STATE_VERSION_V5 => decode_v5(envelope.entries, registered_schemes),
+        CURRENT_STATE_VERSION => decode_v6(envelope.entries, registered_schemes),
         unsupported => {
             warn!(
                 "[decode] Unsupported persisted state version {unsupported} \
@@ -363,25 +499,14 @@ pub(super) fn probe_version(contents: &str) -> Option<u8> {
         .map(|probe| probe.version)
 }
 
-fn decode_legacy_single_window(
-    contents: &str,
-    association: &MonitorDeviceAssociation,
-    registered_schemes: &RegisteredSchemes,
-) -> PersistedWindowStateDecodeOutcome {
+fn decode_legacy_single_window(contents: &str) -> PersistedWindowStateDecodeOutcome {
     let Ok(window_state_v1) = from_str::<PersistedWindowStateV1>(contents) else {
         return PersistedWindowStateDecodeOutcome::WholeFileRejected;
     };
-    let window_state = match convert_v4_state_to_v5(
-        convert_v1_state_to_v4(window_state_v1, &PersistedWindowRole::Primary),
-        association,
-        registered_schemes,
-    ) {
-        PersistedWindowStateConversionOutcome::Converted(window_state) => window_state,
-        PersistedWindowStateConversionOutcome::Rejected(error) => {
-            warn!("[decode] Rejected legacy single-window state: {error}");
-            return PersistedWindowStateDecodeOutcome::Decoded(HashMap::new());
-        },
-    };
+    let window_state = convert_v4_state_to_v5(convert_v1_state_to_v4(
+        window_state_v1,
+        &PersistedWindowRole::Primary,
+    ));
     PersistedWindowStateDecodeOutcome::Decoded(HashMap::from([(
         match RoleKey::try_from(PersistedWindowRole::Primary) {
             Ok(role) => role,
@@ -390,74 +515,41 @@ fn decode_legacy_single_window(
                 return PersistedWindowStateDecodeOutcome::Decoded(HashMap::new());
             },
         },
-        window_state,
+        window_state.into(),
     )]))
 }
 
-fn decode_v1(
-    entries: Vec<Box<RawValue>>,
-    association: &MonitorDeviceAssociation,
-    registered_schemes: &RegisteredSchemes,
-) -> PersistedWindowStateDecodeOutcome {
+fn decode_v1(entries: Vec<Box<RawValue>>) -> PersistedWindowStateDecodeOutcome {
     decode_entries(entries, |entry| {
         let entry = decode_frozen_entry::<PersistedEntryV1>(entry)?;
         let state = convert_v1_state_to_v4(entry.window_state, &entry.persisted_role);
-        match convert_v4_state_to_v5(state, association, registered_schemes) {
-            PersistedWindowStateConversionOutcome::Converted(state) => {
-                Ok((entry.persisted_role, state))
-            },
-            PersistedWindowStateConversionOutcome::Rejected(error) => Err(error.to_string()),
-        }
+        Ok((entry.persisted_role, convert_v4_state_to_v5(state).into()))
     })
 }
 
-fn decode_v2(
-    entries: Vec<Box<RawValue>>,
-    association: &MonitorDeviceAssociation,
-    registered_schemes: &RegisteredSchemes,
-) -> PersistedWindowStateDecodeOutcome {
+fn decode_v2(entries: Vec<Box<RawValue>>) -> PersistedWindowStateDecodeOutcome {
     decode_entries(entries, |entry| {
         let entry = decode_frozen_entry::<PersistedEntryV2>(entry)?;
         let state = convert_v2_state_to_v4(entry.window_state, &entry.persisted_role);
-        match convert_v4_state_to_v5(state, association, registered_schemes) {
-            PersistedWindowStateConversionOutcome::Converted(state) => {
-                Ok((entry.persisted_role, state))
-            },
-            PersistedWindowStateConversionOutcome::Rejected(error) => Err(error.to_string()),
-        }
+        Ok((entry.persisted_role, convert_v4_state_to_v5(state).into()))
     })
 }
 
-fn decode_v3(
-    entries: Vec<Box<RawValue>>,
-    association: &MonitorDeviceAssociation,
-    registered_schemes: &RegisteredSchemes,
-) -> PersistedWindowStateDecodeOutcome {
+fn decode_v3(entries: Vec<Box<RawValue>>) -> PersistedWindowStateDecodeOutcome {
     decode_entries(entries, |entry| {
         let entry = decode_frozen_entry::<PersistedEntryV3>(entry)?;
         let state = convert_v3_state_to_v4(entry.window_state);
-        match convert_v4_state_to_v5(state, association, registered_schemes) {
-            PersistedWindowStateConversionOutcome::Converted(state) => {
-                Ok((entry.persisted_role, state))
-            },
-            PersistedWindowStateConversionOutcome::Rejected(error) => Err(error.to_string()),
-        }
+        Ok((entry.persisted_role, convert_v4_state_to_v5(state).into()))
     })
 }
 
-fn decode_v4(
-    entries: Vec<Box<RawValue>>,
-    association: &MonitorDeviceAssociation,
-    registered_schemes: &RegisteredSchemes,
-) -> PersistedWindowStateDecodeOutcome {
+fn decode_v4(entries: Vec<Box<RawValue>>) -> PersistedWindowStateDecodeOutcome {
     decode_entries(entries, |entry| {
         let entry = decode_frozen_entry::<PersistedEntryV4>(entry)?;
-        match convert_v4_state_to_v5(entry.window_state, association, registered_schemes) {
-            PersistedWindowStateConversionOutcome::Converted(state) => {
-                Ok((entry.persisted_role, state))
-            },
-            PersistedWindowStateConversionOutcome::Rejected(error) => Err(error.to_string()),
-        }
+        Ok((
+            entry.persisted_role,
+            convert_v4_state_to_v5(entry.window_state).into(),
+        ))
     })
 }
 
@@ -469,7 +561,25 @@ fn decode_v5(
         let entry = decode_v5_entry::<PersistedEntryV5>(entry)?;
         validate_window_target(&entry.window_state.target, registered_schemes)
             .map_err(|error| error.to_string())?;
-        Ok((entry.persisted_role, entry.window_state))
+        Ok((entry.persisted_role, entry.window_state.into()))
+    })
+}
+
+fn decode_v6(
+    entries: Vec<Box<RawValue>>,
+    registered_schemes: &RegisteredSchemes,
+) -> PersistedWindowStateDecodeOutcome {
+    decode_entries(entries, |entry| {
+        let entry = decode_v5_entry::<PersistedEntryV6>(entry)?;
+        validate_window_target(&entry.window_state.target, registered_schemes)
+            .map_err(|error| error.to_string())?;
+        Ok((
+            entry.persisted_role,
+            PersistedWindowPlacement::new(
+                entry.window_state,
+                LoadedBindingPolicy::Saved(entry.binding_policy.into()),
+            ),
+        ))
     })
 }
 
@@ -493,18 +603,36 @@ fn persistence_ron_options() -> Options {
     Options::default().with_default_extension(Extensions::UNWRAP_NEWTYPES)
 }
 
+fn recover_rejected_entry_role(entry: &RawValue) -> RejectedEntryRoleEvidence {
+    persistence_ron_options()
+        .from_str::<RejectedEntryRoleProbe>(entry.get_ron())
+        .map_or(RejectedEntryRoleEvidence::Unavailable, |entry_role| {
+            RejectedEntryRoleEvidence::Known(entry_role.persisted_role)
+        })
+}
+
 fn decode_entries(
     entries: Vec<Box<RawValue>>,
     mut decode_entry: impl FnMut(
         &RawValue,
-    ) -> Result<(PersistedWindowRole, PersistedWindowState), String>,
+    ) -> Result<(PersistedWindowRole, PersistedWindowPlacement), String>,
 ) -> PersistedWindowStateDecodeOutcome {
     let mut states = HashMap::with_capacity(entries.len());
     for entry in entries {
         let (persisted_role, state) = match decode_entry(&entry) {
             Ok(decoded) => decoded,
             Err(error) => {
-                warn!("[decode] Rejected one persisted window entry: {error}");
+                match recover_rejected_entry_role(&entry) {
+                    RejectedEntryRoleEvidence::Known(persisted_role) => {
+                        warn!(
+                            "[decode] Rejected persisted window entry for {persisted_role}; that \
+                             window will open at its default position: {error}"
+                        );
+                    },
+                    RejectedEntryRoleEvidence::Unavailable => {
+                        warn!("[decode] Rejected one persisted window entry: {error}");
+                    },
+                }
                 continue;
             },
         };
@@ -539,7 +667,7 @@ fn convert_v1_state_to_v4(
         ),
         logical_width:     state.logical_width,
         logical_height:    state.logical_height,
-        monitor_panel:     PersistedPanelIdentityV4::Anonymous,
+        monitor_display:   PersistedDisplayIdentityV4::Anonymous,
         saved_window_mode: state.saved_window_mode,
         app_name:          state.app_name,
     }
@@ -557,7 +685,7 @@ fn convert_v2_state_to_v4(
         position:          legacy_position(state.logical_position, state.scale, persisted_role),
         logical_width:     state.logical_width,
         logical_height:    state.logical_height,
-        monitor_panel:     PersistedPanelIdentityV4::Anonymous,
+        monitor_display:   PersistedDisplayIdentityV4::Anonymous,
         saved_window_mode: state.saved_window_mode,
         app_name:          state.app_name,
     }
@@ -572,56 +700,30 @@ fn convert_v3_state_to_v4(state: PersistedWindowStateV3) -> PersistedWindowState
         position:          state.position,
         logical_width:     state.logical_width,
         logical_height:    state.logical_height,
-        monitor_panel:     state.monitor_panel,
+        monitor_display:   state.monitor_display,
         saved_window_mode: state.saved_window_mode,
         app_name:          state.app_name,
     }
 }
 
-/// Result of turning a structurally valid legacy entry into live v5 state.
-enum PersistedWindowStateConversionOutcome {
-    /// The entry now has one v5 target and can remain in the state file.
-    Converted(PersistedWindowState),
-    /// The entry's fresh classified evidence contradicted persistence rules.
-    Rejected(PersistedWindowIdentityMigrationFailure),
-}
-
-fn convert_v4_state_to_v5(
-    state: PersistedWindowStateV4,
-    association: &MonitorDeviceAssociation,
-    registered_schemes: &RegisteredSchemes,
-) -> PersistedWindowStateConversionOutcome {
-    let target = match resolve_legacy_target(state.monitor_panel, association, registered_schemes) {
-        PersistedWindowIdentityMigrationOutcome::Resolved(device_key) => {
-            PersistedWindowTargetV5::Classified(device_key)
-        },
-        PersistedWindowIdentityMigrationOutcome::AwaitingLiveEvidence(panel_identity) => {
-            PersistedWindowTargetV5::AwaitingLegacyEvidence(panel_identity)
-        },
-        PersistedWindowIdentityMigrationOutcome::Rejected(error) => {
-            warn!("[convert_v4_state_to_v5] Rejected legacy window target: {error}");
-            return PersistedWindowStateConversionOutcome::Rejected(error);
-        },
-    };
-    PersistedWindowStateConversionOutcome::Converted(PersistedWindowState {
-        target,
-        position: state.position,
-        logical_width: state.logical_width,
-        logical_height: state.logical_height,
+fn convert_v4_state_to_v5(state: PersistedWindowStateV4) -> PersistedWindowState {
+    PersistedWindowState {
+        target:            PersistedWindowTargetV5::AwaitingLegacyEvidence(state.monitor_display),
+        position:          state.position,
+        logical_width:     state.logical_width,
+        logical_height:    state.logical_height,
         saved_window_mode: state.saved_window_mode.into(),
-        app_name: state.app_name,
-    })
+        app_name:          state.app_name,
+    }
 }
 
 pub(super) fn resolve_legacy_target(
-    panel_identity: PersistedPanelIdentityV4,
-    association: &MonitorDeviceAssociation,
+    legacy_identity: PersistedDisplayIdentityV4,
+    live_displays: &LiveDisplayEndpointLookup,
     registered_schemes: &RegisteredSchemes,
 ) -> PersistedWindowIdentityMigrationOutcome {
-    let MonitorDeviceKeyLookup::Exact(device_key) =
-        association.device_for_legacy_panel(panel_identity)
-    else {
-        return PersistedWindowIdentityMigrationOutcome::AwaitingLiveEvidence(panel_identity);
+    let Ok(device_key) = live_displays.key_for_legacy_identity(legacy_identity.into()) else {
+        return PersistedWindowIdentityMigrationOutcome::AwaitingLiveEvidence;
     };
     match validate_classified_key(&device_key, registered_schemes) {
         Ok(()) => PersistedWindowIdentityMigrationOutcome::Resolved(device_key),
@@ -675,19 +777,27 @@ fn legacy_position(
     )
 }
 
-/// Encode live v5 state for a normal save.
+/// Encode live v6 state for a normal save.
 pub(super) fn encode(
-    states: &HashMap<PersistedWindowRole, PersistedWindowState>,
+    states: &HashMap<PersistedWindowRole, PersistedWindowPlacement>,
 ) -> Result<String, Error> {
-    let mut entries: Vec<PersistedEntryV5> = states
+    let mut entries: Vec<PersistedEntryV6> = states
         .iter()
-        .map(|(persisted_role, window_state)| PersistedEntryV5 {
-            persisted_role: persisted_role.clone(),
-            window_state:   window_state.clone(),
+        .map(|(persisted_role, placement)| {
+            let LoadedBindingPolicy::Saved(binding_policy) = placement.loaded_binding_policy else {
+                return Err(Error::Message(format!(
+                    "role {persisted_role} has not resolved its legacy binding policy"
+                )));
+            };
+            Ok(PersistedEntryV6 {
+                persisted_role: persisted_role.clone(),
+                window_state:   placement.window_state.clone(),
+                binding_policy: binding_policy.into(),
+            })
         })
-        .collect();
+        .collect::<Result<_, Error>>()?;
     entries.sort_by(|left, right| left.persisted_role.cmp(&right.persisted_role));
-    let envelope = PersistedStateV5 {
+    let envelope = PersistedStateV6 {
         version: CURRENT_STATE_VERSION,
         entries,
     };
@@ -696,7 +806,14 @@ pub(super) fn encode(
     Ok(format!("{RON_HEADER}{ron_body}"))
 }
 
-/// v5 envelope written by [`encode`].
+/// v6 envelope written by [`encode`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedStateV6 {
+    version: u8,
+    entries: Vec<PersistedEntryV6>,
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedStateV5 {
     version: u8,
@@ -706,8 +823,37 @@ struct PersistedStateV5 {
 #[cfg(test)]
 #[allow(clippy::panic, reason = "tests should panic on unexpected values")]
 mod tests {
+
+    #[test]
+    fn window_role_keys_round_trip_through_the_persisted_discriminator() -> Result<(), String> {
+        let primary = super::super::primary_window_role()
+            .map_err(|error| format!("failed to create the primary role: {error}"))?;
+        let managed = super::super::managed_window_role("inspector")
+            .map_err(|error| format!("failed to create a managed role: {error}"))?;
+
+        assert_eq!(primary.as_str(), "window:primary");
+        assert_eq!(managed.as_str(), "window:managed:inspector");
+        assert_eq!(
+            PersistedWindowRole::try_from(&primary).ok(),
+            Some(PersistedWindowRole::Primary)
+        );
+        assert_eq!(
+            PersistedWindowRole::try_from(&managed).ok(),
+            Some(PersistedWindowRole::Managed(String::from("inspector")))
+        );
+        assert_eq!(
+            RoleKey::try_from(PersistedWindowRole::Primary).ok(),
+            Some(primary)
+        );
+        assert_eq!(
+            RoleKey::try_from(PersistedWindowRole::Managed(String::from("inspector"))).ok(),
+            Some(managed)
+        );
+        Ok(())
+    }
     use std::collections::HashMap;
 
+    use bevy::prelude::UVec2;
     use hana_rigging::prelude::DeviceIdSource;
     use hana_rigging::prelude::Digest;
     use hana_rigging::prelude::ReportedId;
@@ -726,12 +872,15 @@ mod tests {
     }
 
     fn decode(contents: &str) -> PersistedWindowStateDecodeOutcome {
-        super::decode(contents, &MonitorDeviceAssociation::default(), &schemes())
+        super::decode(contents, &schemes())
     }
 
     fn decoded_states(contents: &str) -> HashMap<RoleKey, PersistedWindowState> {
         match decode(contents) {
-            PersistedWindowStateDecodeOutcome::Decoded(states) => states,
+            PersistedWindowStateDecodeOutcome::Decoded(states) => states
+                .into_iter()
+                .map(|(role, placement)| (role, placement.window_state))
+                .collect(),
             PersistedWindowStateDecodeOutcome::WholeFileRejected => {
                 panic!("expected a structurally valid persisted state")
             },
@@ -741,7 +890,7 @@ mod tests {
     fn awaiting_state() -> PersistedWindowState {
         PersistedWindowState {
             target:            PersistedWindowTargetV5::AwaitingLegacyEvidence(
-                PersistedPanelIdentityV4::Anonymous,
+                PersistedDisplayIdentityV4::Anonymous,
             ),
             position:          PersistedPosition::MonitorOffset(IVec2::new(10, 20)),
             logical_width:     800,
@@ -751,9 +900,44 @@ mod tests {
         }
     }
 
+    fn test_binding_policy() -> BindingPolicy {
+        BindingPolicy::new(
+            RecoveryPolicy::ReapplyOnReturn,
+            RetryOn::Interval(Duration::from_secs(2)),
+            OnAbort::Revert,
+            OnSessionLoss::ReportOnly,
+            ApplyDeadline::Authored(Duration::from_secs(7)),
+        )
+    }
+
+    fn saved_placement(window_state: PersistedWindowState) -> PersistedWindowPlacement {
+        PersistedWindowPlacement::new(
+            window_state,
+            LoadedBindingPolicy::Saved(test_binding_policy()),
+        )
+    }
+
     fn primary_role() -> RoleKey {
         super::super::primary_window_role()
             .unwrap_or_else(|error| panic!("test primary role rejected: {error}"))
+    }
+
+    #[test]
+    fn a_rejected_entry_with_an_intact_key_reports_its_role() {
+        let entry = from_str::<Box<RawValue>>(
+            r#"(
+                key: Managed("inspector"),
+                state: "malformed",
+            )"#,
+        )
+        .unwrap_or_else(|error| panic!("test entry did not parse as raw RON: {error}"));
+
+        assert_eq!(
+            recover_rejected_entry_role(&entry),
+            RejectedEntryRoleEvidence::Known(PersistedWindowRole::Managed(String::from(
+                "inspector"
+            )))
+        );
     }
 
     #[test]
@@ -765,7 +949,7 @@ mod tests {
             .unwrap_or_else(|| panic!("v3 fixture did not retain primary state"));
         assert_eq!(
             state.target,
-            PersistedWindowTargetV5::AwaitingLegacyEvidence(PersistedPanelIdentityV4::Anonymous)
+            PersistedWindowTargetV5::AwaitingLegacyEvidence(PersistedDisplayIdentityV4::Anonymous)
         );
     }
 
@@ -905,8 +1089,8 @@ mod tests {
         assert_eq!(
             states[&primary_role()].target,
             PersistedWindowTargetV5::AwaitingLegacyEvidence(
-                PersistedPanelIdentityV4::Fingerprinted(
-                    super::super::window_state::PersistedPanelFingerprintV4(9),
+                PersistedDisplayIdentityV4::Fingerprinted(
+                    super::super::window_state::PersistedDisplayFingerprintV4(9),
                 ),
             )
         );
@@ -938,9 +1122,12 @@ mod tests {
             .cloned()
             .unwrap_or_else(|| panic!("valid v4 sibling did not survive entry rejection"));
         assert_eq!(recovered.len(), 1);
-        let self_healed = encode(&HashMap::from([(PersistedWindowRole::Primary, primary)]))
-            .unwrap_or_else(|error| panic!("recovered v4 entry did not serialize: {error}"));
-        assert!(self_healed.contains("version: 5"));
+        let self_healed = encode(&HashMap::from([(
+            PersistedWindowRole::Primary,
+            saved_placement(primary),
+        )]))
+        .unwrap_or_else(|error| panic!("recovered v4 entry did not serialize: {error}"));
+        assert!(self_healed.contains("version: 6"));
         assert_eq!(decoded_states(&self_healed).len(), 1);
     }
 
@@ -964,14 +1151,14 @@ mod tests {
             assert_eq!(
                 decoded_states(contents)[&primary_role()].target,
                 PersistedWindowTargetV5::AwaitingLegacyEvidence(
-                    PersistedPanelIdentityV4::Anonymous,
+                    PersistedDisplayIdentityV4::Anonymous,
                 )
             );
         }
     }
 
     #[test]
-    fn v5_roundtrip_keeps_a_classified_and_an_awaiting_target() {
+    fn v6_roundtrip_keeps_targets_and_the_complete_binding_policy() {
         let classified = PersistedWindowState {
             target: PersistedWindowTargetV5::Classified(DeviceKey {
                 kind: DeviceKind::Display,
@@ -982,17 +1169,27 @@ mod tests {
             ..awaiting_state()
         };
         let states = HashMap::from([
-            (PersistedWindowRole::Primary, classified.clone()),
+            (
+                PersistedWindowRole::Primary,
+                saved_placement(classified.clone()),
+            ),
             (
                 PersistedWindowRole::Managed(String::from("offline")),
-                awaiting_state(),
+                saved_placement(awaiting_state()),
             ),
         ]);
         let encoded =
-            encode(&states).unwrap_or_else(|error| panic!("v5 state did not serialize: {error}"));
-        assert!(encoded.contains("version: 5"));
-        let decoded = decoded_states(&encoded);
-        assert_eq!(decoded[&primary_role()], classified);
+            encode(&states).unwrap_or_else(|error| panic!("v6 state did not serialize: {error}"));
+        assert!(encoded.contains("version: 6"));
+        let PersistedWindowStateDecodeOutcome::Decoded(decoded) = decode(&encoded) else {
+            panic!("encoded v6 state did not decode");
+        };
+        let primary = &decoded[&primary_role()];
+        assert_eq!(primary.window_state, classified);
+        assert_eq!(
+            primary.loaded_binding_policy,
+            LoadedBindingPolicy::Saved(test_binding_policy())
+        );
         assert_eq!(decoded.len(), 2);
     }
 
@@ -1000,7 +1197,7 @@ mod tests {
     fn v5_roundtrip_accepts_a_registered_reported_display_key() {
         let scheme = SchemeName::new("edid-serial")
             .unwrap_or_else(|error| panic!("test scheme rejected: {error}"));
-        let value = ReportedId::new("reported-panel")
+        let value = ReportedId::new("reported-display")
             .unwrap_or_else(|error| panic!("test reported ID rejected: {error}"));
         let state = PersistedWindowState {
             target: PersistedWindowTargetV5::Classified(DeviceKey {
@@ -1011,9 +1208,9 @@ mod tests {
         };
         let encoded = encode(&HashMap::from([(
             PersistedWindowRole::Primary,
-            state.clone(),
+            saved_placement(state.clone()),
         )]))
-        .unwrap_or_else(|error| panic!("reported v5 state did not serialize: {error}"));
+        .unwrap_or_else(|error| panic!("reported v6 state did not serialize: {error}"));
         let decoded = decoded_states(&encoded);
         assert_eq!(
             decoded.get(&primary_role()),
@@ -1048,7 +1245,7 @@ mod tests {
                     id:   DeviceIdSource::Reported {
                         scheme: SchemeName::new("unregistered")
                             .unwrap_or_else(|error| panic!("test scheme rejected: {error}")),
-                        value:  ReportedId::new("panel")
+                        value:  ReportedId::new("display")
                             .unwrap_or_else(|error| panic!("test id rejected: {error}")),
                     },
                 }),
@@ -1057,7 +1254,7 @@ mod tests {
         };
         let contents = to_string_pretty(
             &PersistedStateV5 {
-                version: CURRENT_STATE_VERSION,
+                version: PERSISTED_STATE_VERSION_V5,
                 entries: vec![valid, non_display, unregistered],
             },
             PrettyConfig::default(),
@@ -1088,5 +1285,210 @@ mod tests {
             decode("(version: 5, entries: ["),
             PersistedWindowStateDecodeOutcome::WholeFileRejected
         ));
+    }
+
+    #[test]
+    fn v1_renamed_fields_and_absent_scale_reach_live_state_intact() {
+        let contents = "(
+            version: 1,
+            entries: [(
+                key: Primary,
+                state: (
+                    position: Some((10, 20)),
+                    width: 800,
+                    height: 600,
+                    monitor_index: 7,
+                    mode: Windowed,
+                    app_name: \"v1-app\",
+                ),
+            )],
+        )";
+        let expected_position =
+            UnrebasedDesktopPosition::from_legacy(IVec2::new(10, 20), default_monitor_scale())
+                .unwrap_or_else(|| panic!("test coordinate rejected by the legacy constructor"));
+
+        let state = decoded_states(contents)[&primary_role()].clone();
+
+        assert_eq!(
+            state.position,
+            PersistedPosition::Unrebased(expected_position)
+        );
+        assert_eq!(state.logical_width, 800);
+        assert_eq!(state.logical_height, 600);
+        assert_eq!(state.saved_window_mode, SavedWindowMode::Windowed);
+        assert_eq!(state.app_name, "v1-app");
+    }
+
+    #[test]
+    fn v2_carries_the_scale_that_wrote_its_coordinate() {
+        let with_scale = "(
+            version: 2,
+            entries: [(
+                key: Primary,
+                state: (
+                    logical_position: Some((640, 480)),
+                    logical_width: 1280,
+                    logical_height: 720,
+                    monitor_scale: 2.0,
+                    monitor_index: 1,
+                    mode: Windowed,
+                    app_name: \"v2-app\",
+                ),
+            )],
+        )";
+        let without_scale = "(
+            version: 2,
+            entries: [(
+                key: Primary,
+                state: (
+                    logical_position: Some((640, 480)),
+                    logical_width: 1280,
+                    logical_height: 720,
+                    monitor_index: 1,
+                    mode: Windowed,
+                ),
+            )],
+        )";
+
+        for (contents, scale, app_name) in [
+            (with_scale, 2.0_f64, "v2-app"),
+            (without_scale, default_monitor_scale(), ""),
+        ] {
+            let expected_position =
+                UnrebasedDesktopPosition::from_legacy(IVec2::new(640, 480), scale).unwrap_or_else(
+                    || panic!("test coordinate rejected by the legacy constructor"),
+                );
+
+            let state = decoded_states(contents)[&primary_role()].clone();
+
+            assert_eq!(
+                state.position,
+                PersistedPosition::Unrebased(expected_position)
+            );
+            assert_eq!(state.logical_width, 1280);
+            assert_eq!(state.logical_height, 720);
+            assert_eq!(state.app_name, app_name);
+        }
+    }
+
+    #[test]
+    fn v2_discards_a_coordinate_whose_saved_scale_cannot_be_used() {
+        let contents = "(
+            version: 2,
+            entries: [(
+                key: Primary,
+                state: (
+                    logical_position: Some((640, 480)),
+                    logical_width: 1280,
+                    logical_height: 720,
+                    monitor_scale: 0.0,
+                    monitor_index: 1,
+                    mode: Windowed,
+                ),
+            )],
+        )";
+
+        let state = decoded_states(contents)[&primary_role()].clone();
+
+        assert_eq!(state.position, PersistedPosition::Unpositioned);
+        assert_eq!(state.logical_width, 1280);
+        assert_eq!(state.logical_height, 720);
+    }
+
+    #[test]
+    fn a_v1_or_v2_record_without_a_saved_coordinate_restores_unpositioned() {
+        let v1 = "(
+            version: 1,
+            entries: [(
+                key: Primary,
+                state: (position: None, width: 800, height: 600, monitor_index: 0, mode: Windowed),
+            )],
+        )";
+        let v2 = "(
+            version: 2,
+            entries: [(
+                key: Primary,
+                state: (
+                    logical_position: None,
+                    logical_width: 800,
+                    logical_height: 600,
+                    monitor_index: 0,
+                    mode: Windowed,
+                ),
+            )],
+        )";
+
+        for contents in [v1, v2] {
+            assert_eq!(
+                decoded_states(contents)[&primary_role()].position,
+                PersistedPosition::Unpositioned
+            );
+        }
+    }
+
+    #[test]
+    fn the_checked_in_v3_fixture_keeps_its_placement_size_and_app_name() {
+        let contents = include_str!("../../tests/config/ron/windows/v3_anonymous_awaiting.ron");
+
+        let state = decoded_states(contents)[&primary_role()].clone();
+
+        assert_eq!(
+            state.position,
+            PersistedPosition::MonitorOffset(IVec2::new(24, 16))
+        );
+        assert_eq!(state.logical_width, 800);
+        assert_eq!(state.logical_height, 600);
+        assert_eq!(state.saved_window_mode, SavedWindowMode::Windowed);
+        assert_eq!(state.app_name, "v3-anonymous");
+    }
+
+    #[test]
+    fn a_v4_fullscreen_record_without_a_video_mode_restores_the_displays_current_mode() {
+        let contents = include_str!("../../tests/config/ron/linux/v4_anonymous_awaiting.ron");
+
+        let state = decoded_states(contents)[&primary_role()].clone();
+
+        assert_eq!(
+            state.saved_window_mode,
+            SavedWindowMode::Fullscreen {
+                video_mode: SavedFullscreenVideoMode::Current,
+            }
+        );
+        assert_eq!(state.position, PersistedPosition::Unpositioned);
+        assert_eq!(state.logical_width, 1024);
+        assert_eq!(state.logical_height, 640);
+        assert_eq!(state.app_name, "v4-anonymous");
+    }
+
+    #[test]
+    fn a_v4_fullscreen_record_naming_a_video_mode_restores_that_exact_mode() {
+        let contents = "(
+            version: 4,
+            entries: [(
+                key: Primary,
+                state: (
+                    position: Unpositioned,
+                    logical_width: 1920,
+                    logical_height: 1080,
+                    monitor_panel: Anonymous,
+                    mode: Fullscreen(video_mode: Some((
+                        physical_size: (3840, 2160),
+                        bit_depth: 24,
+                        refresh_rate_millihertz: 59997,
+                    ))),
+                ),
+            )],
+        )";
+
+        assert_eq!(
+            decoded_states(contents)[&primary_role()].saved_window_mode,
+            SavedWindowMode::Fullscreen {
+                video_mode: SavedFullscreenVideoMode::Specific(SavedVideoMode {
+                    physical_size:           UVec2::new(3840, 2160),
+                    bit_depth:               24,
+                    refresh_rate_millihertz: 59_997,
+                }),
+            }
+        );
     }
 }

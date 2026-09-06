@@ -11,6 +11,9 @@ use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
 use serde::de::Error as DeserializeError;
+use serde::de::IgnoredAny;
+use serde::de::SeqAccess;
+use serde::de::Visitor;
 use thiserror::Error;
 
 use super::identity::DeviceIdSource;
@@ -18,9 +21,9 @@ use super::identity::DeviceKey;
 
 /// Name of a provider-defined identity space that is registered during app construction.
 ///
-/// `SchemeName` rejects malformed syntax while deserializing so invalid persisted configuration
-/// never reaches startup validation. Registration is separate because deserialization cannot see
-/// the app's `RegisteredSchemes` resource.
+/// [`SchemeName`] rejects malformed syntax while deserializing so invalid persisted configuration
+/// never reaches startup validation. Registration is separate because deserialization cannot reach
+/// the app's [`RegisteredSchemes`] resource.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Reflect)]
 #[reflect(opaque)]
 #[reflect(Serialize, Deserialize)]
@@ -34,7 +37,7 @@ impl SchemeName {
     ///
     /// # Errors
     ///
-    /// Returns `SchemeNameError` when `value` is empty or fails the lowercase ASCII and hyphen
+    /// Returns [`SchemeNameError`] when `value` is empty or fails the lowercase ASCII and hyphen
     /// syntax shared by registered provider names.
     pub fn new(value: impl Into<String>) -> Result<Self, SchemeNameError> {
         let value = value.into();
@@ -67,7 +70,7 @@ impl<'de> Deserialize<'de> for SchemeName {
     }
 }
 
-/// Reason a `SchemeName::new` call rejected text before it could name a device identity space.
+/// Reason a [`SchemeName::new`] call rejected text before it could name a device identity space.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum SchemeNameError {
     /// No provider can use an empty name to state which identity space produced a value.
@@ -79,7 +82,7 @@ pub enum SchemeNameError {
     InvalidSyntax,
 }
 
-/// Value reported by a unit within a `SchemeName` identity space.
+/// Value reported by a unit within a [`SchemeName`] identity space.
 ///
 /// The kernel preserves this text without interpreting it: an EDID serial, a `CoreAudio` UID, and
 /// a network dock child address can all be valid values for their respective schemes.
@@ -94,8 +97,8 @@ impl ReportedId {
     ///
     /// # Errors
     ///
-    /// Returns `ReportedIdError` when `value` is empty or has a control character that would make
-    /// persisted configuration and diagnostics ambiguous.
+    /// Returns [`ReportedIdError`] when `value` is empty or has a control character that would
+    /// make persisted configuration and diagnostics ambiguous.
     pub fn new(value: impl Into<String>) -> Result<Self, ReportedIdError> {
         let value = value.into();
         if value.is_empty() {
@@ -124,7 +127,7 @@ impl<'de> Deserialize<'de> for ReportedId {
     }
 }
 
-/// Reason a `ReportedId::new` call rejected text that cannot safely represent a unit's report.
+/// Reason a [`ReportedId::new`] call rejected text that cannot safely represent a unit's report.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ReportedIdError {
     /// A blank value cannot distinguish any physical unit within the selected scheme.
@@ -135,10 +138,238 @@ pub enum ReportedIdError {
     ContainsControlCharacter,
 }
 
+/// The name a unit reported for itself, such as an operating-system product name.
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Reflect)]
+#[reflect(opaque)]
+#[reflect(Serialize, Deserialize)]
+pub struct ReportedDeviceName(String);
+
+impl ReportedDeviceName {
+    /// Create a unit-reported name without blank or control-character text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReportedDeviceNameError`] when `value` cannot safely identify the unit in
+    /// persisted configuration or operator diagnostics.
+    pub fn new(value: impl Into<String>) -> Result<Self, ReportedDeviceNameError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(ReportedDeviceNameError::Empty);
+        }
+        if value.chars().any(char::is_control) {
+            return Err(ReportedDeviceNameError::ContainsControlCharacter);
+        }
+
+        Ok(Self(value))
+    }
+
+    /// Borrow the name exactly as the unit reported it.
+    #[must_use]
+    pub fn as_str(&self) -> &str { &self.0 }
+}
+
+impl<'de> Deserialize<'de> for ReportedDeviceName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = deserialize_device_name_text(deserializer)?;
+        Self::new(value).map_err(<D::Error as DeserializeError>::custom)
+    }
+}
+
+/// Reason [`ReportedDeviceName::new`] rejected text that a unit supplied as its name.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum ReportedDeviceNameError {
+    /// An empty report gives an operator no name by which to recognize the unit.
+    #[error("reported device names must not be empty")]
+    Empty,
+    /// Control characters make a reported name unsafe to show in configuration or diagnostics.
+    #[error("reported device names must not contain control characters")]
+    ContainsControlCharacter,
+}
+
+/// Domain-formatted text that separates two units of one class reporting the same name.
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Reflect)]
+#[reflect(opaque)]
+#[reflect(Serialize, Deserialize)]
+pub struct DeviceNameDisambiguationText(String);
+
+impl DeviceNameDisambiguationText {
+    /// Create distinguishing text without blank or control-character content.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeviceNameDisambiguationTextError`] when `value` cannot safely distinguish
+    /// otherwise identical units in persisted configuration or operator diagnostics.
+    pub fn new(value: impl Into<String>) -> Result<Self, DeviceNameDisambiguationTextError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(DeviceNameDisambiguationTextError::Empty);
+        }
+        if value.chars().any(char::is_control) {
+            return Err(DeviceNameDisambiguationTextError::ContainsControlCharacter);
+        }
+
+        Ok(Self(value))
+    }
+
+    /// Borrow the domain-formatted distinction text.
+    #[must_use]
+    pub fn as_str(&self) -> &str { &self.0 }
+}
+
+impl<'de> Deserialize<'de> for DeviceNameDisambiguationText {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = deserialize_device_name_text(deserializer)?;
+        Self::new(value).map_err(<D::Error as DeserializeError>::custom)
+    }
+}
+
+/// Reason [`DeviceNameDisambiguationText::new`] rejected text intended to distinguish similar
+/// units.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum DeviceNameDisambiguationTextError {
+    /// Empty text cannot distinguish one otherwise identical unit from another.
+    #[error("device-name disambiguation text must not be empty")]
+    Empty,
+    /// Control characters make distinguishing text unsafe to show or persist.
+    #[error("device-name disambiguation text must not contain control characters")]
+    ContainsControlCharacter,
+}
+
+/// The name a person assigned to a unit that cannot name itself.
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Reflect)]
+#[reflect(opaque)]
+#[reflect(Serialize, Deserialize)]
+pub struct OperatorAssignedDeviceName(String);
+
+impl OperatorAssignedDeviceName {
+    /// Create a person-assigned device name without blank or control-character text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OperatorAssignedDeviceNameError`] when `value` cannot safely name the unit in
+    /// persisted configuration or operator diagnostics.
+    #[cfg(feature = "test-support")]
+    pub fn new(value: impl Into<String>) -> Result<Self, OperatorAssignedDeviceNameError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(OperatorAssignedDeviceNameError::Empty);
+        }
+        if value.chars().any(char::is_control) {
+            return Err(OperatorAssignedDeviceNameError::ContainsControlCharacter);
+        }
+
+        Ok(Self(value))
+    }
+
+    #[cfg(not(feature = "test-support"))]
+    pub(crate) fn new(value: impl Into<String>) -> Result<Self, OperatorAssignedDeviceNameError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(OperatorAssignedDeviceNameError::Empty);
+        }
+        if value.chars().any(char::is_control) {
+            return Err(OperatorAssignedDeviceNameError::ContainsControlCharacter);
+        }
+
+        Ok(Self(value))
+    }
+
+    /// Borrow the name exactly as a person assigned it.
+    #[must_use]
+    pub fn as_str(&self) -> &str { &self.0 }
+}
+
+impl<'de> Deserialize<'de> for OperatorAssignedDeviceName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = deserialize_device_name_text(deserializer)?;
+        Self::new(value).map_err(<D::Error as DeserializeError>::custom)
+    }
+}
+
+/// Accepts both ordinary string input and the one-field tuple representation emitted when a
+/// reflected component contains one of the opaque validated text types.
+fn deserialize_device_name_text<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct DeviceNameTextVisitor;
+
+    impl<'de> Visitor<'de> for DeviceNameTextVisitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut Formatter<'_>) -> FormatResult {
+            formatter.write_str("a string or a one-field device-name text tuple")
+        }
+
+        fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+        where
+            E: DeserializeError,
+        {
+            Ok(value.to_owned())
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: DeserializeError,
+        {
+            Ok(value.to_owned())
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: DeserializeError,
+        {
+            Ok(value)
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let Some(value) = sequence.next_element::<String>()? else {
+                return Err(<A::Error as DeserializeError>::invalid_length(0, &self));
+            };
+            if sequence.next_element::<IgnoredAny>()?.is_some() {
+                return Err(<A::Error as DeserializeError>::invalid_length(2, &self));
+            }
+            Ok(value)
+        }
+
+        fn visit_newtype_struct<N>(self, deserializer: N) -> Result<Self::Value, N::Error>
+        where
+            N: Deserializer<'de>,
+        {
+            deserializer.deserialize_string(self)
+        }
+    }
+
+    deserializer.deserialize_any(DeviceNameTextVisitor)
+}
+
+/// Reason [`OperatorAssignedDeviceName::new`] rejected text assigned by a person.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum OperatorAssignedDeviceNameError {
+    /// An empty assignment gives an operator no name by which to recognize the unit.
+    #[error("operator-assigned device names must not be empty")]
+    Empty,
+    /// Control characters make a person-assigned name unsafe to show or persist.
+    #[error("operator-assigned device names must not contain control characters")]
+    ContainsControlCharacter,
+}
+
 /// Persisted identity value that application configuration assigns to one authored device.
 ///
-/// `AuthoredId` is separate from `ReportedId` because an operator label is authorization intent,
-/// not a value supplied by the physical unit or one of its identity schemes.
+/// [`AuthoredId`] is separate from [`ReportedId`] because an operator label is authorization
+/// intent, not a value supplied by the physical unit or one of its identity schemes.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Reflect)]
 #[reflect(opaque)]
 #[reflect(Serialize, Deserialize)]
@@ -149,7 +380,7 @@ impl AuthoredId {
     ///
     /// # Errors
     ///
-    /// Returns `AuthoredIdError` when `value` cannot distinguish an authored inventory entry in
+    /// Returns [`AuthoredIdError`] when `value` cannot distinguish an authored inventory entry in
     /// configuration or diagnostics.
     pub fn new(value: impl Into<String>) -> Result<Self, AuthoredIdError> {
         let value = value.into();
@@ -178,7 +409,7 @@ impl<'de> Deserialize<'de> for AuthoredId {
     }
 }
 
-/// Reason `AuthoredId::new` rejected text before it could name a persisted inventory entry.
+/// Reason [`AuthoredId::new`] rejected text before it could name a persisted inventory entry.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum AuthoredIdError {
     /// A blank value cannot identify a distinct device in authored application inventory.
@@ -191,7 +422,7 @@ pub enum AuthoredIdError {
 
 /// Fixed-width FNV-1a result synthesized from descriptors when a unit reports no unique identity.
 ///
-/// `Digest` uses `u64` instead of text because every `u64` is representable as an FNV-1a result;
+/// [`Digest`] uses `u64` instead of text because every `u64` is representable as an FNV-1a result;
 /// parsing cannot create a malformed digest or allocate a string for it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, Reflect)]
 #[reflect(opaque)]
@@ -207,7 +438,7 @@ impl Digest {
 
 /// App-build registry of identity spaces providers are allowed to report.
 ///
-/// `RegisteredSchemes` keeps syntax and startup registration separate: `SchemeName` can reject
+/// [`RegisteredSchemes`] keeps syntax and startup registration separate: [`SchemeName`] can reject
 /// malformed persisted text during deserialization, while this resource rejects well-formed names
 /// that no provider registered before that state becomes visible.
 #[derive(Debug, Default, Resource, Reflect)]
@@ -219,8 +450,8 @@ pub struct RegisteredSchemes {
 impl RegisteredSchemes {
     /// Register a provider's identity space during app construction.
     ///
-    /// Repeating an existing name succeeds because two providers using the same `SchemeName` assert
-    /// that their reported values are comparable in one identity space.
+    /// Repeating an existing name succeeds because two providers using the same [`SchemeName`]
+    /// assert that their reported values are comparable in one identity space.
     pub fn register(&mut self, name: SchemeName) {
         if !self.names.contains(&name) {
             self.names.push(name);
@@ -235,14 +466,14 @@ impl RegisteredSchemes {
     #[cfg(test)]
     pub(crate) const fn count(&self) -> usize { self.names.len() }
 
-    /// Reject a reported `DeviceKey` whose scheme was absent from app-build registration.
+    /// Reject a reported [`DeviceKey`] whose scheme was absent from app-build registration.
     ///
     /// Synthesized keys need no registration because their digest has no provider-defined identity
     /// space. Call this before publishing deserialized keys so a typo fails during startup.
     ///
     /// # Errors
     ///
-    /// Returns `UnregisteredSchemeError` when a reported key names a scheme that no provider
+    /// Returns [`UnregisteredSchemeError`] when a reported key names a scheme that no provider
     /// registered during app construction.
     pub fn validate(&self, key: &DeviceKey) -> Result<(), UnregisteredSchemeError> {
         let DeviceIdSource::Reported { scheme, .. } = &key.id else {
@@ -288,7 +519,13 @@ mod tests {
     use bevy::reflect::PartialReflect;
     use bevy::reflect::tuple_struct::DynamicTupleStruct;
 
+    use super::DeviceNameDisambiguationText;
+    use super::DeviceNameDisambiguationTextError;
+    use super::OperatorAssignedDeviceName;
+    use super::OperatorAssignedDeviceNameError;
     use super::RegisteredSchemes;
+    use super::ReportedDeviceName;
+    use super::ReportedDeviceNameError;
     use super::SchemeName;
     use crate::DeviceIdSource;
     use crate::DeviceKey;
@@ -308,6 +545,72 @@ mod tests {
     #[test]
     fn reported_id_with_control_character_fails_ron_deserialization() {
         assert!(ron::from_str::<ReportedId>(r#""device\nserial""#).is_err());
+    }
+
+    #[test]
+    fn device_name_text_types_accept_visible_nonempty_text() -> Result<(), Box<dyn Error>> {
+        let reported = ReportedDeviceName::new("Studio Display")?;
+        let disambiguation = DeviceNameDisambiguationText::new("5120x2880 display at (0, 0)")?;
+        let operator = OperatorAssignedDeviceName::new("Stage left laser")?;
+
+        assert_eq!(reported.as_str(), "Studio Display");
+        assert_eq!(disambiguation.as_str(), "5120x2880 display at (0, 0)");
+        assert_eq!(operator.as_str(), "Stage left laser");
+
+        Ok(())
+    }
+
+    #[test]
+    fn device_name_text_types_reject_empty_and_control_character_text() {
+        assert_eq!(
+            ReportedDeviceName::new(""),
+            Err(ReportedDeviceNameError::Empty)
+        );
+        assert_eq!(
+            ReportedDeviceName::new("Studio\nDisplay"),
+            Err(ReportedDeviceNameError::ContainsControlCharacter)
+        );
+        assert_eq!(
+            DeviceNameDisambiguationText::new(""),
+            Err(DeviceNameDisambiguationTextError::Empty)
+        );
+        assert_eq!(
+            DeviceNameDisambiguationText::new("display\tat origin"),
+            Err(DeviceNameDisambiguationTextError::ContainsControlCharacter)
+        );
+        assert_eq!(
+            OperatorAssignedDeviceName::new(""),
+            Err(OperatorAssignedDeviceNameError::Empty)
+        );
+        assert_eq!(
+            OperatorAssignedDeviceName::new("Stage\rleft laser"),
+            Err(OperatorAssignedDeviceNameError::ContainsControlCharacter)
+        );
+    }
+
+    #[test]
+    fn malformed_device_names_fail_ron_deserialization() {
+        assert!(ron::from_str::<ReportedDeviceName>(r#""Studio\nDisplay""#).is_err());
+        assert!(ron::from_str::<DeviceNameDisambiguationText>("\"\"").is_err());
+        assert!(ron::from_str::<OperatorAssignedDeviceName>(r#""Stage\rlaser""#).is_err());
+    }
+
+    #[test]
+    fn device_name_text_types_accept_reflected_newtype_encoding() -> Result<(), Box<dyn Error>> {
+        assert_eq!(
+            ron::from_str::<ReportedDeviceName>(r#"("Studio Display")"#)?,
+            ReportedDeviceName::new("Studio Display")?
+        );
+        assert_eq!(
+            ron::from_str::<DeviceNameDisambiguationText>(r#"("5120x2880 display at (0, 0)")"#,)?,
+            DeviceNameDisambiguationText::new("5120x2880 display at (0, 0)")?
+        );
+        assert_eq!(
+            ron::from_str::<OperatorAssignedDeviceName>(r#"("Stage left laser")"#)?,
+            OperatorAssignedDeviceName::new("Stage left laser")?
+        );
+
+        Ok(())
     }
 
     #[test]

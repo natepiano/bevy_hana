@@ -50,7 +50,7 @@ pub struct TitleBarBuilder<S> {
 
 impl<S> TitleBarBuilder<S> {
     /// Toggles `chip` active on `Begin` and inactive on `End` for any event
-    /// of those types. Use this when only one chip cares about the event.
+    /// of those types. Use this when only one chip responds to the event.
     /// For multi-chip discrimination (e.g. `AnimationBegin` shared by
     /// `LookAt` and `LookAtAndZoomToFit`), use
     /// [`Self::wire_chip_to_events_filtered`] instead.
@@ -120,8 +120,8 @@ impl<S> TitleBarBuilder<S> {
         self.wire_chip_to_state::<R, _>(chip, TitleChipActivation::activation)
     }
 
-    /// Like [`Self::wire_chip_to_events`], but each filter decides whether a
-    /// given event applies to this chip. Return `false` to ignore.
+    /// Like [`Self::wire_chip_to_events`], but each filter reports whether a
+    /// given event applies to this chip. Return `false` to skip it.
     #[must_use]
     pub fn wire_chip_to_events_filtered<Begin, End, FStart, FEnd>(
         mut self,
@@ -223,7 +223,7 @@ impl<S> TitleBarBuilder<S> {
     #[must_use]
     pub fn with_brp_extras(self) -> SprinkleBuilder<S> { self.finish().with_brp_extras() }
 
-    /// Finalizes the title bar and adds the smart camera control panel.
+    /// Finalizes the title bar and adds the camera control panel.
     #[must_use]
     pub fn with_camera_control_panel(self) -> SprinkleBuilder<S> {
         self.finish().with_camera_control_panel()

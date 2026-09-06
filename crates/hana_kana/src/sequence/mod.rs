@@ -61,10 +61,11 @@ use crate::easing::EasingPlugin;
 
 /// Installs the shared driver arbitration, movement order, and evaluation order.
 ///
-/// Domain plugins remain responsible for placing their evaluation systems in
+/// Domain plugins place their own evaluation systems in
 /// [`SequencePlaybackSystems::EvaluateSequences`] and their producers in
-/// [`SequencePlaybackSystems::ProduceMovement`]. The plugin is repeatable so
-/// multiple domain plugins can compose it safely.
+/// [`SequencePlaybackSystems::ProduceMovement`]. `is_unique` returns `false`,
+/// so several domain plugins can each add this plugin; only the first
+/// composition installs the arbitration systems.
 pub struct SequencePlaybackPlugin;
 
 impl Plugin for SequencePlaybackPlugin {

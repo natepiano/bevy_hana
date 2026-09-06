@@ -1,0 +1,32 @@
+error[E0277]: `ReflectedAttribute` is not a `Component`
+ --> tests/compile_fail/capability_requires_component.rs:8:38
+  |
+8 |     let _ = Capabilities::new().with(ReflectedAttribute);
+  |                                 ---- ^^^^^^^^^^^^^^^^^^ invalid `Component`
+  |                                 |
+  |                                 required by a bound introduced by this call
+  |
+help: the trait `bevy::bevy_ecs::component::Component` is not implemented for `ReflectedAttribute`
+ --> tests/compile_fail/capability_requires_component.rs:5:1
+  |
+5 | struct ReflectedAttribute;
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: consider annotating `ReflectedAttribute` with `#[derive(Component)]`
+  = help: the following other types implement trait `bevy::bevy_ecs::component::Component`:
+            Aabb
+            AccessibilityNode
+            AccessibilityRequested
+            AccessibleLabel
+            AccumulatedMouseMotion
+            AccumulatedMouseScroll
+            AmbientLight
+            Anchor
+          and $N others
+note: required by a bound in `Capabilities::with`
+ --> src/capabilities.rs
+  |
+  |     pub fn with<C>(mut self, capability: C) -> Self
+  |            ---- required by a bound in this associated function
+  |     where
+  |         C: Component + Reflect + PartialEq,
+  |            ^^^^^^^^^ required by this bound in `Capabilities::with`

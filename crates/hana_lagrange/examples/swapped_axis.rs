@@ -194,7 +194,7 @@ fn main() {
 
 // The Z-up engines' (Blender, Unreal) camera basis: a right-handed Z-up frame
 // (right=X, up=Z, back=-Y). Using `-Y` for back keeps the determinant
-// positive, so tilting to the Y-up basis `[X, Y, Z]` is a clean 90° rotation
+// positive, so tilting to the Y-up basis `[X, Y, Z]` is a 90° rotation
 // about X rather than a handedness flip the camera can't interpolate through.
 const Z_UP_BASIS: CameraBasis = CameraBasis::Z_UP;
 // Distance the camera orbits the origin-centered gizmo at — frames the arms and

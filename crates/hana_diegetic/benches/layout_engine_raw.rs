@@ -5,8 +5,8 @@
 
 //! Raw `LayoutEngine` and diagnostic micro-benchmarks.
 //!
-//! This target is gated behind `bench_support` because it intentionally
-//! touches crate internals that are not part of the normal public API.
+//! This target is gated behind `bench_support` because it touches crate
+//! internals that are not part of the public API.
 //!
 //! Slices per row count:
 //! - **`build_tree_only`**: public `LayoutBuilder` tree construction.

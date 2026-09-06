@@ -7,8 +7,8 @@ use hana_kana::SequenceTime;
 ///
 /// A [`FoldSequence`](super::FoldSequence) requires one of these as its default;
 /// a [`FoldStage`](super::FoldStage) or a single stage member may override the
-/// whole value. Authored durations are trusted, so a zero `duration` is an
-/// instantaneous snap to the member's target rather than a rejected value.
+/// whole value. No authored duration is rejected: a zero `duration` snaps the
+/// member to its target with no travel.
 ///
 /// This value is cloneable rather than `Copy` because `easing` may own a
 /// lookup curve.

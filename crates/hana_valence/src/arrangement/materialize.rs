@@ -22,7 +22,7 @@ use crate::Hinge;
 
 /// Connection calibration retained privately for later arrangement phases.
 ///
-/// This component deliberately has no public readers. It preserves the plan's
+/// This component has no public readers. It preserves the plan's
 /// validated connection values after the transient typed association and plan
 /// are dropped, without exposing a second mutable arrangement representation.
 #[derive(Component)]
@@ -101,9 +101,10 @@ pub(super) fn queue_arrangement_without_scenes<M, Selection>(
 
 /// Whether materialization owns the member entities or only borrows them.
 ///
-/// Reserved roots are created by this command and therefore retain ordinary
-/// deferred-command failures. Bound roots remain application-owned, so a
-/// disappearance after validation is best effort at application time.
+/// Reserved roots are created by this command, so their writes use `insert` and
+/// a missing entity surfaces as an ordinary deferred-command failure. Bound
+/// roots remain application-owned, so their writes use `try_insert` and a root
+/// despawned between validation and command application is skipped.
 #[derive(Clone, Copy)]
 enum MemberWrites {
     Reserved,
@@ -193,6 +194,9 @@ mod tests {
     #[test]
     fn materialization_retains_only_private_connection_data_and_selection_identity() {
         let mut world = World::new();
+        // Materialization writes baseline hinges, and `Hinge`'s hook refuses a
+        // world with no driver; an `App` would install `HingePlugin` for us.
+        world.insert_resource(crate::hinge::Pintle::installed());
         let controller = world.spawn_empty().id();
         let root = world.spawn_empty().id();
         let member = world.spawn_empty().id();

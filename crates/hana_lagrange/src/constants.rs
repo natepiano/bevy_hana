@@ -1,7 +1,8 @@
 // interpolation constants
 /// Approximate-equality threshold for floating-point convergence checks.
 pub(crate) const EPSILON: f32 = 0.001;
-/// Exponent applied to the smoothing response curve.
+/// Exponent applied to `smoothness` before that result is raised to the
+/// elapsed seconds.
 pub(crate) const SMOOTHNESS_EXPONENT: i32 = 7;
 
 // orbit defaults

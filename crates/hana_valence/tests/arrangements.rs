@@ -34,7 +34,6 @@ use bevy::ecs::prelude::Resource;
 use bevy::ecs::query::Changed;
 use bevy::ecs::query::With;
 use bevy::ecs::schedule::IntoScheduleConfigs;
-use bevy::ecs::schedule::Schedule;
 use bevy::ecs::schedule::SingleThreadedExecutor;
 use bevy::ecs::schedule::common_conditions::run_once;
 use bevy::ecs::system::Commands;
@@ -121,6 +120,7 @@ use hana_valence::FoldTarget;
 use hana_valence::FoldTiming;
 use hana_valence::Hinge;
 use hana_valence::HingeClearance;
+use hana_valence::HingePlugin;
 use hana_valence::HingePoseReported;
 use hana_valence::Member;
 use hana_valence::MemberBinding;
@@ -163,7 +163,6 @@ use hana_valence::WindingClearance;
 use hana_valence::Wrap;
 use hana_valence::evaluate_fold_angle;
 use hana_valence::fold_fraction;
-use hana_valence::hinge_to_pose;
 use hana_valence::resolve_anchors;
 
 const MEMBER_COUNT: u8 = 6;
@@ -2727,17 +2726,28 @@ impl<S: Subscriber> Layer<S> for WarnCount {
     }
 }
 
-/// Runs `schedule` on the calling thread with warnings counted.
-fn run_counted(counter: &WarnCount, world: &mut World, schedule: &mut Schedule) {
+/// Runs one `PostUpdate` on the calling thread with warnings counted.
+fn run_counted(counter: &WarnCount, app: &mut App) {
     let subscriber = Registry::default().with(counter.clone());
-    bevy::log::tracing::subscriber::with_default(subscriber, || schedule.run(world));
+    bevy::log::tracing::subscriber::with_default(subscriber, || {
+        app.world_mut().run_schedule(PostUpdate);
+    });
 }
 
-fn hinge_schedule() -> Schedule {
-    let mut schedule = Schedule::default();
-    schedule.set_executor(SingleThreadedExecutor::new());
-    schedule.add_systems(hinge_to_pose);
-    schedule
+/// An app holding nothing but the hinge driver `HingePlugin` registers.
+///
+/// The driver is private, so these tests reach it the only way an application
+/// can: through its plugin, which also files the `Pintle` every hinge
+/// insertion demands. `PostUpdate` runs single-threaded because
+/// `with_default` installs the counting subscriber on the calling thread
+/// alone, and a warning raised on a task-pool thread would never be seen.
+fn hinge_app() -> App {
+    let mut app = App::new();
+    app.add_plugins(HingePlugin);
+    app.edit_schedule(PostUpdate, |schedule| {
+        schedule.set_executor(SingleThreadedExecutor::new());
+    });
+    app
 }
 
 /// Turns `overwrite_poses` on for a single run of the shared schedule.
@@ -2752,39 +2762,41 @@ fn overwrite_poses(mut poses: Query<&mut AnchorPose>) {
     }
 }
 
-/// One schedule instance, so its second run compares against the first run's
+/// One retained schedule, so its second run compares against the first run's
 /// tick rather than against a fresh `last_run` that predates every change.
-fn contended_schedule() -> Schedule {
-    let mut schedule = Schedule::default();
-    schedule.set_executor(SingleThreadedExecutor::new());
-    schedule.add_systems((overwrite_poses.run_if(contending), hinge_to_pose).chain());
-    schedule
+fn contended_app() -> App {
+    let mut app = hinge_app();
+    app.init_resource::<Contend>().add_systems(
+        PostUpdate,
+        overwrite_poses
+            .run_if(contending)
+            .before(AnchorSystems::HingeToPose),
+    );
+    app
 }
 
 #[test]
 fn a_required_pose_stays_silent_and_an_earlier_same_frame_write_warns() {
     let counter = WarnCount::default();
-    let mut world = World::new();
-    world.init_resource::<Contend>();
-    let target = world.spawn_empty().id();
-    world.spawn((
+    let mut app = contended_app();
+    let target = app.world_mut().spawn_empty().id();
+    app.world_mut().spawn((
         hinge_geometry(),
         AnchoredTo::new(target, AnchorSite::Center, AnchorSite::Center),
         folded_hinge(QUARTER_TURN, QUARTER_TURN, Displacement::default()),
     ));
-    let mut schedule = contended_schedule();
 
     // `#[require(AnchorPose)]` adds the pose with the hinge, so its added and
     // changed ticks are the same one and materialization stays silent.
-    run_counted(&counter, &mut world, &mut schedule);
+    run_counted(&counter, &mut app);
     assert_eq!(
         counter.count(),
         0,
         "a freshly required pose is not a rewrite"
     );
 
-    world.resource_mut::<Contend>().0 = true;
-    run_counted(&counter, &mut world, &mut schedule);
+    app.world_mut().resource_mut::<Contend>().0 = true;
+    run_counted(&counter, &mut app);
 
     // The warning is `#[cfg(debug_assertions)]`, so a release run counts zero
     // for a reason that is not a regression.
@@ -2799,36 +2811,36 @@ fn a_required_pose_stays_silent_and_an_earlier_same_frame_write_warns() {
 #[test]
 fn unfilled_geometry_stays_silent_while_an_authoring_gap_warns_once() {
     let counter = WarnCount::default();
-    let mut world = World::new();
-    let target = world.spawn_empty().id();
+    let mut app = hinge_app();
+    let target = app.world_mut().spawn_empty().id();
     let resting = folded_hinge(QUARTER_TURN, QUARTER_TURN, Displacement::default());
-    world.spawn(resting);
-    let without_relationship = world.spawn((hinge_geometry(), resting)).id();
-    let mut schedule = hinge_schedule();
+    app.world_mut().spawn(resting);
+    let without_relationship = app.world_mut().spawn((hinge_geometry(), resting)).id();
 
-    run_counted(&counter, &mut world, &mut schedule);
-    run_counted(&counter, &mut world, &mut schedule);
+    run_counted(&counter, &mut app);
+    run_counted(&counter, &mut app);
 
     // Geometry arrives a frame or more after materialization, so its absence
     // never warns; a missing relationship is an authoring gap and warns once.
     assert_eq!(counter.count(), 1, "one warning per misauthored entity");
     assert_eq!(
-        world.get::<AnchorPose>(without_relationship).copied(),
+        app.world().get::<AnchorPose>(without_relationship).copied(),
         Some(AnchorPose::default()),
         "a skipped hinge leaves its pose in place",
     );
 
-    world
+    app.world_mut()
         .entity_mut(without_relationship)
         .insert(AnchoredTo::new(
             target,
             AnchorSite::Center,
             AnchorSite::Center,
         ));
-    run_counted(&counter, &mut world, &mut schedule);
+    run_counted(&counter, &mut app);
 
     assert_eq!(counter.count(), 1, "repair raises no further warning");
-    let rotation = world
+    let rotation = app
+        .world()
         .get::<AnchorPose>(without_relationship)
         .map(|pose| pose.rotation.into_inner())
         .unwrap_or_default();
@@ -2939,7 +2951,7 @@ fn read_owner(input: In<Entity>, fold_commands: FoldCommands) -> SequenceOwnersh
     fold_commands.owner(input.0)
 }
 
-/// Returns who currently owns a retained sequence's local position.
+/// Returns which owner currently holds a retained sequence's local position.
 fn owner_of(app: &mut App, sequence: Entity) -> SequenceOwner {
     match app
         .world_mut()
@@ -3225,7 +3237,7 @@ fn arbitrary_forward_and_backward_travel_agree_with_direct_sampling() {
         "backward travel reaches the same fraction the forward pass did",
     );
 
-    // Direct sampling of the immutable track answers the same values in any
+    // Direct sampling of the immutable track returns the same values in any
     // order, which is what history independence means.
     let Some(authored) = app.world().get::<FoldSequence>(sequence) else {
         panic!("the authored sequence stays on its entity");
@@ -4148,7 +4160,7 @@ fn a_movement_that_contradicts_local_position_warns_once_and_rearms() {
     advance(&mut app, Duration::from_millis(1500));
     let held = position_of(&app, sequence);
 
-    // A producer that claims backward travel while naming a position ahead of
+    // A producer that names backward travel together with a position ahead of
     // local position contradicts itself, so nothing is applied.
     let driver = app
         .world_mut()

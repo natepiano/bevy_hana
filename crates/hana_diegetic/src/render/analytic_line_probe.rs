@@ -60,9 +60,9 @@ use super::material_table::MaterialTableUpdatedToCurrent;
 use crate::layout::Lighting;
 use crate::layout::Sidedness;
 
-/// Design-space units assigned to the stroke (thin) axis. Fixing the thin axis
-/// at a healthy resolution keeps the anti-aliased edge sharp no matter how long
-/// or thin the line is, the same way a path stem always packs into ~1000
+/// Design-space units assigned to the stroke (thin) axis. The thin axis is
+/// fixed at this resolution so the anti-aliased edge stays sharp no matter how
+/// long or thin the line is, the same way a path stem always packs into ~1000
 /// font units regardless of point size.
 const STROKE_DESIGN_UNITS: f32 = 128.0;
 /// Anti-aliasing fringe added around the outline, in design units. Converted to

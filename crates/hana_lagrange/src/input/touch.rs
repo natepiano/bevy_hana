@@ -5,36 +5,36 @@ use bevy::prelude::Resource;
 use bevy::prelude::Touches;
 use bevy::prelude::Vec2;
 
-/// Holds information about current mobile gestures
+/// The touch gesture recognized for the current frame.
 #[derive(Debug, Clone)]
 pub(crate) enum TouchGestures {
-    /// No mobile gestures
+    /// No touch gesture this frame.
     None,
-    /// One finger mobile gestures
+    /// One-finger touch gesture.
     OneFinger(OneFingerGestures),
-    /// Two finger mobile gestures
+    /// Two-finger touch gesture.
     TwoFinger(TwoFingerGestures),
 }
 
 /// Holds information pertaining to one finger gestures
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct OneFingerGestures {
-    /// The delta movement of the mobile
+    /// Movement of the touch since the previous frame, in logical pixels.
     pub motion: Vec2,
 }
 
 /// Holds information pertaining to two finger gestures
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TwoFingerGestures {
-    /// The delta movement of both touches.
-    /// Uses the midpoint between the touches to calculate movement. Thus, if the midpoint doesn't
-    /// move then this will be zero (or close to zero), like when pinching.
+    /// Movement of both touches since the previous frame, measured as the
+    /// change in their midpoint. When the midpoint holds still this is zero (or
+    /// near zero), as it is during a pinch.
     pub motion:   Vec2,
-    /// The delta distance between both touches.
-    /// Use this to implement pinch gestures.
+    /// Change in the distance between the two touches since the previous
+    /// frame. Use this to implement pinch gestures.
     pub pinch:    f32,
-    /// The delta angle of the two touches.
-    /// Positive values correspond to rotating clockwise.
+    /// Change in the angle of the line joining the two touches since the
+    /// previous frame. Positive values are clockwise.
     #[allow(
         dead_code,
         reason = "computed but not yet wired — planned for touch-based camera roll"
@@ -42,7 +42,8 @@ pub(crate) struct TwoFingerGestures {
     pub rotation: f32,
 }
 
-/// Stores current and previous frame mobile data, and provides a method to get mobile gestures
+/// The pressed touches from the current and previous frames, which
+/// [`TouchTracker::get_touch_gestures`] differences into a gesture.
 #[derive(Resource, Default, Debug)]
 pub(crate) struct TouchTracker {
     current_pressed:  (Option<Touch>, Option<Touch>),
@@ -50,12 +51,11 @@ pub(crate) struct TouchTracker {
 }
 
 impl TouchTracker {
-    /// Calculate and return mobile gesture data for this frame
+    /// Returns the touch gesture for this frame.
     pub(crate) fn get_touch_gestures(&self) -> TouchGestures {
-        // The below matches only match when the previous and current frames have the same number
-        // of touches. This means that when the number of touches changes, there's one frame
-        // where this will return `TouchGestures::None`. From my testing, this does not result
-        // in any adverse effects.
+        // The arms below match only when the previous and current frames hold the same number
+        // of touches, so the frame on which the touch count changes returns
+        // `TouchGestures::None`.
         match (self.current_pressed, self.previous_pressed) {
             // One finger
             ((Some(curr), None), (Some(prev), None)) => {
@@ -94,12 +94,11 @@ impl TouchTracker {
                     current_angle_from_negative_y - previous_angle_from_negative_y;
                 let rotation_from_positive_y =
                     current_angle_from_positive_y - previous_angle_from_positive_y;
-                // The angle between -1deg and +1deg is 358deg according to Vec2::angle_between,
-                // but we want the answer to be +2deg (or -2deg if swapped). Therefore, we calculate
-                // two angles - one from UP and one from DOWN, and use the one with the smallest
-                // absolute value. This is necessary to get a predictable result when the two
-                // touches swap sides (i.e. mobile 1's X position being less than
-                // the other, to the other way round).
+                // Vec2::angle_between reports the angle between -1deg and +1deg as 358deg, where
+                // the wanted answer is +2deg (or -2deg if swapped). So two angles are computed,
+                // one from UP and one from DOWN, and the one with the smaller absolute value is
+                // used. That keeps the result continuous when the two touches swap sides (touch
+                // 1's X position going from less than touch 2's to greater).
                 let rotation = if rotation_from_negative_y.abs() < rotation_from_positive_y.abs() {
                     rotation_from_negative_y
                 } else {
@@ -118,7 +117,9 @@ impl TouchTracker {
     }
 }
 
-/// Read touch input and save it in `TouchTracker` resource for easy consumption by the main system
+/// Moves the previously pressed touches into `previous_pressed` and records
+/// this frame's pressed touches in the [`TouchTracker`] resource. Frames with
+/// three or more touches leave the tracker unchanged.
 pub(super) fn touch_tracker(touches: Res<Touches>, mut touch_tracker: ResMut<TouchTracker>) {
     let pressed: Vec<&Touch> = touches.iter().collect();
 

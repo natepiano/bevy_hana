@@ -215,8 +215,9 @@ impl CommandRegistry {
     /// still validated during initialization so BRP and other reflection consumers can find the
     /// command event.
     ///
-    /// A hold-to-act command carries a [`HoldPhase`] its caller must choose, so it is rejected
-    /// before its event is constructed.
+    /// A hold-to-act command carries a [`HoldPhase`] this call supplies no value for, so it is
+    /// rejected as [`CommandInvocationOutcome::HeldCommandRequiresPhase`] before its event is
+    /// constructed.
     pub fn invoke(&self, command_id: &CommandId, world: &mut World) -> CommandInvocationOutcome {
         let Some(entry) = self.entries.get(command_id) else {
             return CommandInvocationOutcome::UnknownCommand;

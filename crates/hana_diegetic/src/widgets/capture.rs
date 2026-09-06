@@ -239,8 +239,8 @@ pub(super) fn reconcile_pointer_input(
         // Defer a release only when a later press re-captured this pointer
         // within the same batch — the owner is the latest observed press and
         // its raw press sits after this release. A disabled or projection-
-        // failing slider press is deliberately not observed, so it never enters
-        // the widget capture-order path: when the observed-press count differs
+        // failing slider press is never observed, so it never enters the widget
+        // capture-order path: when the observed-press count differs
         // from the raw primary-press count the latest raw press was one of
         // those, and it must not suppress the accepted interaction's real
         // release.

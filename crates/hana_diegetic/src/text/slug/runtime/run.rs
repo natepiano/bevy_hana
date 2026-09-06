@@ -133,9 +133,9 @@ pub(in crate::text::slug) enum CachedGlyphOutline {
 /// first time a glyph is packed, its records are appended here with global
 /// offsets and its slot recorded in `record_indices`, so every run that draws
 /// the glyph stores that one global index in its mesh instead of copying the
-/// glyph's curves per run. `revision` bumps on every append so the GPU upload
-/// knows when the tables grew. The atlas is append-only — glyphs are never
-/// evicted.
+/// glyph's curves per run. `revision` bumps on every append; the GPU upload
+/// compares it against the revision it last uploaded and re-uploads only when
+/// the two differ. The atlas is append-only — glyphs are never evicted.
 #[derive(Clone, Debug, Default)]
 pub(in crate::text::slug) struct GlyphOutlineCache {
     glyphs:         HashMap<GlyphKey, CachedGlyphOutline>,

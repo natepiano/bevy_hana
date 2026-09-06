@@ -10,5 +10,27 @@
 [profile.default]
 default-filter = "not (binary(tool_id_boundary) and test(/^downstream_/))"
 
+[[profile.default.overrides]]
+filter           = "package(hana) and test(/tool::command_palette::tests::.*reload/)"
+test-group       = "command-palette-reload"
+threads-required = "num-test-threads"
+
 [profile.ci]
 default-filter = "all()"
+
+[test-groups.command-palette-reload]
+max-threads = 1
+
+# The two native-watch tests probe the operating system's filesystem-notification
+# service and opt out, naming the reason, in an environment that denies it — a
+# command sandbox most commonly. That reason is the whole point of the opt-out, so
+# it has to reach the person reading the run: nextest gives each test its own
+# process and captures its output, so without this the skip would be invisible and
+# a sandboxed pass would look exactly like real coverage.
+[[profile.default.overrides]]
+filter         = 'test(/^disk::worker::watch::tests::a_native_watch_/)'
+success-output = "immediate"
+
+[[profile.ci.overrides]]
+filter         = 'test(/^disk::worker::watch::tests::a_native_watch_/)'
+success-output = "immediate"

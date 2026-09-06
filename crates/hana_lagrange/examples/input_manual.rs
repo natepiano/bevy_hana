@@ -1,6 +1,6 @@
 //! Spawns an `OrbitCam` with `OrbitCamInputMode::Manual` and writes orbit /
 //! pan / zoom intent ourselves through `OrbitCamManualInputWriter`. Pick this
-//! mode when the app — not a preset, not a binding list — decides what
+//! mode when the app — not a preset, not a binding list — defines what
 //! counts as camera input: `write_manual_input` reads the keyboard directly
 //! every `PreUpdate` and hands Lagrange the resulting pixel deltas and zoom
 //! amount. Press orbit, pan, and zoom keys together to see multiple manual

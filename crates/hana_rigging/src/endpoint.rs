@@ -15,24 +15,35 @@ use crate::DeviceKey;
 
 /// Binding target that identifies one provider-defined endpoint on one durable device.
 ///
-/// `DeviceEndpoint` permits several bindings to address different channels of one audio
-/// interface, lighting controller, or HID panel. A display uses the same type with
-/// `EndpointId::Whole`.
+/// [`DeviceEndpoint`] permits several bindings to address different channels of one audio
+/// interface, lighting controller, or control surface. A display uses the same type with
+/// [`EndpointId::Whole`].
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, Reflect)]
 #[reflect(Serialize, Deserialize)]
 pub struct DeviceEndpoint {
     /// Durable device designation that keeps the endpoint associated with one physical unit.
     pub device: DeviceKey,
-    /// Provider-defined address within `device`, distinguishing a whole display from one named
-    /// part such as `ch/7` or `key/3`.
+    /// Provider-defined address within [`Self::device`], distinguishing a whole display from one
+    /// named part such as `ch/7` or `key/3`.
     pub id:     EndpointId,
+}
+
+impl DeviceEndpoint {
+    /// Address the undivided endpoint exposed by one durable device.
+    #[must_use]
+    pub const fn whole(key: DeviceKey) -> Self {
+        Self {
+            device: key,
+            id:     EndpointId::Whole,
+        }
+    }
 }
 
 /// Address within a device that distinguishes its whole surface from one provider-named part.
 ///
-/// A display has one endpoint, so it uses `Whole` rather than inventing a part name. `Part` keeps
-/// the provider's vocabulary because the kernel cannot know whether `ch/7` is an audio channel,
-/// `key/3` is a control surface key, or `nfc` is a reader.
+/// A display has one endpoint, so it uses [`Self::Whole`] rather than inventing a part name.
+/// [`Self::Part`] keeps the provider's vocabulary because nothing in the kernel says whether
+/// `ch/7` is an audio channel, `key/3` is a control surface key, or `nfc` is a reader.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, Reflect)]
 #[reflect(Serialize, Deserialize)]
 pub enum EndpointId {
@@ -44,8 +55,8 @@ pub enum EndpointId {
 
 /// Provider-defined name for one named part within a device.
 ///
-/// `PartName` retains the provider's vocabulary because the kernel cannot know whether `ch/7` is
-/// an audio channel, `key/3` is a control surface key, or `nfc` is a reader. Its checked
+/// [`PartName`] retains the provider's vocabulary because nothing in the kernel says whether
+/// `ch/7` is an audio channel, `key/3` is a control surface key, or `nfc` is a reader. Its checked
 /// constructor rejects blank and control-character values before endpoint configuration is
 /// retained.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Reflect)]
@@ -58,7 +69,7 @@ impl PartName {
     ///
     /// # Errors
     ///
-    /// Returns `PartNameError` when `value` cannot identify an endpoint in diagnostics or
+    /// Returns [`PartNameError`] when `value` cannot identify an endpoint in diagnostics or
     /// persisted configuration.
     pub fn new(value: impl Into<String>) -> Result<Self, PartNameError> {
         let value = value.into();
@@ -91,7 +102,7 @@ impl<'de> Deserialize<'de> for PartName {
     }
 }
 
-/// Reason `PartName::new` rejected text before it could name an endpoint.
+/// Reason [`PartName::new`] rejected text before it could name an endpoint.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum PartNameError {
     /// An empty value cannot select a named device endpoint.

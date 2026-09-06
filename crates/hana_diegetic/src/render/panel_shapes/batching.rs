@@ -115,11 +115,11 @@ use crate::widgets::VisualSlotOverride;
 /// Target design-unit extent for one panel-line band (≈ 5.8mm at the
 /// reference design scale). Bands shrink the per-fragment curve loop — a
 /// merged ruler path carries hundreds of curves — but the banded distance
-/// scan is blind past the band overlap (half this extent), so bands smaller
-/// than the on-screen scan width collapse the AA ramp to a hard step. At
-/// this size a single tick or arrowhead still packs one exact band, and
-/// blindness only sets in once a whole millimeter ruler drops under ~200
-/// screen pixels, where 1mm ticks are sub-pixel mush regardless.
+/// scan reaches only as far as the band overlap (half this extent), so bands
+/// smaller than the on-screen scan width collapse the AA ramp to a hard step.
+/// At this size a single tick or arrowhead still packs one exact band, and the
+/// scan falls short only once a whole millimeter ruler drops under ~200 screen
+/// pixels, where 1mm ticks are sub-pixel mush regardless.
 const PANEL_LINE_BAND_TARGET_DESIGN_UNITS: f32 = 2048.0;
 
 const PANEL_LINE_LINE_DEPTH_BIAS_STEP: f32 = 0.001;

@@ -173,8 +173,8 @@ pub struct FreeCamInteractionSpeedChanged {
 /// Emitted on the rising edge of a camera home/reset action.
 ///
 /// The event fires when the camera begins easing toward its home pose. Fired
-/// for every camera kind that supports home; panels light the home row off this
-/// until the eased motion settles.
+/// for every camera kind that supports home; panels highlight the home row from
+/// this event until the eased motion settles.
 #[derive(Clone, Copy, Debug, EntityEvent, Reflect)]
 #[reflect(Event, FromReflect)]
 pub struct CameraHomed {

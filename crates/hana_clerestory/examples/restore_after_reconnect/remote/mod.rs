@@ -103,6 +103,15 @@ struct RecordResponse {
     records:        Vec<WireRecord>,
 }
 
+enum ProbeRequestParameters {
+    Provided(Value),
+    Missing,
+}
+
+impl From<Option<Value>> for ProbeRequestParameters {
+    fn from(params: Option<Value>) -> Self { params.map_or(Self::Missing, Self::Provided) }
+}
+
 pub(super) fn plugin() -> RemotePlugin {
     RemotePlugin::default()
         .with_method_main(PROBE_COMMAND_METHOD, command_handler)
@@ -116,10 +125,15 @@ pub(super) fn http_plugin(port: u16) -> RemoteHttpPlugin {
 }
 
 fn authenticated<T: for<'de> Deserialize<'de> + CapabilityRequest>(
-    params: Option<Value>,
+    params: ProbeRequestParameters,
     session: &ProbeSession,
 ) -> Result<T, BrpError> {
-    let params = params.ok_or_else(|| invalid_params("missing request parameters"))?;
+    let params = match params {
+        ProbeRequestParameters::Provided(params) => params,
+        ProbeRequestParameters::Missing => {
+            return Err(invalid_params("missing request parameters"));
+        },
+    };
     let request: T = serde_json::from_value(params).map_err(invalid_params)?;
     if request.capability() != session.capability {
         return Err(invalid_params("invalid capability"));
@@ -131,15 +145,16 @@ fn snapshot_handler(In(params): In<Option<Value>>, world: &mut World) -> BrpResu
     let session = world
         .get_resource::<ProbeSession>()
         .ok_or_else(|| BrpError::internal("probe session is unavailable"))?;
-    let _: AuthenticatedRequest = authenticated(params, session)?;
-    serde_json::to_value(snapshot(world)).map_err(BrpError::internal)
+    let _: AuthenticatedRequest = authenticated(params.into(), session)?;
+    let probe_snapshot = snapshot(world).map_err(BrpError::internal)?;
+    serde_json::to_value(probe_snapshot).map_err(BrpError::internal)
 }
 
 fn records_handler(In(params): In<Option<Value>>, world: &mut World) -> BrpResult {
     let session = world
         .get_resource::<ProbeSession>()
         .ok_or_else(|| BrpError::internal("probe session is unavailable"))?;
-    let request: RecordRequest = authenticated(params, session)?;
+    let request: RecordRequest = authenticated(params.into(), session)?;
     let trace = world
         .get_resource::<ProbeTrace>()
         .ok_or_else(|| BrpError::internal("probe trace is unavailable"))?;
@@ -181,7 +196,7 @@ fn shutdown_handler(In(params): In<Option<Value>>, world: &mut World) -> BrpResu
     let session = world
         .get_resource::<ProbeSession>()
         .ok_or_else(|| BrpError::internal("probe session is unavailable"))?;
-    let _: AuthenticatedRequest = authenticated(params, session)?;
+    let _: AuthenticatedRequest = authenticated(params.into(), session)?;
     world.write_message(AppExit::Success);
     serde_json::to_value(serde_json::json!({ "accepted": true })).map_err(BrpError::internal)
 }
@@ -190,7 +205,7 @@ fn command_handler(In(params): In<Option<Value>>, world: &mut World) -> BrpResul
     let session = world
         .get_resource::<ProbeSession>()
         .ok_or_else(|| BrpError::internal("probe session is unavailable"))?;
-    let request: CommandRequest = authenticated(params, session)?;
+    let request: CommandRequest = authenticated(params.into(), session)?;
     if request.command_id.is_empty() {
         return Err(invalid_params("command_id must not be empty"));
     }

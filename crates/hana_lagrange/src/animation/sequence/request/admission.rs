@@ -31,7 +31,7 @@ use crate::animation::lifecycle::OrbitControllerOverrideRestoration;
 use crate::animation::sequence::CameraSequence;
 use crate::fit::ZoomBegin;
 
-/// `CameraRequestAdmission` owns the queries used by final facade admission.
+/// The queries final facade admission reads and writes.
 #[derive(SystemParam)]
 pub(in crate::animation) struct CameraRequestAdmission<'w, 's> {
     sequence_commands:   SequenceCommands<'w, 's>,

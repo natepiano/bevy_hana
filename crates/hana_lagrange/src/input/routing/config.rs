@@ -35,7 +35,8 @@ pub enum NoPositionFallback {
     OnlyEligibleCamera,
 }
 
-/// Public routing preference for preset/custom camera input.
+/// Routing mode, explicit target, and no-position fallback applied to preset
+/// and custom camera input.
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq, Reflect)]
 #[reflect(Resource, Default)]
 pub struct CameraInputRoutingConfig {

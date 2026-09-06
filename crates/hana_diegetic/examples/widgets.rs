@@ -3,7 +3,7 @@
 //! The example keeps the complete widget interaction path runnable in one
 //! Fairy Dust app.
 //!
-//! Current controls:
+//! Controls:
 //!   D - Disable or re-enable the secondary button and level slider
 //!   H - Return to the camera home pose
 //!   Tab / Shift+Tab - Move keyboard focus to the next/previous widget

@@ -140,10 +140,10 @@ impl AddAssign<usize> for FrameWork {
 
 /// A running total since startup that only ever grows.
 ///
-/// [`AddAssign`] is the only way to write one — there is deliberately no
-/// `From<usize>` and no setter — so no per-frame producer can reset it. That is
-/// what keeps a transient event readable after the frame it happened on: a
-/// surface dropped once, hundreds of frames ago, still reports itself.
+/// [`AddAssign`] is the only way to write one — there is no `From<usize>` and no
+/// setter — so no per-frame producer can reset it. That is what keeps a transient
+/// event readable after the frame it happened on: a surface dropped once, hundreds
+/// of frames ago, is still counted in the total.
 ///
 /// Addition saturates. A total that runs for the life of the process must not
 /// panic on overflow in a debug build.
@@ -241,7 +241,7 @@ pub struct PanelGeometryPerfStats {
     /// Resolved surfaces that routed no SDF record, by cause, totalled since
     /// startup.
     ///
-    /// These are [`LifetimeTotal`]s on purpose. A drop is usually transient —
+    /// These are [`LifetimeTotal`]s. A drop is usually transient —
     /// one frame empties a panel and the next frame is clean — so a per-frame
     /// count can be non-zero at the moment of failure and zero by the time
     /// anyone reads it.
@@ -257,8 +257,8 @@ pub struct PanelGeometryPerfStats {
 /// `Counter` is the kind of number held. A producer tallies one frame into a
 /// `DroppedSdfSurfaces<FrameWork>`, and `Self::accumulate` is the only route
 /// from there to the [`LifetimeTotal`] copy on [`PanelGeometryPerfStats`].
-/// Assigning a frame's tally over the running totals — which is how a drop
-/// became unreadable one frame after it happened — does not typecheck.
+/// Assigning a frame's tally over the running totals does not typecheck, so a drop
+/// stays readable after the frame it happened on.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Reflect)]
 pub struct DroppedSdfSurfaces<Counter = LifetimeTotal> {
     /// `build_panel_geometry` reached a panel whose `ComputedDiegeticPanel`
@@ -296,8 +296,8 @@ impl DroppedSdfSurfaces<LifetimeTotal> {
 
 /// Shared material-table counters.
 ///
-/// Mostly current-frame state, except [`Self::allocations`], which is a
-/// [`LifetimeTotal`] — its type now says so rather than only its doc comment.
+/// Every field but [`Self::allocations`] holds current-frame state;
+/// [`Self::allocations`] is a [`LifetimeTotal`] and accumulates across frames.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Reflect)]
 pub struct MaterialTablePerfStats {
     /// Current-frame `MaterialSlotValues` rows appended by render producers.

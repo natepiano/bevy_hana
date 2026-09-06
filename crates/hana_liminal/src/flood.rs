@@ -244,10 +244,13 @@ pub(crate) fn prepare_flood_settings(
 }
 
 /// Number of jump-flood passes required to cover an outline of the given
-/// pixel width. Derived from the `JumpFlood` radius: convert width ->
-/// diameter,
-/// diameter → next-power-of-two radius, plus one final compose pass.
-/// Returns 0 when no flood is needed.
+/// pixel width.
+///
+/// Rounds the diameter (`width * 2`) up to a whole pixel, halves it back to an
+/// integer radius, rounds `radius + 1` up to a power of two and takes its
+/// base-2 exponent, then adds one final compose pass. Returns
+/// `NO_FLOOD_PASS_COUNT` when `width` is at or below
+/// `NO_FLOOD_WIDTH_THRESHOLD`.
 pub(super) fn jump_flood_pass_count(width: f32) -> u32 {
     if width <= NO_FLOOD_WIDTH_THRESHOLD {
         return NO_FLOOD_PASS_COUNT;

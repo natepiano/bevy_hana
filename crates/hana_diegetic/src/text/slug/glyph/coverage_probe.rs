@@ -867,9 +867,9 @@ fn stride_does_not_alias_straight_edge() {
 }
 
 /// CPU mirror of the line branch (single lane). `dil_mode`: 0 = no dilation,
-/// 1 = per-strided-sample dilation (attempt 1, the shader as-is), 2 = dilation
-/// sized ONCE from the center fragment's normal and reused across the stride
-/// (proposed fix). Returns coverage.
+/// 1 = dilation resized from each strided sample's own normal, 2 = dilation
+/// sized ONCE from the center fragment's normal and reused across the stride.
+/// Returns coverage.
 fn line_cov(
     gt: &GroundTruth,
     point: Vec2,

@@ -80,9 +80,10 @@ use crate::layout::ResolvedFontFace;
 /// Used with [`TextStyle::with_font`](crate::TextStyle::with_font) to select which
 /// font a text element uses.
 ///
-/// Currently the only available font is [`MONOSPACE`](Self::MONOSPACE)
-/// (`JetBrains Mono`), which is embedded in the library and used by default.
-/// Custom font loading will be added in a future release.
+/// [`MONOSPACE`](Self::MONOSPACE) (`JetBrains Mono`) is embedded in the library
+/// and is the id every text element resolves to when none is set. Further ids
+/// are assigned by [`FontRegistry::register_font`] and by loading a `.ttf` or
+/// `.otf` file as a [`Font`] asset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FontId(pub u16);
 
@@ -123,8 +124,8 @@ impl FontRegistry {
     /// Creates a new registry with the embedded default font.
     ///
     /// Returns `None` if the embedded `JetBrains Mono` font fails to parse.
-    /// This is infallible in practice because the font binary is compiled into
-    /// the library and is known to be valid.
+    /// That binary is compiled into the library and parses, so `None` does not
+    /// occur in practice.
     #[must_use]
     pub fn new() -> Option<Self> {
         let mut font_cx = FontContext::default();

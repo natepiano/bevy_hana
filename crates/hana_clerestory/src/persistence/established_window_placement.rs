@@ -39,7 +39,7 @@ pub(crate) enum RestorableWindowPosition {
     CompositorControlled,
 }
 
-/// Window-driver value placed inside `LastKnownGoodConfiguration::Known`.
+/// Window-driver value retained as the binding's last known good configuration.
 ///
 /// This contains only the configuration a safe readback established. Attempt lifecycle, write
 /// eligibility, and role ownership stay in `hana_rigging::Bindings`.

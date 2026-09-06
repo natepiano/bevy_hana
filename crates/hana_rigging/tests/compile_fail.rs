@@ -2,22 +2,20 @@
 
 use bevy::app::App;
 use bevy::tasks::IoTaskPool;
-use hana_rigging::DeviceReporter;
-use hana_rigging::DeviceScan;
-use hana_rigging::DiscoveryCadence;
-use hana_rigging::DiscoveryJob;
-use hana_rigging::DiscoverySchedulerError;
-use hana_rigging::DiscoverySchedulerState;
-use hana_rigging::DiscoveryStatus;
-use hana_rigging::DiscoveryStatusError;
-use hana_rigging::DiscoveryWork;
-use hana_rigging::LastDiscoveryOutcome;
-use hana_rigging::MainThreadDiscoveryJob;
-use hana_rigging::ReporterCoverage;
-use hana_rigging::ReporterRegistration;
-use hana_rigging::RiggingAppExt;
-use hana_rigging::RiggingPlugin;
-use hana_rigging::StartupDiscoveryState;
+use hana_rigging::prelude::DeviceReporter;
+use hana_rigging::prelude::DeviceScan;
+use hana_rigging::prelude::DiscoveryCadence;
+use hana_rigging::prelude::DiscoveryJob;
+use hana_rigging::prelude::DiscoveryWork;
+use hana_rigging::prelude::FirstCompleteSetStatus;
+use hana_rigging::prelude::MainThreadDiscoveryJob;
+use hana_rigging::prelude::ReporterCoverage;
+use hana_rigging::prelude::ReporterHealth;
+use hana_rigging::prelude::ReporterId;
+use hana_rigging::prelude::ReporterOutcomeHealth;
+use hana_rigging::prelude::ReporterRegistration;
+use hana_rigging::prelude::RiggingAppExt;
+use hana_rigging::prelude::RiggingPlugin;
 
 struct BackgroundReporter;
 
@@ -39,7 +37,7 @@ impl DeviceReporter for ImmediateReporter {
 
 #[test]
 fn required_background_reporter_stays_blocked_before_io_pool_initialization()
--> Result<(), DiscoveryStatusError> {
+-> Result<(), &'static str> {
     assert!(IoTaskPool::try_get().is_none());
     let mut app = App::new();
     app.add_plugins(RiggingPlugin);
@@ -48,35 +46,27 @@ fn required_background_reporter_stays_blocked_before_io_pool_initialization()
         ReporterRegistration::required(
             DiscoveryCadence::OnDemand,
             ReporterCoverage::MatchingEvidenceOnly,
+            std::time::Duration::from_secs(10),
         ),
     );
 
     app.update();
 
-    let discovery_status = app.world().resource::<DiscoveryStatus>();
-    assert_eq!(
-        discovery_status.scheduler,
-        DiscoverySchedulerState::Failed {
-            error: DiscoverySchedulerError::IoTaskPoolUnavailable,
-        }
-    );
+    let health = reporter_health(&app, reporter).ok_or("reporter health was not projected")?;
     assert!(matches!(
-        discovery_status.startup,
-        StartupDiscoveryState::Discovering
+        health.first_complete_set(),
+        FirstCompleteSetStatus::Waiting(_)
     ));
-    let reporter_discovery_status = discovery_status.reporter_status(reporter)?;
     assert!(matches!(
-        reporter_discovery_status.last_outcome,
-        LastDiscoveryOutcome::NotCompleted
+        health.outcome(),
+        ReporterOutcomeHealth::NotCompleted
     ));
-    assert_eq!(reporter_discovery_status.completed_batches, 0);
-
+    assert_eq!(health.completed_runs(), 0);
     Ok(())
 }
 
 #[test]
-fn immediate_reporter_completes_without_io_pool_initialization() -> Result<(), DiscoveryStatusError>
-{
+fn immediate_reporter_completes_without_io_pool_initialization() -> Result<(), &'static str> {
     assert!(IoTaskPool::try_get().is_none());
     let mut app = App::new();
     app.add_plugins(RiggingPlugin);
@@ -85,6 +75,7 @@ fn immediate_reporter_completes_without_io_pool_initialization() -> Result<(), D
         ReporterRegistration::required(
             DiscoveryCadence::OnDemand,
             ReporterCoverage::MatchingEvidenceOnly,
+            std::time::Duration::from_secs(10),
         ),
     );
 
@@ -92,17 +83,20 @@ fn immediate_reporter_completes_without_io_pool_initialization() -> Result<(), D
     app.update();
 
     assert!(IoTaskPool::try_get().is_none());
-    let reporter_discovery_status = app
-        .world()
-        .resource::<DiscoveryStatus>()
-        .reporter_status(reporter)?;
-    assert_eq!(reporter_discovery_status.completed_batches, 1);
+    let health = reporter_health(&app, reporter).ok_or("reporter health was not projected")?;
+    assert_eq!(health.completed_runs(), 1);
     assert!(matches!(
-        reporter_discovery_status.last_outcome,
-        LastDiscoveryOutcome::Succeeded { .. }
+        health.outcome(),
+        ReporterOutcomeHealth::Succeeded { .. }
     ));
-
     Ok(())
+}
+
+fn reporter_health(app: &App, reporter: ReporterId) -> Option<&ReporterHealth> {
+    app.world()
+        .iter_entities()
+        .filter_map(|entity| entity.get::<ReporterHealth>())
+        .find(|health| health.belongs_to(reporter))
 }
 
 #[test]
@@ -114,9 +108,9 @@ fn constructor_cannot_bypass_validated_constructors() {
 
 #[test]
 #[ignore = "CI-only compile-time API test"]
-fn device_kind_requires_a_wildcard_arm() {
+fn device_kind_match_must_cover_every_variant() {
     let cases = trybuild::TestCases::new();
-    cases.compile_fail("tests/compile_fail/device_kind_requires_a_wildcard_arm.rs");
+    cases.compile_fail("tests/compile_fail/device_kind_match_must_cover_every_variant.rs");
 }
 
 #[test]
@@ -149,10 +143,32 @@ fn match_evidence_only_cannot_expose_a_device_key() {
 
 #[test]
 #[ignore = "CI-only compile-time API test"]
-fn attempt_progress_finished_requires_an_attempt_outcome() {
+fn capabilities_require_components_with_typed_equality() {
+    let cases = trybuild::TestCases::new();
+    cases.compile_fail("tests/compile_fail/capability_requires_component.rs");
+    cases.compile_fail("tests/compile_fail/capability_requires_partial_eq.rs");
+}
+
+#[test]
+#[ignore = "CI-only compile-time API test"]
+fn binding_authoring_requires_the_registered_driver_configuration() {
+    let cases = trybuild::TestCases::new();
+    cases.compile_fail("tests/compile_fail/binding_authoring_rejects_wrong_configuration.rs");
+}
+
+#[test]
+#[ignore = "CI-only compile-time API test"]
+fn continuous_flow_intervals_cannot_be_exchanged() {
+    let cases = trybuild::TestCases::new();
+    cases.compile_fail("tests/compile_fail/continuous_flow_intervals_cannot_be_exchanged.rs");
+}
+
+#[test]
+#[ignore = "CI-only compile-time API test"]
+fn role_presentation_cannot_be_constructed_outside_the_crate() {
     let cases = trybuild::TestCases::new();
     cases.compile_fail(
-        "tests/compile_fail/attempt_progress_finished_requires_an_attempt_outcome.rs",
+        "tests/compile_fail/role_presentation_cannot_be_constructed_outside_the_crate.rs",
     );
 }
 
@@ -172,10 +188,13 @@ fn apply_permit_cannot_be_matched() {
 
 #[test]
 #[ignore = "CI-only compile-time API test"]
-fn lifecycle_mutation_and_request_minting_are_kernel_only() {
+fn attempt_and_session_authorities_enforce_one_owner() {
     let cases = trybuild::TestCases::new();
-    cases.compile_fail("tests/compile_fail/lifecycle_mutation_is_kernel_only.rs");
-    cases.compile_fail("tests/compile_fail/state_issued_request_cannot_be_constructed.rs");
+    cases.compile_fail("tests/compile_fail/attempt_completion_rejects_wrong_configuration.rs");
+    cases.compile_fail("tests/compile_fail/authorities_cannot_be_constructed.rs");
+    cases.compile_fail("tests/compile_fail/authorities_cannot_be_cloned.rs");
+    cases.compile_fail("tests/compile_fail/authorities_cannot_be_serialized.rs");
+    cases.compile_fail("tests/compile_fail/attempt_completion_cannot_finish_twice.rs");
 }
 
 #[test]
@@ -213,4 +232,25 @@ fn discovery_jobs_cannot_receive_world_or_capture_non_send_state_and_own_device_
     cases.compile_fail("tests/compile_fail/discovery_job_cannot_receive_world.rs");
     cases.compile_fail("tests/compile_fail/discovery_job_cannot_capture_non_send_state.rs");
     cases.compile_fail("tests/compile_fail/discovery_job_requires_owned_device_scan.rs");
+}
+
+#[test]
+#[ignore = "CI-only compile-time API test"]
+fn a_driver_cannot_assert_a_datum_arrival() {
+    let cases = trybuild::TestCases::new();
+    cases.compile_fail("tests/compile_fail/driver_cannot_assert_a_datum_arrival.rs");
+}
+
+#[test]
+#[ignore = "CI-only compile-time API test"]
+fn a_driver_ledger_does_not_yield_an_owned_authority() {
+    let cases = trybuild::TestCases::new();
+    cases.compile_fail("tests/compile_fail/ledger_does_not_yield_an_owned_authority.rs");
+}
+
+#[test]
+#[ignore = "CI-only compile-time API test"]
+fn driver_ledger_outcomes_must_be_used() {
+    let cases = trybuild::TestCases::new();
+    cases.compile_fail("tests/compile_fail/ledger_outcomes_must_be_used.rs");
 }

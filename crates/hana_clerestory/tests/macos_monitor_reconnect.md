@@ -70,8 +70,8 @@ the probe is running:
 The shortcuts do not cover these physical cases:
 
 - Returning the Dell through another USB-C port or dock.
-- Substituting another panel on the Dell's connector.
-- Two identical panels or duplicate identity evidence.
+- Substituting another display on the Dell's connector.
+- Two identical displays or duplicate identity evidence.
 - Closing and reopening the MacBook lid.
 - Rearranging displays in macOS Settings.
 - Removing every display at once.
@@ -91,9 +91,9 @@ unavailable with the exact missing hardware or operator action.
 | --- | --- | --- | --- |
 | 1 | Same Dell, same connection | Autonomous | None after calibration. |
 | 2 | Same Dell through another port or dock | Operator-assisted | Move the Dell USB-C cable or dock connection. |
-| 3 | Different same-model panel at the same position | Hardware-dependent | A second DELL S3425DW. |
-| 4 | Simultaneous duplicate identity evidence | Hardware-dependent | Two panels that expose indistinguishable qualified evidence. |
-| 5 | Different panel on the original connector | Operator-assisted | Move the Samsung onto the Dell's connection. |
+| 3 | Different same-model display at the same position | Hardware-dependent | A second DELL S3425DW. |
+| 4 | Simultaneous duplicate identity evidence | Hardware-dependent | Two displays that expose indistinguishable qualified evidence. |
+| 5 | Different display on the original connector | Operator-assisted | Move the Samsung onto the Dell's connection. |
 | 6 | MacBook lid close/open | Operator-assisted | Bluetooth input and a clamshell-capable external display. |
 | 7 | Repeated dock or cable churn | Operator-assisted | Repeated physical dock/cable disconnects; shortcut power churn is a separate variant. |
 | 8 | Arrangement-only change | Operator-assisted | Change display arrangement in macOS Settings without disconnecting a display. |
@@ -186,17 +186,21 @@ detached shell. Capture these initial records before touching monitor power:
 
 - `probe-session`, including startup mode and selected index.
 - The Dell monitor entity, scale, and `Verified(MonitorId(...))` identity.
-- One `control-association-confirmed` record.
-- One `pre-unplug-association` record for each canonical key.
-- Exactly one `recovery-ready` record.
-- The expected `recovery-accepted` records, or the documented
-  `recovery-unarmed` record in exclusive mode.
-- One `content-attached` record for each of the four initial windows.
+- One `window-created` record for each of the four managed canonical keys.
+- A probe snapshot whose four `windows` entries each have a `current_monitor.verified_id`
+  matching the Dell.
+- Exactly one `recovery-ready` record. Its producer requires all five probe windows, including
+  the unmanaged control, to be registered and placed on the selected monitor.
+- The initial `role-status-changed` records. Their `role_status` fields serialize
+  `Waiting`, `Applying`, `Established`, or `Stopped` lifecycle status; they do
+  not carry recovery-policy acceptance or a registration generation.
+- `recovery-ready` is the startup proof that every expected binding has its
+  configured recovery policy. In exclusive mode it requires the managed
+  automatic recovery role to be absent.
 
-Take a screenshot and inspect it when a visible result is part of the case.
-All four initial windows should be on the Dell. If the screenshot does not make
-the monitor or fullscreen presentation unambiguous, ask the operator instead of
-inferring the result from the component trace.
+Take a screenshot and confirm that every managed initial window shows its scenario content on the
+Dell. If the screenshot does not make the content, monitor, or fullscreen presentation
+unambiguous, ask the operator instead of inferring the result from the component trace.
 
 ## Calibration: prove that power-off is a disconnect
 
@@ -213,7 +217,7 @@ reconnect evidence:
 6. Wait 5 seconds, then wait for the Dell's monitor connection record and the
    eligible restore results.
 
-If step 3 or 4 fails, run the on shortcut and stop. A dark panel that remains
+If step 3 or 4 fails, run the on shortcut and stop. A dark display that remains
 enumerated over USB-C is not a monitor disconnect and cannot validate recovery.
 
 ## Autonomous runs
@@ -258,8 +262,10 @@ For every cycle:
 
 The example restores the application-controlled key on the first return and
 cancels it after its second pending record. Later cycles therefore expect only
-the two automatic keys to return. Neither automatic key may emit another
-`recovery-accepted` record; both retain their original recovery generation.
+the two automatic keys to return. The probe checks each returned target, the
+single window entry for each automatic key, cancellation of the application key,
+and absence of a recovery mismatch. Registration-generation retention is not
+serialized by the current role-status contract.
 
 ### Rapid off/on
 
@@ -294,12 +300,12 @@ judgment.
 ### Exclusive automatic-unarmed branch
 
 1. Launch in `exclusive` mode and wait for `recovery-ready`.
-2. Confirm the managed automatic key has zero accepted registrations and one
-   `recovery-unarmed` record naming exclusive-fullscreen return.
+2. Treat `recovery-ready` as confirmation that the managed automatic recovery
+   role is absent under the exclusive startup contract.
 3. Turn the Dell off, wait for the installed disconnect, then turn it on.
 4. Confirm only the independently armed primary and application-controlled
    keys return. The exclusive managed window must not be reconstructed or
-   reported as automatically restored.
+   reported as automatically restored; its `restored` count must remain zero.
 
 ## Operator-assisted and hardware-dependent runs
 
@@ -323,39 +329,39 @@ the evidence for visible behavior that the trace or screenshot cannot show.
 
 The connector path must not become the monitor's identity.
 
-### Different same-model panel at the same position
+### Different same-model display at the same position
 
 Run only when a second DELL S3425DW is available.
 
 1. Launch with the original Dell selected and wait for `recovery-ready`.
-2. Record both panels' physical labels and serial numbers before moving a
+2. Record both displays' physical labels and serial numbers before moving a
    cable. Do not identify them only by the macOS display name.
 3. Ask the operator to remove the original Dell and connect the second Dell
    through the same path and arrangement position.
-4. Confirm the substitute panel receives a different verified `MonitorId` from
-   the original panel. The original target's keys must remain pending and must
+4. Confirm the substitute display receives a different verified `MonitorId` from
+   the original display. The original target's keys must remain pending and must
    not return to the substitute.
 5. Reconnect the original Dell and confirm the eligible keys return only then.
 
-If the second panel lacks qualified serial evidence, record the unverified
+If the second display lacks qualified serial evidence, record the unverified
 branch instead of claiming distinct verified identity.
 
 ### Simultaneous duplicate identity evidence
 
-Run only when two connected panels expose identical qualified evidence.
+Run only when two connected displays expose identical qualified evidence.
 
 1. Record the physical labels and the native evidence returned for both
-   panels.
+   displays.
 2. Confirm Clerestory marks the ambiguous identity as `Unverified`; it must not
-   choose a panel by connector, position, entity, index, or enumeration order.
-3. Disconnect and reconnect either panel.
+   choose a display by connector, position, entity, index, or enumeration order.
+3. Disconnect and reconnect either display.
 4. Confirm no automatic return claims verified continuity through the
    ambiguous evidence.
 
-Two panels with the same model name but distinct qualified serial evidence do
+Two displays with the same model name but distinct qualified serial evidence do
 not satisfy this case.
 
-### Different panel on the original connector
+### Different display on the original connector
 
 1. Launch with the Dell selected while the Samsung is also connected. Record
    both verified identities and wait for `recovery-ready`.
@@ -401,9 +407,10 @@ For each cycle:
 4. Wait for one installed reconnect revision and exactly one return per
    eligible automatic key.
 
-Confirm the automatic keys retain their original accepted generations through
-all cycles. Record any application-controlled cancellation after the first
-cycle separately.
+Confirm one return per eligible automatic key, no duplicate window key, and no
+recovery mismatch through all cycles. Record any application-controlled
+cancellation after the first cycle separately. Registration generations are not
+present in `role-status-changed` records.
 
 ### Arrangement-only change
 
@@ -459,9 +466,10 @@ or external-monitor rows.
    are visible.
 3. Ask the operator to leave Primary Automatic untouched and focus Managed
    Automatic.
-4. Ask them to move and resize it, press `B`, wait for the borderless
-   `window-component-changed` record, press `W`, and wait for the windowed
-   record.
+4. Ask them to move and resize it, then read a probe snapshot and confirm the managed automatic
+   window's `position` and `physical_size` changed. Ask them to press `B`; wait until
+   `requested_mode`, `effective_mode`, and `native_fullscreen` report the borderless result. Ask
+   them to press `W`; wait until the same snapshot fields report the windowed result.
 5. Confirm those changes did not replace its registered Dell target.
 6. Ask them to press `Shift+C` once. Confirm exactly one automatic
    `recovery-cancellation-requested` record.
@@ -494,7 +502,7 @@ Report each run with:
   `MonitorId`.
 - Installed topology revisions and the observed operating-system timing.
 - Original, fallback, replacement, and returned window entities by key.
-- Acceptance, pending, available, cancellation, restored, and mismatch counts.
+- Role-status, pending, available, cancellation, restored, and mismatch counts.
 - Visible result and screenshot path, or the operator's observation.
 - Pass, fail, or unavailable, with the exact reason.
 - Confirmation that the Dell was returned to the on state.

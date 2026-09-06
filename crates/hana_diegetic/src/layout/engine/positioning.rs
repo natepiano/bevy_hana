@@ -63,10 +63,11 @@ struct GeometryStackEntry {
 }
 
 /// Clip state threaded down the DFS.
-/// `inherited` = viewport ∩ every [`ChildOverflow::Clipped`] ancestor; applied to owner-bound
-/// content. `scissor`   = only explicit [`ChildOverflow::Clipped`] ancestors (no viewport); line
-/// geometry that               overflows a panel is not clipped to the panel viewport, but still
-/// respects these regions.
+///
+/// `inherited` is the viewport ∩ every [`ChildOverflow::Clipped`] ancestor, and applies to
+/// owner-bound content. `scissor` is only the explicit [`ChildOverflow::Clipped`] ancestors, with
+/// no viewport term: line geometry that overflows a panel is not clipped to the panel viewport,
+/// but is still clipped to these regions.
 #[derive(Clone, Copy)]
 struct ClipContext {
     inherited: BoundingBox,
@@ -380,10 +381,10 @@ fn emit_text_commands(
     font_scale: f32,
     z_index: DrawZIndex,
 ) {
-    // Render commands store font sizes in layout units so downstream
-    // renderers don't need to know about the font unit conversion.
-    // `TextStyle::scaled(1.0)` is intentionally an identity transform; avoid
-    // the multiply path in per-text command emission after trees are pre-scaled.
+    // Render commands store font sizes in layout units, so downstream renderers
+    // do not repeat the font-unit conversion. `TextStyle::scaled(1.0)` is an
+    // identity transform, so a pre-scaled tree (`font_scale == 1.0`) clones the
+    // config and skips the multiply.
     let scaled_config = if font_scale.to_bits() == 1.0_f32.to_bits() {
         config.clone()
     } else {

@@ -18,9 +18,9 @@ use parley::style::LineHeight;
 use parley::style::StyleProperty;
 
 use crate::layout::FontSlant;
-use crate::layout::LineMetricsSnapshot;
 use crate::layout::ResolvedFontFace;
 use crate::layout::ShapedGlyph;
+use crate::layout::ShapedLineMetrics;
 use crate::layout::ShapedTextCache;
 use crate::layout::ShapedTextRun;
 use crate::layout::TextDimensions;
@@ -127,7 +127,9 @@ pub(super) fn positioned_glyphs<'a>(
     positioned_glyphs
 }
 
-/// Runs parley text shaping, using the cache when possible.
+/// Runs parley text shaping. A cache entry for this text and the style's
+/// measure is returned as-is; otherwise the text is shaped and the run plus its
+/// dimensions are inserted into the cache.
 pub(super) fn shape_text_cached(
     text: &str,
     config: &TextStyle,
@@ -227,12 +229,12 @@ fn collect_shaped_run(layout: &Layout<()>, requested_font_id: u16) -> ShapedText
     }
 }
 
-fn collect_line_metrics(layout: &Layout<()>) -> Vec<LineMetricsSnapshot> {
+fn collect_line_metrics(layout: &Layout<()>) -> Vec<ShapedLineMetrics> {
     layout
         .lines()
         .map(|line| {
             let metrics = line.metrics();
-            LineMetricsSnapshot {
+            ShapedLineMetrics {
                 ascent:   metrics.ascent,
                 descent:  metrics.descent,
                 baseline: metrics.baseline,

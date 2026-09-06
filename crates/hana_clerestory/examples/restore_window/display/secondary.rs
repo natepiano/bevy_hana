@@ -10,7 +10,7 @@ use bevy::prelude::Window;
 use bevy::prelude::default;
 use bevy::window::Monitor;
 use hana_clerestory::CurrentMonitor;
-use hana_clerestory::ManagedWindow;
+use hana_clerestory::ManagedWindowName;
 
 use super::super::constants::DEFAULT_COLOR;
 use super::super::constants::FONT_SIZE;
@@ -35,7 +35,7 @@ pub(crate) struct SecondaryDisplay(pub(crate) Entity);
 pub(crate) fn update_secondary_displays(
     mut displays: Query<(Entity, &SecondaryDisplay)>,
     windows: Query<(&Window, Option<&CurrentMonitor>)>,
-    managed_query: Query<&ManagedWindow>,
+    managed_query: Query<&ManagedWindowName>,
     bevy_monitors: Query<(Entity, &Monitor)>,
     mut selected_video_modes: ResMut<SelectedVideoModes>,
     restored_states: Res<RestoredStates>,
@@ -52,9 +52,7 @@ pub(crate) fn update_secondary_displays(
 
         let name = managed_query
             .get(display.0)
-            .map_or(UNKNOWN_MANAGED_WINDOW_NAME, |managed_window| {
-                &managed_window.name
-            });
+            .map_or(UNKNOWN_MANAGED_WINDOW_NAME, |managed_name| &managed_name.0);
         let cached_restored_state = restored_states.by_entity.get(&display.0);
         let cached_mismatch_state = mismatch_states.by_entity.get(&display.0);
 

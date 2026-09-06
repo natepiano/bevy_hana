@@ -5,10 +5,11 @@ use bevy::prelude::Reflect;
 /// Retention and reapplication policy stored with a device binding after its provider reports a
 /// unit absent.
 ///
-/// `RecoveryPolicy` makes a saved configuration's later treatment explicit, so a missing display,
-/// projector, or HID panel cannot acquire automatic output merely because its configuration
-/// remains available. `Presence` and `Claim` answer current usability; this policy instead
-/// controls whether the binding keeps a configuration and how it may return.
+/// [`RecoveryPolicy`] makes a saved configuration's later treatment explicit, so a missing display,
+/// projector, or control surface cannot acquire automatic output merely because its configuration
+/// remains available. [`Presence`](crate::Presence) and [`Claim`](crate::Claim) answer current
+/// usability; this policy instead controls whether the binding keeps a configuration and how it
+/// may return.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Component, Reflect)]
 #[reflect(Component, PartialEq)]
 pub enum RecoveryPolicy {
@@ -19,18 +20,14 @@ pub enum RecoveryPolicy {
     /// a later application decision must supply any new configuration and authorization.
     #[default]
     Forget,
-    /// Keep the saved configuration but never send it to the device, as for a lighting rig whose
-    /// operator must approve every blackout change at the console.
-    ///
-    /// The kernel holds the value for reports and inspection and offers no path that reapplies
-    /// it. `ReapplyOnRequest` is the neighbouring policy that does; choose that one instead when
-    /// application code needs to ask the kernel to send the value back.
-    Retain,
     /// Keep the saved configuration until application code requests reapplication, as for a
-    /// projector whose next presentation determines when its shutter state should return.
+    /// projector whose next presentation determines when its shutter state should return, or a
+    /// lighting rig whose operator approves every blackout change at the console.
     ///
     /// A verified return report does not apply the configuration by itself; the application makes
-    /// the request when the restored setting suits its current work.
+    /// the request when the restored setting suits its current work. Holding the value purely for
+    /// reports is this policy with a request that never comes — the kernel touches no device until
+    /// one does.
     ReapplyOnRequest,
     /// Keep the saved configuration and reapply it after reconciliation verifies the returning
     /// physical unit, as when a replugged Stream Deck reports its earlier serial.
@@ -79,7 +76,7 @@ mod tests {
             Some(true)
         );
         assert_eq!(
-            RecoveryPolicy::Forget.reflect_partial_eq(&RecoveryPolicy::Retain),
+            RecoveryPolicy::Forget.reflect_partial_eq(&RecoveryPolicy::ReapplyOnReturn),
             Some(false)
         );
     }

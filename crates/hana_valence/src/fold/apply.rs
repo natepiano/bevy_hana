@@ -65,8 +65,8 @@ where
 
     reject_hinges_away_from_base(world, &assignments)?;
     for assignment in assignments {
-        // Application-owned entities may already be gone; a later missing
-        // member is best effort once writing has begun.
+        // Application-owned entities may already be gone; once writing has
+        // begun, a member whose entity or `Hinge` is missing is skipped.
         if let Some(mut member) = world.get_entity_mut(assignment.member_entity).ok()
             && let Some(hinge) = member.get::<Hinge>().copied()
         {
@@ -192,9 +192,10 @@ fn validate_assignments(
 
 /// Rejects replacement anywhere but the shared base endpoint.
 ///
-/// A hinge already carrying a distinct folded endpoint is mid-recipe: swapping
-/// its target would move geometry that playback is holding. A member whose
-/// hinge is absent is left to the best-effort write pass.
+/// A hinge whose folded endpoint already differs from its base angle carries
+/// an earlier recipe's result, and replacing its target would move geometry
+/// that playback is holding. A member carrying no [`Hinge`] is not rejected
+/// here; the write pass skips it too.
 fn reject_hinges_away_from_base(
     world: &World,
     assignments: &[FoldAssignment],

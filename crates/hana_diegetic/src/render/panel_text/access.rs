@@ -11,7 +11,7 @@
 //! The id-addressed pair resolve a run through the panel's `id → Entity` index
 //! ([`DiegeticPanel::text_child`]) and validate liveness via their
 //! `PanelTextLayout` query, so a despawned run reads back as `None` rather than
-//! a dangling `Entity` (TR-Q). The lone-run helpers ([`PanelTextReader::sole_text`],
+//! a dangling `Entity`. The lone-run helpers ([`PanelTextReader::sole_text`],
 //! [`PanelText::set_sole_text`], and [`DiegeticTextMut`]) resolve a label's run
 //! through its [`PanelTextRuns`] set.
 
@@ -253,7 +253,7 @@ impl PanelText<'_, '_> {
     /// [`DiegeticText`](crate::DiegeticText)), no id needed. Returns whether a
     /// single run was found.
     ///
-    /// A [`DiegeticText`](crate::DiegeticText)'s run is anonymous — it is minted
+    /// A [`DiegeticText`](crate::DiegeticText)'s run is anonymous — it is given
     /// a crate-internal [`PanelElementId::Auto`] id that a caller cannot build —
     /// so this is the only way to restyle one such label. See
     /// [`Self::set_style`] for why the write goes to the tree rather than to the
@@ -281,7 +281,7 @@ impl PanelText<'_, '_> {
 /// [`PanelTextReader`]'s `&DiegeticPanel` one, so neither can embed the other.
 ///
 /// `text_child` is an unchecked index read; the `layouts` query confirms the
-/// entity is still a live run (TR-Q). A stale index entry (entity despawned out
+/// entity is still a live run. A stale index entry (entity despawned out
 /// of flow before reification rebuilt the index) falls to the miss path, but its
 /// id is still valid in the tree — authoritative for valid ids at build time,
 /// unlike the reification-timed index — so a `#[cfg(debug_assertions)]` `warn!`
@@ -335,7 +335,7 @@ fn lone_run(runs: &PanelTextRuns, layouts: &Query<&PanelTextLayout>) -> Option<E
 ///
 /// `set_text` read-compares against the current tree string first, so an
 /// unchanged write never takes the `&mut DiegeticPanel` path and never dirties
-/// the panel — a no-op edit drives no relayout and no measure (TR-L). It holds a
+/// the panel — a no-op edit drives no relayout and no measure. It holds a
 /// [`Mut`] (not a `&mut`) for the same reason: reads go through `Deref` and do
 /// not flag the panel changed.
 ///
@@ -368,8 +368,8 @@ impl TextEdit<'_> {
     /// dirties the panel, records a change, nor triggers a relayout.
     pub fn set_text(&mut self, text: impl Into<String>) {
         let text = text.into();
-        // Read through `Deref` (no change flag) and bail on a no-op, mirroring
-        // the equality guard the deleted `sync_run_text_to_cache` held.
+        // Read through `Deref` (no change flag) and return on a no-op, so an
+        // unchanged string never takes the `&mut` path.
         if self.panel.tree().element_text(self.element_idx) == Some(text.as_str()) {
             return;
         }
@@ -574,10 +574,10 @@ mod tests {
     }
 
     /// A measurer whose height encodes the `font_id`, so a restyle that changes
-    /// the font produces an observably different measured size. Bug 1 was that
-    /// `for_each_style_mut` wrote the run's derived style instead of the
-    /// authoritative tree config, so the layout engine never saw the new font;
-    /// a font-id-sensitive height makes that omission a test failure.
+    /// the font produces an observably different measured size. A
+    /// `for_each_style_mut` that wrote the run's derived style instead of the
+    /// authoritative tree config would leave the layout engine measuring the old
+    /// font; a font-id-sensitive height turns that into a test failure.
     fn font_id_height_measurer() -> DiegeticTextMeasurer {
         DiegeticTextMeasurer {
             measure_fn: Arc::new(|text: &str, measure: &TextMeasure| {
@@ -607,7 +607,7 @@ mod tests {
     }
 
     /// Headless layout with the monospace approximation measurer — the default
-    /// for tests that do not care which font measures.
+    /// for tests whose assertions do not depend on which font measures.
     fn access_app() -> App { app_with_measurer(monospace_measurer()) }
 
     fn auto_tree(text: &str) -> LayoutTree {
@@ -975,10 +975,10 @@ mod tests {
     #[test]
     fn restyle_through_diegetic_text_mut_refits_the_panel() {
         // The measurer's height grows with `font_id`, so re-fitting the panel
-        // after a restyle is observable as a height change. Before Bug 1 was
-        // fixed, `for_each_style_mut` mutated only the run's derived style, the
-        // tree config the engine measures kept font 0, and the height held —
-        // the new font rendered but the panel never resized to it.
+        // after a restyle is observable as a height change. If
+        // `for_each_style_mut` mutated only the run's derived style, the tree
+        // config the engine measures would keep font 0 and the height would
+        // hold — the new font rendering while the panel never resized to it.
         let mut app = app_with_measurer(font_id_height_measurer());
         let panel = spawn_panel(&mut app, auto_tree("Hi"));
         app.world_mut().entity_mut(panel).insert(Label);

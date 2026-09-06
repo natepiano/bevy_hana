@@ -26,7 +26,6 @@ use super::window_state::PersistedWindowState;
 #[cfg(test)]
 use super::window_state::SavedWindowMode;
 use crate::constants::STATE_FILE;
-use crate::monitors::MonitorDeviceAssociation;
 use crate::restore_window_config::RestoreWindowConfig;
 
 /// Get the default state file path using the executable name.
@@ -66,11 +65,10 @@ pub(crate) fn get_state_path_for_app(app_name: &str) -> Option<PathBuf> {
 /// [`back_up_unreadable_state_file`].
 pub(super) fn load_all_states(
     path: &Path,
-    association: &MonitorDeviceAssociation,
     registered_schemes: &RegisteredSchemes,
 ) -> Option<PersistedWindowStateDecodeOutcome> {
     let contents = fs::read_to_string(path).ok()?;
-    let decoded = decode_roles(&contents, association, registered_schemes);
+    let decoded = decode_roles(&contents, registered_schemes);
     if matches!(
         decoded,
         PersistedWindowStateDecodeOutcome::WholeFileRejected
@@ -82,10 +80,9 @@ pub(super) fn load_all_states(
 
 pub(super) fn decode_roles(
     contents: &str,
-    association: &MonitorDeviceAssociation,
     registered_schemes: &RegisteredSchemes,
 ) -> PersistedWindowStateDecodeOutcome {
-    format::decode(contents, association, registered_schemes)
+    format::decode(contents, registered_schemes)
 }
 
 /// Copy a state file aside before the app starts writing over it.
@@ -96,8 +93,8 @@ pub(super) fn decode_roles(
 /// are gone with no way back and no message saying so.
 ///
 /// Saving is deliberately **not** suppressed afterwards. The copy already preserves the data, and
-/// refusing to write would silently stop remembering window positions for the rest of the session
-/// to protect a file that is already safe.
+/// refusing to write would silently stop saving window positions for the rest of the session
+/// to protect a file that is already copied.
 ///
 /// The one case this does not fully cover: running a newer build, then an older one, then the
 /// newer one again leaves the newer file only as a backup. It is still recoverable by hand.
@@ -129,7 +126,7 @@ fn back_up_unreadable_state_file(path: &Path, contents: &str) {
 }
 
 /// First unused `<file>.bak.<label>` name, adding `.1`, `.2`, … so an earlier backup of the same
-/// version is never clobbered by a later failure.
+/// version is never overwritten by a later failure.
 fn unused_backup_path(path: &Path, version_label: &str) -> Option<PathBuf> {
     let file_name = path.file_name()?.to_str()?;
     let directory = path.parent()?;
@@ -149,14 +146,13 @@ fn unused_backup_path(path: &Path, version_label: &str) -> Option<PathBuf> {
 /// Seed the startup-only RON adapter once during `PreStartup`.
 pub(super) fn load_persisted_window_placements(
     config: Res<RestoreWindowConfig>,
-    association: Res<MonitorDeviceAssociation>,
     registered_schemes: Res<RegisteredSchemes>,
     mut persisted_window_placements: ResMut<PersistedWindowPlacements>,
 ) {
     if persisted_window_placements.startup_load_status() == StartupLoadStatus::Read {
         return;
     }
-    let persisted = match load_all_states(&config.path, &association, &registered_schemes) {
+    let persisted = match load_all_states(&config.path, &registered_schemes) {
         Some(PersistedWindowStateDecodeOutcome::Decoded(states)) => states,
         Some(PersistedWindowStateDecodeOutcome::WholeFileRejected) | None => HashMap::new(),
     };
@@ -172,16 +168,23 @@ mod tests {
     use bevy::ecs::schedule::Schedule;
     use bevy::ecs::world::World;
     use bevy::math::IVec2;
+    use hana_rigging::prelude::ApplyDeadline;
+    use hana_rigging::prelude::BindingPolicy;
+    use hana_rigging::prelude::OnAbort;
+    use hana_rigging::prelude::OnSessionLoss;
+    use hana_rigging::prelude::RecoveryPolicy;
     use hana_rigging::prelude::RegisteredSchemes;
+    use hana_rigging::prelude::RetryOn;
     use hana_rigging::prelude::RoleKey;
     use tempfile::NamedTempFile;
 
     use super::PersistedWindowState;
     use super::SavedWindowMode;
     use crate::constants::CURRENT_STATE_VERSION;
-    use crate::monitors::MonitorDeviceAssociation;
-    use crate::persistence::PersistedPanelIdentityV4;
+    use crate::persistence::LoadedBindingPolicy;
+    use crate::persistence::PersistedDisplayIdentityV4;
     use crate::persistence::PersistedPosition;
+    use crate::persistence::PersistedWindowPlacement;
     use crate::persistence::PersistedWindowPlacements;
     use crate::persistence::PersistedWindowStateDecodeOutcome;
     use crate::persistence::PersistedWindowTargetV5;
@@ -207,7 +210,7 @@ mod tests {
     fn sample_state() -> PersistedWindowState {
         PersistedWindowState {
             target:            PersistedWindowTargetV5::AwaitingLegacyEvidence(
-                PersistedPanelIdentityV4::Anonymous,
+                PersistedDisplayIdentityV4::Anonymous,
             ),
             position:          PersistedPosition::MonitorOffset(IVec2::new(10, 20)),
             logical_width:     800,
@@ -217,12 +220,22 @@ mod tests {
         }
     }
 
-    fn load_states(path: &Path) -> Option<HashMap<RoleKey, PersistedWindowState>> {
-        match load::load_all_states(
-            path,
-            &MonitorDeviceAssociation::default(),
-            &hana_rigging::prelude::RegisteredSchemes::default(),
-        ) {
+    fn sample_policy() -> BindingPolicy {
+        BindingPolicy::new(
+            RecoveryPolicy::ReapplyOnRequest,
+            RetryOn::NewRevision,
+            OnAbort::default(),
+            OnSessionLoss::default(),
+            ApplyDeadline::ProcessDefault,
+        )
+    }
+
+    fn saved_state() -> PersistedWindowPlacement {
+        PersistedWindowPlacement::new(sample_state(), LoadedBindingPolicy::Saved(sample_policy()))
+    }
+
+    fn load_states(path: &Path) -> Option<HashMap<RoleKey, PersistedWindowPlacement>> {
+        match load::load_all_states(path, &hana_rigging::prelude::RegisteredSchemes::default()) {
             Some(PersistedWindowStateDecodeOutcome::Decoded(states)) => Some(states),
             Some(PersistedWindowStateDecodeOutcome::WholeFileRejected) | None => None,
         }
@@ -237,8 +250,8 @@ mod tests {
         let path = file.path();
 
         let states = HashMap::from([
-            (primary_role(), sample_state()),
-            (managed_role("primary"), sample_state()),
+            (primary_role(), saved_state()),
+            (managed_role("primary"), saved_state()),
         ]);
         save::save_all_states(path, &states);
 
@@ -273,7 +286,10 @@ mod tests {
 
         let states = load_states(path);
         assert!(states.is_some(), "expected legacy content to decode");
-        let states = states.unwrap_or_default();
+        let mut states = states.unwrap_or_default();
+        for placement in states.values_mut() {
+            placement.loaded_binding_policy = LoadedBindingPolicy::Saved(sample_policy());
+        }
         save::save_all_states(path, &states);
 
         let contents = fs::read_to_string(path);
@@ -298,7 +314,7 @@ mod tests {
         };
         save::save_all_states(
             file.path(),
-            &HashMap::from([(primary_role(), sample_state())]),
+            &HashMap::from([(primary_role(), saved_state())]),
         );
 
         let mut world = World::new();
@@ -306,7 +322,6 @@ mod tests {
             path: file.path().to_path_buf(),
         });
         world.init_resource::<PersistedWindowPlacements>();
-        world.init_resource::<MonitorDeviceAssociation>();
         world.init_resource::<RegisteredSchemes>();
         let mut schedule = Schedule::default();
         schedule.add_systems(load::load_persisted_window_placements);
@@ -316,7 +331,7 @@ mod tests {
 
         let persisted = world.resource::<PersistedWindowPlacements>();
         assert_eq!(persisted.startup_load_status(), StartupLoadStatus::Read);
-        assert!(persisted.get(&primary_role()).is_some());
+        assert!(persisted.get(&primary_role()).is_saved());
     }
 
     /// An unreadable file must survive the launch that replaces it.
@@ -384,7 +399,7 @@ mod tests {
         let _ = fs::remove_file(&backup_path);
     }
 
-    /// A second failure of the same version must not clobber the first backup.
+    /// A second failure of the same version must not overwrite the first backup.
     #[test]
     fn a_second_backup_of_the_same_version_gets_its_own_name() {
         let file = match NamedTempFile::new() {
@@ -422,7 +437,7 @@ mod tests {
             Err(error) => panic!("failed to create temp file: {error}"),
         };
         let path = file.path();
-        let states = HashMap::from([(primary_role(), sample_state())]);
+        let states = HashMap::from([(primary_role(), saved_state())]);
         save::save_all_states(path, &states);
 
         assert!(load_states(path).is_some());
@@ -445,7 +460,7 @@ mod tests {
             Err(error) => panic!("failed to create temp file: {error}"),
         };
         let path = file.path();
-        let states = HashMap::from([(primary_role(), sample_state())]);
+        let states = HashMap::from([(primary_role(), saved_state())]);
 
         assert_eq!(
             save::save_all_states(path, &states),

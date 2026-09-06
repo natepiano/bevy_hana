@@ -2,7 +2,8 @@
 //!
 //! Each test builds the same layout in both Clay (via `clay-layout` FFI) and
 //! `hana_diegetic`, then asserts that every rectangle/text bounding box matches.
-//! This is the source of truth — if Clay produces it, we should too.
+//! Clay's output is the expected value: whatever Clay produces, this engine
+//! must produce.
 
 #![allow(
     clippy::float_cmp,
@@ -17,8 +18,19 @@
     clippy::unwrap_used,
     reason = "tests use panic/unwrap for clearer failure messages"
 )]
+#![allow(
+    clippy::significant_drop_tightening,
+    reason = "`ExclusiveClay` holds the Clay lock for exactly as long as the `Clay` it \
+              guards; the lint's suggested rewrite borrows from a temporary and does \
+              not compile"
+)]
 
+use std::ops::Deref;
+use std::ops::DerefMut;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::sync::PoisonError;
 
 use clay_layout::Clay;
 use clay_layout::ClayLayoutScope;
@@ -160,10 +172,43 @@ fn assert_bboxes_match(clay_boxes: &[Bbox], diegetic_boxes: &[Bbox], kind: BboxK
 
 // ── Clay helper ───────────────────────────────────────────────────────────
 
-fn new_clay(size: f32) -> Clay {
-    let mut clay = Clay::new((size, size).into());
+/// Serializes every Clay layout in this module onto one thread at a time.
+///
+/// Clay keeps its current context (`Clay__currentContext`) and its measure-text
+/// callback (`Clay__MeasureText`) in plain C globals, so two test threads
+/// building layouts concurrently clobber each other mid-layout. The damage
+/// surfaces as random `DuplicateId` / `InternalError` panics out of Clay's
+/// error handler, or as a read through a freed measure-text closure.
+static CLAY_GLOBALS: Mutex<()> = Mutex::new(());
+
+/// A `Clay` that holds [`CLAY_GLOBALS`] for as long as it lives.
+struct ExclusiveClay {
+    clay:   Clay,
+    _guard: MutexGuard<'static, ()>,
+}
+
+impl Deref for ExclusiveClay {
+    type Target = Clay;
+
+    fn deref(&self) -> &Clay { &self.clay }
+}
+
+impl DerefMut for ExclusiveClay {
+    fn deref_mut(&mut self) -> &mut Clay { &mut self.clay }
+}
+
+fn new_clay(size: f32) -> ExclusiveClay { new_clay_dims(size, size) }
+
+fn new_clay_dims(width: f32, height: f32) -> ExclusiveClay {
+    // A failing assertion inside a guarded scope poisons the lock; the globals
+    // are still sound for the next test, so take the guard either way.
+    let guard = CLAY_GLOBALS.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut clay = Clay::new((width, height).into());
     clay.set_measure_text_function_user_data((), clay_monospace_measure);
-    clay
+    ExclusiveClay {
+        clay,
+        _guard: guard,
+    }
 }
 
 fn collect_clay_bboxes<'a>(
@@ -717,8 +762,7 @@ fn parity_cross_axis_grow_with_large_content() {
     let height = 100.0;
 
     // Clay
-    let mut clay = Clay::new((width, height).into());
-    clay.set_measure_text_function_user_data((), clay_monospace_measure);
+    let mut clay = new_clay_dims(width, height);
     let mut layout = clay.begin::<(), ()>();
     layout.with(
         Declaration::new()

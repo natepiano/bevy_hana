@@ -17,9 +17,9 @@
 //! resolves to `AdoptionOutcome::NoSuchQuestion` instead of panicking or silently doing nothing.
 //!
 //! A `crate::DeviceIdSource::Synthesized` key raises nothing here. A value that rotates on every
-//! replug is not an identifier, and a reporter that synthesizes a key from stable evidence has
-//! already made the decision this register exists for: the kernel takes the claim at face value,
-//! answers `crate::IdentityVerdict::RestoreOnly`, and never asks the application anything.
+//! replug is not an identifier, and a key synthesized from stable evidence is a digest over
+//! descriptors the reporter itself selected: the kernel takes the claim at face value, answers
+//! `crate::IdentityVerdict::Presumed`, and never asks the application anything.
 
 use bevy::ecs::reflect::ReflectResource;
 use bevy::ecs::system::Commands;
@@ -36,7 +36,6 @@ use crate::DeviceStateLookup;
 use crate::Devices;
 use crate::HardwareInventory;
 use crate::IdentityDecisionOwed;
-use crate::IdentityQuestionExpired;
 use crate::IdentityQuestionRaised;
 use crate::IdentityVerdict;
 use crate::Presence;
@@ -109,8 +108,9 @@ pub enum IdentityAnswer {
 
 /// Result of reading the one question standing for a role.
 ///
-/// A named result rather than an optional reference so a caller learns at the lookup that a role
-/// simply has nothing outstanding, which is the ordinary case and not a missing value.
+/// A named result rather than an optional reference: [`IdentityQuestionLookup::NoQuestion`] names
+/// the ordinary case — a role with nothing outstanding — where an absent value would read as a
+/// missing one.
 #[derive(Debug)]
 pub enum IdentityQuestionLookup<'a> {
     /// This role has no outstanding identity question.
@@ -160,9 +160,10 @@ pub enum IdentityAdoptionPreparation {
 
 /// One checked device-wide set of identity questions ready to be adopted atomically.
 ///
-/// The role set belongs to the integration because only it knows which independently routed roles
-/// share one physical device. The kernel keeps this type device- and identity-specific: it matches
-/// standing questions by role, saved key, and candidate key without naming an integration kind.
+/// The role set is supplied by the integration, which is what maps one physical device onto the
+/// independently routed roles that share it. The kernel keeps this type device- and
+/// identity-specific: it matches standing questions by role, saved key, and candidate key without
+/// naming an integration kind.
 #[derive(Debug)]
 pub struct PreparedIdentityAdoption {
     role:           RoleKey,
@@ -221,8 +222,8 @@ enum IdentityDebtDischarge {
 /// Read the list, answer whichever entries the interface has room for, and leave the rest standing:
 /// several units can go ambiguous at once and more can arrive while an operator is working through
 /// an earlier one. Nothing here is mirrored onto an entity — the register is a queue of questions,
-/// not a state axis of one device — so `crate::IdentityQuestionRaised` and
-/// `crate::IdentityQuestionExpired` are what a consumer watches to keep a dialog in step with it.
+/// not a state axis of one device — so `crate::IdentityQuestionRaised` announces new work and
+/// consumers read this register to remove or update a dialog after the question changes.
 ///
 /// Persistence is the application's. Adopting a candidate tells the application which durable key
 /// its saved configuration should be rewritten to; the kernel does no file I/O and will ask the
@@ -547,7 +548,7 @@ pub(crate) fn adjudicate_identity_questions(
     }
     let unanswerable = unanswerable_questions(&identity_decisions, &bindings, &devices);
     if !unanswerable.is_empty() {
-        expire_questions(&mut commands, &mut identity_decisions, &unanswerable);
+        expire_questions(&mut identity_decisions, &unanswerable);
     }
 
     let raise_pass =
@@ -624,16 +625,7 @@ fn apply_recorded_answers(
                         // `raise_new_questions` announcing the same question a second time.
                         still_waiting.push(recorded_answer);
                     },
-                    Err(_) => {
-                        // `BindingError::RoleNotBound` — the role was retired between the answer
-                        // and this pass — or `BindingError::TransitionSequenceExhausted`, which
-                        // never recovers. Either way no binding can move onto the candidate, so
-                        // the question the answer was written against is gone.
-                        commands.trigger(IdentityQuestionExpired {
-                            role:      recorded_answer.role,
-                            candidate: recorded_answer.candidate,
-                        });
-                    },
+                    Err(_) => {},
                 }
             },
             IdentityAnswer::Reject => {
@@ -687,33 +679,19 @@ fn unanswerable_questions(
         .collect()
 }
 
-/// Drop the questions this pass can no longer answer, and announce each one.
-///
-/// Without this the register accumulates questions about hardware that left, and a dialog opened
-/// against one of them has no signal that the entry vanished underneath it.
+/// Drop the questions this pass can no longer answer.
 ///
 /// Entries are removed last position first, which requires `unanswerable` to be in the ascending
-/// order `unanswerable_questions` produces: only then do the earlier positions still address the
-/// entries they were derived from. They are announced in the order they arose, which is the order
-/// `IdentityDecisions::questions` is documented to hold.
+/// order `unanswerable_questions` produces; only then do the earlier positions still address the
+/// entries they were derived from.
 fn expire_questions(
-    commands: &mut Commands,
     identity_decisions: &mut IdentityDecisions,
     unanswerable: &[UnanswerableQuestion],
 ) {
-    let mut expired = Vec::with_capacity(unanswerable.len());
     for unanswerable_question in unanswerable.iter().rev() {
-        expired.push(
-            identity_decisions
-                .questions
-                .remove(unanswerable_question.standing),
-        );
-    }
-    for question in expired.into_iter().rev() {
-        commands.trigger(IdentityQuestionExpired {
-            role:      question.role,
-            candidate: question.candidate,
-        });
+        identity_decisions
+            .questions
+            .remove(unanswerable_question.standing);
     }
 }
 
@@ -723,17 +701,15 @@ enum CandidateHardware {
     /// The key resolves to a retained device the contributors still report `Presence::Present`, so
     /// an adoption would move the binding onto hardware that is actually there.
     Present,
-    /// The unit is gone, by either of the two departures `crate::DeviceDeparture` distinguishes.
+    /// The retained availability conclusion does not authorize the unit.
     Departed,
 }
 
-/// Decide whether one candidate key still names usable hardware.
+/// Report whether one candidate key still names usable hardware.
 ///
 /// `Devices::resolve` alone cannot answer this: it reports only whether the key is in the
-/// reconciled identity map, and a unit a reporter still enumerates while no longer reporting it
-/// present keeps its handle, its state, and its entity. That is exactly
-/// `crate::DeviceDeparture::RetainedButNotPresent`, the departure `crate::DeviceDeparted` fires
-/// for, so a question about it has to expire the same way one about an unplugged unit does.
+/// reconciled identity map, and departure grace keeps a handle, state, and entity while revoking
+/// authorization. A question about that unit expires the same way one about a retired unit does.
 fn candidate_hardware(devices: &Devices, candidate: &DeviceKey) -> CandidateHardware {
     let DeviceResolution::Resolved(device_id) = devices.resolve(candidate) else {
         return CandidateHardware::Departed;
@@ -896,10 +872,10 @@ fn askable_roles(
 /// Only a claim of stability can be violated. `crate::DeviceIdSource::Reported` is a reporter
 /// asserting the unit itself supplies this value, and `crate::DeviceIdSource::Authored` is a human
 /// asserting the assignment, so a live unit contradicting either is a question.
-/// `crate::DeviceIdSource::Synthesized` asserts nothing of the sort — a reporter that synthesizes a
-/// key from location evidence has already decided what is stable about that hardware — so a
-/// same-kind unit arriving where a synthesized key left is simply a different unit, and asking
-/// about it would leave a rotating-serial device unusable while nobody could answer.
+/// `crate::DeviceIdSource::Synthesized` asserts nothing of the sort: its digest is derived from the
+/// location descriptors a reporter hashed, so the key names the slot and not the unit occupying it.
+/// A same-kind unit arriving where a synthesized key left is therefore simply a different unit, and
+/// asking about it would leave a rotating-serial device unusable while nobody could answer.
 ///
 /// This is the only place that exemption is applied. The departed-slot join in
 /// `crate::reconcile::verdict_for` reads the saved key's source only to tell `WrongUnit` from

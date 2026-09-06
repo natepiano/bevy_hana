@@ -62,9 +62,10 @@ impl SequencePosition {
 
     /// Clamps normalized progress into the valid range.
     ///
-    /// An infinite value clamps to the bound it exceeds. NaN orders against
-    /// nothing and so names no position; it clamps to [`Self::START`] rather
-    /// than breaching the finite invariant `try_new` enforces.
+    /// An infinite value clamps to the bound it exceeds. `f32::clamp` returns
+    /// NaN for a NaN input, so NaN is checked first and mapped to
+    /// [`Self::START`], keeping the finite invariant [`Self::try_new`]
+    /// enforces.
     pub(crate) const fn clamped(normalized: f32) -> Self {
         if normalized.is_nan() {
             return Self::START;
@@ -173,8 +174,9 @@ impl SequenceMovement {
 
     /// Replaces only the position portion of this movement.
     ///
-    /// Direction, repetition, and range-crossing metadata stay under producer
-    /// control, so a scalar producer such as a tween never invents traversal.
+    /// Direction, repetition, and range-crossing metadata keep the values the
+    /// producer set, so a scalar producer such as a tween writes no traversal
+    /// metadata.
     pub const fn set_position(&mut self, position: SequencePosition) { self.position = position; }
 }
 

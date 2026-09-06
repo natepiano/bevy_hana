@@ -11,14 +11,14 @@ use sealed::Sealed;
 
 /// Type-family key for one complete lagrange camera kind.
 ///
-/// Implementors are zero-sized marker types such as [`OrbitCamKind`] and
-/// [`FreeCamKind`]. The trait is the compile-time checklist for behavior every
-/// camera kind must supply: controller registration, `AnimateToFit` support,
-/// `ZoomToFit` support, and `LookAt` / `LookAtAndZoomToFit` support.
+/// Implementors are zero-sized marker types. The trait lists the behavior every
+/// camera kind supplies: controller registration, `AnimateToFit` support,
+/// `ZoomToFit` support, and `LookAt` / `LookAtAndZoomToFit` support. A camera
+/// kind that omits one of them does not compile.
 /// Generic input code extends the same kind key with input-specific associated
 /// types.
-/// This trait is sealed; implementers are the crate-defined [`OrbitCamKind`]
-/// and [`FreeCamKind`]. Camera kinds are defined by this crate.
+/// The trait is sealed, so [`OrbitCamKind`] and [`FreeCamKind`] are the only
+/// implementors.
 ///
 /// [`FreeCamKind`]: crate::FreeCamKind
 /// [`OrbitCamKind`]: crate::OrbitCamKind
@@ -28,12 +28,13 @@ pub trait CameraKind: Copy + Send + Sync + Sealed + 'static {
 
     /// Registers every required system for this camera kind.
     ///
-    /// Camera plugins should call this default method instead of manually
-    /// sequencing the individual registration methods, so the compile-time
-    /// checklist stays centralized as new required camera behavior is added.
-    /// Fit and look requests use camera-kind-independent observers; the
-    /// compatibility hooks below ensure that shared registration is installed
-    /// idempotently.
+    /// Camera plugins should call this default method instead of sequencing the
+    /// individual registration methods themselves, so a method added to this
+    /// trait later reaches every camera plugin at once.
+    /// Fit and look requests are served by observers that do not vary by camera
+    /// kind; the three registration methods below add the shared
+    /// `UnifiedFitRequestObserversPlugin` only when the app does not already
+    /// have it, so registering both camera kinds installs it once.
     fn add_camera_kind_systems(app: &mut App) {
         Self::add_controller_systems(app);
         Self::add_animate_to_fit_systems(app);
@@ -57,9 +58,9 @@ pub trait CameraKind: Copy + Send + Sync + Sealed + 'static {
 
     /// Registers optional shared support systems used by this camera kind.
     ///
-    /// This hook exists for systems shared by several required behaviors on the
-    /// same kind. It deliberately defaults to no-op; the behavior-specific
-    /// methods above remain mandatory.
+    /// This hook covers systems shared by several required behaviors on the
+    /// same kind. It defaults to doing nothing; the behavior-specific methods
+    /// above have no default and must be written out.
     fn add_camera_kind_support_systems(_: &mut App) {}
 }
 

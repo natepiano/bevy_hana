@@ -569,7 +569,9 @@ pub(super) struct FrameMaterialTableBuilder {
     entries:           Vec<MaterialSlotEntry>,
     /// Live source-to-row assignments.
     source_slots:      HashMap<MaterialSourceKey, MaterialSlotId>,
-    /// Rows waiting for the prior extraction snapshots to expire.
+    /// Rows that cannot be reassigned until their `reusable_at_frame`, so
+    /// records extracted in earlier frames still read the values they were
+    /// built with.
     retired:           VecDeque<RetiredMaterialSlot>,
     /// New source identities rejected by the active GPU capacity.
     rejected:          HashSet<MaterialSourceKey>,
@@ -1583,7 +1585,8 @@ pub(super) struct MaterialTableMeasurement {
     pub material_refresh_bucket: Duration,
 }
 
-/// Runs the Phase 2 synthetic material-table measurements and prints structured rows.
+/// Runs the synthetic material-table measurement scenarios and logs one
+/// structured row per scenario.
 #[cfg_attr(
     not(test),
     expect(

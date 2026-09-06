@@ -11,22 +11,22 @@ use bevy::ecs::change_detection::Tick;
 use bevy::ecs::component::Component;
 use bevy::ecs::reflect::AppTypeRegistry;
 use bevy::ecs::reflect::ReflectComponent;
+use bevy::ecs::world::EntityWorldMut;
 use bevy::log::warn;
 use bevy::prelude::Entity;
-use bevy::prelude::Reflect;
 use bevy::prelude::Res;
 use bevy::prelude::ResMut;
 use bevy::prelude::World;
 use bevy::reflect::PartialReflect;
+use bevy::reflect::Reflect;
 use bevy::reflect::TypeRegistry;
 use bevy::time::Real;
 use bevy::time::Time;
 
 use crate::AttachmentPath;
-use crate::BindingEntities;
-use crate::BindingEntityLookup;
+use crate::BatchRef;
 use crate::Bindings;
-use crate::CapabilitiesDisputed;
+use crate::CapabilityProjectionFailure;
 use crate::Claim;
 use crate::ConfiguredDeviceConnection;
 use crate::ConfiguredDeviceMode;
@@ -35,46 +35,77 @@ use crate::DeviceId;
 use crate::DeviceIdSource;
 use crate::DeviceKey;
 use crate::DeviceRecord;
+use crate::DeviceRef;
 use crate::DeviceResolution;
+use crate::DeviceRevisionView;
 use crate::DeviceStateLookup;
+use crate::DeviceStatus;
 use crate::Devices;
 use crate::DiscoveryCadence;
+use crate::DriverCleanupRoleEntity;
 use crate::HardwareInventory;
 use crate::IdentityDecisionOwed;
 use crate::IdentityVerdict;
+use crate::KeyAvailability;
 use crate::LastKnownGoodConfiguration;
+use crate::NonEmptyReporterRefs;
 use crate::PlatformDeviceHandle;
 use crate::Presence;
+use crate::PresentEvidence;
 use crate::ReconciledDeviceState;
 use crate::RecoveryPolicy;
 use crate::RegisteredSchemes;
 use crate::ReportedAs;
+use crate::ReportedHandleResolution;
 use crate::ReportedId;
 use crate::ReportedParent;
+use crate::ReporterCoverage;
 use crate::ReporterId;
+use crate::ReporterRef;
 use crate::ResolvedToDevice;
+use crate::RetirementEvidence;
 use crate::RiggingLimits;
 use crate::RiggingRevision;
-use crate::RoleKey;
-use crate::RoleState;
-use crate::binding::CaptureDispatch;
-use crate::binding::ConfigurationReadability;
-use crate::binding::RoleView;
+use crate::RiggingRuntimeClock;
+use crate::RiggingRuntimeTime;
+use crate::SchemeName;
+use crate::SessionReleaseCause;
+use crate::UnconfirmedBasis;
+use crate::apply;
+use crate::binding;
+use crate::binding::AvailabilityWaitAction;
+use crate::binding::AvailabilityWaitTarget;
 use crate::binding::WaitingWork;
 use crate::capabilities;
+use crate::capabilities::CapabilityDeclaration;
+use crate::capabilities::CapabilityProjectionDeclaration;
+use crate::capabilities::CapabilitySourceState;
+use crate::capabilities::ReporterCapabilityProjectionFailure;
 use crate::capabilities::reflect_component_for;
+use crate::devices;
 use crate::devices::ConfiguredDeviceConnectionChange;
-use crate::devices::DepartedDevice;
-use crate::devices::DepartureAnnouncements;
+use crate::devices::DepartureGraceDeadlineStatus;
+use crate::devices::DeviceAvailabilityChange;
+use crate::devices::DeviceChangeAnnouncements;
 use crate::devices::DeviceEntityLookup;
 use crate::devices::DeviceRegisterChangeDetection;
+use crate::devices::DeviceRevision;
+use crate::devices::DeviceRevisionLookup;
+use crate::devices::HandleOwner;
+use crate::devices::KeyAvailabilityEvidence;
 use crate::devices::PresentWithUsableClaim;
+use crate::devices::PriorKeyAvailability;
+use crate::devices::ReconcilePassConclusions;
 use crate::devices::ReconciledDeviceChanges;
 use crate::devices::ReconciledDeviceReplacement;
+use crate::presence::DeviceSet;
 use crate::registration::Drivers;
 use crate::registration::RegisteredReporter;
 use crate::registration::ReporterContribution;
 use crate::registration::Reporters;
+use crate::status::ContributorView;
+use crate::status::NonEmptyContributors;
+use crate::status::PresenceView;
 
 /// Merge every contributing reporter's latest whole set into one device set, once per tick.
 ///
@@ -90,19 +121,32 @@ pub(crate) fn reconcile(
     mut devices: ResMut<Devices>,
     mut rigging_revision: ResMut<RiggingRevision>,
     mut reconciled_device_changes: ResMut<ReconciledDeviceChanges>,
+    bindings: Res<Bindings>,
+    departure_grace_deadline_status: Res<DepartureGraceDeadlineStatus>,
     rigging_limits: Res<RiggingLimits>,
     registered_schemes: Res<RegisteredSchemes>,
     hardware_inventory: Res<HardwareInventory>,
+    runtime_clock: Res<RiggingRuntimeClock>,
     time: Res<Time<Real>>,
 ) {
+    let observed_at = time.last_update().unwrap_or_else(|| time.startup());
     let freshness_lease = FreshnessLease {
         rigging_limits: &rigging_limits,
         clock:          FrameClockReading::from(&*time),
     };
-    if reconcile_work(&reporters, &devices, freshness_lease) == ReconcileWork::Settled {
-        // The queue is drained even here: a failure leaves every retained device alone, so the
-        // record of it is the one thing a settled frame would otherwise let grow.
-        drop(reporters.take_reporter_failures());
+    let reconcile_work = reconcile_work(
+        &reporters,
+        &devices,
+        &registered_schemes,
+        &hardware_inventory,
+        &bindings,
+        freshness_lease,
+        &rigging_limits,
+        observed_at,
+        *runtime_clock,
+        departure_grace_deadline_status.requires_reconciliation(),
+    );
+    if matches!(&reconcile_work, ReconcileWork::Settled) {
         return;
     }
 
@@ -110,10 +154,7 @@ pub(crate) fn reconcile(
         &mut reporters,
         devices.bypass_change_detection(),
         &mut rigging_revision,
-        &rigging_limits,
-        &registered_schemes,
-        &hardware_inventory,
-        FrameClockReading::from(&*time),
+        reconcile_work,
     ) {
         match replacement.device_register_change_detection {
             DeviceRegisterChangeDetection::Preserve => {},
@@ -154,22 +195,20 @@ impl From<&Time<Real>> for FrameClockReading {
     }
 }
 
-/// Whether the freshness lease has anything left to apply to the devices already retained.
+/// Whether the freshness lease must withdraw reporter records in this frame.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum FreshnessLeaseWork {
-    /// Every retained device already reflects how fresh its reporters are, so the lease alone is
-    /// no reason to merge again.
+enum LeaseWork {
+    /// Every reporter is fresh, or every expired reporter was withdrawn by an earlier pass.
     Settled,
-    /// At least one still-reachable device belongs to a reporter that went silent past its lease.
-    MarksDevicesUnreachable,
+    /// At least one reporter crossed its lease since the latest published reconciliation.
+    WithdrawsReporterRecords,
 }
 
 /// How long each reporter may stay silent this frame, so freshness is answered one reporter at a
 /// time instead of by collecting the silent ones.
 ///
-/// Answering per reporter rather than building a list is what keeps a settled frame free of
-/// allocation while a reporter stays wedged: a permanently silent reporter is judged again every
-/// frame, and judging it costs nothing.
+/// Answering per reporter rather than building a list keeps the fast path free of allocation while
+/// checking whether a reporter newly crossed its lease.
 #[derive(Clone, Copy)]
 struct FreshnessLease<'a> {
     rigging_limits: &'a RiggingLimits,
@@ -179,15 +218,16 @@ struct FreshnessLease<'a> {
 impl FreshnessLease<'_> {
     /// Report how much one reporter's records still count as evidence that its devices are there.
     ///
-    /// A reporter that has not completed a first scan is not silent — it has never promised
-    /// anything yet — and a reporter that declared no cadence may stay quiet indefinitely without
-    /// being late.
+    /// A reporter that has not completed a first scan is not silent — there is no completion time
+    /// to measure silence from — and a reporter that declared no cadence may stay quiet
+    /// indefinitely without being late.
     fn freshness_of(&self, registered_reporter: &RegisteredReporter<'_>) -> ReporterFreshness {
         let FrameClockReading::Measurable(now) = self.clock else {
             return ReporterFreshness::Fresh;
         };
-        let ReporterContribution::Completed { completed_at, .. } =
-            &registered_reporter.contribution
+        let ReporterContribution::Completed {
+            freshness_anchor, ..
+        } = &registered_reporter.contribution
         else {
             return ReporterFreshness::Fresh;
         };
@@ -197,29 +237,17 @@ impl FreshnessLease<'_> {
             return ReporterFreshness::Fresh;
         };
 
-        let silence = now.saturating_duration_since(*completed_at);
+        let silence = now.saturating_duration_since(*freshness_anchor);
         if silence > lease {
             ReporterFreshness::SilentFor(silence)
         } else {
             ReporterFreshness::Fresh
         }
     }
-
-    /// Report the freshness of the reporter a retained device names as a contributor.
-    ///
-    /// A contributor the registry no longer lists cannot be judged silent: the reporter is gone,
-    /// not late, and the next merge drops it from the device anyway.
-    fn freshness_by_id(&self, reporters: &Reporters, reporter: ReporterId) -> ReporterFreshness {
-        reporters
-            .registered_reporters()
-            .find(|registered_reporter| registered_reporter.reporter == reporter)
-            .map_or(ReporterFreshness::Fresh, |registered_reporter| {
-                self.freshness_of(&registered_reporter)
-            })
-    }
 }
 
-/// How much a reporter's silence is worth trusting when its records reach the merge.
+/// Whether a reporter is still inside its freshness lease when its records reach the merge, and
+/// how far past it when it is not.
 #[derive(Clone, Copy)]
 enum ReporterFreshness {
     /// The reporter is inside its lease, so its records read as it reported them.
@@ -229,12 +257,13 @@ enum ReporterFreshness {
     SilentFor(Duration),
 }
 
-/// How silent a reporter may be before the kernel stops trusting its devices.
+/// How long a reporter may stay silent before the kernel stops counting its records as evidence
+/// that its devices are reachable.
 enum ReporterFreshnessLease {
     /// The reporter declared no cadence, so silence proves nothing: it runs when the application
     /// asks and can stay quiet indefinitely without being late.
     NoDeclaredCadence,
-    /// The reporter promised a run within this interval, so exceeding it plus the configured grace
+    /// The reporter declared a run within this interval, so exceeding it plus the configured grace
     /// means the reporter is wedged rather than idle.
     Expires(Duration),
 }
@@ -350,42 +379,19 @@ struct MergedDevice<'a> {
 /// 0.19, and consuming a declaration out of a retained set would destroy evidence a reporter that
 /// did not re-scan this frame still needs. It points at data the reporter registry already holds,
 /// so each site that needs one builds its own instead of storing it in a resource.
-type CoReportView<'a> = HashMap<TypeId, Vec<&'a dyn PartialReflect>>;
+type CoReportView<'a> = HashMap<TypeId, Vec<&'a CapabilityDeclaration>>;
 
 fn reconcile_devices(
     reporters: &mut Reporters,
     devices: &mut Devices,
     rigging_revision: &mut RiggingRevision,
-    rigging_limits: &RiggingLimits,
-    registered_schemes: &RegisteredSchemes,
-    hardware_inventory: &HardwareInventory,
-    clock: FrameClockReading,
+    reconcile_work: ReconcileWork,
 ) -> ReconcilePass {
-    // `DiscoveryStatus` holds each failure's error, and a failed scan retains the preceding whole
-    // set and revision, so a failure changes no device state here. Draining keeps the queue from
-    // growing; the attempt lifecycle aborts what a failure invalidates.
-    drop(reporters.take_reporter_failures());
-
-    // The lease feeds the merge instead of editing the merged result, because the merge rebuilds
-    // every device from the retained sets: a presence written before it would be overwritten, and
-    // a presence written after it would have to be re-derived on every following frame.
-    let freshness_lease = FreshnessLease {
-        rigging_limits,
-        clock,
-    };
-
-    if reconcile_work(reporters, devices, freshness_lease) == ReconcileWork::Settled {
+    let ReconcileWork::Merges(reconcile_publication) = reconcile_work else {
         return ReconcilePass::Settled;
-    }
+    };
     let changed_reporters = reporters.take_changed_reporters();
-
-    let reconciled_device_changes = ingest(
-        reporters,
-        devices,
-        registered_schemes,
-        hardware_inventory,
-        freshness_lease,
-    );
+    let reconciled_device_changes = reconcile_publication.publish(devices);
 
     if !changed_reporters.is_empty() {
         rigging_revision.advance();
@@ -395,13 +401,27 @@ fn reconcile_devices(
 }
 
 /// Whether this frame reaches the merge at all.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ReconcileWork {
     /// No reporter completed a scan and no lease has anything left to apply, so the retained
     /// device set already says what this frame would conclude.
     Settled,
     /// Either new evidence arrived or a lease expired, so the device set has to be rebuilt.
-    Merges,
+    Merges(Box<ReconcilePublication>),
+}
+
+/// One authoritative frame result ready to replace the retained device conclusions.
+struct ReconcilePublication {
+    reconciled:         Vec<ReconciledDeviceState>,
+    conclusions:        ReconcilePassConclusions,
+    connection_changes: Vec<ConfiguredDeviceConnectionChange>,
+}
+
+impl ReconcilePublication {
+    fn publish(self, devices: &mut Devices) -> ReconciledDeviceReplacement {
+        let mut replacement = devices.replace_reconciled(self.reconciled, self.conclusions);
+        replacement.changes.connections = self.connection_changes;
+        replacement
+    }
 }
 
 /// Decide whether the frame has reconcile work, without consuming any of the evidence that says so.
@@ -411,32 +431,50 @@ enum ReconcileWork {
 fn reconcile_work(
     reporters: &Reporters,
     devices: &Devices,
+    registered_schemes: &RegisteredSchemes,
+    hardware_inventory: &HardwareInventory,
+    bindings: &Bindings,
     freshness_lease: FreshnessLease<'_>,
+    rigging_limits: &RiggingLimits,
+    observed_at: Instant,
+    runtime_clock: RiggingRuntimeClock,
+    departure_grace_deadline_reached: bool,
 ) -> ReconcileWork {
     if reporters.any_reporter_changed()
-        || lease_work(devices, reporters, freshness_lease)
-            == FreshnessLeaseWork::MarksDevicesUnreachable
+        || bindings.bound_device_keys().any(|key| {
+            matches!(
+                devices.key_availability(key),
+                PriorKeyAvailability::NeverPublished
+            )
+        })
+        || departure_grace_deadline_reached
+        || lease_work(devices, reporters, freshness_lease) == LeaseWork::WithdrawsReporterRecords
     {
-        return ReconcileWork::Merges;
+        return ReconcileWork::Merges(Box::new(calculate_reconcile_publication(
+            reporters,
+            devices,
+            registered_schemes,
+            hardware_inventory,
+            bindings,
+            freshness_lease,
+            rigging_limits,
+            observed_at,
+            runtime_clock,
+        )));
     }
 
     ReconcileWork::Settled
 }
 
-/// Report whether an expired lease would still change any retained device.
+/// Report whether a reporter's newly expired lease must withdraw its retained records.
 ///
-/// This is what keeps a frame with no completed reporter free of work: a reporter that stayed
-/// silent for an hour is judged once, and every following frame sees its devices already
-/// unreachable and merges nothing.
-///
-/// A device only has lease work left when *every* contributor to it has gone silent. A silent
-/// reporter withdraws its evidence rather than reporting absence, so a device another reporter
-/// still reports keeps the presence that reporter gives it.
+/// `Devices` retains which reporters the latest pass withdrew. A reporter that remains silent is
+/// therefore reconciled once when it crosses the lease, while following frames remain settled.
 fn lease_work(
     devices: &Devices,
     reporters: &Reporters,
     freshness_lease: FreshnessLease<'_>,
-) -> FreshnessLeaseWork {
+) -> LeaseWork {
     let every_reporter_fresh = reporters.registered_reporters().all(|registered_reporter| {
         matches!(
             freshness_lease.freshness_of(&registered_reporter),
@@ -444,27 +482,18 @@ fn lease_work(
         )
     });
     if every_reporter_fresh {
-        return FreshnessLeaseWork::Settled;
+        return LeaseWork::Settled;
     }
 
-    let marks_devices_unreachable = devices.states().any(|reconciled_device_state| {
-        Reachability::from_presence(reconciled_device_state.presence) == Reachability::Reachable
-            && !reconciled_device_state.contributors.is_empty()
-            && reconciled_device_state
-                .contributors
-                .iter()
-                .all(|contributor| {
-                    matches!(
-                        freshness_lease.freshness_by_id(reporters, *contributor),
-                        ReporterFreshness::SilentFor(_)
-                    )
-                })
-    });
-
-    if marks_devices_unreachable {
-        FreshnessLeaseWork::MarksDevicesUnreachable
+    if reporters.registered_reporters().any(|registered_reporter| {
+        matches!(
+            freshness_lease.freshness_of(&registered_reporter),
+            ReporterFreshness::SilentFor(_)
+        ) && !devices.reporter_records_are_withdrawn(registered_reporter.reporter)
+    }) {
+        LeaseWork::WithdrawsReporterRecords
     } else {
-        FreshnessLeaseWork::Settled
+        LeaseWork::Settled
     }
 }
 
@@ -492,18 +521,6 @@ fn freshness_lease(
     }
 }
 
-/// Which keyed device one reported platform handle names.
-///
-/// A handle two reporters attached to different keys names no device: joining an evidence-only
-/// record to whichever key happened to be ingested last is exactly the plausible fallback that
-/// exact-match identity exists to forbid.
-enum HandleOwner {
-    /// Every keyed record carrying this handle reported the same key.
-    OneKey(DeviceKey),
-    /// Keyed records disagree about which key this handle belongs to.
-    SeveralKeys,
-}
-
 /// One record that carried no key, held with what it would contribute to the keyed device its
 /// platform handle names.
 struct EvidenceOnlyReport<'a> {
@@ -513,26 +530,254 @@ struct EvidenceOnlyReport<'a> {
     presence:      CoReportedPresence,
 }
 
-/// Merge every retained whole set into one device set and hand it to the registry.
-fn ingest(
-    reporters: &Reporters,
-    devices: &mut Devices,
-    registered_schemes: &RegisteredSchemes,
-    hardware_inventory: &HardwareInventory,
+/// One fresh retained completion as availability reconciliation reads it.
+struct FreshRetainedReport<'a> {
+    reporter:   ReporterId,
+    batch:      BatchRef,
+    coverage:   &'a ReporterCoverage,
+    device_set: &'a DeviceSet,
+}
+
+fn fresh_retained_reports<'a>(
+    reporters: &'a Reporters,
     freshness_lease: FreshnessLease<'_>,
-) -> ReconciledDeviceReplacement {
-    let mut merged: HashMap<DeviceKey, MergedDevice<'_>> = HashMap::new();
-    // First-seen order, so the handles the registry issues to new keys depend on the reporters'
-    // own report order rather than on hash iteration order, which varies between runs.
-    let mut ingest_order: Vec<DeviceKey> = Vec::new();
-    let mut keyed_by_handle: HashMap<&ReportedId, HandleOwner> = HashMap::new();
-    let mut evidence_only: Vec<EvidenceOnlyReport<'_>> = Vec::new();
+) -> Vec<FreshRetainedReport<'a>> {
+    reporters
+        .registered_reporters()
+        .filter_map(|registered_reporter| {
+            if !matches!(
+                freshness_lease.freshness_of(&registered_reporter),
+                ReporterFreshness::Fresh
+            ) {
+                return None;
+            }
+            let ReporterContribution::Completed {
+                batch, device_set, ..
+            } = registered_reporter.contribution
+            else {
+                return None;
+            };
+            Some(FreshRetainedReport {
+                reporter: registered_reporter.reporter,
+                batch,
+                coverage: registered_reporter.coverage,
+                device_set,
+            })
+        })
+        .collect()
+}
+
+fn key_availability_evidence(
+    reporters: &Reporters,
+    fresh_reports: &[FreshRetainedReport<'_>],
+    key: &DeviceKey,
+    keyed_by_handle: &HashMap<&ReportedId, HandleOwner>,
+    freshness_lease: FreshnessLease<'_>,
+    observed_at: Instant,
+    runtime_clock: RiggingRuntimeClock,
+) -> KeyAvailabilityEvidence {
+    let mut contributors = Vec::new();
+    let mut combined_presence = None;
+    let mut confirmed_absence = Vec::new();
+    let mut uncovered_absence = Vec::new();
+    let mut unreachable_reporters = Vec::new();
+    let mut unreachable_since = None;
+
+    for report in fresh_reports {
+        let reported_presence = report
+            .device_set
+            .devices
+            .iter()
+            .filter(|record| fresh_record_contributes_to_key(record, key, keyed_by_handle))
+            .map(|record| record.presence)
+            .reduce(least_reachable);
+        let reporter_ref = ReporterRef::from_reporter_id(report.reporter);
+        match reported_presence {
+            Some(presence) => {
+                combined_presence = Some(
+                    combined_presence
+                        .map_or(presence, |combined| least_reachable(combined, presence)),
+                );
+                contributors.push(ContributorView::new(
+                    reporter_ref,
+                    report.batch,
+                    PresenceView::from(presence),
+                ));
+                match presence {
+                    Presence::Present => {},
+                    Presence::Absent if report.coverage.establishes_absence_for(key) => {
+                        confirmed_absence.push(RetirementEvidence::new(reporter_ref, report.batch));
+                    },
+                    Presence::Absent => {
+                        uncovered_absence.push(RetirementEvidence::new(reporter_ref, report.batch));
+                    },
+                    Presence::Unreachable { since } => {
+                        unreachable_reporters.push(report.reporter);
+                        retain_earliest_runtime_time(
+                            &mut unreachable_since,
+                            runtime_clock
+                                .time_at(observed_at.checked_sub(since).unwrap_or(observed_at)),
+                        );
+                    },
+                }
+            },
+            None if report.coverage.establishes_absence_for(key) => {
+                confirmed_absence.push(RetirementEvidence::new(reporter_ref, report.batch));
+            },
+            None => {},
+        }
+    }
+
+    if combined_presence == Some(Presence::Present)
+        && let Ok(contributors) = NonEmptyContributors::from_contributors(contributors)
+    {
+        return KeyAvailabilityEvidence::Present(PresentEvidence::new(contributors));
+    }
+
+    if let Some(established_by) = confirmed_absence
+        .into_iter()
+        .min_by_key(|evidence| evidence.reporter.get())
+    {
+        return KeyAvailabilityEvidence::ConfirmedAbsent(established_by);
+    }
+
+    if combined_presence == Some(Presence::Absent)
+        && let Some(evidence) = uncovered_absence
+            .into_iter()
+            .min_by_key(|evidence| evidence.reporter.get())
+    {
+        return KeyAvailabilityEvidence::Unconfirmed(UnconfirmedBasis::UncoveredAbsence {
+            reporter: evidence.reporter,
+            batch:    evidence.batch,
+        });
+    }
+
+    if combined_presence.is_some_and(|presence| matches!(presence, Presence::Unreachable { .. }))
+        && let Ok(reporters) =
+            NonEmptyReporterRefs::from_reporter_ids(unreachable_reporters.iter().copied())
+    {
+        return KeyAvailabilityEvidence::Unreachable {
+            since: unreachable_since.unwrap_or_else(|| runtime_clock.time_at(observed_at)),
+            reporters,
+        };
+    }
+
+    availability_when_fresh_reports_do_not_conclude(
+        reporters,
+        key,
+        keyed_by_handle,
+        freshness_lease,
+        observed_at,
+        runtime_clock,
+    )
+}
+
+fn availability_when_fresh_reports_do_not_conclude(
+    reporters: &Reporters,
+    key: &DeviceKey,
+    keyed_by_handle: &HashMap<&ReportedId, HandleOwner>,
+    freshness_lease: FreshnessLease<'_>,
+    observed_at: Instant,
+    runtime_clock: RiggingRuntimeClock,
+) -> KeyAvailabilityEvidence {
+    let mut awaited_covering_reporters = Vec::new();
+    let mut covering_reporter_completed = false;
+    let mut expired_reporters = Vec::new();
+    let mut unreachable_since = None;
+    for registered_reporter in reporters.registered_reporters() {
+        let covers_key = registered_reporter.coverage.establishes_absence_for(key);
+        match registered_reporter.contribution {
+            ReporterContribution::AwaitingFirstCompleteSet if covers_key => {
+                awaited_covering_reporters.push(registered_reporter.reporter);
+            },
+            ReporterContribution::AwaitingFirstCompleteSet => {},
+            ReporterContribution::Completed { device_set, .. } => {
+                if covers_key {
+                    covering_reporter_completed = true;
+                }
+                if let ReporterFreshness::SilentFor(silence) =
+                    freshness_lease.freshness_of(&registered_reporter)
+                {
+                    let names_key = device_set.devices.iter().any(|record| {
+                        fresh_record_contributes_to_key(record, key, keyed_by_handle)
+                    });
+                    if names_key || covers_key {
+                        expired_reporters.push(registered_reporter.reporter);
+                        retain_earliest_runtime_time(
+                            &mut unreachable_since,
+                            runtime_clock
+                                .time_at(observed_at.checked_sub(silence).unwrap_or(observed_at)),
+                        );
+                    }
+                }
+            },
+        }
+    }
+
+    if let Ok(reporters) = NonEmptyReporterRefs::from_reporter_ids(expired_reporters) {
+        return KeyAvailabilityEvidence::Unreachable {
+            since: unreachable_since.unwrap_or_else(|| runtime_clock.time_at(observed_at)),
+            reporters,
+        };
+    }
+
+    if !covering_reporter_completed
+        && let Ok(reporters) = NonEmptyReporterRefs::from_reporter_ids(awaited_covering_reporters)
+    {
+        return KeyAvailabilityEvidence::AwaitingFirstReport(reporters);
+    }
+
+    KeyAvailabilityEvidence::Unconfirmed(UnconfirmedBasis::NoFreshEvidence)
+}
+
+fn fresh_record_contributes_to_key(
+    device_record: &DeviceRecord,
+    key: &DeviceKey,
+    keyed_by_handle: &HashMap<&ReportedId, HandleOwner>,
+) -> bool {
+    match &device_record.reported_as {
+        ReportedAs::Keyed(reported_key) => reported_key == key,
+        ReportedAs::MatchEvidenceOnly => {
+            let PlatformDeviceHandle::Reported(handle) = &device_record.platform_device_handle
+            else {
+                return false;
+            };
+            matches!(keyed_by_handle.get(handle), Some(HandleOwner::OneKey(owner)) if owner == key)
+        },
+    }
+}
+
+fn retain_earliest_runtime_time(
+    retained: &mut Option<RiggingRuntimeTime>,
+    candidate: RiggingRuntimeTime,
+) {
+    if retained.is_none_or(|current| candidate.elapsed() < current.elapsed()) {
+        *retained = Some(candidate);
+    }
+}
+
+/// Retained records combined by durable key before identity and availability are concluded.
+struct RetainedReportMerge<'reports> {
+    merged:               HashMap<DeviceKey, MergedDevice<'reports>>,
+    ingest_order:         Vec<DeviceKey>,
+    keyed_by_handle:      HashMap<&'reports ReportedId, HandleOwner>,
+    duplicate_keys:       HashSet<DeviceKey>,
+    unregistered_schemes: HashSet<SchemeName>,
+}
+
+fn merge_retained_records<'reports>(
+    reporters: &'reports Reporters,
+    registered_schemes: &RegisteredSchemes,
+    freshness_lease: FreshnessLease<'_>,
+) -> RetainedReportMerge<'reports> {
+    let mut merged = HashMap::new();
+    // First-seen order makes newly issued handles follow reporter order instead of hash order.
+    let mut ingest_order = Vec::new();
+    let mut keyed_by_handle = HashMap::new();
+    let mut evidence_only = Vec::new();
     let mut duplicate_keys = HashSet::new();
     let mut unregistered_schemes = HashSet::new();
 
-    // One pass over every retained record. Keyed records group through one `HashMap::entry`, which
-    // is what makes co-report merging linear in device count rather than a pairwise join across
-    // reporter lists; the same pass collects the evidence-only records the join below needs.
     for registered_reporter in reporters.registered_reporters() {
         let freshness = freshness_lease.freshness_of(&registered_reporter);
         let reporter = registered_reporter.reporter;
@@ -540,9 +785,6 @@ fn ingest(
         else {
             continue;
         };
-
-        // A silent reporter's records still describe the devices it named; what they stop being is
-        // evidence that those devices are reachable right now.
         let reported_presence = |device_record: &DeviceRecord| {
             CoReportedPresence::from_contribution(freshness, device_record.presence)
         };
@@ -554,8 +796,9 @@ fn ingest(
                         unregistered_schemes.insert(unregistered_scheme.scheme().clone());
                         continue;
                     }
-                    if let PlatformDeviceHandle::Reported(handle) =
-                        &device_record.platform_device_handle
+                    if matches!(freshness, ReporterFreshness::Fresh)
+                        && let PlatformDeviceHandle::Reported(handle) =
+                            &device_record.platform_device_handle
                     {
                         record_handle_owner(&mut keyed_by_handle, handle, key);
                     }
@@ -578,10 +821,6 @@ fn ingest(
                         key,
                     );
                 },
-                // An evidence-only record carries no key, so it can only join a keyed record
-                // through a handle the platform actually reported. Two records that each reported
-                // no handle compare equal, which is exactly the plausible-fallback join that
-                // exact-match identity exists to prevent, so every other variant joins nothing.
                 ReportedAs::MatchEvidenceOnly => {
                     if let PlatformDeviceHandle::Reported(handle) =
                         &device_record.platform_device_handle
@@ -598,8 +837,27 @@ fn ingest(
         }
     }
 
-    // A joined record is a co-report of the device its handle names, so it merges through the same
-    // path a keyed record does: its presence, claim, and capability declarations all count.
+    join_evidence_only_records(
+        &mut merged,
+        &keyed_by_handle,
+        evidence_only,
+        &mut duplicate_keys,
+    );
+    RetainedReportMerge {
+        merged,
+        ingest_order,
+        keyed_by_handle,
+        duplicate_keys,
+        unregistered_schemes,
+    }
+}
+
+fn join_evidence_only_records<'reports>(
+    merged: &mut HashMap<DeviceKey, MergedDevice<'reports>>,
+    keyed_by_handle: &HashMap<&'reports ReportedId, HandleOwner>,
+    evidence_only: Vec<EvidenceOnlyReport<'reports>>,
+    duplicate_keys: &mut HashSet<DeviceKey>,
+) {
     for evidence_only_report in evidence_only {
         let Some(HandleOwner::OneKey(key)) = keyed_by_handle.get(evidence_only_report.handle)
         else {
@@ -613,10 +871,31 @@ fn ingest(
             evidence_only_report.reporter,
             evidence_only_report.device_record,
             evidence_only_report.presence,
-            &mut duplicate_keys,
+            duplicate_keys,
             key,
         );
     }
+}
+
+/// Calculate every conclusion one reconcile pass will publish.
+fn calculate_reconcile_publication(
+    reporters: &Reporters,
+    devices: &Devices,
+    registered_schemes: &RegisteredSchemes,
+    hardware_inventory: &HardwareInventory,
+    bindings: &Bindings,
+    freshness_lease: FreshnessLease<'_>,
+    rigging_limits: &RiggingLimits,
+    observed_at: Instant,
+    runtime_clock: RiggingRuntimeClock,
+) -> ReconcilePublication {
+    let RetainedReportMerge {
+        merged,
+        ingest_order,
+        keyed_by_handle,
+        duplicate_keys,
+        unregistered_schemes,
+    } = merge_retained_records(reporters, registered_schemes, freshness_lease);
 
     let departed_slots = departed_slots(devices, &merged);
     let identity_evidence = IdentityEvidence {
@@ -625,14 +904,200 @@ fn ingest(
         hardware_inventory,
     };
 
-    let reconciled = fold_presence_roots_first(&merged, ingest_order, devices, identity_evidence);
+    let reported = fold_presence_roots_first(&merged, ingest_order, devices, identity_evidence);
+    let fresh_reports = fresh_retained_reports(reporters, freshness_lease);
+    let (reconciled, availability) = KeyAvailabilityReconciliation {
+        reporters,
+        devices,
+        hardware_inventory,
+        bindings,
+        fresh_reports: &fresh_reports,
+        keyed_by_handle: &keyed_by_handle,
+        freshness_lease,
+        rigging_limits,
+        observed_at,
+        runtime_clock,
+    }
+    .reconcile(reported);
 
-    let mut replacement =
-        devices.replace_reconciled(reconciled, duplicate_keys, unregistered_schemes);
-    replacement.changes.connections =
-        configured_device_connection_changes(reporters, hardware_inventory, freshness_lease);
+    let reported_handle_owners = keyed_by_handle
+        .into_iter()
+        .map(|(reported_id, handle_owner)| (reported_id.clone(), handle_owner))
+        .collect();
+    let withdrawn_reporters = reporters
+        .registered_reporters()
+        .filter(|registered_reporter| {
+            matches!(
+                freshness_lease.freshness_of(registered_reporter),
+                ReporterFreshness::SilentFor(_)
+            )
+        })
+        .map(|registered_reporter| registered_reporter.reporter)
+        .collect();
+    ReconcilePublication {
+        reconciled,
+        conclusions: ReconcilePassConclusions {
+            availability,
+            duplicate_keys,
+            reported_handle_owners,
+            unregistered_schemes,
+            withdrawn_reporters,
+        },
+        connection_changes: configured_device_connection_changes(
+            reporters,
+            hardware_inventory,
+            freshness_lease,
+        ),
+    }
+}
 
-    replacement
+/// Inputs shared while every key receives one availability conclusion.
+struct KeyAvailabilityReconciliation<'reports, 'pass, 'limits> {
+    reporters:          &'reports Reporters,
+    devices:            &'pass Devices,
+    hardware_inventory: &'pass HardwareInventory,
+    bindings:           &'pass Bindings,
+    fresh_reports:      &'pass [FreshRetainedReport<'reports>],
+    keyed_by_handle:    &'pass HashMap<&'reports ReportedId, HandleOwner>,
+    freshness_lease:    FreshnessLease<'limits>,
+    rigging_limits:     &'limits RiggingLimits,
+    observed_at:        Instant,
+    runtime_clock:      RiggingRuntimeClock,
+}
+
+impl KeyAvailabilityReconciliation<'_, '_, '_> {
+    fn reconcile(
+        self,
+        reported: Vec<ReconciledDeviceState>,
+    ) -> (
+        Vec<ReconciledDeviceState>,
+        HashMap<DeviceKey, KeyAvailability>,
+    ) {
+        let mut key_order = Vec::new();
+        let mut seen = HashSet::new();
+        for state in &reported {
+            if seen.insert(state.key.clone()) {
+                key_order.push(state.key.clone());
+            }
+        }
+        for key in self
+            .devices
+            .availability_keys()
+            .chain(self.devices.states().map(|state| &state.key))
+            .chain(self.hardware_inventory.configured_keys())
+            .chain(self.bindings.bound_device_keys())
+        {
+            if seen.insert(key.clone()) {
+                key_order.push(key.clone());
+            }
+        }
+
+        let mut reported_by_key = reported
+            .into_iter()
+            .map(|state| (state.key.clone(), state))
+            .collect::<HashMap<_, _>>();
+        let mut reconciled = Vec::new();
+        let mut availability = HashMap::with_capacity(key_order.len());
+
+        for key in key_order {
+            let evidence = key_availability_evidence(
+                self.reporters,
+                self.fresh_reports,
+                &key,
+                self.keyed_by_handle,
+                self.freshness_lease,
+                self.observed_at,
+                self.runtime_clock,
+            );
+            let evidence = match reported_by_key.get(&key) {
+                Some(reported_state) => carry_parent_uncertainty(
+                    evidence,
+                    reported_state,
+                    self.observed_at,
+                    self.runtime_clock,
+                ),
+                None => evidence,
+            };
+            let key_availability = devices::transition_key_availability(
+                evidence,
+                self.observed_at,
+                self.runtime_clock,
+                self.rigging_limits.departure_grace,
+                self.devices.key_availability(&key),
+            );
+
+            if !matches!(key_availability, KeyAvailability::Absent { .. }) {
+                if let Some(reconciled_device_state) = reported_by_key.remove(&key) {
+                    reconciled.push(reconciled_device_state);
+                } else if let DeviceResolution::Resolved(device_id) = self.devices.resolve(&key)
+                    && let DeviceStateLookup::Retained(prior_state) = self.devices.state(device_id)
+                {
+                    reconciled.push(retain_device_state_for_availability(
+                        prior_state.clone(),
+                        &key_availability,
+                        self.hardware_inventory,
+                    ));
+                }
+            }
+            availability.insert(key, key_availability);
+        }
+
+        (reconciled, availability)
+    }
+}
+
+fn carry_parent_uncertainty(
+    evidence: KeyAvailabilityEvidence,
+    reported_state: &ReconciledDeviceState,
+    observed_at: Instant,
+    runtime_clock: RiggingRuntimeClock,
+) -> KeyAvailabilityEvidence {
+    if !matches!(evidence, KeyAvailabilityEvidence::Present(_))
+        || matches!(reported_state.presence, Presence::Present)
+    {
+        return evidence;
+    }
+    let Ok(reporters) =
+        NonEmptyReporterRefs::from_reporter_ids(reported_state.contributors.iter().copied())
+    else {
+        return evidence;
+    };
+    let since = match reported_state.presence {
+        Presence::Unreachable { since } => {
+            runtime_clock.time_at(observed_at.checked_sub(since).unwrap_or(observed_at))
+        },
+        Presence::Absent | Presence::Present => runtime_clock.time_at(observed_at),
+    };
+    KeyAvailabilityEvidence::Unreachable { since, reporters }
+}
+
+fn retain_device_state_for_availability(
+    mut state: ReconciledDeviceState,
+    availability: &KeyAvailability,
+    hardware_inventory: &HardwareInventory,
+) -> ReconciledDeviceState {
+    state.mode = hardware_inventory
+        .configured_device(&state.key)
+        .map_or(ConfiguredDeviceMode::Managed, |configured_device| {
+            configured_device.mode
+        });
+    state.presence = presence_from_availability(availability);
+    state.contributors.clear();
+    state.declared.clear();
+    state.disputed.clear();
+    state
+}
+
+const fn presence_from_availability(availability: &KeyAvailability) -> Presence {
+    match availability {
+        KeyAvailability::Present(_) => Presence::Present,
+        KeyAvailability::DepartureGrace { .. } | KeyAvailability::Absent { .. } => Presence::Absent,
+        KeyAvailability::AwaitingFirstReport { .. }
+        | KeyAvailability::Unconfirmed { .. }
+        | KeyAvailability::Unreachable { .. } => Presence::Unreachable {
+            since: Duration::ZERO,
+        },
+    }
 }
 
 /// Reconcile every authored inventory key to what current reporter evidence says about it.
@@ -733,7 +1198,7 @@ impl AuthoredKeyEvidence {
 /// How much one fact about an authored key is currently worth.
 ///
 /// Ordered weakest to strongest so accumulating across reporters is a `max`: a second reporter can
-/// only strengthen what the kernel knows, never retract another reporter's fresher evidence.
+/// only strengthen the accumulated fact, never retract another reporter's fresher evidence.
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 enum EvidenceStrength {
     /// No reporter has offered this fact at all.
@@ -766,8 +1231,18 @@ fn record_handle_owner<'a>(
             vacant.insert(HandleOwner::OneKey(key.clone()));
         },
         Entry::Occupied(mut occupied) => {
-            if !matches!(occupied.get(), HandleOwner::OneKey(owner) if owner == key) {
-                occupied.insert(HandleOwner::SeveralKeys);
+            let newly_ambiguous = match occupied.get_mut() {
+                HandleOwner::OneKey(owner) if owner != key => {
+                    Some(HashSet::from([owner.clone(), key.clone()]))
+                },
+                HandleOwner::SeveralKeys(device_keys) => {
+                    device_keys.insert(key.clone());
+                    None
+                },
+                HandleOwner::OneKey(_) => None,
+            };
+            if let Some(device_keys) = newly_ambiguous {
+                occupied.insert(HandleOwner::SeveralKeys(device_keys));
             }
         },
     }
@@ -804,9 +1279,9 @@ fn merge_keyed_record<'a>(
     for capability in device_record.capabilities.declarations() {
         merged_device
             .capabilities
-            .entry(capability.as_any().type_id())
+            .entry(capability.value().as_any().type_id())
             .or_default()
-            .push(capability.as_partial_reflect());
+            .push(capability);
     }
 }
 
@@ -827,8 +1302,8 @@ const fn claim_restriction(claim: &Claim) -> u8 {
 /// Order the merged devices roots first and fold each child's presence against its parent.
 ///
 /// Reporters may list a child before the device it hangs off, so the order the records arrived in
-/// cannot be trusted. Following the parent links first means a child is never folded against a
-/// parent whose own presence has not been settled.
+/// does not put parents ahead of their children. Following the parent links first means a child is
+/// never folded against a parent whose own presence has not been settled.
 fn fold_presence_roots_first(
     merged: &HashMap<DeviceKey, MergedDevice<'_>>,
     ingest_order: Vec<DeviceKey>,
@@ -937,9 +1412,9 @@ struct DepartedSlot {
 
 /// Everything outside one merged device that its verdict depends on.
 ///
-/// Grouped rather than passed as four arguments because all four are read together at exactly one
-/// call site, and a reader of `verdict_for` should see one word for "what the rest of this pass
-/// knows".
+/// Grouped rather than passed as three separate arguments because they travel together from the
+/// merge through `fold_presence_roots_first` into `verdict_for`, and a reader of `verdict_for`
+/// should see one word for "what the rest of this pass concluded".
 #[derive(Clone, Copy)]
 struct IdentityEvidence<'a> {
     duplicate_keys:     &'a HashSet<DeviceKey>,
@@ -1081,9 +1556,7 @@ fn decision_owed(devices: &Devices, resolution: DeviceResolution) -> IdentityDec
 
 /// Report which capability component types the contributors disagree about.
 ///
-/// Equality is `PartialReflect::reflect_partial_eq` across the references under one type. A type
-/// whose reflected comparison cannot answer counts as disputed: unavailable equality evidence is
-/// not agreement.
+/// Equality calls the typed function stored with each erased declaration under one component type.
 fn disputed_capabilities(capabilities: &CoReportView<'_>) -> HashSet<TypeId> {
     capabilities
         .iter()
@@ -1091,7 +1564,7 @@ fn disputed_capabilities(capabilities: &CoReportView<'_>) -> HashSet<TypeId> {
             declarations.windows(2).any(|pair| {
                 pair.first().is_some_and(|first| {
                     pair.get(1)
-                        .is_some_and(|second| first.reflect_partial_eq(*second) != Some(true))
+                        .is_some_and(|second| !first.equals(second.value()))
                 })
             })
         })
@@ -1106,8 +1579,8 @@ fn disputed_capabilities(capabilities: &CoReportView<'_>) -> HashSet<TypeId> {
 /// set for as long as it runs. It is exclusive because it spawns and despawns entities, reads the
 /// reporter registry for capability values, and dispatches driver capture in one pass.
 pub(crate) fn project_device_entities(world: &mut World) {
-    let app_type_registry = world.resource::<AppTypeRegistry>().clone();
-    let type_registry = app_type_registry.read();
+    let app_type_registry = world.get_resource::<AppTypeRegistry>().cloned();
+    let type_registry = app_type_registry.as_ref().map(|registry| registry.read());
     let mut reconciled_device_changes =
         std::mem::take(&mut *world.resource_mut::<ReconciledDeviceChanges>());
 
@@ -1128,40 +1601,60 @@ pub(crate) fn project_device_entities(world: &mut World) {
         }
     }
 
-    // Every mutable path to `Bindings` marks the resource changed, so a pass with no departure
-    // must not open one: a once-per-change consumer would otherwise fire on every frame.
-    if !reconciled_device_changes.departed.is_empty() {
-        owe_departure_work(
-            &mut world.resource_mut::<Bindings>(),
-            &reconciled_device_changes.departed,
-        );
+    let newly_unavailable = reconciled_device_changes
+        .availability
+        .iter()
+        .filter(|change| {
+            matches!(change.from, KeyAvailability::Present(_))
+                && !matches!(change.to, KeyAvailability::Present(_))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !newly_unavailable.is_empty() {
+        let now = world
+            .resource::<Time<Real>>()
+            .last_update()
+            .unwrap_or_else(|| world.resource::<Time<Real>>().startup());
+        apply_device_unavailability(world, &newly_unavailable, now);
+    }
+    if !reconciled_device_changes.availability.is_empty() {
+        let now = world
+            .resource::<Time<Real>>()
+            .last_update()
+            .unwrap_or_else(|| world.resource::<Time<Real>>().startup());
+        project_role_availability_waits(world, &reconciled_device_changes.availability, now);
     }
 
-    // The two facts with no mirrored component behind them are moved to the event stage before the
-    // rest of this pass consumes them; nothing else retains a departure once the entities are gone.
+    // Availability edges and connection changes move to the event stage before the projection
+    // resource is cleared. Some `Absent` edges no longer have a device entity to read there.
     {
-        let mut departure_announcements = world.resource_mut::<DepartureAnnouncements>();
-        departure_announcements
-            .departed
-            .append(&mut reconciled_device_changes.departed);
-        departure_announcements
+        let mut device_change_announcements = world.resource_mut::<DeviceChangeAnnouncements>();
+        device_change_announcements
+            .availability
+            .append(&mut reconciled_device_changes.availability);
+        device_change_announcements
             .connections
             .append(&mut reconciled_device_changes.connections);
     }
 
     let device_set_write = world.resource_scope::<Devices, _>(|world, mut devices| {
         let entered = devices.last_changed();
-        let device_set_projection = world.resource_scope::<Reporters, _>(|world, reporters| {
-            mirror_device_entities(world, &mut devices, &reporters, &type_registry)
+        let device_set_projection = world.resource_scope::<Reporters, _>(|world, mut reporters| {
+            mirror_device_entities(
+                world,
+                &mut devices,
+                &mut reporters,
+                type_registry.as_deref(),
+            )
         });
         resolve_binding_links(world, &devices);
-        capture_ready_configurations(world, &devices);
-        announce_disputes(
-            world,
-            &devices,
-            &reconciled_device_changes.disputes_changed,
-            &type_registry,
-        );
+        if let Some(type_registry) = type_registry.as_deref() {
+            announce_disputes(
+                &devices,
+                &reconciled_device_changes.disputes_changed,
+                type_registry,
+            );
+        }
 
         match device_set_projection {
             DeviceSetProjection::Projected => DeviceSetWrite::Written,
@@ -1175,53 +1668,142 @@ pub(crate) fn project_device_entities(world: &mut World) {
         // device set from reading as one that rewrote it.
         world.resource_mut::<Devices>().set_last_changed(entered);
     }
-    mirror_last_known_good(world, &type_registry);
+    if let Some(type_registry) = type_registry.as_deref() {
+        mirror_last_known_good(world, type_registry);
+    }
 }
 
-/// Record what each role bound to a departed device is owed, as its `RecoveryPolicy` defines it.
+/// Revoke each role bound to a newly unavailable device and record what its recovery policy owes.
 ///
-/// `RecoveryPolicy::ReapplyOnReturn` owes a restoration, which is what makes the saved value return
-/// with the unit. The other three owe an application request instead: without that record a
-/// departed role falls back to `WaitingWork::Nothing`, reaches `WaitingRole::Hardware`, and has
-/// its authored request dispatched automatically on the device's return — the one thing
-/// `RecoveryPolicy::Retain` promises never happens. `RecoveryPolicy::Forget` additionally drops the
-/// saved value at the departure rather than leaving it for a later restore.
+/// `RecoveryPolicy::ReapplyOnReturn` owes a restoration once a readback has established a value,
+/// which is what makes that value return with the unit; with nothing established there is nothing
+/// to restore and no work is recorded. The other two owe application work instead: without that
+/// record a departed role falls back to `WaitingWork::Nothing`, reaches `WaitingRole::Hardware`,
+/// and has its authored request dispatched automatically on the device's return — the automatic
+/// reapply both asked the kernel not to perform.
+///
+/// Which work they owe differs, and the recorded value says which.
+/// `RecoveryPolicy::ReapplyOnRequest` keeps its saved value, so `ReapplyConfiguration` sends it
+/// back and clears the hold. `RecoveryPolicy::Forget` drops the value here, so no request can
+/// restore it and only a fresh registration restarts the role.
 ///
 /// Nothing else records it: a role that owes a restoration must not have its endpoint read back
 /// first, because that would record the state the departure left behind as the value last known to
 /// work.
 ///
-/// Both departure causes count. A unit whose key left the reconciled set and a retained unit that
-/// stopped being present are the same event for the role bound to it: the endpoint the saved value
-/// belongs on is gone, and the value returns with the unit.
-fn owe_departure_work(bindings: &mut Bindings, departed: &[DepartedDevice]) {
-    for departed_device in departed {
-        let roles: Vec<RoleKey> = bindings.roles_for(&departed_device.key).cloned().collect();
+/// This runs only on a transition from `Present`: later unavailable-to-unavailable edges update the
+/// published wait without repeating session release or recovery bookkeeping.
+fn apply_device_unavailability(
+    world: &mut World,
+    changes: &[DeviceAvailabilityChange],
+    now: Instant,
+) {
+    for change in changes {
+        let Ok(unavailable) = crate::UnavailableKeyAvailability::try_from(change.to.clone()) else {
+            continue;
+        };
+        let roles = world
+            .resource::<Bindings>()
+            .roles_for(&change.key)
+            .cloned()
+            .collect::<Vec<_>>();
+
         for role in roles {
-            let Ok(binding) = bindings.binding(&role) else {
-                continue;
+            let (recovery, established, session) = {
+                let bindings = world.resource::<Bindings>();
+                let Ok(binding) = bindings.binding(&role) else {
+                    continue;
+                };
+                let session = bindings
+                    .established_sessions()
+                    .into_iter()
+                    .find(|session| session.role == role);
+                (
+                    binding.recovery,
+                    binding.last_known_good.is_established(),
+                    session,
+                )
             };
-            let recovery = binding.recovery;
-            let established = matches!(
-                binding.last_known_good,
-                LastKnownGoodConfiguration::Known(_)
-            );
-            // The recorded work is only ever read through `RoleView::Waiting`, so a role the
-            // departure left in `RoleState::Ready` would never reach it and every policy would
-            // behave the same.
-            bindings.await_departed_device(&role);
+            if let Some(session) = session {
+                let role_entity = world.resource::<Bindings>().role_entity(&role).ok();
+                if let Some(role_entity) = role_entity {
+                    let role_entity = DriverCleanupRoleEntity::checked(world, role_entity);
+                    world.resource_scope::<Drivers, _>(|world, mut drivers| {
+                        if let Err(error) = drivers.release_session(
+                            world,
+                            session.driver,
+                            &role,
+                            role_entity,
+                            session.session,
+                            SessionReleaseCause::DeviceUnavailable {
+                                availability: unavailable.clone(),
+                            },
+                        ) {
+                            warn!("role `{role}`: unavailable session release failed: {error}");
+                        }
+                    });
+                } else {
+                    warn!("role `{role}`: unavailable session has no live role entity");
+                }
+            }
+            let mut bindings = world.resource_mut::<Bindings>();
+            bindings.await_departed_device(&role, FrameClockReading::Measurable(now));
             match recovery {
                 RecoveryPolicy::ReapplyOnReturn if established => {
                     bindings.set_waiting_work(&role, WaitingWork::RestorationOwed);
                 },
                 RecoveryPolicy::ReapplyOnReturn => {},
-                RecoveryPolicy::Retain | RecoveryPolicy::ReapplyOnRequest => {
-                    bindings.set_waiting_work(&role, WaitingWork::ApplicationRequestOwed);
+                RecoveryPolicy::ReapplyOnRequest => {
+                    bindings.set_waiting_work(&role, WaitingWork::ReapplyRequestOwed);
                 },
                 RecoveryPolicy::Forget => {
                     bindings.forget_last_known_good(&role);
-                    bindings.set_waiting_work(&role, WaitingWork::ApplicationRequestOwed);
+                    bindings.set_waiting_work(&role, WaitingWork::RegistrationOwed);
                 },
+            }
+        }
+    }
+}
+
+fn project_role_availability_waits(
+    world: &mut World,
+    changes: &[DeviceAvailabilityChange],
+    now: Instant,
+) {
+    for change in changes {
+        let roles = world
+            .resource::<Bindings>()
+            .roles_for(&change.key)
+            .cloned()
+            .collect::<Vec<_>>();
+        for role in roles {
+            let target = if matches!(change.to, KeyAvailability::Present(_)) {
+                AvailabilityWaitTarget::Present
+            } else {
+                AvailabilityWaitTarget::Unavailable
+            };
+            let action = world
+                .resource::<Bindings>()
+                .availability_wait_action(&role, target);
+            let waiting_condition = if target == AvailabilityWaitTarget::Present {
+                binding::waiting_condition_for_work(
+                    world.resource::<Bindings>().waiting_work(&role),
+                )
+            } else {
+                apply::availability_wait(world, &change.key, &change.to, now)
+            };
+            match action {
+                AvailabilityWaitAction::SetWait => {
+                    world
+                        .resource_mut::<Bindings>()
+                        .set_wait(&role, now, waiting_condition);
+                },
+                AvailabilityWaitAction::StageForApplyingRole => {
+                    world
+                        .resource_mut::<Bindings>()
+                        .stage_device_unavailability_wait(&role, now, waiting_condition);
+                },
+                AvailabilityWaitAction::PreserveLifecycle => {},
             }
         }
     }
@@ -1238,28 +1820,12 @@ fn owe_departure_work(bindings: &mut Bindings, departed: &[DepartedDevice]) {
 fn mirror_device_entities(
     world: &mut World,
     devices: &mut Devices,
-    reporters: &Reporters,
-    type_registry: &TypeRegistry,
+    reporters: &mut Reporters,
+    type_registry: Option<&TypeRegistry>,
 ) -> DeviceSetProjection {
     let mut device_set_projection = DeviceSetProjection::Unwritten;
-    let mirrored: Vec<MirroredDevice> = devices
-        .states()
-        .filter_map(|reconciled_device_state| {
-            let DeviceResolution::Resolved(device_id) =
-                devices.resolve(&reconciled_device_state.key)
-            else {
-                return None;
-            };
-            Some(MirroredDevice {
-                device_id,
-                key: reconciled_device_state.key.clone(),
-                verdict: reconciled_device_state.verdict.clone(),
-                presence: reconciled_device_state.presence,
-                claim: reconciled_device_state.claim.clone(),
-                disputed: reconciled_device_state.disputed.clone(),
-            })
-        })
-        .collect();
+    let mut capability_projection_failures = Vec::new();
+    let mirrored = collect_mirrored_devices(devices);
 
     for mirrored_device in mirrored {
         let entity = match devices.entity(mirrored_device.device_id) {
@@ -1275,15 +1841,15 @@ fn mirror_device_entities(
         // A disputed type has one value per contributor and the kernel adjudicates neither, so
         // attaching the union would write both in turn and make `Changed<C>` true on every frame
         // for the whole life of the disagreement.
-        let (agreed, disputed): (Vec<&dyn Reflect>, Vec<&dyn Reflect>) =
-            capability_declarations(reporters, &mirrored_device.key)
-                .into_iter()
-                .partition(|declaration| {
-                    !mirrored_device
-                        .disputed
-                        .contains(&declaration.as_any().type_id())
-                });
+        let (agreed, disputed) = partition_capability_declarations(
+            reporters,
+            devices,
+            &mirrored_device.key,
+            &mirrored_device.disputed,
+        );
         let mut device_entity = world.entity_mut(entity);
+
+        update_device_status(&mirrored_device, &mut device_entity);
 
         if !device_entity.contains::<DeviceId>() {
             device_entity.insert(mirrored_device.device_id);
@@ -1304,7 +1870,7 @@ fn mirror_device_entities(
             device_entity.insert(mirrored_device.claim.clone());
         }
 
-        let usable = mirrored_device.presence == Presence::Present
+        let usable = matches!(mirrored_device.availability, KeyAvailability::Present(_))
             && matches!(
                 mirrored_device.claim,
                 Claim::Held | Claim::Free | Claim::NotApplicable
@@ -1317,27 +1883,126 @@ fn mirror_device_entities(
             }
         }
 
-        if let Err(capability_attach_error) =
-            capabilities::attach_declarations(&mut device_entity, type_registry, agreed)
-        {
-            warn!(
-                "device `{:?}` declares a capability the projection cannot attach: \
-                 {capability_attach_error}",
-                mirrored_device.key
-            );
-        }
-        if let Err(capability_attach_error) =
-            capabilities::detach_declarations(&mut device_entity, type_registry, disputed)
-        {
-            warn!(
-                "device `{:?}` disputes a capability the projection cannot detach: \
-                 {capability_attach_error}",
-                mirrored_device.key
-            );
+        if let Some(type_registry) = type_registry {
+            capability_projection_failures.extend(attach_device_capabilities(
+                &mut device_entity,
+                type_registry,
+                agreed,
+                disputed,
+                &mirrored_device.key,
+            ));
         }
     }
 
+    if type_registry.is_some() {
+        publish_capability_projection_failures(world, reporters, capability_projection_failures);
+    }
+
     device_set_projection
+}
+
+fn collect_mirrored_devices(devices: &Devices) -> Vec<MirroredDevice> {
+    devices
+        .states()
+        .filter_map(|reconciled_device_state| {
+            let DeviceResolution::Resolved(device_id) =
+                devices.resolve(&reconciled_device_state.key)
+            else {
+                return None;
+            };
+            let DeviceRevisionLookup::Retained(revision) = devices.revision(device_id) else {
+                return None;
+            };
+            Some(MirroredDevice {
+                device_id,
+                key: reconciled_device_state.key.clone(),
+                revision,
+                verdict: reconciled_device_state.verdict.clone(),
+                presence: reconciled_device_state.presence,
+                availability: match devices.key_availability(&reconciled_device_state.key) {
+                    PriorKeyAvailability::Published(availability) => availability.clone(),
+                    PriorKeyAvailability::NeverPublished => return None,
+                },
+                claim: reconciled_device_state.claim.clone(),
+                disputed: reconciled_device_state.disputed.clone(),
+            })
+        })
+        .collect()
+}
+
+fn publish_capability_projection_failures(
+    world: &mut World,
+    reporters: &mut Reporters,
+    failures: Vec<ReporterCapabilityProjectionFailure>,
+) {
+    reporters.record_capability_projection_failures(
+        world,
+        failures
+            .into_iter()
+            .map(ReporterCapabilityProjectionFailure::into_parts),
+    );
+}
+
+fn attach_device_capabilities(
+    device_entity: &mut EntityWorldMut<'_>,
+    type_registry: &TypeRegistry,
+    agreed: Vec<CapabilityProjectionDeclaration<'_>>,
+    disputed: Vec<CapabilityProjectionDeclaration<'_>>,
+    key: &DeviceKey,
+) -> Vec<ReporterCapabilityProjectionFailure> {
+    match capabilities::project_declarations(device_entity, type_registry, &agreed, &disputed) {
+        Ok(()) => Vec::new(),
+        Err(failures) => {
+            for failure in &failures {
+                let type_path = match failure.failure() {
+                    CapabilityProjectionFailure::ApplicationTypeRegistryUnavailable {
+                        affected_type_path,
+                    } => affected_type_path,
+                    CapabilityProjectionFailure::ReflectComponentNotRegistered { type_path } => {
+                        type_path
+                    },
+                };
+                warn!(
+                    "device `{key:?}` has capability `{type_path}` from reporter {:?} but its \
+                     reflected component metadata is unavailable during projection",
+                    failure.reporter()
+                );
+            }
+            failures
+        },
+    }
+}
+
+fn partition_capability_declarations<'a>(
+    reporters: &'a Reporters,
+    devices: &Devices,
+    key: &DeviceKey,
+    disputed_types: &HashSet<TypeId>,
+) -> (
+    Vec<CapabilityProjectionDeclaration<'a>>,
+    Vec<CapabilityProjectionDeclaration<'a>>,
+) {
+    capability_declarations(reporters, devices, key)
+        .into_iter()
+        .partition(|contribution| {
+            !disputed_types.contains(&contribution.declaration().value().as_any().type_id())
+        })
+}
+
+fn update_device_status(mirrored_device: &MirroredDevice, device_entity: &mut EntityWorldMut<'_>) {
+    let status = projected_device_status(mirrored_device);
+    if device_entity.get::<DeviceStatus>() != Some(&status) {
+        device_entity.insert(status);
+    }
+}
+
+fn projected_device_status(mirrored_device: &MirroredDevice) -> DeviceStatus {
+    DeviceStatus::new(
+        mirrored_device.key.clone(),
+        DeviceRef::from_device_id(mirrored_device.device_id),
+        DeviceRevisionView::from_revision(mirrored_device.revision),
+        mirrored_device.availability.clone(),
+    )
 }
 
 /// What the projection pass leaves behind on the device set's change tick.
@@ -1364,32 +2029,97 @@ enum DeviceSetProjection {
 /// The conclusions one device's entity carries, copied out of the registry so the projection can
 /// spawn and write while the registry stays borrowable.
 struct MirroredDevice {
-    device_id: DeviceId,
-    key:       DeviceKey,
-    verdict:   IdentityVerdict,
-    presence:  Presence,
-    claim:     Claim,
-    disputed:  HashSet<TypeId>,
+    device_id:    DeviceId,
+    key:          DeviceKey,
+    revision:     DeviceRevision,
+    verdict:      IdentityVerdict,
+    presence:     Presence,
+    availability: KeyAvailability,
+    claim:        Claim,
+    disputed:     HashSet<TypeId>,
 }
 
 /// Borrow every capability declaration the contributing reporters retain for one durable key.
 ///
 /// Read from the reporter registry rather than from `ReconciledDeviceState`, which keeps the
 /// declared and disputed type identifiers but not the values: `Box<dyn Reflect>` is neither
-/// clonable nor reflectable, so a copy in the registry could drift from what its reporter holds.
-fn capability_declarations<'a>(reporters: &'a Reporters, key: &DeviceKey) -> Vec<&'a dyn Reflect> {
+/// clonable nor reflectable, so a copy kept beside the reconciled state could drift from what its
+/// reporter holds.
+fn capability_declarations<'a>(
+    reporters: &'a Reporters,
+    devices: &Devices,
+    key: &DeviceKey,
+) -> Vec<CapabilityProjectionDeclaration<'a>> {
+    contributing_records(reporters, devices, key)
+        .into_iter()
+        .flat_map(|contribution| {
+            contribution
+                .record
+                .capabilities
+                .declarations()
+                .map(move |declaration| {
+                    CapabilityProjectionDeclaration::new(declaration, contribution.reporter)
+                })
+        })
+        .collect()
+}
+
+/// One retained reporter record whose source and identity evidence resolve to a durable key.
+struct ContributingRecord<'a> {
+    reporter: ReporterId,
+    record:   &'a DeviceRecord,
+}
+
+fn contributing_records<'a>(
+    reporters: &'a Reporters,
+    devices: &Devices,
+    key: &DeviceKey,
+) -> Vec<ContributingRecord<'a>> {
     reporters
         .registered_reporters()
-        .filter_map(
-            |registered_reporter| match registered_reporter.contribution {
-                ReporterContribution::Completed { device_set, .. } => Some(device_set),
-                ReporterContribution::AwaitingFirstCompleteSet => None,
-            },
-        )
-        .flat_map(|device_set| device_set.devices.iter())
-        .filter(|device_record| device_record.reported_as == ReportedAs::Keyed(key.clone()))
-        .flat_map(|device_record| device_record.capabilities.declarations())
+        .filter_map(|registered_reporter| {
+            let ReporterContribution::Completed { device_set, .. } =
+                registered_reporter.contribution
+            else {
+                return None;
+            };
+            Some((registered_reporter.reporter, device_set))
+        })
+        .flat_map(|(reporter, device_set)| {
+            device_set
+                .devices
+                .iter()
+                .enumerate()
+                .filter_map(move |(record_index, record)| {
+                    let CapabilitySourceState::Retained(source) = record.capabilities.source()
+                    else {
+                        return None;
+                    };
+                    if source.reporter != reporter
+                        || source.record_index != record_index
+                        || !record_contributes_to_key(record, devices, key)
+                    {
+                        return None;
+                    }
+                    Some(ContributingRecord { reporter, record })
+                })
+        })
         .collect()
+}
+
+fn record_contributes_to_key(record: &DeviceRecord, devices: &Devices, key: &DeviceKey) -> bool {
+    match &record.reported_as {
+        ReportedAs::Keyed(reported_key) => reported_key == key,
+        ReportedAs::MatchEvidenceOnly => {
+            let PlatformDeviceHandle::Reported(reported_id) = &record.platform_device_handle else {
+                return false;
+            };
+            matches!(
+                devices.resolve_reported_handle(reported_id),
+                ReportedHandleResolution::OneKey(resolved_key) if resolved_key == *key
+            )
+        },
+    }
 }
 
 /// Point each binding entity at the device entity its durable endpoint currently resolves to.
@@ -1423,15 +2153,11 @@ fn resolve_binding_links(world: &mut World, devices: &Devices) {
 /// writing afterwards keeps a pass that resolves nothing new invisible to a change filter.
 fn planned_binding_links(world: &World, devices: &Devices) -> Vec<PlannedBindingLink> {
     let bindings = world.resource::<Bindings>();
-    let binding_entities = world.resource::<BindingEntities>();
 
     bindings
         .registered_roles()
         .filter_map(|role| {
-            let BindingEntityLookup::Registered(binding_entity) = binding_entities.entity(role)
-            else {
-                return None;
-            };
+            let binding_entity = bindings.role_entity(role).ok()?;
             let Ok(binding) = bindings.binding(role) else {
                 return None;
             };
@@ -1537,23 +2263,28 @@ fn planned_configuration_mirrors<'a>(
     type_registry: &'a TypeRegistry,
 ) -> Vec<PlannedConfigurationMirror<'a>> {
     let bindings = world.resource::<Bindings>();
-    let binding_entities = world.resource::<BindingEntities>();
     let mut planned_mirrors = Vec::new();
 
     for role in bindings.registered_roles() {
-        let BindingEntityLookup::Registered(binding_entity) = binding_entities.entity(role) else {
+        let Ok(binding_entity) = bindings.role_entity(role) else {
             continue;
         };
         let Ok(binding) = bindings.binding(role) else {
             continue;
         };
-        let LastKnownGoodConfiguration::Known(configuration) = &binding.last_known_good else {
-            if let Some(planned_erase) =
-                planned_configuration_erase(world, type_registry, binding_entity)
-            {
-                planned_mirrors.push(planned_erase);
-            }
-            continue;
+        let configuration: &dyn Reflect = match &binding.last_known_good {
+            LastKnownGoodConfiguration::NotEstablished => {
+                if let Some(planned_erase) =
+                    planned_configuration_erase(world, type_registry, binding_entity)
+                {
+                    planned_mirrors.push(planned_erase);
+                }
+                continue;
+            },
+            LastKnownGoodConfiguration::MatchesRequested => binding.requested.configuration(),
+            LastKnownGoodConfiguration::DiffersFromDispatched(configuration) => {
+                configuration.as_ref()
+            },
         };
         let reflect_component =
             match reflect_component_for(configuration.as_partial_reflect(), type_registry) {
@@ -1629,109 +2360,11 @@ enum PlannedConfigurationMirror<'a> {
     },
 }
 
-/// Take every safe opportunity this pass opened to learn what is actually on an endpoint.
-///
-/// The conditions are all of: a managed configured device, a role in `RoleState::Ready` so no
-/// driver operation is in flight, nothing owed to the role, a present endpoint, a driver that has
-/// not permanently declined, and no configuration established yet.
-/// `ReadyRole::capture_request` is the only way to mint the request driver dispatch accepts, so the
-/// checks cannot be bypassed by choosing a driver directly.
-fn capture_ready_configurations(world: &mut World, devices: &Devices) {
-    let capture_roles = roles_with_a_safe_capture_opportunity(world, devices);
-    if capture_roles.is_empty() {
-        return;
-    }
-
-    world.resource_scope::<Bindings, _>(|world, mut bindings| {
-        world.resource_scope::<Drivers, _>(|world, mut drivers| {
-            world.resource_scope::<HardwareInventory, _>(|world, hardware_inventory| {
-                for role in capture_roles {
-                    let capture_outcome = {
-                        let Ok(RoleView::Ready(ready_role)) = bindings.role_view(&role) else {
-                            continue;
-                        };
-                        let Ok(capture_request) = ready_role.capture_request(&hardware_inventory)
-                        else {
-                            continue;
-                        };
-                        let dispatched_role = capture_request.role.clone();
-                        match drivers.capture(world, capture_request) {
-                            Ok(capture_outcome) => capture_outcome,
-                            Err(driver_contract_error) => {
-                                warn!(
-                                    "role `{dispatched_role:?}` configuration readback failed: \
-                                     {driver_contract_error}"
-                                );
-                                continue;
-                            },
-                        }
-                    };
-                    if let Ok(RoleView::Ready(mut ready_role)) = bindings.role_view(&role) {
-                        ready_role.record_capture(capture_outcome);
-                    }
-                }
-            });
-        });
-    });
-}
-
-/// List the roles whose every safe-capture condition already holds, before anything is borrowed
-/// mutably.
-///
-/// Selecting first is what keeps a settled frame silent: `Bindings` and `Drivers` are reached
-/// through `World::resource_scope`, which marks a resource changed on reinsertion whether or not
-/// the closure wrote to it, so a frame with no capture opportunity must never enter one. A role
-/// whose `LastKnownGoodConfiguration` is already `Known` is one such settled role: the safe
-/// readback it needed has happened, and repeating it every pass would dispatch a driver call per
-/// frame for as long as the binding lives. A later departure clears the readback opportunity's
-/// other conditions instead, through `WaitingWork::RestorationOwed`. Every condition here is
-/// re-checked by `ReadyRole::capture_request`, which remains the only way to mint the request
-/// driver dispatch accepts.
-fn roles_with_a_safe_capture_opportunity(world: &World, devices: &Devices) -> Vec<RoleKey> {
-    let bindings = world.resource::<Bindings>();
-    let hardware_inventory = world.resource::<HardwareInventory>();
-
-    bindings
-        .registered_roles()
-        .filter(|role| {
-            bindings.waiting_work(role) == WaitingWork::Nothing
-                && bindings.capture_dispatch(role) == CaptureDispatch::Eligible
-                && bindings.configuration_readability(role) == ConfigurationReadability::Readable
-                && bindings.binding(role).is_ok_and(|binding| {
-                    binding.state == RoleState::Ready
-                        && matches!(
-                            binding.last_known_good,
-                            LastKnownGoodConfiguration::NotEstablished
-                        )
-                        && endpoint_device_present(devices, &binding.endpoint.device)
-                        && hardware_inventory
-                            .ensure_operational(&binding.endpoint.device)
-                            .is_ok()
-                })
-        })
-        .cloned()
-        .collect()
-}
-
-/// Report whether the device one endpoint names is currently reachable.
-fn endpoint_device_present(devices: &Devices, key: &DeviceKey) -> bool {
-    let DeviceResolution::Resolved(device_id) = devices.resolve(key) else {
-        return false;
-    };
-    matches!(
-        devices.state(device_id),
-        DeviceStateLookup::Retained(reconciled_device_state)
-            if reconciled_device_state.presence == Presence::Present
-    )
-}
-
 /// Report every device whose contributors changed what they disagree about, once per change.
 ///
-/// The warning is what makes a disagreement visible with no user interface attached; the event is
-/// what a diagnostic panel consumes instead of polling `Devices`. An empty payload means the
-/// disagreement cleared and the device is fully drivable again.
+/// The warning makes a disagreement visible with no user interface attached. An empty capability
+/// list means the disagreement cleared and the device is fully drivable again.
 fn announce_disputes(
-    world: &mut World,
     devices: &Devices,
     disputes_changed: &[DeviceId],
     type_registry: &TypeRegistry,
@@ -1740,10 +2373,7 @@ fn announce_disputes(
         let DeviceStateLookup::Retained(reconciled_device_state) = devices.state(*device_id) else {
             continue;
         };
-        let DeviceEntityLookup::Projected(device) = devices.entity(*device_id) else {
-            continue;
-        };
-        // Sorted so one disagreement reads the same in every log line and in every event, since
+        // Sorted so one disagreement reads the same in every log line, since
         // `ReconciledDeviceState::disputed` is a set whose iteration order varies between runs.
         let mut capabilities: Vec<String> = reconciled_device_state
             .disputed
@@ -1768,10 +2398,6 @@ fn announce_disputes(
                 reconciled_device_state.key
             );
         }
-        world.trigger(CapabilitiesDisputed {
-            device,
-            capabilities,
-        });
     }
 }
 
@@ -1786,6 +2412,7 @@ mod tests {
     use std::alloc::Layout;
     use std::alloc::System;
     use std::cell::Cell;
+    use std::collections::HashSet;
     use std::error::Error;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -1803,40 +2430,41 @@ mod tests {
     use bevy::ecs::relationship::RelationshipTarget;
     use bevy::prelude::Changed;
     use bevy::prelude::Component;
-    use bevy::prelude::On;
     use bevy::prelude::Query;
     use bevy::prelude::Reflect;
     use bevy::prelude::Res;
     use bevy::prelude::ResMut;
     use bevy::prelude::Resource;
     use bevy::prelude::World;
+    use bevy::time::Real;
+    use bevy::time::Time;
     use bevy::world_serialization::DynamicWorldBuilder;
 
     use super::FrameClockReading;
+    use super::FreshnessLease;
+    use super::PriorKeyAvailability;
     use super::ReconcilePass;
     use super::planned_configuration_mirrors;
     use super::project_device_entities;
     use super::reconcile_devices;
+    use super::reconcile_work;
     use super::reflect_component_for;
+    use crate::Applied;
+    use crate::ApplyContext;
     use crate::ApplyDeadline;
-    use crate::ApplyPermit;
     use crate::AttachmentPath;
-    use crate::AttemptId;
-    use crate::AttemptOutcome;
-    use crate::AttemptProgress;
+    use crate::AttemptInvalidation;
+    use crate::AttemptRef;
     use crate::AuthoritativeReporterCoverage;
     use crate::Binding;
-    use crate::BindingEntities;
-    use crate::BindingEntityLookup;
     use crate::Bindings;
     use crate::Capabilities;
-    use crate::CapabilitiesDisputed;
-    use crate::CaptureOutcome;
     use crate::Claim;
     use crate::ClaimHolder;
     use crate::ConfiguredDevice;
     use crate::ConfiguredDeviceConnection;
     use crate::ConfiguredDeviceMode;
+    use crate::ConfiguredDeviceName;
     use crate::CoveredDeviceIdentitySpace;
     use crate::DeviceDescriptor;
     use crate::DeviceEndpoint;
@@ -1852,11 +2480,18 @@ mod tests {
     use crate::Devices;
     use crate::Digest;
     use crate::DiscoveryCadence;
+    use crate::DiscoveryLimits;
     use crate::DiscoveryWork;
+    use crate::DriverCleanupRoleEntity;
+    use crate::DriverCompletion;
     use crate::EndpointDriver;
     use crate::EndpointId;
+    use crate::EstablishedContext;
+    use crate::FlowExpectation;
     use crate::HardwareInventory;
+    use crate::HardwareWait;
     use crate::IdentityVerdict;
+    use crate::KeyAvailability;
     use crate::LastKnownGoodConfiguration;
     use crate::MainThreadDiscoveryJob;
     use crate::OnAbort;
@@ -1866,11 +2501,13 @@ mod tests {
     use crate::RecoveryPolicy;
     use crate::RegisteredSchemes;
     use crate::ReportedAs;
+    use crate::ReportedHandleResolution;
     use crate::ReportedId;
     use crate::ReportedParent;
     use crate::ReportedSerial;
     use crate::ReporterCoverage;
     use crate::ReporterId;
+    use crate::ReporterRef;
     use crate::ReporterRegistration;
     use crate::RequestedConfiguration;
     use crate::RetryOn;
@@ -1878,14 +2515,21 @@ mod tests {
     use crate::RiggingLimits;
     use crate::RiggingPlugin;
     use crate::RiggingRevision;
+    use crate::RiggingRuntimeClock;
+    use crate::RiggingRuntimeTime;
     use crate::RoleKey;
-    use crate::RoleState;
+    use crate::RoleStatusView;
     use crate::SchemeName;
+    use crate::SessionRef;
+    use crate::SessionReleaseCause;
+    use crate::TargetResolution;
+    use crate::TargetResolutionContext;
+    use crate::UnconfirmedBasis;
     use crate::UnverifiedReason;
-    use crate::binding::RoleView;
-    use crate::binding::WaitingRole;
+    use crate::WaitingStatusView;
     use crate::binding::WaitingWork;
     use crate::capabilities::CapabilityAttachError;
+    use crate::devices::DeviceAvailabilityChange;
     use crate::devices::DeviceEntityLookup;
     use crate::devices::ReconciledDeviceChanges;
     use crate::registration::DriverId;
@@ -2012,7 +2656,11 @@ mod tests {
     ) -> ReporterId {
         app.add_device_reporter(
             FixedReporter(build),
-            ReporterRegistration::required(cadence, ReporterCoverage::MatchingEvidenceOnly),
+            ReporterRegistration::required(
+                cadence,
+                ReporterCoverage::MatchingEvidenceOnly,
+                std::time::Duration::from_secs(10),
+            ),
         )
     }
 
@@ -2020,6 +2668,14 @@ mod tests {
     /// test controls the frame clock and the reporter registry contents exactly.
     fn reconcile_once(app: &mut App, clock: FrameClockReading) -> usize {
         let mut allocations = 0;
+        let bindings = Bindings::default();
+        let runtime_clock = *app.world().resource::<RiggingRuntimeClock>();
+        let observed_at = match clock {
+            FrameClockReading::Measurable(observed_at) => observed_at,
+            FrameClockReading::NotYetAdvanced => {
+                runtime_clock.instant_at(RiggingRuntimeTime::from_elapsed(Duration::ZERO))
+            },
+        };
         app.world_mut()
             .resource_scope::<Reporters, _>(|world, mut reporters| {
                 world.resource_scope::<Devices, _>(|world, mut devices| {
@@ -2028,14 +2684,30 @@ mod tests {
                             world.resource_scope::<RegisteredSchemes, _>(
                                 |_, registered_schemes| {
                                     allocations = allocations_during(|| {
+                                        let hardware_inventory = HardwareInventory::default();
+                                        let freshness_lease = FreshnessLease {
+                                            rigging_limits: &rigging_limits,
+                                            clock,
+                                        };
+                                        let reconcile_work = reconcile_work(
+                                            &reporters,
+                                            &devices,
+                                            &registered_schemes,
+                                            &hardware_inventory,
+                                            &bindings,
+                                            freshness_lease,
+                                            &rigging_limits,
+                                            observed_at,
+                                            runtime_clock,
+                                            devices.departure_grace_due(
+                                                runtime_clock.time_at(observed_at),
+                                            ),
+                                        );
                                         reconcile_devices(
                                             &mut reporters,
                                             &mut devices,
                                             &mut rigging_revision,
-                                            &rigging_limits,
-                                            &registered_schemes,
-                                            &HardwareInventory::default(),
-                                            clock,
+                                            reconcile_work,
                                         );
                                     });
                                 },
@@ -2084,6 +2756,16 @@ mod tests {
     /// and reconciliation sees the accepted set on the next one.
     fn run_until_reconciled(app: &mut App) {
         app.update();
+        app.update();
+    }
+
+    fn advance_past_departure_grace(app: &mut App) {
+        let departure_grace = app.world().resource::<RiggingLimits>().departure_grace;
+        let time = app.world().resource::<Time<Real>>();
+        let now = time.last_update().unwrap_or_else(|| time.startup());
+        app.world_mut()
+            .resource_mut::<Time<Real>>()
+            .update_with_instant(now + departure_grace + Duration::from_secs(1));
         app.update();
     }
 
@@ -2138,6 +2820,10 @@ mod tests {
         assert!(matches!(
             presence_of(devices, &key("camera")),
             Some(Presence::Unreachable { .. })
+        ));
+        assert!(matches!(
+            devices.key_availability(&key("camera")),
+            PriorKeyAvailability::Published(KeyAvailability::Unreachable { .. })
         ));
     }
 
@@ -2323,6 +3009,17 @@ mod tests {
             presence_of(app.world().resource::<Devices>(), &key("panel-a")),
             Some(Presence::Present)
         );
+        let devices = app.world().resource::<Devices>();
+        let PriorKeyAvailability::Published(KeyAvailability::Present(evidence)) =
+            devices.key_availability(&key("panel-a"))
+        else {
+            panic!("the fresh contributor did not keep the key present");
+        };
+        assert_eq!(evidence.contributors().as_slice().len(), 1);
+        assert_eq!(
+            evidence.contributors().as_slice()[0].reporter,
+            ReporterRef::from_reporter_id(winit_like)
+        );
 
         app.world_mut()
             .resource_mut::<Reporters>()
@@ -2332,6 +3029,179 @@ mod tests {
         assert!(matches!(
             presence_of(app.world().resource::<Devices>(), &key("panel-a")),
             Some(Presence::Unreachable { .. })
+        ));
+    }
+
+    #[test]
+    fn an_expired_keyed_owner_withdraws_evidence_only_presence_in_the_expiry_frame()
+    -> Result<(), Box<dyn Error>> {
+        let mut app = app_with_scheme();
+        let device_key = key("lease-owned-panel");
+        let role = RoleKey::new("lease-owned-panel")?;
+        let handle = ReportedId::new("lease-owned-handle")?;
+        let driver = app
+            .world_mut()
+            .resource_mut::<Drivers>()
+            .add(CountingCaptureDriver(Arc::new(AtomicUsize::new(0))));
+        app.world_mut()
+            .resource_mut::<Bindings>()
+            .register(panel_binding(role.clone(), device_key.clone(), driver))?;
+        let owner = add_reporter_with_cadence(
+            &mut app,
+            || {
+                let mut owner = record(ReportedAs::Keyed(key("lease-owned-panel")));
+                owner.platform_device_handle = PlatformDeviceHandle::Reported(
+                    ReportedId::new("lease-owned-handle").expect("test handle is well formed"),
+                );
+                vec![owner]
+            },
+            DiscoveryCadence::Periodic {
+                interval: Duration::from_secs(5),
+            },
+        );
+        let evidence_only = add_reporter_with_cadence(
+            &mut app,
+            || {
+                let mut evidence = record(ReportedAs::MatchEvidenceOnly);
+                evidence.platform_device_handle = PlatformDeviceHandle::Reported(
+                    ReportedId::new("lease-owned-handle").expect("test handle is well formed"),
+                );
+                vec![evidence]
+            },
+            DiscoveryCadence::OnDemand,
+        );
+
+        run_until_reconciled(&mut app);
+        let devices = app.world().resource::<Devices>();
+        let PriorKeyAvailability::Published(KeyAvailability::Present(evidence)) =
+            devices.key_availability(&device_key)
+        else {
+            return Err("the initial exact handle match was not published as present".into());
+        };
+        assert_eq!(evidence.contributors().as_slice().len(), 2);
+        assert!(
+            evidence
+                .contributors()
+                .as_slice()
+                .iter()
+                .any(|contributor| {
+                    contributor.reporter == ReporterRef::from_reporter_id(evidence_only)
+                })
+        );
+
+        let report_grace = app.world().resource::<RiggingLimits>().report_grace;
+        app.world_mut()
+            .resource_mut::<Reporters>()
+            .backdate_completion(owner, report_grace + Duration::from_mins(10));
+        let changes = reconcile_and_project_changes(&mut app, now());
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].key, device_key);
+        assert!(matches!(changes[0].from, KeyAvailability::Present(_)));
+        let KeyAvailability::Unreachable { reporters, .. } = &changes[0].to else {
+            return Err("lease expiry did not publish unreachable availability".into());
+        };
+        assert!(reporters.contains(ReporterRef::from_reporter_id(owner)));
+        assert_eq!(
+            app.world()
+                .resource::<Devices>()
+                .resolve_reported_handle(&handle),
+            ReportedHandleResolution::NoKeyedRecord
+        );
+        let projected_status = app.world().resource::<Bindings>().projected_status(&role)?;
+        let RoleStatusView::Waiting(WaitingStatusView::Reporter(HardwareWait::Unreachable {
+            key: waited_key,
+            reporters: waited_reporters,
+            ..
+        })) = projected_status
+        else {
+            return Err("the role did not enter its unreachable hardware wait".into());
+        };
+        assert_eq!(waited_key, device_key);
+        assert!(waited_reporters.contains(ReporterRef::from_reporter_id(owner)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn keyed_and_evidence_only_records_publish_the_same_present_decision() {
+        let mut keyed_app = app_with_scheme();
+        add_reporter(&mut keyed_app, || {
+            vec![record(ReportedAs::Keyed(key("keyed-decision")))]
+        });
+        add_reporter(&mut keyed_app, || {
+            vec![record(ReportedAs::Keyed(key("keyed-decision")))]
+        });
+        run_until_reconciled(&mut keyed_app);
+
+        let mut evidence_app = app_with_scheme();
+        add_reporter(&mut evidence_app, || {
+            let mut keyed = record(ReportedAs::Keyed(key("evidence-decision")));
+            keyed.platform_device_handle = PlatformDeviceHandle::Reported(
+                ReportedId::new("decision-handle").expect("test handle is well formed"),
+            );
+            vec![keyed]
+        });
+        add_reporter(&mut evidence_app, || {
+            let mut evidence = record(ReportedAs::MatchEvidenceOnly);
+            evidence.platform_device_handle = PlatformDeviceHandle::Reported(
+                ReportedId::new("decision-handle").expect("test handle is well formed"),
+            );
+            vec![evidence]
+        });
+        run_until_reconciled(&mut evidence_app);
+
+        for (app, device_key) in [
+            (&keyed_app, key("keyed-decision")),
+            (&evidence_app, key("evidence-decision")),
+        ] {
+            let PriorKeyAvailability::Published(KeyAvailability::Present(evidence)) = app
+                .world()
+                .resource::<Devices>()
+                .key_availability(&device_key)
+            else {
+                panic!("the two-report contribution did not publish present availability");
+            };
+            assert_eq!(evidence.contributors().as_slice().len(), 2);
+        }
+    }
+
+    #[test]
+    fn covering_and_noncovering_omissions_publish_distinct_availability() {
+        let omitted_key = key("omitted-panel");
+        let availability_after = |coverage| {
+            let mut app = app_with_scheme();
+            app.world_mut()
+                .resource_mut::<HardwareInventory>()
+                .configure(ConfiguredDevice {
+                    key:  omitted_key.clone(),
+                    mode: ConfiguredDeviceMode::Managed,
+                    name: ConfiguredDeviceName::NeverDerived,
+                });
+            add_set_reporter(&mut app, Vec::new(), coverage);
+            run_until_reconciled(&mut app);
+            match app
+                .world()
+                .resource::<Devices>()
+                .key_availability(&omitted_key)
+            {
+                PriorKeyAvailability::Published(availability) => availability.clone(),
+                PriorKeyAvailability::NeverPublished => {
+                    panic!("the configured key received no availability conclusion");
+                },
+            }
+        };
+
+        assert!(matches!(
+            availability_after(establishes_absence()),
+            KeyAvailability::Absent { .. }
+        ));
+        assert!(matches!(
+            availability_after(ReporterCoverage::MatchingEvidenceOnly),
+            KeyAvailability::Unconfirmed {
+                basis: UnconfirmedBasis::NoFreshEvidence,
+                ..
+            }
         ));
     }
 
@@ -2399,6 +3269,10 @@ mod tests {
             contributors(devices, &key("panel-a")),
             vec![keyed, evidence]
         );
+        assert_eq!(
+            devices.resolve_reported_handle(&ReportedId::new("display-7").expect("well formed")),
+            ReportedHandleResolution::OneKey(key("panel-a"))
+        );
     }
 
     #[test]
@@ -2459,11 +3333,17 @@ mod tests {
         // than two before every whole set has been accepted.
         run_until_reconciled(&mut app);
         run_until_reconciled(&mut app);
+        run_until_reconciled(&mut app);
+        run_until_reconciled(&mut app);
 
         // The handle names two keys, so it names neither: attaching the evidence to whichever key
         // was ingested last would be the plausible fallback exact-match identity forbids.
         let devices = app.world().resource::<Devices>();
         assert_eq!(devices.count(), 2);
+        assert_eq!(
+            devices.resolve_reported_handle(&ReportedId::new("display-7").expect("well formed")),
+            ReportedHandleResolution::SeveralKeys(HashSet::from([key("panel-a"), key("panel-b"),]))
+        );
         for device_key in [key("panel-a"), key("panel-b")] {
             assert!(!contributors(devices, &device_key).contains(&evidence));
         }
@@ -2481,7 +3361,45 @@ mod tests {
 
         run_until_reconciled(&mut app);
 
-        assert_eq!(app.world().resource::<Devices>().count(), 0);
+        let devices = app.world().resource::<Devices>();
+        assert_eq!(devices.count(), 0);
+        assert_eq!(
+            devices.resolve_reported_handle(&ReportedId::new("display-9").expect("well formed")),
+            ReportedHandleResolution::NoKeyedRecord
+        );
+    }
+
+    #[test]
+    fn a_later_scan_drops_the_handle_resolution_from_the_prior_scan() {
+        let mut app = app_with_scheme();
+        let reported_id = ReportedId::new("display-7").expect("well formed");
+        let panel = key("panel-a");
+        let mut reported_unit = unit(panel.clone());
+        reported_unit.platform_device_handle = PlatformDeviceHandle::Reported(reported_id.clone());
+        let reported_units = add_set_reporter(
+            &mut app,
+            vec![reported_unit],
+            ReporterCoverage::MatchingEvidenceOnly,
+        );
+
+        run_until_reconciled(&mut app);
+
+        assert_eq!(
+            app.world()
+                .resource::<Devices>()
+                .resolve_reported_handle(&reported_id),
+            ReportedHandleResolution::OneKey(panel.clone())
+        );
+
+        rewrite(&reported_units, vec![unit(panel)]);
+        run_until_reconciled(&mut app);
+
+        assert_eq!(
+            app.world()
+                .resource::<Devices>()
+                .resolve_reported_handle(&reported_id),
+            ReportedHandleResolution::NoKeyedRecord
+        );
     }
 
     #[test]
@@ -2493,7 +3411,7 @@ mod tests {
         run_until_reconciled(&mut app);
 
         // Both records carry `PlatformReportedNothing`, which compares equal to itself. Joining on
-        // it would mint a device out of two reports that share no evidence at all.
+        // it would create a device out of two reports that share no evidence at all.
         assert_eq!(app.world().resource::<Devices>().count(), 0);
     }
 
@@ -2527,28 +3445,29 @@ mod tests {
         // Three reporters that each name the same two devices. A pairwise join would compare every
         // reporter against every other; the single-pass merge visits six records and stops.
         let mut app = app_with_scheme();
-        let first = add_reporter(&mut app, || {
-            vec![
-                record(ReportedAs::Keyed(key("panel-a"))),
-                record(ReportedAs::Keyed(key("panel-b"))),
-            ]
-        });
-        let second = add_reporter(&mut app, || {
-            vec![
-                record(ReportedAs::Keyed(key("panel-a"))),
-                record(ReportedAs::Keyed(key("panel-b"))),
-            ]
-        });
-        let third = add_reporter(&mut app, || {
-            vec![
-                record(ReportedAs::Keyed(key("panel-a"))),
-                record(ReportedAs::Keyed(key("panel-b"))),
-            ]
-        });
+        app.world_mut()
+            .resource_mut::<DiscoveryLimits>()
+            .set_max_completions_per_frame(
+                std::num::NonZeroUsize::new(3).unwrap_or(std::num::NonZeroUsize::MIN),
+            );
+        let add_subject = |app: &mut App| {
+            add_reporter_with_cadence(
+                app,
+                || {
+                    vec![
+                        record(ReportedAs::Keyed(key("panel-a"))),
+                        record(ReportedAs::Keyed(key("panel-b"))),
+                    ]
+                },
+                DiscoveryCadence::OnDemand,
+            )
+        };
+        let first = add_subject(&mut app);
+        let second = add_subject(&mut app);
+        let third = add_subject(&mut app);
 
-        // Discovery admits a bounded number of jobs per frame, so three reporters need more frames
-        // than two before every whole set has been accepted.
-        run_until_reconciled(&mut app);
+        // The completion budget admits all three whole sets together so this test isolates merge
+        // behavior from scheduler pacing.
         run_until_reconciled(&mut app);
 
         let devices = app.world().resource::<Devices>();
@@ -2570,12 +3489,13 @@ mod tests {
     /// `DeviceRecord` itself cannot be cloned, because its capability declarations are erased.
     #[derive(Clone)]
     struct ReportedUnit {
-        key:        DeviceKey,
-        parent:     ReportedParent,
-        attachment: AttachmentPath,
-        claim:      Claim,
-        presence:   Presence,
-        brightness: Vec<u8>,
+        key:                    DeviceKey,
+        parent:                 ReportedParent,
+        attachment:             AttachmentPath,
+        claim:                  Claim,
+        presence:               Presence,
+        brightness:             Vec<u8>,
+        platform_device_handle: PlatformDeviceHandle,
     }
 
     /// A reporter whose whole set the owning test rewrites between scans.
@@ -2607,33 +3527,57 @@ mod tests {
     #[reflect(Component, PartialEq)]
     struct PanelConfiguration(u8);
 
-    /// A driver that reads one fixed configuration back and counts how often it was asked.
+    /// A driver that establishes one fixed configuration and counts how often it was asked.
     struct CountingCaptureDriver(Arc<AtomicUsize>);
 
     impl EndpointDriver for CountingCaptureDriver {
         type Configuration = PanelConfiguration;
+        type Target = ();
 
-        fn capture(
+        fn resolve_target(
             &mut self,
             _: &mut World,
-            _: &crate::DeviceEndpoint,
-        ) -> CaptureOutcome<Self::Configuration> {
-            self.0.fetch_add(1, Ordering::Relaxed);
-            CaptureOutcome::Read(PanelConfiguration(7))
+            _: &TargetResolutionContext<'_>,
+            _: &Self::Configuration,
+        ) -> crate::TargetResolution<Self::Target> {
+            TargetResolution::Reached(())
         }
 
         fn start_apply(
             &mut self,
             _: &mut World,
-            _: &crate::DeviceEndpoint,
+            context: ApplyContext<'_, Self::Configuration>,
             _: &Self::Configuration,
-            _: crate::AttemptId,
-            _: crate::ApplyPermit,
+            (): Self::Target,
+        ) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            context
+                .into_completion()
+                .finish(DriverCompletion::Succeeded(Applied::DiffersFromDispatched(
+                    PanelConfiguration(7),
+                )));
+        }
+
+        fn established(&mut self, _: &mut World, _: EstablishedContext<'_, Self::Configuration>) {}
+
+        fn cancel_apply(
+            &mut self,
+            _: &mut World,
+            _: &RoleKey,
+            _: DriverCleanupRoleEntity,
+            _: AttemptRef,
+            _: AttemptInvalidation,
         ) {
         }
 
-        fn poll(&mut self, _: &mut World, _: crate::AttemptId) -> crate::AttemptProgress {
-            AttemptProgress::Finished(AttemptOutcome::Succeeded)
+        fn release_session(
+            &mut self,
+            _: &mut World,
+            _: &RoleKey,
+            _: DriverCleanupRoleEntity,
+            _: SessionRef,
+            _: SessionReleaseCause,
+        ) {
         }
     }
 
@@ -2646,43 +3590,68 @@ mod tests {
     #[derive(Clone, PartialEq, Debug, Component, Reflect)]
     struct UnmirrorableConfiguration(u8);
 
-    /// A driver that reads back a configuration the mirror cannot project.
+    /// A driver that establishes a configuration the mirror cannot project.
     struct UnmirrorableDriver;
 
     impl EndpointDriver for UnmirrorableDriver {
         type Configuration = UnmirrorableConfiguration;
+        type Target = ();
 
-        fn capture(
+        fn resolve_target(
             &mut self,
             _: &mut World,
-            _: &crate::DeviceEndpoint,
-        ) -> CaptureOutcome<Self::Configuration> {
-            CaptureOutcome::Read(UnmirrorableConfiguration(7))
+            _: &TargetResolutionContext<'_>,
+            _: &Self::Configuration,
+        ) -> crate::TargetResolution<Self::Target> {
+            TargetResolution::Reached(())
         }
 
         fn start_apply(
             &mut self,
             _: &mut World,
-            _: &crate::DeviceEndpoint,
+            context: ApplyContext<'_, Self::Configuration>,
             _: &Self::Configuration,
-            _: crate::AttemptId,
-            _: crate::ApplyPermit,
+            (): Self::Target,
+        ) {
+            context
+                .into_completion()
+                .finish(DriverCompletion::Succeeded(Applied::DiffersFromDispatched(
+                    UnmirrorableConfiguration(7),
+                )));
+        }
+
+        fn established(&mut self, _: &mut World, _: EstablishedContext<'_, Self::Configuration>) {}
+
+        fn cancel_apply(
+            &mut self,
+            _: &mut World,
+            _: &RoleKey,
+            _: DriverCleanupRoleEntity,
+            _: AttemptRef,
+            _: AttemptInvalidation,
         ) {
         }
 
-        fn poll(&mut self, _: &mut World, _: crate::AttemptId) -> crate::AttemptProgress {
-            AttemptProgress::Finished(AttemptOutcome::Succeeded)
+        fn release_session(
+            &mut self,
+            _: &mut World,
+            _: &RoleKey,
+            _: DriverCleanupRoleEntity,
+            _: SessionRef,
+            _: SessionReleaseCause,
+        ) {
         }
     }
 
     fn unit(device_key: DeviceKey) -> ReportedUnit {
         ReportedUnit {
-            key:        device_key,
-            parent:     ReportedParent::Root,
-            attachment: AttachmentPath::PlatformHasNoConcept,
-            claim:      Claim::NotApplicable,
-            presence:   Presence::Present,
-            brightness: Vec::new(),
+            key:                    device_key,
+            parent:                 ReportedParent::Root,
+            attachment:             AttachmentPath::PlatformHasNoConcept,
+            claim:                  Claim::NotApplicable,
+            presence:               Presence::Present,
+            brightness:             Vec::new(),
+            platform_device_handle: PlatformDeviceHandle::PlatformReportedNothing,
         }
     }
 
@@ -2698,7 +3667,7 @@ mod tests {
             claim: reported_unit.claim.clone(),
             capabilities,
             serial: ReportedSerial::NotExposedByUnit,
-            platform_device_handle: PlatformDeviceHandle::PlatformReportedNothing,
+            platform_device_handle: reported_unit.platform_device_handle.clone(),
             attachment: reported_unit.attachment.clone(),
             descriptor: DeviceDescriptor::PlatformReportedNothing,
         }
@@ -2746,7 +3715,7 @@ mod tests {
         let reported_units = Arc::new(Mutex::new(units));
         let reporter = app.add_device_reporter(
             SetReporter(Arc::clone(&reported_units)),
-            ReporterRegistration::required(cadence, coverage),
+            ReporterRegistration::required(cadence, coverage, std::time::Duration::from_secs(10)),
         );
 
         (reporter, reported_units)
@@ -2792,7 +3761,23 @@ mod tests {
     /// this one reads the app's authored inventory and applies the pass's changes, so a test can
     /// judge entities, links, capture, and connection conclusions after aging a retained set.
     fn reconcile_and_project(app: &mut App, clock: FrameClockReading) {
+        drop(reconcile_and_project_changes(app, clock));
+    }
+
+    /// Run one reconcile pass and return the availability edges before projecting its changes.
+    fn reconcile_and_project_changes(
+        app: &mut App,
+        clock: FrameClockReading,
+    ) -> Vec<DeviceAvailabilityChange> {
+        let runtime_clock = *app.world().resource::<RiggingRuntimeClock>();
+        let observed_at = match clock {
+            FrameClockReading::Measurable(observed_at) => observed_at,
+            FrameClockReading::NotYetAdvanced => {
+                runtime_clock.instant_at(RiggingRuntimeTime::from_elapsed(Duration::ZERO))
+            },
+        };
         let world = app.world_mut();
+        let mut availability_changes = Vec::new();
         world.resource_scope::<Reporters, _>(|world, mut reporters| {
             world.resource_scope::<Devices, _>(|world, mut devices| {
                 world.resource_scope::<RiggingRevision, _>(|world, mut rigging_revision| {
@@ -2801,17 +3786,34 @@ mod tests {
                             |world, registered_schemes| {
                                 world.resource_scope::<HardwareInventory, _>(
                                     |world, hardware_inventory| {
+                                        let freshness_lease = FreshnessLease {
+                                            rigging_limits: &rigging_limits,
+                                            clock,
+                                        };
+                                        let reconcile_work = reconcile_work(
+                                            &reporters,
+                                            &devices,
+                                            &registered_schemes,
+                                            &hardware_inventory,
+                                            world.resource::<Bindings>(),
+                                            freshness_lease,
+                                            &rigging_limits,
+                                            observed_at,
+                                            runtime_clock,
+                                            devices.departure_grace_due(
+                                                runtime_clock.time_at(observed_at),
+                                            ),
+                                        );
                                         if let ReconcilePass::Merged(replacement) =
                                             reconcile_devices(
                                                 &mut reporters,
                                                 &mut devices,
                                                 &mut rigging_revision,
-                                                &rigging_limits,
-                                                &registered_schemes,
-                                                &hardware_inventory,
-                                                clock,
+                                                reconcile_work,
                                             )
                                         {
+                                            availability_changes =
+                                                replacement.changes.availability.clone();
                                             *world.resource_mut::<ReconciledDeviceChanges>() =
                                                 replacement.changes;
                                         }
@@ -2824,6 +3826,7 @@ mod tests {
             });
         });
         project_device_entities(world);
+        availability_changes
     }
 
     fn now() -> FrameClockReading { FrameClockReading::Measurable(Instant::now()) }
@@ -2853,7 +3856,7 @@ mod tests {
         );
         assert_eq!(
             verdict_of(devices, &synthesized),
-            Some(IdentityVerdict::RestoreOnly)
+            Some(IdentityVerdict::Presumed)
         );
         assert_eq!(
             verdict_of(devices, &authored),
@@ -2870,6 +3873,7 @@ mod tests {
             .configure(ConfiguredDevice {
                 key:  unreported.clone(),
                 mode: ConfiguredDeviceMode::Managed,
+                name: ConfiguredDeviceName::NeverDerived,
             });
         add_set_reporter(
             &mut app,
@@ -3180,6 +4184,7 @@ mod tests {
             .configure(ConfiguredDevice {
                 key:  authored.clone(),
                 mode: ConfiguredDeviceMode::Managed,
+                name: ConfiguredDeviceName::NeverDerived,
             });
 
         assert_eq!(
@@ -3212,8 +4217,9 @@ mod tests {
                 .connection(&authored),
             Ok(ConfiguredDeviceConnection::Absent)
         );
-        // An absent unit is a connection conclusion, never an entity: nothing was reported to
-        // mirror.
+        // Grace revokes authorization while retaining the device entity.
+        assert!(device_entity_of(&app, &authored).is_some());
+        advance_past_departure_grace(&mut app);
         assert_eq!(device_entity_of(&app, &authored), None);
     }
 
@@ -3226,6 +4232,7 @@ mod tests {
             .configure(ConfiguredDevice {
                 key:  authored.clone(),
                 mode: ConfiguredDeviceMode::Managed,
+                name: ConfiguredDeviceName::NeverDerived,
             });
         let (reporter, _reported_units) = registered_set_reporter(
             &mut app,
@@ -3269,6 +4276,7 @@ mod tests {
             .configure(ConfiguredDevice {
                 key:  authored.clone(),
                 mode: ConfiguredDeviceMode::Managed,
+                name: ConfiguredDeviceName::NeverDerived,
             });
         let reported_units = add_set_reporter(
             &mut app,
@@ -3332,12 +4340,12 @@ mod tests {
     #[test]
     fn a_reconciled_device_gains_an_entity_and_its_departure_despawns_it() {
         let mut app = app_with_scheme();
+        app.world_mut()
+            .resource_mut::<RiggingLimits>()
+            .departure_grace = Duration::ZERO;
         let panel = key("panel-a");
-        let reported_units = add_set_reporter(
-            &mut app,
-            vec![unit(panel.clone())],
-            ReporterCoverage::MatchingEvidenceOnly,
-        );
+        let reported_units =
+            add_set_reporter(&mut app, vec![unit(panel.clone())], establishes_absence());
 
         run_until_reconciled(&mut app);
 
@@ -3358,6 +4366,7 @@ mod tests {
 
         rewrite(&reported_units, Vec::new());
         run_until_reconciled(&mut app);
+        run_until_reconciled(&mut app);
 
         assert_eq!(
             app.world().resource::<Devices>().resolve(&panel),
@@ -3370,41 +4379,38 @@ mod tests {
     fn a_reconcile_pass_links_a_binding_to_its_device_and_a_departure_removes_the_link()
     -> Result<(), Box<dyn Error>> {
         let mut app = app_with_scheme();
+        app.world_mut()
+            .resource_mut::<RiggingLimits>()
+            .departure_grace = Duration::ZERO;
         let panel = key("panel-a");
         let role = crate::RoleKey::new("primary-window")?;
         app.world_mut()
             .resource_mut::<crate::Bindings>()
             .register(crate::Binding {
-                role:            role.clone(),
-                endpoint:        crate::DeviceEndpoint {
+                role:             role.clone(),
+                endpoint:         crate::DeviceEndpoint {
                     device: panel.clone(),
                     id:     EndpointId::Whole,
                 },
-                driver:          DriverId(0),
-                recovery:        RecoveryPolicy::Forget,
-                retry:           RetryOn::NewRevision,
-                on_abort:        crate::OnAbort::default(),
-                on_loss:         crate::OnSessionLoss::default(),
-                state:           crate::RoleState::default(),
-                requested:       crate::RequestedConfiguration::new(()),
-                last_known_good: crate::LastKnownGoodConfiguration::default(),
-                apply_deadline:  ApplyDeadline::ProcessDefault,
+                driver:           DriverId(0),
+                recovery:         RecoveryPolicy::Forget,
+                retry:            RetryOn::NewRevision,
+                on_abort:         crate::OnAbort::default(),
+                on_loss:          crate::OnSessionLoss::default(),
+                requested:        crate::RequestedConfiguration::new(()),
+                last_known_good:  crate::LastKnownGoodConfiguration::default(),
+                apply_deadline:   ApplyDeadline::ProcessDefault,
+                flow_expectation: FlowExpectation::NotMonitored,
             })?;
-        let reported_units = add_set_reporter(
-            &mut app,
-            vec![unit(panel.clone())],
-            ReporterCoverage::MatchingEvidenceOnly,
-        );
+        let reported_units =
+            add_set_reporter(&mut app, vec![unit(panel.clone())], establishes_absence());
 
         run_until_reconciled(&mut app);
 
-        let BindingEntityLookup::Registered(binding_entity) = app
+        let binding_entity = app
             .world()
-            .resource::<crate::BindingEntities>()
-            .entity(&role)
-        else {
-            return Err("a registered role owns a binding entity".into());
-        };
+            .resource::<crate::Bindings>()
+            .role_entity(&role)?;
         let device_entity = device_entity_of(&app, &panel).expect("a retained device is mirrored");
         assert_eq!(
             app.world()
@@ -3420,6 +4426,7 @@ mod tests {
         );
 
         rewrite(&reported_units, Vec::new());
+        run_until_reconciled(&mut app);
         run_until_reconciled(&mut app);
 
         assert!(
@@ -3452,41 +4459,31 @@ mod tests {
             retry: RetryOn::NewRevision,
             on_abort: OnAbort::default(),
             on_loss: OnSessionLoss::default(),
-            state: RoleState::default(),
             requested: RequestedConfiguration::new(PanelConfiguration(3)),
             last_known_good: LastKnownGoodConfiguration::default(),
             apply_deadline: ApplyDeadline::ProcessDefault,
+            flow_expectation: FlowExpectation::NotMonitored,
         }
     }
 
     /// Drive one registered role from waiting to ready through a completed apply.
-    ///
-    /// Registration always resets a role to waiting, and only a finished operation opens the
-    /// safe-capture window this phase reads back through. The permit is a parameter because a role
-    /// only leaves waiting on an authorized operation, and a test that reads its permit out of
-    /// `Devices` proves the authorization step rather than assuming it.
-    fn reach_ready(app: &mut App, role: &RoleKey, permit: ApplyPermit) {
-        let hardware_inventory = HardwareInventory::default();
-        let world = app.world_mut();
-        world.resource_scope::<Bindings, _>(|world, mut bindings| {
-            world.resource_scope::<Drivers, _>(|world, mut drivers| {
-                let Ok(RoleView::Waiting(WaitingRole::Hardware(requesting_role))) =
-                    bindings.role_view(role)
-                else {
-                    panic!("a registered role starts out waiting for hardware");
-                };
-                let start_apply_request = requesting_role
-                    .start_requested_apply(AttemptId::default(), permit, &hardware_inventory)
-                    .expect("an unauthored endpoint accepts an in-service apply");
-                drivers
-                    .start_apply(world, start_apply_request)
-                    .expect("the registered driver accepts its own configuration type");
-                let Ok(RoleView::Applying(mut applying_role)) = bindings.role_view(role) else {
-                    panic!("a dispatched apply selects the applying view");
-                };
-                applying_role.finish(AttemptOutcome::Succeeded);
-            });
-        });
+    fn reach_ready(app: &mut App, role: &RoleKey) {
+        let startup = app.world().resource::<Time<Real>>().startup();
+        app.world_mut()
+            .resource_mut::<Time<Real>>()
+            .update_with_instant(startup + Duration::from_millis(1));
+        for _ in 0..16 {
+            app.update();
+            if app
+                .world()
+                .resource::<Bindings>()
+                .projected_status(role)
+                .is_ok_and(|status| matches!(status, crate::RoleStatusView::Established { .. }))
+            {
+                return;
+            }
+        }
+        panic!("the role did not establish within sixteen updates");
     }
 
     #[test]
@@ -3524,17 +4521,13 @@ mod tests {
 
         run_until_reconciled(&mut app);
 
-        let BindingEntityLookup::Registered(binding_entity) =
-            app.world().resource::<BindingEntities>().entity(&role)
-        else {
-            return Err("a registered role owns a binding entity".into());
-        };
+        let binding_entity = app.world().resource::<Bindings>().role_entity(&role)?;
         // A waiting role is not a safe readback opportunity, and an unestablished value mirrors
         // nothing onto the entity.
         assert_eq!(captures.load(Ordering::Relaxed), 0);
         assert_eq!(app.world().get::<PanelConfiguration>(binding_entity), None);
 
-        reach_ready(&mut app, &role, ApplyPermit::in_service());
+        reach_ready(&mut app, &role);
         app.update();
 
         assert_eq!(captures.load(Ordering::Relaxed), 1);
@@ -3585,6 +4578,7 @@ mod tests {
             .configure(ConfiguredDevice {
                 key:  panel,
                 mode: ConfiguredDeviceMode::Offline,
+                name: ConfiguredDeviceName::NeverDerived,
             });
         let captures_before_offline = captures.load(Ordering::Relaxed);
         app.update();
@@ -3622,20 +4616,16 @@ mod tests {
         );
 
         run_until_reconciled(&mut app);
-        reach_ready(&mut app, &role, ApplyPermit::in_service());
+        reach_ready(&mut app, &role);
         app.update();
 
-        let BindingEntityLookup::Registered(binding_entity) =
-            app.world().resource::<BindingEntities>().entity(&role)
-        else {
-            return Err("a registered role owns a binding entity".into());
-        };
+        let binding_entity = app.world().resource::<Bindings>().role_entity(&role)?;
         let app_type_registry = app.world().resource::<AppTypeRegistry>().clone();
         let type_registry = app_type_registry.read();
         let bindings = app.world().resource::<Bindings>();
         // The readback established a value, so the mirror reached the driver's own type rather than
         // skipping the role for having nothing to project.
-        let LastKnownGoodConfiguration::Known(configuration) =
+        let LastKnownGoodConfiguration::DiffersFromDispatched(configuration) =
             &bindings.binding(&role)?.last_known_good
         else {
             return Err("a ready managed role establishes its configuration".into());
@@ -3656,6 +4646,84 @@ mod tests {
             None
         );
         drop(type_registry);
+
+        Ok(())
+    }
+
+    /// One binding whose requested configuration is not the registered driver's configuration
+    /// type: `CountingCaptureDriver` accepts `PanelConfiguration`, and this hands it an
+    /// `UnmirrorableConfiguration`.
+    fn mistyped_binding(role: RoleKey, device: DeviceKey, driver: DriverId) -> Binding {
+        Binding {
+            requested: RequestedConfiguration::new(UnmirrorableConfiguration(3)),
+            ..panel_binding(role, device, driver)
+        }
+    }
+
+    /// The surviving contract-failure path, driven through the real lifecycle.
+    ///
+    /// No public API can make a driver return `Err`, so the only way to reach
+    /// `DriverContractError` is the erased boundary's own downcast. A configuration of the wrong
+    /// type is the reachable case, and it has to be refused before any driver method runs: a
+    /// mismatch that slipped through would establish a session against a value the driver never
+    /// agreed to.
+    #[test]
+    fn a_configuration_of_the_wrong_type_is_refused_before_any_driver_method_runs()
+    -> Result<(), Box<dyn Error>> {
+        let mut app = app_with_scheme();
+        let panel = key("panel-a");
+        let role = RoleKey::new("primary-window")?;
+        let captures = Arc::new(AtomicUsize::new(0));
+        let driver = app
+            .world_mut()
+            .resource_mut::<Drivers>()
+            .add(CountingCaptureDriver(Arc::clone(&captures)));
+        app.world_mut()
+            .resource_mut::<Bindings>()
+            .register(mistyped_binding(role.clone(), panel.clone(), driver))?;
+        add_set_reporter(
+            &mut app,
+            vec![unit(panel)],
+            ReporterCoverage::MatchingEvidenceOnly,
+        );
+
+        run_until_reconciled(&mut app);
+        let startup = app.world().resource::<Time<Real>>().startup();
+        app.world_mut()
+            .resource_mut::<Time<Real>>()
+            .update_with_instant(startup + Duration::from_millis(1));
+        for _ in 0..16 {
+            app.update();
+        }
+
+        let status = app.world().resource::<Bindings>().projected_status(&role)?;
+        let RoleStatusView::Waiting(WaitingStatusView::DriverRepair { error, .. }) = &status else {
+            return Err(format!(
+                "a mistyped configuration must leave the role waiting on driver repair, not {status:?}"
+            )
+            .into());
+        };
+        assert_eq!(
+            error,
+            &crate::DriverContractFailureView::ConfigurationTypeMismatch {
+                expected_configuration: "hana_rigging::reconcile::tests::PanelConfiguration"
+                    .to_owned(),
+                received_configuration: "hana_rigging::reconcile::tests::UnmirrorableConfiguration"
+                    .to_owned(),
+            }
+        );
+        assert_eq!(
+            captures.load(Ordering::Relaxed),
+            0,
+            "the driver's own methods must never see a configuration it cannot accept"
+        );
+        assert!(
+            app.world()
+                .resource::<Bindings>()
+                .established_sessions()
+                .is_empty(),
+            "a refused dispatch establishes no session"
+        );
 
         Ok(())
     }
@@ -3684,27 +4752,27 @@ mod tests {
             app.world().resource::<Devices>().resolve(&panel),
             DeviceResolution::NotResolved
         ));
-        assert_eq!(
-            app.world().resource::<Bindings>().binding(&role)?.state,
-            RoleState::Waiting
-        );
+        assert!(matches!(
+            app.world().resource::<Bindings>().projected_status(&role)?,
+            crate::RoleStatusView::Waiting(_)
+        ));
         assert_eq!(captures.load(Ordering::Relaxed), 0);
 
         rewrite(&reported_units, vec![unit(panel.clone())]);
         run_until_reconciled(&mut app);
 
-        // The same role reaches ready only through a permit the reconciled device minted.
+        // The same role reaches ready only through a permit the reconciled device issued.
         let devices = app.world().resource::<Devices>();
         let DeviceResolution::Resolved(device_id) = devices.resolve(&panel) else {
             return Err("a reported key resolves after reconciliation".into());
         };
-        let permit = devices.authorize_service(device_id)?;
-        reach_ready(&mut app, &role, permit);
+        devices.authorize_service(device_id)?;
+        reach_ready(&mut app, &role);
 
-        assert_eq!(
-            app.world().resource::<Bindings>().binding(&role)?.state,
-            RoleState::Ready
-        );
+        assert!(matches!(
+            app.world().resource::<Bindings>().projected_status(&role)?,
+            crate::RoleStatusView::Established { .. }
+        ));
 
         Ok(())
     }
@@ -3747,65 +4815,6 @@ mod tests {
         assert!(!serialized.contains("DeviceId"));
 
         Ok(())
-    }
-
-    #[test]
-    fn a_capability_disagreement_announces_once_and_announces_once_more_when_it_clears() {
-        #[derive(Default, Resource)]
-        struct AnnouncedDisputes(Vec<Vec<String>>);
-
-        let mut app = app_with_scheme();
-        let contested = key("streamdeck-xl");
-        let mut agreeing = unit(contested.clone());
-        agreeing.brightness = vec![50];
-        let mut disagreeing = unit(contested.clone());
-        disagreeing.brightness = vec![90];
-        add_set_reporter(
-            &mut app,
-            vec![agreeing],
-            ReporterCoverage::MatchingEvidenceOnly,
-        );
-        let disagreeing_units = add_set_reporter(
-            &mut app,
-            vec![disagreeing],
-            ReporterCoverage::MatchingEvidenceOnly,
-        );
-        app.init_resource::<AnnouncedDisputes>().add_observer(
-            |capabilities_disputed: On<CapabilitiesDisputed>,
-             mut announced_disputes: ResMut<AnnouncedDisputes>| {
-                announced_disputes
-                    .0
-                    .push(capabilities_disputed.capabilities.clone());
-            },
-        );
-
-        run_until_reconciled(&mut app);
-        run_until_reconciled(&mut app);
-
-        assert_eq!(
-            app.world().resource::<AnnouncedDisputes>().0,
-            vec![vec![String::from(
-                "hana_rigging::reconcile::tests::Brightness"
-            )]]
-        );
-
-        // A frame that changes nothing restates nothing.
-        app.update();
-
-        assert_eq!(app.world().resource::<AnnouncedDisputes>().0.len(), 1);
-
-        let mut agreeing_again = unit(contested);
-        agreeing_again.brightness = vec![50];
-        rewrite(&disagreeing_units, vec![agreeing_again]);
-        run_until_reconciled(&mut app);
-        run_until_reconciled(&mut app);
-
-        let announced_disputes = &app.world().resource::<AnnouncedDisputes>().0;
-        assert_eq!(announced_disputes.len(), 2);
-        assert!(
-            announced_disputes[1].is_empty(),
-            "a cleared disagreement announces itself with an empty payload"
-        );
     }
 
     /// One entry per frame in which a rescanned capability component was written.
@@ -3958,7 +4967,7 @@ mod tests {
         );
 
         run_until_reconciled(&mut app);
-        reach_ready(&mut app, &role, ApplyPermit::in_service());
+        reach_ready(&mut app, &role);
         app.update();
 
         assert_eq!(captures.load(Ordering::Relaxed), 1);
@@ -4003,7 +5012,7 @@ mod tests {
         );
 
         run_until_reconciled(&mut app);
-        reach_ready(&mut app, &role, ApplyPermit::in_service());
+        reach_ready(&mut app, &role);
         app.update();
 
         assert_eq!(captures.load(Ordering::Relaxed), 1);
@@ -4022,11 +5031,7 @@ mod tests {
             WaitingWork::RestorationOwed
         );
         assert!(app.world().get_entity(device_entity).is_ok());
-        let BindingEntityLookup::Registered(binding_entity) =
-            app.world().resource::<BindingEntities>().entity(&role)
-        else {
-            return Err("a registered role owns a binding entity".into());
-        };
+        let binding_entity = app.world().resource::<Bindings>().role_entity(&role)?;
         assert!(
             app.world()
                 .get::<crate::ResolvedToDevice>(binding_entity)
@@ -4040,9 +5045,20 @@ mod tests {
         Ok(())
     }
 
+    /// What a departure did to the configuration the role had already established.
+    ///
+    /// Named rather than a `bool` because the assertions below read as a table: `Dropped` states
+    /// which policy is the one that cannot be restarted by a request, which is the whole difference
+    /// between the two holds and unreadable as `false`.
+    #[derive(PartialEq, Eq, Debug)]
+    enum SavedValue {
+        Kept,
+        Dropped,
+    }
+
     /// Drive one binding under `recovery` to an established last-known-good value, make its unit
     /// absent, and read back what the departure recorded and whether the saved value survived.
-    fn depart_under(recovery: RecoveryPolicy) -> Result<(WaitingWork, bool), Box<dyn Error>> {
+    fn depart_under(recovery: RecoveryPolicy) -> Result<(WaitingWork, SavedValue), Box<dyn Error>> {
         let mut app = app_with_scheme();
         let panel = key("panel-a");
         let role = RoleKey::new("primary-window")?;
@@ -4064,7 +5080,7 @@ mod tests {
         );
 
         run_until_reconciled(&mut app);
-        reach_ready(&mut app, &role, ApplyPermit::in_service());
+        reach_ready(&mut app, &role);
         app.update();
         assert_eq!(captures.load(Ordering::Relaxed), 1);
 
@@ -4074,39 +5090,38 @@ mod tests {
         run_until_reconciled(&mut app);
 
         let bindings = app.world().resource::<Bindings>();
-        Ok((
-            bindings.waiting_work(&role),
-            matches!(
-                bindings.binding(&role)?.last_known_good,
-                LastKnownGoodConfiguration::Known(_)
-            ),
-        ))
+        let saved_value = if matches!(
+            bindings.binding(&role)?.last_known_good,
+            LastKnownGoodConfiguration::DiffersFromDispatched(_)
+        ) {
+            SavedValue::Kept
+        } else {
+            SavedValue::Dropped
+        };
+        Ok((bindings.waiting_work(&role), saved_value))
     }
 
     #[test]
     fn each_recovery_policy_records_its_own_departure_work() -> Result<(), Box<dyn Error>> {
         // `ReapplyOnReturn` is the only policy that reapplies without being asked, so it is the
-        // only one that owes a restoration. The other three owe an application request: without
-        // that record a departed role falls back to `WaitingWork::Nothing`, reaches
+        // only one that owes a restoration. The other two hold the role for application code:
+        // without that record a departed role falls back to `WaitingWork::Nothing`, reaches
         // `WaitingRole::Hardware`, and has its authored request dispatched automatically when
         // the unit returns.
         assert_eq!(
             depart_under(RecoveryPolicy::ReapplyOnReturn)?,
-            (WaitingWork::RestorationOwed, true)
+            (WaitingWork::RestorationOwed, SavedValue::Kept,)
         );
-        assert_eq!(
-            depart_under(RecoveryPolicy::Retain)?,
-            (WaitingWork::ApplicationRequestOwed, true)
-        );
+        // Which hold each owes is what makes the two answerable by different moves: the kept value
+        // is what `ReapplyConfiguration` sends back, and `Forget` drops it at the departure so only
+        // a fresh registration restarts the role.
         assert_eq!(
             depart_under(RecoveryPolicy::ReapplyOnRequest)?,
-            (WaitingWork::ApplicationRequestOwed, true)
+            (WaitingWork::ReapplyRequestOwed, SavedValue::Kept,)
         );
-        // `Forget` drops the saved value at the departure rather than leaving it for a later
-        // restore.
         assert_eq!(
             depart_under(RecoveryPolicy::Forget)?,
-            (WaitingWork::ApplicationRequestOwed, false)
+            (WaitingWork::RegistrationOwed, SavedValue::Dropped,)
         );
 
         Ok(())
@@ -4137,11 +5152,12 @@ mod tests {
 
         run_until_reconciled(&mut app);
 
-        let mut bindings = app.world_mut().resource_mut::<Bindings>();
+        let bindings = app.world_mut().resource_mut::<Bindings>();
         assert_eq!(bindings.waiting_work(&role), WaitingWork::Nothing);
-        let Ok(RoleView::Waiting(WaitingRole::Hardware(_))) = bindings.role_view(&role) else {
-            return Err("a newly registered role waits for hardware".into());
-        };
+        assert!(matches!(
+            bindings.projected_status(&role)?,
+            crate::RoleStatusView::Waiting(_)
+        ));
 
         Ok(())
     }
@@ -4167,14 +5183,10 @@ mod tests {
         );
 
         run_until_reconciled(&mut app);
-        reach_ready(&mut app, &role, ApplyPermit::in_service());
+        reach_ready(&mut app, &role);
         app.update();
 
-        let BindingEntityLookup::Registered(binding_entity) =
-            app.world().resource::<BindingEntities>().entity(&role)
-        else {
-            return Err("a registered role owns a binding entity".into());
-        };
+        let binding_entity = app.world().resource::<Bindings>().role_entity(&role)?;
         assert_eq!(
             app.world().get::<PanelConfiguration>(binding_entity),
             Some(&PanelConfiguration(7))
@@ -4234,11 +5246,7 @@ mod tests {
             device_entity_of(&app, &source_panel).expect("a retained device owns an entity");
         let destination_entity =
             device_entity_of(&app, &destination_panel).expect("a retained device owns an entity");
-        let BindingEntityLookup::Registered(binding_entity) =
-            app.world().resource::<BindingEntities>().entity(&role)
-        else {
-            return Err("a registered role owns a binding entity".into());
-        };
+        let binding_entity = app.world().resource::<Bindings>().role_entity(&role)?;
         assert_eq!(
             resolved_binding_entities(&app, source_entity),
             vec![binding_entity]
@@ -4306,11 +5314,7 @@ mod tests {
 
         let first_entity =
             device_entity_of(&app, &first_panel).expect("a retained device owns an entity");
-        let BindingEntityLookup::Registered(binding_entity) =
-            app.world().resource::<BindingEntities>().entity(&role)
-        else {
-            return Err("a registered role owns a binding entity".into());
-        };
+        let binding_entity = app.world().resource::<Bindings>().role_entity(&role)?;
         assert_eq!(
             app.world()
                 .get::<crate::ResolvedBindings>(first_entity)
@@ -4322,6 +5326,7 @@ mod tests {
         // by a different physical unit, and only a reconcile pass re-resolves the link.
         rewrite(&reported_units, Vec::new());
         run_until_reconciled(&mut app);
+        advance_past_departure_grace(&mut app);
         rewrite(&reported_units, vec![unit(first_panel.clone())]);
         run_until_reconciled(&mut app);
 

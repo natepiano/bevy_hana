@@ -1,8 +1,7 @@
 //! Drives an `OrbitCam` from app code by setting the `pan`/`orbit`/`zoom`
-//! operation targets directly. Pressing **H** kicks off a home
-//! animation that temporarily raises the camera's per-axis damping so the lerp
-//! reads as a slow camera move, then restores the previous damping once the camera
-//! arrives. The
+//! operation targets directly. Pressing **H** starts a home animation that
+//! raises the camera's per-axis damping so the lerp reads as a slow camera
+//! move, then restores the previous damping once the camera arrives. The
 //! `HomeAnimationBegin` / `HomeAnimationEnd` events expose the animation window
 //! for other systems (here, the title-bar control chip) to react to.
 //!

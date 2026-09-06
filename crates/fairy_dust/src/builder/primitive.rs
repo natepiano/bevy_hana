@@ -160,7 +160,7 @@ impl<S> PrimitiveBuilder<S> {
     #[must_use]
     pub fn with_brp_extras(self) -> SprinkleBuilder<S> { self.finish().with_brp_extras() }
 
-    /// Finalizes the current primitive and adds the smart camera control panel.
+    /// Finalizes the current primitive and adds the camera control panel.
     #[must_use]
     pub fn with_camera_control_panel(self) -> SprinkleBuilder<S> {
         self.finish().with_camera_control_panel()

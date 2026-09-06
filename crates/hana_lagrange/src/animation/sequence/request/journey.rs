@@ -7,7 +7,7 @@ use crate::animation::events::AnimationSource;
 use crate::animation::sequence::CameraSequence;
 use crate::fit::ZoomContext;
 
-/// `RetainedCameraJourneyOrigin` records the authoring source for one sequence revision.
+/// The authoring source for one sequence revision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::animation) enum RetainedCameraJourneyOrigin {
     /// Originated at the durable public request facade.
@@ -17,7 +17,8 @@ pub(in crate::animation) enum RetainedCameraJourneyOrigin {
 }
 
 impl RetainedCameraJourneyOrigin {
-    /// Maps retained request identity onto public lifecycle events.
+    /// Returns the [`AnimationSource`] this journey puts on its public
+    /// lifecycle events.
     pub(in crate::animation::sequence) const fn event_source(self) -> AnimationSource {
         match self {
             Self::Facade(source) => source,
@@ -28,9 +29,9 @@ impl RetainedCameraJourneyOrigin {
 
 /// Metadata committed beside one exact retained stage revision.
 ///
-/// A direct `CameraSequence` has source identity but no fabricated fit target
-/// or zoom context. Requests preserve all facade information until the next
-/// retained definition replaces it.
+/// `direct` records the origin and leaves `target` and `zoom` as `None`; a
+/// facade request copies both from the request. Either way the journey stays
+/// beside the camera until the next retained definition replaces it.
 #[derive(Component, Clone, Debug)]
 pub(in crate::animation) struct RetainedCameraJourney {
     pub(in crate::animation::sequence) revision: SequenceStagesRevision,

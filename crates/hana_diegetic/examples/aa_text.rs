@@ -326,7 +326,7 @@ fn main() {
             ),
         )
         // Every key runs through Fairy Dust's shortcut binding, which fires each
-        // only when no modifier is held — so bare `A` no longer also fires on the
+        // only when no modifier is held — so bare `A` does not also fire on the
         // `Ctrl+Shift+A` home-gizmo chord.
         .with_shortcut(KeyCode::Digit1, set_anti_alias_off)
         .with_shortcut(KeyCode::Digit2, set_anti_alias_anisotropic)
@@ -666,8 +666,7 @@ impl DemoView {
 
 /// `A` / `B` animate every orbit camera to that demo's viewpoint through Fairy
 /// Dust's shortcut binding. The binding fires each only when no modifier is
-/// held, so the `Ctrl+Shift+A` gizmo chord no longer also triggers `A` — the
-/// hand-rolled Ctrl+Shift guard this used to need is gone.
+/// held, so the `Ctrl+Shift+A` gizmo chord does not also trigger `A`.
 fn select_demo_view(
     view: &DemoView,
     cameras: &Query<Entity, With<OrbitCam>>,
@@ -1162,7 +1161,7 @@ fn refresh_cube_status_panels(
     }
     *last_snapshot = Some(snapshot);
     // The tree built at spawn already named these three runs, so each row is
-    // retext in place — only the changed strings relayout, no tree rebuild.
+    // retexted in place — only the changed strings relayout, no tree rebuild.
     for entity in &panels {
         panel_text.set_text(
             entity,

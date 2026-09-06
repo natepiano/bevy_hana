@@ -15,8 +15,8 @@ use crate::FoldGroups;
 /// Provider capability values for one selection, keyed by concrete Rust type.
 ///
 /// The table stores at most one value per concrete capability type, so a
-/// recipe asking for its required capability can never receive an ambiguous
-/// answer. Values stay type-erased; nothing here inspects or validates the
+/// recipe's lookup for its required capability resolves to a single value or to
+/// none. Values stay type-erased; nothing here inspects or validates the
 /// invariants inside an arbitrary provider capability.
 pub(super) struct ArrangementCapabilities {
     entries: Vec<CapabilityEntry>,

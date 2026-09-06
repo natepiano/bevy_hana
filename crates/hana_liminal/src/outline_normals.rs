@@ -25,9 +25,9 @@ use super::constants::TRIANGLE_VERTEX_COUNT;
 /// Computes angle-weighted smoothed outline normals and stores them as
 /// [`ATTRIBUTE_OUTLINE_NORMAL`] on the mesh.
 ///
-/// Vertices at the same position (but with different normals or UVs due to
-/// hard edges or UV seams) receive the same outline normal, producing a
-/// continuous silhouette.
+/// Vertices sharing one position — split into separate vertices by hard edges
+/// or UV boundaries, so their normals or UVs differ — all receive the same
+/// outline normal, producing a continuous silhouette.
 ///
 /// Only operates on `TriangleList` meshes with positions. Returns silently
 /// for other topologies.

@@ -967,10 +967,10 @@ pub(crate) fn handle_anchor_count_input(
 /// off the bottom end, in whichever mode is active. Growth anchors each new tile
 /// onto the current last tile in fan modes, while hinge growth leaves relation
 /// setup to [`crate::hinge::reconcile_hinge_arrangement`]. Fan growth adds a pose when an
-/// animation is in flight; shrink despawns the surplus. Survivors keep their
-/// current ownership — only the chain's tail changes — and the color wheel
-/// recolor of every tile for the new count is handled by [`reconcile_panels`],
-/// which rebuilds on a count change.
+/// animation is in flight; shrink despawns the surplus. Surviving tiles are left
+/// untouched — only the chain's tail changes — and the color wheel recolor of
+/// every tile for the new count is handled by [`reconcile_panels`], which
+/// rebuilds on a count change.
 pub(crate) fn reconcile_anchor_chain(
     active: Res<ActiveCapability>,
     morph: Res<ModeMorph>,

@@ -494,7 +494,7 @@ pub(super) fn handle_adjustment_request(
 /// Hana never installs this observer; an application that does not own its
 /// slider values adds it with
 /// `app.add_observer(slider_self_update)`. Controlled sliders instead observe
-/// [`SliderChangeRequested`] directly and decide with
+/// [`SliderChangeRequested`] directly and apply or reject each proposal with
 /// [`SliderState::set_value`].
 pub fn slider_self_update(change: On<SliderChangeRequested>, mut sliders: Query<&mut SliderState>) {
     let Ok(mut state) = sliders.get_mut(change.event_target()) else {
@@ -1062,7 +1062,7 @@ fn current_thumb_hit_bounds(slots: &WidgetVisualSlots, state: &SliderState) -> O
 ///
 /// A finite oversized thumb — active-axis extent at or beyond the content extent
 /// — centers on the content box's active axis; every other finite case solves
-/// the desired center from the same directed endpoint interval pointer
+/// the value's center from the same directed endpoint interval pointer
 /// projection uses, then subtracts the thumb's solved authored center. The
 /// returned delta preserves the thumb's cross axis and authored draw depth.
 fn thumb_translation(slots: &WidgetVisualSlots, state: &SliderState) -> Option<Vec2> {
@@ -1114,8 +1114,8 @@ fn thumb_translation(slots: &WidgetVisualSlots, state: &SliderState) -> Option<V
 /// [`RemovedComponents`] stream is consumed here, so a quiet frame never walks
 /// the live sliders. Hover reads the all-pointer
 /// [`PickingInteraction`] aggregate and pressed reads the private [`SliderDrag`]
-/// marker; [`SliderCaptures`] stays lifecycle authority and is never consulted
-/// for presentation. Writes go through [`visual::write_widget_overrides`],
+/// marker; [`SliderCaptures`] stays lifecycle authority and is never read for
+/// presentation. Writes go through [`visual::write_widget_overrides`],
 /// which compares immutably first, so an unchanged state never marks
 /// [`WidgetVisualOverrides`] changed. The thumb slot receives only its
 /// value-derived translation; the thumb element's state appearance supplies
@@ -1665,7 +1665,8 @@ pub(super) fn handle_semantic_intent(
 
 /// Records a slider cancellation and, when newly recorded, removes
 /// [`SliderDrag`] so its hook emits the terminal. Returns whether a terminal
-/// was recorded, so the shared dispatcher knows shared occupancy will free.
+/// was recorded, so the shared dispatcher marks the pointer freed only when
+/// shared occupancy will be released.
 pub(super) fn cancel_slider_drag(
     entity: Entity,
     cause: SliderCancelCause,
@@ -5596,9 +5597,9 @@ mod tests {
 
     /// A slider whose marked thumb is authored at the content-box center — away
     /// from every directed range start — so each expected presentation
-    /// translation is genuinely computed from the solved authored center rather
-    /// than reading back a zero offset. The root is intentionally non-square so
-    /// an active-axis swap yields a wrong translation.
+    /// translation is computed from the solved authored center rather than read
+    /// back as a zero offset. The root is non-square, so an active-axis swap
+    /// yields a wrong translation.
     fn centered_thumb_tree(slider: Slider, thumb_width: f32, thumb_height: f32) -> LayoutTree {
         let mut builder = LayoutBuilder::new(100.0, 50.0);
         builder.with(

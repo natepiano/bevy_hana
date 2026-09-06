@@ -44,21 +44,21 @@ pub(in crate::animation::sequence) enum CameraPlaybackClosureReason {
     Cancelled,
 }
 
-/// `NativePlaybackActivation` records whether native playback may own controller output.
+/// Whether native playback may own controller output.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativePlaybackActivation {
     Effective,
     Inactive,
 }
 
-/// `PlaybackControllerChange` records whether preparation kept the controller installation.
+/// Whether preparation kept the controller installation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PlaybackControllerChange {
     Unchanged,
     Replaced,
 }
 
-/// `DriverEpisode` records whether a selected driver opened its current lifecycle episode.
+/// Whether a selected driver opened the current lifecycle episode.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum DriverEpisode {
     #[default]

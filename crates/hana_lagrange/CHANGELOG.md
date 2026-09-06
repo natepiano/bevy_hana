@@ -11,13 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-23
+
 ### Added
 
-- `CameraEventTiming`, `AnimationRejectionReason`, and
-  `CameraRequestPreparationError` enrich the established camera lifecycle and
-  rejection events. Lifecycle payloads now include source, target, owner,
-  direction, and raw timing; move payloads additionally include stable stage
-  identity and exact `boundary_elapsed` time.
+- `CameraEventTiming`, `AnimationRejectionReason`,
+  `CameraRequestPreparationError`, and `CameraEvaluationError` enrich the
+  established camera lifecycle and rejection events. Lifecycle payloads now
+  include source, target, owner, direction, and raw timing; move payloads
+  additionally include stable stage identity and exact `boundary_elapsed` time.
 
 - `CameraMove::try_to_look_at()` and `CameraMove::try_to_orbital_look_at()`
   fallible constructors, `CameraMoveError` for every rejected authored value,
@@ -32,13 +34,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on the sequence entity so shared driver arbitration and transport can resolve
   scopes against it.
 - Re-exports of the `hana_kana` sequence and easing types reachable through
-  camera signatures: `Easing`, `EasingCurve`, `EasingInput`,
-  `EasingInterpolation`, `EasingKnot`, `EasingOutput`, `EasingSlope`,
-  `EasingSlopes`, `SequenceCommand`, `SequenceCommandOutcome`,
-  `SequenceCommandRejected`, `SequenceCommandResponse`, `SequenceDirection`,
-  `SequenceDriver`, `SequenceDriverTakeover`, `SequenceEasing`,
-  `SequenceEasingError`, `SequenceEvaluation`, `SequenceMovement`,
-  `SequenceOwner`, `SequencePosition`, `SequenceScope`, `SequenceSourceState`,
+  camera signatures: `Easing`, `EasingCurve`, `EasingCurveBuilder`,
+  `EasingCurveError`, `EasingInput`, `EasingInterpolation`, `EasingKnot`,
+  `EasingOutput`, `EasingSlope`, `EasingSlopes`, `SequenceCommand`,
+  `SequenceCommandOutcome`, `SequenceCommandRejected`,
+  `SequenceCommandResponse`, `SequenceDirection`, `SequenceDriver`,
+  `SequenceDriverTakeover`, `SequenceEasing`, `SequenceEasingError`,
+  `SequenceEvaluation`, `SequenceMovement`, `SequenceOwner`,
+  `SequencePosition`, `SequenceScope`, `SequenceSourceState`,
   `SequenceStageId`, `SequenceStageSpan`, `SequenceStages`, `SequenceTime`.
 - `CameraCommands`, `CameraPlaybackObservation`, and `SequenceOwnership` give
   applications one shared command/ownership vocabulary for retained camera and
@@ -75,6 +78,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ZoomBegin` (when applicable), `AnimationBegin`, move begin, move end,
   `AnimationEnd`, and `ZoomEnd` (when applicable); no `CameraAnimation*`
   replacement API was added.
+- The sequence and easing dependency is now
+  [`hana_kana`](https://crates.io/crates/hana_kana) rather than `bevy_kana`,
+  whose final release under the old name was 0.3.1. Nothing a 0.4.0 consumer
+  could name changes: 0.4.0 used the dependency only internally and re-exported
+  none of its types. The two are separate crates on crates.io, though, so a
+  project that still depends on `bevy_kana` directly holds types that will not
+  unify with the `hana_kana` types re-exported above — move those paths over.
 
 ## [0.4.0] - 2026-07-30
 

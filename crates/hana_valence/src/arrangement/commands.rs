@@ -28,8 +28,9 @@ use crate::fold;
 /// Synchronous association, provider, and plan failures preserve their
 /// [`ArrangementError`] variant and provider source. They queue cleanup for
 /// every reserved entity and never call a member-scene factory. Once deferred
-/// commands begin applying, application-owned entity removal is best effort:
-/// a later missing existing binding is not recreated or preflighted.
+/// commands begin applying, an application-owned entity that has since been
+/// removed is skipped: an existing binding that is gone by then is neither
+/// recreated nor checked in advance.
 pub trait ArrangementCommandsExt {
     /// Reserves and materializes an arrangement controller plus one root per provider member.
     ///
@@ -71,7 +72,7 @@ pub trait ArrangementCommandsExt {
     /// optional omission. All bindings are consumed before association or plan
     /// validation begins, so a failure cannot leave a partial membership write.
     ///
-    /// Bound entities are deliberately not preflighted. A bound entity removed
+    /// Bound entities are not checked in advance. A bound entity removed
     /// by application code before deferred commands apply remains absent; this
     /// command neither restores it nor creates a replacement member or scene.
     ///
@@ -96,7 +97,8 @@ pub trait ArrangementCommandsExt {
     /// selected member. The recipe is transient: it is consumed once, here, and
     /// the arrangement retains only the resulting hinge endpoints.
     ///
-    /// The whole application is deferred, so it may be issued in the same
+    /// Applying the recipe runs entirely inside a deferred command, so this
+    /// call may be issued in the same
     /// `Commands` batch as [`Self::spawn_arrangement`] or
     /// [`Self::spawn_arrangement_from_members`] on the controller they return.
     /// Every read, capability retrieval, and validation happens before the first

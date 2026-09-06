@@ -2,9 +2,9 @@
 //!
 //! Run with: `cargo run --example custom_path`
 //!
-//! This shows how to manually construct a cross-platform config path using `dirs`,
-//! giving you full control over the app name and filename. Of course you can put it anywhere you
-//! want, we're just using `dirs` for convenience in this example.
+//! This shows how to construct a cross-platform config path by hand using `dirs`,
+//! which puts the app name and the filename under your control. The path can point anywhere;
+//! `dirs` appears here only because it locates each platform's config directory.
 //!
 //! Window state is saved to:
 //! - macOS: `~/Library/Application Support/my_custom_app/window_state.ron`

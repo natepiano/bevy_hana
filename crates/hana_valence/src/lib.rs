@@ -37,7 +37,7 @@
 //!
 //! A [`Hinge`] is not animated directly. It stores the two endpoints a member
 //! travels between — its base pose and its folded pose — and
-//! [`hinge_to_pose`] derives the current [`AnchorPose`] from the
+//! The hinge driver derives the current [`AnchorPose`] from the
 //! [`EasedFoldFraction`] that [`FoldSequencePlayback`] resolved for that member
 //! in `Update`, or from the base endpoint when no sequence stages it. A fold
 //! recipe such as [`Accordion`], [`Coil`], or [`Wrap`] replaces the folded
@@ -45,7 +45,7 @@
 //! [`ArrangementCommandsExt::apply_fold_recipe`].
 //!
 //! Because the angle is derived in `PostUpdate` from the live [`Hinge`],
-//! replacing that component before [`hinge_to_pose`] changes the pose in the
+//! replacing that component before [`AnchorSystems::HingeToPose`] changes the pose in the
 //! same frame even at an unchanged sequence position. An unchanged pose is not
 //! rewritten, so an idle fold performs no write; a pose that does change
 //! discards a direct `AnchorPose` tween on that hinged entity, and debug builds
@@ -64,8 +64,8 @@
 //! from adjacency and never require authored names. Hand-authored regular
 //! geometry should use provider names such as `Anchor::TopLeft` when offered.
 //! One-off geometry can use raw [`AnchorSite`] values. Pick the highest tier that
-//! matches the data you own; reusable recipes ask [`ResolvedAnchorGeometry`]
-//! which edge is shared with the predecessor instead of hardcoding ids.
+//! matches the data you own; reusable recipes read the shared edge with the
+//! predecessor out of [`ResolvedAnchorGeometry`] instead of hardcoding ids.
 //!
 //! Resolver math for an entity with [`AnchoredTo`] is:
 //!
@@ -230,8 +230,8 @@ pub use hana_kana::SequenceStages;
 pub use hana_kana::SequenceTime;
 pub use hinge::Hinge;
 pub use hinge::HingeError;
+pub use hinge::HingePlugin;
 pub use hinge::HingePoseReported;
-pub use hinge::hinge_to_pose;
 pub use pose::AnchorPose;
 pub use pose::AnchorSystems;
 pub use pose::ResolvedAnchorWorld;

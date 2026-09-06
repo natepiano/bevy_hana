@@ -55,17 +55,12 @@ impl Plugin for HotplugProbePlugin {
             .init_resource::<remote::ProbeReadiness>()
             .init_resource::<trace::ProbeTrace>()
             .add_observer(control::apply_probe_command)
-            .add_observer(control::on_application_role_available)
-            .add_observer(control::on_application_role_awaiting)
-            .add_observer(trace::on_attempt_finished)
+            .add_observer(control::on_application_role_status_changed)
             .add_observer(trace::on_device_arrived)
             .add_observer(trace::on_device_departed)
             .add_observer(trace::on_identity_question_raised)
             .add_observer(trace::on_probe_window_added)
-            .add_observer(trace::on_recovery_policy_changed)
-            .add_observer(trace::on_role_available)
-            .add_observer(trace::on_role_awaiting)
-            .add_observer(trace::on_role_state_changed)
+            .add_observer(trace::on_live_role_changed)
             .add_observer(trace::on_window_restore_mismatch)
             .add_observer(trace::on_window_restored)
             .add_systems(
@@ -94,16 +89,18 @@ impl Plugin for HotplugProbePlugin {
 }
 
 /// Deterministic initial `WindowMode` for the managed automatic window.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Resource)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Resource)]
 enum ProbeStartupMode {
+    #[default]
     Windowed,
     Borderless,
     Exclusive,
 }
 
 impl ProbeStartupMode {
-    /// Chooses only a winit startup mode. The clerestory binding later authorizes one exact
-    /// reported display; this startup hint does not select a display for recovery.
+    /// Maps to the winit [`WindowMode`] the automatic window is created with. `monitor_index`
+    /// reaches only that initial placement; recovery goes to the one exact reported display the
+    /// clerestory binding later authorizes, not to this index.
     const fn automatic_window_mode(self, monitor_index: usize) -> WindowMode {
         match self {
             Self::Windowed => WindowMode::Windowed,
@@ -127,29 +124,66 @@ impl ProbeStartupMode {
     }
 }
 
-#[derive(Resource)]
+#[derive(Clone, Copy, Resource)]
 struct SmokeExitFrame(u32);
 
-#[derive(Resource)]
-struct ProbeMonitorIndex(usize);
+/// Requested monitor before startup, or the live fallback selected when it is unavailable.
+///
+/// The existing `selected_monitor_index` wire field serializes the requested index for
+/// `Requested` and the active index for `Fallback`. A fallback logs
+/// `requested monitor index {requested} is unavailable; using monitor index {active}`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Resource)]
+enum ProbeMonitorSelection {
+    Requested(usize),
+    Fallback { requested: usize, active: usize },
+}
 
-fn optional_environment_value(name: &str) -> std::io::Result<Option<String>> {
-    match var(name) {
-        Ok(value) => Ok(Some(value)),
-        Err(VarError::NotPresent) => Ok(None),
-        Err(VarError::NotUnicode(_)) => Err(Error::new(
-            ErrorKind::InvalidInput,
-            format!("{name} must contain Unicode text"),
-        )),
+impl ProbeMonitorSelection {
+    const fn selected_monitor_index(self) -> usize {
+        match self {
+            Self::Requested(requested) => requested,
+            Self::Fallback { active, .. } => active,
+        }
+    }
+
+    const fn requested_monitor_index(self) -> usize {
+        match self {
+            Self::Requested(requested) | Self::Fallback { requested, .. } => requested,
+        }
+    }
+
+    const fn use_fallback(&mut self, active: usize) {
+        *self = Self::Fallback {
+            requested: self.requested_monitor_index(),
+            active,
+        };
     }
 }
 
-fn parse_startup_mode(value: Option<&str>) -> std::io::Result<ProbeStartupMode> {
+enum ProbePersistencePath {
+    Supplied(PathBuf),
+    Derived(PathBuf),
+}
+
+#[derive(Clone, Copy)]
+enum ProbeExitBehavior {
+    Continue,
+    ExitAfter(SmokeExitFrame),
+}
+
+fn invalid_unicode_environment_value(name: &str) -> Error {
+    Error::new(
+        ErrorKind::InvalidInput,
+        format!("{name} must contain Unicode text"),
+    )
+}
+
+fn parse_startup_mode(value: &str) -> std::io::Result<ProbeStartupMode> {
     match value {
-        None | Some(STARTUP_MODE_WINDOWED) => Ok(ProbeStartupMode::Windowed),
-        Some(STARTUP_MODE_BORDERLESS) => Ok(ProbeStartupMode::Borderless),
-        Some(STARTUP_MODE_EXCLUSIVE) => Ok(ProbeStartupMode::Exclusive),
-        Some(other) => Err(Error::new(
+        STARTUP_MODE_WINDOWED => Ok(ProbeStartupMode::Windowed),
+        STARTUP_MODE_BORDERLESS => Ok(ProbeStartupMode::Borderless),
+        STARTUP_MODE_EXCLUSIVE => Ok(ProbeStartupMode::Exclusive),
+        other => Err(Error::new(
             ErrorKind::InvalidInput,
             format!(
                 "invalid {STARTUP_MODE_ENVIRONMENT_VARIABLE}: {other:?} (expected \
@@ -160,59 +194,109 @@ fn parse_startup_mode(value: Option<&str>) -> std::io::Result<ProbeStartupMode> 
 }
 
 fn selected_startup_mode() -> std::io::Result<ProbeStartupMode> {
-    parse_startup_mode(optional_environment_value(STARTUP_MODE_ENVIRONMENT_VARIABLE)?.as_deref())
+    match var(STARTUP_MODE_ENVIRONMENT_VARIABLE) {
+        Ok(value) => parse_startup_mode(&value),
+        Err(VarError::NotPresent) => Ok(ProbeStartupMode::default()),
+        Err(VarError::NotUnicode(_)) => Err(invalid_unicode_environment_value(
+            STARTUP_MODE_ENVIRONMENT_VARIABLE,
+        )),
+    }
 }
 
-fn persistence_path() -> std::io::Result<PathBuf> {
-    Ok(
-        optional_environment_value(PROBE_PERSISTENCE_PATH_ENVIRONMENT_VARIABLE)?.map_or_else(
-            || std::env::temp_dir().join(format!("{PERSISTENCE_FILE_PREFIX}-{}.ron", id())),
-            PathBuf::from,
-        ),
-    )
+fn persistence_path() -> std::io::Result<ProbePersistencePath> {
+    match var(PROBE_PERSISTENCE_PATH_ENVIRONMENT_VARIABLE) {
+        Ok(path) => Ok(ProbePersistencePath::Supplied(PathBuf::from(path))),
+        Err(VarError::NotPresent) => Ok(ProbePersistencePath::Derived(
+            std::env::temp_dir().join(format!("{PERSISTENCE_FILE_PREFIX}-{}.ron", id())),
+        )),
+        Err(VarError::NotUnicode(_)) => Err(invalid_unicode_environment_value(
+            PROBE_PERSISTENCE_PATH_ENVIRONMENT_VARIABLE,
+        )),
+    }
 }
 
 fn probe_port() -> std::io::Result<u16> {
-    optional_environment_value(PROBE_PORT_ENVIRONMENT_VARIABLE)?.map_or(
-        Ok(DEFAULT_PROBE_PORT),
-        |value| {
-            value.parse().map_err(|error| {
-                Error::new(
-                    ErrorKind::InvalidInput,
-                    format!("invalid {PROBE_PORT_ENVIRONMENT_VARIABLE}: {error}"),
-                )
-            })
-        },
-    )
+    match var(PROBE_PORT_ENVIRONMENT_VARIABLE) {
+        Ok(value) => value.parse().map_err(|error| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!("invalid {PROBE_PORT_ENVIRONMENT_VARIABLE}: {error}"),
+            )
+        }),
+        Err(VarError::NotPresent) => Ok(DEFAULT_PROBE_PORT),
+        Err(VarError::NotUnicode(_)) => Err(invalid_unicode_environment_value(
+            PROBE_PORT_ENVIRONMENT_VARIABLE,
+        )),
+    }
 }
 
-fn probe_monitor_index() -> std::io::Result<ProbeMonitorIndex> {
-    optional_environment_value(MONITOR_INDEX_ENVIRONMENT_VARIABLE)?.map_or(
-        Ok(ProbeMonitorIndex(DEFAULT_EXTERNAL_MONITOR_INDEX)),
-        |value| {
-            value.parse().map(ProbeMonitorIndex).map_err(|error| {
+fn probe_monitor_selection() -> std::io::Result<ProbeMonitorSelection> {
+    match var(MONITOR_INDEX_ENVIRONMENT_VARIABLE) {
+        Ok(value) => value
+            .parse()
+            .map(ProbeMonitorSelection::Requested)
+            .map_err(|error| {
                 Error::new(
                     ErrorKind::InvalidInput,
                     format!("invalid {MONITOR_INDEX_ENVIRONMENT_VARIABLE}: {error}"),
                 )
-            })
-        },
-    )
+            }),
+        Err(VarError::NotPresent) => Ok(ProbeMonitorSelection::Requested(
+            DEFAULT_EXTERNAL_MONITOR_INDEX,
+        )),
+        Err(VarError::NotUnicode(_)) => Err(invalid_unicode_environment_value(
+            MONITOR_INDEX_ENVIRONMENT_VARIABLE,
+        )),
+    }
+}
+
+fn probe_run_id(process_id: u32) -> std::io::Result<String> {
+    match var(PROBE_RUN_ID_ENVIRONMENT_VARIABLE) {
+        Ok(run_id) => Ok(run_id),
+        Err(VarError::NotPresent) => Ok(format!("manual-{process_id}")),
+        Err(VarError::NotUnicode(_)) => Err(invalid_unicode_environment_value(
+            PROBE_RUN_ID_ENVIRONMENT_VARIABLE,
+        )),
+    }
+}
+
+fn probe_boot_nonce(process_id: u32) -> std::io::Result<String> {
+    match var(PROBE_BOOT_NONCE_ENVIRONMENT_VARIABLE) {
+        Ok(boot_nonce) => Ok(boot_nonce),
+        Err(VarError::NotPresent) => Ok(format!("boot-{process_id}")),
+        Err(VarError::NotUnicode(_)) => Err(invalid_unicode_environment_value(
+            PROBE_BOOT_NONCE_ENVIRONMENT_VARIABLE,
+        )),
+    }
+}
+
+fn probe_capability(process_id: u32) -> std::io::Result<String> {
+    match var(PROBE_CAPABILITY_ENVIRONMENT_VARIABLE) {
+        Ok(capability) => Ok(capability),
+        Err(VarError::NotPresent) => Ok(format!("local-{process_id}")),
+        Err(VarError::NotUnicode(_)) => Err(invalid_unicode_environment_value(
+            PROBE_CAPABILITY_ENVIRONMENT_VARIABLE,
+        )),
+    }
 }
 
 fn probe_session() -> std::io::Result<remote::ProbeSession> {
     let process_id = id();
-    let run_id = optional_environment_value(PROBE_RUN_ID_ENVIRONMENT_VARIABLE)?
-        .unwrap_or_else(|| format!("manual-{process_id}"));
-    let boot_nonce = optional_environment_value(PROBE_BOOT_NONCE_ENVIRONMENT_VARIABLE)?
-        .unwrap_or_else(|| format!("boot-{process_id}"));
-    let capability = optional_environment_value(PROBE_CAPABILITY_ENVIRONMENT_VARIABLE)?
-        .unwrap_or_else(|| format!("local-{process_id}"));
+    let run_id = probe_run_id(process_id)?;
+    let boot_nonce = probe_boot_nonce(process_id)?;
+    let capability = probe_capability(process_id)?;
     Ok(remote::ProbeSession::new(run_id, boot_nonce, capability))
 }
 
 fn fresh_persistence_path() -> std::io::Result<PathBuf> {
-    let path = persistence_path()?;
+    prepare_persistence_path(persistence_path()?)
+}
+
+fn prepare_persistence_path(selection: ProbePersistencePath) -> std::io::Result<PathBuf> {
+    let path = match selection {
+        ProbePersistencePath::Supplied(path) => return Ok(path),
+        ProbePersistencePath::Derived(path) => path,
+    };
     match remove_file(&path) {
         Ok(()) => {},
         Err(error) if error.kind() == ErrorKind::NotFound => {},
@@ -221,29 +305,34 @@ fn fresh_persistence_path() -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
-fn smoke_exit_frame() -> std::io::Result<Option<u32>> {
-    optional_environment_value(EXIT_AFTER_FRAME_ENVIRONMENT_VARIABLE)?
-        .map(|value| {
-            value.parse().map_err(|error| {
+fn smoke_exit_frame() -> std::io::Result<ProbeExitBehavior> {
+    match var(EXIT_AFTER_FRAME_ENVIRONMENT_VARIABLE) {
+        Ok(value) => value
+            .parse()
+            .map(|frame| ProbeExitBehavior::ExitAfter(SmokeExitFrame(frame)))
+            .map_err(|error| {
                 Error::new(
                     ErrorKind::InvalidInput,
                     format!("invalid {EXIT_AFTER_FRAME_ENVIRONMENT_VARIABLE}: {error}"),
                 )
-            })
-        })
-        .transpose()
+            }),
+        Err(VarError::NotPresent) => Ok(ProbeExitBehavior::Continue),
+        Err(VarError::NotUnicode(_)) => Err(invalid_unicode_environment_value(
+            EXIT_AFTER_FRAME_ENVIRONMENT_VARIABLE,
+        )),
+    }
 }
 
 fn main() -> std::io::Result<()> {
     let startup_mode = selected_startup_mode()?;
     let smoke_exit_frame = smoke_exit_frame()?;
     let persistence_path = fresh_persistence_path()?;
-    let probe_monitor_index = probe_monitor_index()?;
+    let probe_monitor_selection = probe_monitor_selection()?;
     let probe_port = probe_port()?;
     let probe_session = probe_session()?;
     let mut app = App::new();
     app.insert_resource(startup_mode)
-        .insert_resource(probe_monitor_index)
+        .insert_resource(probe_monitor_selection)
         .insert_resource(probe_session)
         .add_plugins(HotplugProbePlugin)
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -253,9 +342,9 @@ fn main() -> std::io::Result<()> {
         }))
         .add_plugins(remote::plugin())
         .add_plugins(remote::http_plugin(probe_port))
-        .add_plugins(WindowManagerPlugin::with_path(persistence_path));
-    if let Some(frame) = smoke_exit_frame {
-        app.insert_resource(SmokeExitFrame(frame));
+        .add_plugins(WindowManagerPlugin::with_path(persistence_path).recover_on_return());
+    if let ProbeExitBehavior::ExitAfter(smoke_exit_frame) = smoke_exit_frame {
+        app.insert_resource(smoke_exit_frame);
     }
     app.run();
     Ok(())
@@ -267,31 +356,30 @@ fn main() -> std::io::Result<()> {
     reason = "tests should panic on unexpected values"
 )]
 mod tests {
+    use std::error::Error as StdError;
+
     use super::*;
 
     #[test]
     fn startup_mode_selector_parses_each_documented_value_and_defaults_to_windowed() {
+        assert_eq!(ProbeStartupMode::default(), ProbeStartupMode::Windowed);
         assert_eq!(
-            parse_startup_mode(None).expect("absent selector should default"),
+            parse_startup_mode(STARTUP_MODE_WINDOWED).expect("windowed should parse"),
             ProbeStartupMode::Windowed,
         );
         assert_eq!(
-            parse_startup_mode(Some(STARTUP_MODE_WINDOWED)).expect("windowed should parse"),
-            ProbeStartupMode::Windowed,
-        );
-        assert_eq!(
-            parse_startup_mode(Some(STARTUP_MODE_BORDERLESS)).expect("borderless should parse"),
+            parse_startup_mode(STARTUP_MODE_BORDERLESS).expect("borderless should parse"),
             ProbeStartupMode::Borderless,
         );
         assert_eq!(
-            parse_startup_mode(Some(STARTUP_MODE_EXCLUSIVE)).expect("exclusive should parse"),
+            parse_startup_mode(STARTUP_MODE_EXCLUSIVE).expect("exclusive should parse"),
             ProbeStartupMode::Exclusive,
         );
     }
 
     #[test]
     fn startup_mode_selector_rejects_unknown_values_naming_the_variable() {
-        let error = parse_startup_mode(Some("fullscreen"))
+        let error = parse_startup_mode("fullscreen")
             .expect_err("undocumented selector value should be rejected");
         assert_eq!(error.kind(), ErrorKind::InvalidInput);
         assert!(
@@ -328,5 +416,18 @@ mod tests {
                 VideoModeSelection::Current,
             ),
         );
+    }
+
+    #[test]
+    fn explicitly_supplied_persistence_path_is_preserved() -> Result<(), Box<dyn StdError>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("windows.ron");
+        std::fs::write(&path, "saved state")?;
+
+        let selected_path = prepare_persistence_path(ProbePersistencePath::Supplied(path.clone()))?;
+
+        assert_eq!(selected_path, path);
+        assert_eq!(std::fs::read_to_string(selected_path)?, "saved state");
+        Ok(())
     }
 }

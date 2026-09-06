@@ -131,12 +131,6 @@ use hana_diegetic::DiegeticUiPlugin;
 use hana_lagrange::LagrangePlugin;
 pub use hana_lagrange::OrbitCam;
 pub use keymap::CommandPaletteKeymap;
-/// Returns the fixed Command+P (macOS) or Control+P recovery chord that an
-/// externally installed contextual Rubric keymap must associate with the palette command.
-///
-/// Pass this and [`command_palette_recovery_command_id`] to
-/// [`hana_rubric::KeymapPlugin::with_protected_command_binding`] before installing Fairy Dust
-/// so authored bindings cannot compete with the command palette's direct recovery route.
 pub use keymap::command_palette_recovery_command_id;
 pub use keymap::command_palette_recovery_keystroke;
 pub use lighting::FairyDustStudioLightingSet;

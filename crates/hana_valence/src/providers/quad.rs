@@ -106,9 +106,9 @@ impl QuadCreaseEdge {
 /// The sheet enumerates its cells in row-major order and authors one
 /// connection forest rooted at `QuadCell::new(0, 0)`. Row zero chains leftward
 /// along its shared vertical edges, and every cell below row zero attaches to
-/// the cell directly above it through their shared horizontal edge. No cell
-/// assumes it follows the previously enumerated member, so a sheet wider than
-/// one column is a branching forest rather than a chain.
+/// the cell directly above it through their shared horizontal edge. Each cell's
+/// target comes from its own row and column, not from the enumeration order, so
+/// a sheet wider than one column is a branching forest rather than a chain.
 ///
 /// One row or one column is a normal degenerate sheet: a one-row sheet is a
 /// horizontal strip whose creases are all vertical, and a one-column sheet is

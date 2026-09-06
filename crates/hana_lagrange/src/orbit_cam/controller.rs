@@ -297,7 +297,9 @@ fn smooth_and_update_transform(
     );
 }
 
-/// Main system for processing input and converting to transformations
+/// Initializes each `OrbitCam` on its first pass, applies one frame of
+/// `OrbitCamInput` to the orbit, pan, and zoom targets, and writes the camera
+/// `Transform` when something changed.
 pub(super) fn orbit_cam(
     route: Res<ResolvedCameraInputRoute>,
     mut orbit_cameras: Query<(

@@ -29,7 +29,7 @@ use crate::cascade::Cascade;
 use crate::cascade::CascadeRoot;
 use crate::layout::Dimension;
 
-/// One widget state's decision for a single visual property.
+/// One widget state's value for a single visual property.
 #[derive(Clone, Debug, Default, PartialEq, Reflect)]
 pub(crate) enum VisualChange<T> {
     /// The state keeps whatever value the prior layer resolved.
@@ -726,7 +726,8 @@ pub(crate) enum WidgetState {
     Hovered,
     /// The widget is held: a button press or a slider drag.
     Pressed,
-    /// The widget refuses interaction.
+    /// The widget carries [`WidgetDisabled`](super::WidgetDisabled) and takes
+    /// no interaction.
     Disabled,
 }
 

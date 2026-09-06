@@ -2,9 +2,25 @@ use std::time::Duration;
 
 use bevy::prelude::Reflect;
 
+use crate::BindingPolicy;
+use crate::ContinuousFlowExpectation;
+use crate::FlowExpectation;
+
+impl BindingPolicy {
+    /// Return the data-arrival rule evaluated after this role establishes a session.
+    #[must_use]
+    pub const fn flow_expectation(self) -> FlowExpectation { self.flow_expectation }
+
+    /// Evaluate each established session against continuous data-arrival bounds.
+    #[must_use]
+    pub const fn with_continuous_flow(self, expectation: ContinuousFlowExpectation) -> Self {
+        self.with_flow_expectation(FlowExpectation::Continuous(expectation))
+    }
+}
+
 /// Condition that permits another apply attempt after a provider reports a failure.
 ///
-/// `RetryOn` distinguishes a failure that needs a new device report from one that can clear while
+/// [`RetryOn`] distinguishes a failure that needs a new device report from one that can clear while
 /// the report remains unchanged, preventing both missed camera recovery and needless retries.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Reflect)]
 pub enum RetryOn {
@@ -24,8 +40,13 @@ pub enum RetryOn {
 /// Response to an apply attempt abandoned after the device set changes while the device remains
 /// reachable.
 ///
-/// The kernel consults `OnAbort` only for a revision change. A lost `Claim` makes reversion
-/// impossible, and a deferred `ServiceVeto` makes it unsafe, so both outcomes bypass this policy.
+/// The kernel consults [`OnAbort`] only for [`AttemptInvalidation::RevisionAdvanced`]; every other
+/// invalidation reason returns before this policy is read. A lost [`Claim`](crate::Claim) has
+/// already stopped this process from reaching the hardware, and a device the application switched
+/// to [`ConfiguredDeviceMode::Offline`](crate::ConfiguredDeviceMode::Offline) may take no driver
+/// operation at all.
+///
+/// [`AttemptInvalidation::RevisionAdvanced`]: crate::AttemptInvalidation::RevisionAdvanced
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Reflect)]
 pub enum OnAbort {
     /// Keep the partial device configuration until the next reconciliation selects a new target.
@@ -44,15 +65,16 @@ pub enum OnAbort {
 
 /// Response when a still-present device loses its local session without becoming absent.
 ///
-/// `OnSessionLoss` differs from `RecoveryPolicy`, which handles a departing device, and `OnAbort`,
-/// which handles an in-flight apply attempt. Nothing unplugged and no attempt was abandoned.
+/// [`OnSessionLoss`] differs from [`RecoveryPolicy`](crate::RecoveryPolicy), which handles a
+/// departing device, and [`OnAbort`], which handles an in-flight apply attempt. Nothing unplugged
+/// and no attempt was abandoned.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Reflect)]
 pub enum OnSessionLoss {
     /// Open another local session and apply the captured configuration without application code.
     ///
     /// A camera panel can turn black for a frame after laptop wake, then repopulate through an
-    /// ordinary attempt that retains its published image handle for bound materials. `RetryOn`
-    /// gates that attempt, so a camera the operating system has wedged is not reopened in a
+    /// ordinary attempt that retains its published image handle for bound materials. [`RetryOn`]
+    /// gates that attempt, so a camera the operating system left unresponsive is not reopened in a
     /// loop.
     #[default]
     Recreate,

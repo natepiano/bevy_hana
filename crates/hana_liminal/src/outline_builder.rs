@@ -2,6 +2,7 @@ use std::marker::PhantomData;
 
 use bevy::prelude::Color;
 use bevy::prelude::Entity;
+use sealed::Sealed;
 
 use super::constants::DEFAULT_OUTLINE_INTENSITY;
 use super::outline::LineStyle;
@@ -10,13 +11,26 @@ use super::outline::OutlineActivity;
 use super::outline::OutlineMethod;
 use super::outline::OverlapMode;
 
-/// Sealed trait implemented by outline mode type-state markers.
-pub trait OutlineModeState {
+mod sealed {
+    /// Private supertrait that confines the outline-method markers to this module.
+    pub trait Sealed {}
+}
+
+/// Sealed trait implemented by the outline-method type-state markers.
+///
+/// The private `sealed::Sealed` supertrait keeps the marker set closed to this
+/// module, so every `MODE` is one of the three [`OutlineMethod`] variants that
+/// `extract` and `queue` dispatch on.
+pub trait OutlineModeState: sealed::Sealed {
     /// The [`OutlineMethod`] variant this state represents.
     const MODE: OutlineMethod;
 }
 
 /// Marker trait for hull-based outline modes (`WorldHull`, `ScreenHull`).
+///
+/// Sealed through [`OutlineModeState`]: implementing this trait requires the
+/// private supertrait, so no outside marker reaches the hull `build` and pairs a
+/// hull code path with a jump-flood `MODE`.
 pub trait HullModeState: OutlineModeState {}
 
 /// Type-state marker for the jump-flood outline method.
@@ -46,7 +60,12 @@ impl OutlineModeState for ScreenHullState {
 impl HullModeState for WorldHullState {}
 impl HullModeState for ScreenHullState {}
 
-/// Type-safe builder for constructing an `Outline` component.
+impl Sealed for JumpFloodState {}
+impl Sealed for WorldHullState {}
+impl Sealed for ScreenHullState {}
+
+/// Builder for an [`Outline`] component. The state type parameter fixes the
+/// method and selects which `build` is reachable.
 #[derive(Debug, Clone)]
 pub struct OutlineBuilder<M: OutlineModeState> {
     width:        f32,
@@ -141,7 +160,7 @@ impl<M: OutlineModeState> OutlineBuilder<M> {
     }
 }
 
-/// Settings only available on hull methods (`WorldHull`, `ScreenHull`).
+/// Build step reachable only from the hull methods (`WorldHull`, `ScreenHull`).
 impl<M: HullModeState> OutlineBuilder<M> {
     /// Consume the builder and produce a configured `Outline` component.
     #[must_use]
@@ -154,7 +173,7 @@ impl<M: HullModeState> OutlineBuilder<M> {
             method:       M::MODE,
             line_style:   LineStyle::Solid,
             activity:     OutlineActivity::Enabled,
-            group_source: None,
+            group_source: self.group_source,
         }
     }
 }
@@ -173,6 +192,7 @@ const fn defaults<M: OutlineModeState>(width: f32) -> OutlineBuilder<M> {
 #[cfg(test)]
 mod tests {
     use bevy::prelude::Color;
+    use bevy::prelude::World;
 
     use crate::Outline;
     use crate::OutlineActivity;
@@ -218,6 +238,22 @@ mod tests {
 
         assert_eq!(outline.overlap_mode, OverlapMode::Grouped);
         assert_eq!(outline.group_source, None);
+    }
+
+    #[test]
+    fn hull_with_group_keeps_group_source() {
+        let mut world = World::new();
+        let group = world.spawn_empty().id();
+
+        let world_hull = Outline::world_hull(0.05).with_group(group).build();
+        assert_eq!(world_hull.method, OutlineMethod::WorldHull);
+        assert_eq!(world_hull.overlap_mode, OverlapMode::Grouped);
+        assert_eq!(world_hull.group_source, Some(group));
+
+        let screen_hull = Outline::screen_hull(3.0).with_group(group).build();
+        assert_eq!(screen_hull.method, OutlineMethod::ScreenHull);
+        assert_eq!(screen_hull.overlap_mode, OverlapMode::Grouped);
+        assert_eq!(screen_hull.group_source, Some(group));
     }
 
     #[test]

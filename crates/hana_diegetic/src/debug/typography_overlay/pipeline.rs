@@ -18,8 +18,8 @@ use super::OverlayContainer;
 use super::TypographyOverlay;
 use super::glyph;
 use super::metric_lines;
-use crate::layout::LineMetricsSnapshot;
 use crate::layout::MeasureTextFn;
+use crate::layout::ShapedLineMetrics;
 use crate::layout::ShapedTextCache;
 use crate::render::ComputedWorldText;
 use crate::text;
@@ -43,7 +43,7 @@ pub(super) struct OverlayContext<'w, 's, 'a> {
 /// guides. Exists to reduce helper parameter counts.
 pub(super) struct FontContext<'a> {
     pub(super) font: &'a FontMetrics,
-    pub(super) line: &'a LineMetricsSnapshot,
+    pub(super) line: &'a ShapedLineMetrics,
 }
 
 /// Asset store handles for overlay mesh/material spawning. Exists to reduce

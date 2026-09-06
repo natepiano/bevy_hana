@@ -2,11 +2,12 @@ use bevy::prelude::Query;
 use bevy::prelude::With;
 
 use super::target::TargetPosition;
-use crate::restore::RestorePreparation;
+use crate::restore::WindowRestoreAttempt;
 
-/// Run condition: returns true if any entity has a `TargetPosition` component.
+/// Whether any entity carries both `TargetPosition` and `WindowRestoreAttempt`, which is a window
+/// with a restore in progress.
 pub(crate) fn has_restoring_windows(
-    query: Query<(), (With<TargetPosition>, With<RestorePreparation>)>,
+    query: Query<(), (With<TargetPosition>, With<WindowRestoreAttempt>)>,
 ) -> bool {
     !query.is_empty()
 }

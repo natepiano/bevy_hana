@@ -84,11 +84,11 @@ impl RangeCrossing {
 /// Ordered selected-range entries and exits recorded within one update.
 ///
 /// A producer that crossed no selected-range boundary passes
-/// [`RangeCrossings::NONE`] rather than omitting the value, so a consumer never
-/// interprets absence. The encoding is a fixed-size bit field, so recording a
-/// crossing allocates nothing. A round trip that returns to its starting
-/// position keeps its crossings even though its start and end positions are
-/// equal.
+/// [`RangeCrossings::NONE`]; the value is never optional, so a consumer reads
+/// an empty list and never a missing one. The encoding is a fixed-size bit
+/// field, so recording a crossing allocates nothing. A round trip that returns
+/// to its starting position keeps its crossings even though its start and end
+/// positions are equal.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Reflect)]
 #[reflect(opaque)]
 pub struct RangeCrossings {
@@ -197,8 +197,9 @@ pub enum RangeCrossingsError {
 /// Compact traversal between two ordered-ledger gaps.
 ///
 /// The traversal retains its movement direction and uses it when counting or
-/// iterating crossed records. A domain can emit its metadata lazily without a
-/// boundary collection allocated per update.
+/// iterating crossed records. [`SequenceTraversal::boundaries`] walks the
+/// crossed ordinals from the two gaps and the repetition count, so no
+/// per-update boundary collection is allocated.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SequenceTraversal {
     old_gap:                  usize,

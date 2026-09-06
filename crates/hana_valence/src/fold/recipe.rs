@@ -15,8 +15,8 @@ use crate::RetainedProviderKnowledge;
 
 /// One recipe-authored replacement for a single connection's folded endpoint.
 ///
-/// An assignment deliberately omits the member's [`crate::Edge`] and base
-/// angle: those stay provider geometry that a recipe reads but never rewrites.
+/// An assignment carries no [`crate::Edge`] and no base angle: those stay
+/// provider geometry that a recipe reads but never rewrites.
 /// Assignments are returned as one plain vector so an omitted or repeated
 /// member is visible while the whole result is validated, before any hinge is
 /// written.
@@ -74,8 +74,8 @@ pub trait FoldRecipe {
 /// Implementing this trait is what makes a capability storable through
 /// [`crate::ArrangementPlan::with_capability`] and
 /// [`crate::Provides`], and it is also what gives the type its
-/// [`FoldRecipeCapability`] table lookup. A capability that no recipe can ask
-/// for therefore fails to compile at the line that files it.
+/// [`FoldRecipeCapability`] table lookup. A capability type no recipe can
+/// declare therefore fails to compile at the line that files it.
 pub trait ProviderCapability: Send + Sync + 'static {}
 
 /// How a recipe's declared capability is retrieved for one selection.

@@ -26,8 +26,9 @@
 //! fields it provides, which is useful for render-to-texture and editor-panel
 //! cameras whose logical input surface differs from the rendered camera view.
 //! Mouse-like and keyboard held interactions keep their owner while held.
-//! Gamepad and touch source attribution is reported today; selected-gamepad
-//! and touch-owner latching are future routing policy work.
+//! Gamepad and touch sources are named in the reported attribution, but no
+//! latch holds them: `CameraInputSourceLatches` latches only the mouse, wheel,
+//! and smooth-scroll sources, plus the keyboard.
 //!
 //! [`CameraInputPhase::WriteManual`]: crate::CameraInputPhase::WriteManual
 

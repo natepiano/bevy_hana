@@ -56,8 +56,9 @@ use super::queue::CameraMove;
 /// construction names each step once, and replacing the authored definition
 /// produces a new description with a new revision.
 ///
-/// Reflection is opaque because the stage description is derived from the
-/// authored moves during construction and must never be reached structurally.
+/// Reflection is opaque: the stage description is derived from the authored
+/// moves at construction, and opaque reflection stops a reflected write from
+/// setting it independently of the moves it describes.
 #[derive(Component, Clone, Debug, Reflect)]
 #[reflect(opaque)]
 #[reflect(Component)]

@@ -16,7 +16,7 @@ use crate::ArrangementConnection;
 /// The same entity may appear in several different groups, which is how one
 /// arrangement expresses overlapping fold alternatives.
 ///
-/// Construction is the only place membership is decided. There is no mutable
+/// Construction is the only place membership is set. There is no mutable
 /// accessor, no unchecked constructor, and no empty state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FoldGroup {

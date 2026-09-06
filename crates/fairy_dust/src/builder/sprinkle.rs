@@ -179,7 +179,7 @@ impl<S, Baseline> SprinkleBuilder<S, Baseline> {
         builder
     }
 
-    /// Enable smart screen-space camera control panels for `OrbitCam` cameras.
+    /// Enable screen-space camera control panels for `OrbitCam` cameras.
     ///
     /// Cameras without an explicit [`CameraGuidance`](crate::CameraGuidance) component get
     /// [`CameraGuidance::auto()`](crate::CameraGuidance::auto), so the panel reflects the effective
@@ -206,8 +206,8 @@ impl<S, Baseline> SprinkleBuilder<S, Baseline> {
     /// directory; the palette renders that unresolved configuration directory as
     /// an advisory row.
     ///
-    /// An application that declares its own commands, or that wants the user's
-    /// keymap read from disk, supplies its own
+    /// An application that declares its own commands, or whose keymap is read
+    /// from the user's configuration directory, supplies its own
     /// [`CommandPaletteKeymap`](crate::CommandPaletteKeymap) with
     /// [`with_command_palette_keymap`](Self::with_command_palette_keymap).
     #[must_use]
@@ -221,16 +221,17 @@ impl<S, Baseline> SprinkleBuilder<S, Baseline> {
     /// Enable the command palette against `keymap` instead of Fairy Dust's
     /// shipped defaults. Use this when the application declares its own
     /// commands, so the embedded document binds only ids the command registry
-    /// knows — a document naming an unregistered id is rejected whole, which
+    /// declares — a document naming an unregistered id is rejected whole, which
     /// leaves the palette unopenable.
     ///
     /// The supplied document replaces Fairy Dust's shipped one, so it must bind
-    /// the `fairy_dust::` commands it wants to keep as well as its own ids.
+    /// whichever `fairy_dust::` commands are to stay reachable, as well as its
+    /// own ids.
     ///
     /// Call this or [`with_command_palette`](Self::with_command_palette) once. A
     /// second call carrying a different keymap panics rather than silently
-    /// keeping the first, because an application running bindings it never asked
-    /// for is worse than a crash at startup.
+    /// keeping the first, which would leave the application running bindings its
+    /// author never named.
     #[must_use]
     pub fn with_command_palette_keymap(self, keymap: CommandPaletteKeymap) -> SprinkleBuilder<S> {
         let mut builder = self.into_installed();
@@ -411,9 +412,10 @@ impl<S, Baseline> SprinkleBuilder<S, Baseline> {
         builder
     }
 
-    /// Run the configured app. Mirror of [`App::run`], with the exception
-    /// that a `Ctrl+Shift+R` press handled via `with_restart_key`
-    /// will re-exec the current binary before this method returns.
+    /// Run the configured app. Mirror of [`App::run`], except that Fairy Dust's
+    /// `Ctrl+Shift+R` restart command replaces this process with
+    /// `cargo run --example <name>` on Unix, or spawns it and exits on Windows,
+    /// so `run` does not return in that case.
     pub fn run(self) -> AppExit {
         let mut builder = self.into_installed();
         keymap::install(&mut builder.app);
@@ -900,8 +902,8 @@ mod tests {
     }
 
     /// Opening the palette names Fairy Dust's shipped document, so naming the
-    /// same one again is the application repeating itself rather than asking for
-    /// two different sets of bindings.
+    /// same one again repeats one document instead of naming two different sets
+    /// of bindings.
     #[test]
     fn the_palette_and_the_shipped_keymap_name_the_same_document() {
         let builder = crate::sprinkle_example()

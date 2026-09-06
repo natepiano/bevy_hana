@@ -412,8 +412,9 @@ fn record_transport_diagnostics(world: &mut World, diagnostics: Vec<Diagnostic>)
     retain_recent_diagnostics(&mut keymap_load_failures.diagnostics);
 }
 
-/// Whether `MergedKeymap::from_sources` re-derives this kind from the defaults
-/// and user documents on every commit.
+/// Whether `AcceptedKeymapDocument::from_sources` and
+/// `MergedKeymap::from_effective_state_bindings` re-derive this kind from the
+/// defaults and user documents on every commit.
 ///
 /// The kinds left out are recorded once and never re-derived: `Disk` and
 /// `Companion` come from the disk worker's transport,

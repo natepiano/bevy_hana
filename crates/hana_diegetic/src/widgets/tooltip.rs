@@ -1254,7 +1254,7 @@ pub struct TooltipTargetEntity<Space> {
 }
 
 impl<Space> TooltipTargetEntity<Space> {
-    /// Returns the underlying Bevy entity for unrelated ECS work.
+    /// Returns the wrapped Bevy entity, for ECS work outside the tooltip API.
     #[must_use]
     pub const fn entity(&self) -> Entity { self.entity }
 

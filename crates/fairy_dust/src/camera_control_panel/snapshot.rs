@@ -118,8 +118,8 @@ pub(super) fn row_active(
         // Non-directional action rows match on source alone.
         None => true,
         // A directional zoom row lights only when the live zoom matches it. Until
-        // a direction is known (no zoom engaged yet) fall back to source-only so
-        // the row can still light rather than going dark.
+        // a direction has been reported (no zoom engaged yet) fall back to
+        // source-only so the row can still light rather than going dark.
         Some(direction) => live_zoom_direction.is_none_or(|live| live == direction),
     }
 }

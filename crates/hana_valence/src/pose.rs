@@ -12,10 +12,10 @@ use crate::AnchorSite;
 
 /// Local-frame resolver input for an anchored entity.
 ///
-/// `AnchorPose` is deliberately not `Transform`: animation systems write
-/// `AnchorPose`, and resolver systems convert it into a `Transform` later.
-/// Keeping those components separate prevents animation systems and resolver
-/// systems from writing the same component for different meanings.
+/// `AnchorPose` is a separate component from `Transform`: animation systems
+/// write `AnchorPose`, and resolver systems convert it into a `Transform`
+/// later. Two components keep animation writes and resolver writes off the same
+/// component, where the stored value would mean two different things.
 /// [`Hinge`](crate::Hinge) is an `AnchorPose` driver; remove `Hinge` when
 /// another system should write `AnchorPose` directly.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Reflect)]
@@ -49,6 +49,15 @@ pub enum AnchorSystems {
     FillGeometry,
     /// Drivers write [`AnchorPose`], hinge data, or source transforms.
     AnimatePose,
+    /// The hinge driver turns each [`Hinge`](crate::Hinge)
+    /// into an [`AnchorPose`].
+    ///
+    /// [`HingePlugin`](crate::HingePlugin) nests this set inside
+    /// [`Self::AnimatePose`]. Order pose-writing systems against this set rather
+    /// than against the system itself: an ordering against a set holds whether
+    /// or not the set is populated, while an ordering against a system that no
+    /// plugin registered is silently discarded.
+    HingeToPose,
     /// Resolver systems read geometry, relations, and pose, then write transforms.
     Resolve,
 }

@@ -24,10 +24,10 @@ use crate::Platform;
 pub enum DisplayProductName {
     /// The operating system supplied a product name for this display.
     Reported(String),
+    /// This platform supports product names but supplied none for this display.
+    NotReported,
     /// This platform has no operating-system concept of a display product name.
     PlatformHasNoConcept,
-    /// This platform normally supplies display product names, but supplied none for this display.
-    PlatformReportedNothing,
 }
 
 impl DisplayProductName {
@@ -36,7 +36,7 @@ impl DisplayProductName {
     pub fn as_reported(&self) -> Option<&str> {
         match self {
             Self::Reported(name) => Some(name),
-            Self::PlatformHasNoConcept | Self::PlatformReportedNothing => None,
+            Self::NotReported | Self::PlatformHasNoConcept => None,
         }
     }
 }
@@ -60,7 +60,7 @@ pub(super) fn from_platform(
     let _ = monitor_handle;
     match platform {
         Platform::Windows | Platform::X11 => winit_name.map_or_else(
-            || DisplayProductName::PlatformReportedNothing,
+            || DisplayProductName::NotReported,
             |name| DisplayProductName::Reported(name.to_owned()),
         ),
         Platform::MacOs | Platform::Wayland => DisplayProductName::PlatformHasNoConcept,
@@ -71,10 +71,10 @@ pub(super) fn from_platform(
 #[cfg(target_os = "macos")]
 fn macos_product_name(monitor_handle: Option<&MonitorHandle>) -> DisplayProductName {
     let Some(monitor_handle) = monitor_handle else {
-        return DisplayProductName::PlatformReportedNothing;
+        return DisplayProductName::NotReported;
     };
     let Some(main_thread) = MainThreadMarker::new() else {
-        return DisplayProductName::PlatformReportedNothing;
+        return DisplayProductName::NotReported;
     };
     let screen_number_key = NSString::from_str("NSScreenNumber");
     let display_id = monitor_handle.native_id();
@@ -90,7 +90,7 @@ fn macos_product_name(monitor_handle: Option<&MonitorHandle>) -> DisplayProductN
                         .is_some_and(|screen_number| screen_number.unsignedIntValue() == display_id)
                 })
         })
-        .map_or(DisplayProductName::PlatformReportedNothing, |screen| {
+        .map_or(DisplayProductName::NotReported, |screen| {
             DisplayProductName::Reported(screen.localizedName().to_string())
         })
 }
@@ -109,13 +109,10 @@ mod tests {
     #[test]
     fn absent_product_names_expose_no_rendering_value() {
         assert_eq!(DisplayProductName::PlatformHasNoConcept.as_reported(), None);
-        assert_eq!(
-            DisplayProductName::PlatformReportedNothing.as_reported(),
-            None
-        );
+        assert_eq!(DisplayProductName::NotReported.as_reported(), None);
         assert_ne!(
             DisplayProductName::PlatformHasNoConcept,
-            DisplayProductName::PlatformReportedNothing,
+            DisplayProductName::NotReported,
         );
     }
 }

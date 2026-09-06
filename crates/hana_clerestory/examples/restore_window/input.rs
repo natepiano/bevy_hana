@@ -22,7 +22,7 @@ use bevy::window::WindowMode;
 use dirs::config_dir;
 use hana_clerestory::CurrentMonitor;
 use hana_clerestory::CurrentMonitorIndex;
-use hana_clerestory::ManagedWindow;
+use hana_clerestory::ManagedWindowName;
 #[cfg(target_os = "linux")]
 use hana_clerestory::Platform;
 
@@ -124,7 +124,7 @@ pub(crate) fn handle_global_input(
 }
 
 pub(crate) fn despawn_managed_and_exit(
-    managed_entities: &Query<Entity, With<ManagedWindow>>,
+    managed_entities: &Query<Entity, With<ManagedWindowName>>,
     commands: &mut Commands,
     app_exit: &mut MessageWriter<AppExit>,
 ) {

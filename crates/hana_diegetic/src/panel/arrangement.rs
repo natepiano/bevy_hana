@@ -25,7 +25,7 @@ impl ArrangedPanel {
         }
     }
 
-    /// Returns the arrangement controller this panel will belong to.
+    /// Returns the arrangement controller this bundle makes the panel a member of.
     #[must_use]
     pub const fn arrangement(&self) -> Entity { self.member.arrangement_entity }
 }

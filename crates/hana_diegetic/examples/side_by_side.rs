@@ -9,7 +9,7 @@
 //!
 //! - **Left (Clay)**: Uses `clay-layout` (C FFI) for layout, then spawns [`WorldText`] entities at
 //!   the positions clay computed. This side demonstrates how to use [`DiegeticTextMeasurer`] as a
-//!   bridge: clay calls its own measurement callback, which delegates to our parley-backed measurer
+//!   bridge: clay calls its own measurement callback, which delegates to the parley-backed measurer
 //!   via [`TextMeasure`] and [`TextDimensions`]. This pattern works for any external layout engine
 //!   that needs a text measurement callback.
 //!
@@ -150,8 +150,8 @@ struct ClayGizmoGroup;
 #[derive(Component)]
 struct ClayPanelMarker;
 
-/// Marker for `WorldText` entities spawned by the clay side, so we can
-/// despawn them on rebuild.
+/// Marker for `WorldText` entities spawned by the clay side, so a rebuild can
+/// despawn them.
 #[derive(Component)]
 struct ClayTextEntity;
 
@@ -674,8 +674,8 @@ fn spawn_clay_text(
 
 // ── Diegetic tree builder ────────────────────────────────────────────────────
 
-/// Builds the diegetic layout tree. Returns a `LayoutTree`.
-/// The plugin handles layout computation and text rendering.
+/// Builds the diegetic layout tree. The plugin handles layout computation and
+/// text rendering.
 ///
 /// `world_size` is the panel width in meters (layout coordinates = meters).
 fn build_diegetic_tree(rows: &[(String, String)], world_size: f32) -> LayoutTree {

@@ -39,7 +39,9 @@ pub enum FreeCamRollTarget {
 /// Which authored form a [`CameraMove`] uses to describe its destination.
 ///
 /// Both forms resolve to the same retained orbit parameters. A free-flight
-/// journey uses the authored form to preserve its intended look direction.
+/// journey branches on the authored form: `OrbitalLookAt` takes the authored
+/// yaw and pitch as the look angles, while `LookAt` derives them from the
+/// authored position, which loses yaw at +/-PI/2 pitch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Reflect)]
 pub enum CameraMoveDestination {
     /// A world-space camera position looking at a focus point.
@@ -67,9 +69,10 @@ enum AuthoredPose {
 
 /// One validated step in a retained camera journey.
 ///
-/// Every field is private and every coordinate is semantic, so a constructed
-/// move has finite pose data and a non-negative orbit radius. Reflection is
-/// opaque because construction preserves those invariants.
+/// Every field is private, and both constructors reject non-finite pose data
+/// and a negative orbit radius, so a constructed move always carries a finite
+/// pose and a non-negative radius. Reflection is opaque, so a reflected write
+/// cannot reach the fields and skip that validation.
 #[derive(Clone, Debug, PartialEq, Reflect)]
 #[reflect(opaque)]
 pub struct CameraMove {
@@ -279,7 +282,7 @@ pub enum CameraMoveError {
     },
 }
 
-/// Logs rejected retained authoring so the caller can skip its request.
+/// Logs a rejected [`CameraMove`] construction at warn level.
 pub(crate) fn warn_rejected_camera_move(error: &CameraMoveError) {
     warn!("camera move rejected: {error}");
 }

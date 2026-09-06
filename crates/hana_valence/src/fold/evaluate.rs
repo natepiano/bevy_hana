@@ -14,9 +14,10 @@ use crate::Hinge;
 /// `select_easing` receives the member's raw segment progress and answers with
 /// the producer's easing decision for that position: the ECS caller forwards
 /// [`SequenceEasingSampler::sample`](hana_kana::SequenceEasingSampler::sample)
-/// and a value test answers with a [`SequenceEasingSample`] directly. Because
-/// the position travels inside the decision, a curve that replaced authored
-/// easing cannot also run it, and one that fed authored easing cannot skip it.
+/// and a value test answers with a [`SequenceEasingSample`] directly. Each
+/// variant carries the position it applies to, so a curve that replaced
+/// authored easing cannot also run it, and one that fed authored easing cannot
+/// skip it.
 /// Raw stage evaluation answers
 /// [`SequenceEasingSample::AuthoredEasingSuppressed`] with the raw position.
 ///
@@ -76,7 +77,7 @@ impl EasedFoldFraction {
     /// # Errors
     ///
     /// Returns [`FoldEvaluationError::NonFiniteEasing`] for a NaN or infinite
-    /// value, which is exactly the condition that produced it.
+    /// value.
     pub const fn try_new(fraction: f64) -> Result<Self, FoldEvaluationError> {
         if fraction.is_finite() {
             Ok(Self(fraction))
@@ -157,7 +158,7 @@ pub fn fold_fraction(
     EasedFoldFraction::try_new(from.mul_add(1.0 - eased, to * eased))
 }
 
-/// Widens a finite eased output, rejecting one that names no position.
+/// Widens a finite eased output to `f64` and rejects a NaN or infinite one.
 fn finite_easing(eased: f32) -> Result<f64, FoldEvaluationError> {
     if eased.is_finite() {
         Ok(f64::from(eased))

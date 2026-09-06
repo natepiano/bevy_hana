@@ -6,13 +6,13 @@
 //! own monitor. Only the front tab is displayed; the vacated display shows an
 //! empty black fullscreen Space.
 //!
-//! The real fix is the app-wide class property
+//! What stops it is the app-wide class property
 //! `NSWindow.allowsAutomaticWindowTabbing = false`, set in
 //! [`disable_automatic_tabbing`] during plugin build — before winit creates any
 //! OS window. Per-window `NSWindow.tabbingMode = .disallowed` (the
 //! [`disable_tabbing_on_managed`] system) cannot fix automatic tabbing on its
 //! own: the tab merge happens at `AppKit` window-creation time, before any ECS
-//! system sees the new window. It is kept on `ManagedWindow`s to also block
+//! system sees the new window. It is kept on secondary windows to also block
 //! MANUAL tabbing (dragging a window onto another's tab bar, "Merge All
 //! Windows").
 
@@ -29,8 +29,10 @@ use bevy::prelude::NonSendMut;
 use bevy::prelude::On;
 use bevy::prelude::Query;
 use bevy::prelude::Remove;
+use bevy::prelude::Without;
 use bevy::prelude::debug;
 use bevy::prelude::warn;
+use bevy::window::PrimaryWindow;
 use bevy::winit::WINIT_WINDOWS;
 use block2::RcBlock;
 use objc2::MainThreadMarker;
@@ -209,9 +211,9 @@ pub(crate) fn activate_fullscreen_window(entity: Entity) {
     );
 }
 
-/// Disable manual tabbing on newly added `ManagedWindow` entities.
+/// Disable manual tabbing on each newly managed secondary window.
 pub(crate) fn disable_tabbing_on_managed(
-    new_windows: Query<Entity, Added<ManagedWindow>>,
+    new_windows: Query<Entity, (Added<ManagedWindow>, Without<PrimaryWindow>)>,
     _: NonSendMarker,
 ) {
     for entity in &new_windows {

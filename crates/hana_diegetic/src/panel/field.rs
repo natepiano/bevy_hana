@@ -43,7 +43,7 @@ pub struct PanelFieldRecord {
     pub field_spec:          ImeEditableFieldSpec,
     /// Text displayed by this field when the record was computed.
     pub display_text:        String,
-    /// Source element index in the panel's `LayoutTree`.
+    /// Source element index in the panel's [`LayoutTree`].
     pub element_index:       usize,
     /// Whether this id is duplicated elsewhere in the panel.
     pub duplicate_id:        bool,

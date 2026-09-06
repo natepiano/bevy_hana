@@ -9,10 +9,10 @@
 //! inline as you build it. `hana_diegetic` is retained-mode: the [`LayoutTree`] is built once
 //! via [`LayoutBuilder`], stored on a component, and the
 //! `LayoutEngine` only recomputes positions when the tree changes.
-//! This is the natural fit for Bevy — the entire ECS is built around doing nothing unless something
-//! changed (`Changed<T>`, `Res::is_changed()`, observers). An immediate-mode engine would fight the
-//! framework by recomputing unconditionally every frame; retained mode lets Bevy's change detection
-//! skip layout entirely on frames where the tree hasn't been touched.
+//! Retained mode matches how Bevy schedules work — `Changed<T>`, `Res::is_changed()`, and
+//! observers all run a system's body only when something changed. An immediate-mode engine
+//! recomputes every frame unconditionally; retained mode lets Bevy's change detection skip
+//! layout entirely on frames where the tree hasn't been touched.
 //!
 //! # Quick start
 //!
@@ -226,9 +226,8 @@ pub use layout::TextAlign;
 /// Measured width and height of a text string, returned by [`MeasureTextFn`].
 pub use layout::TextDimensions;
 /// Font configuration passed to [`MeasureTextFn`]: font ID, size, weight,
-/// slant, line height, letter/word spacing. See the `side_by_side` example
-/// for a real-world custom measurer that bridges clay-layout to our
-/// parley-backed measurement via this type.
+/// slant, line height, letter/word spacing. The `side_by_side` example uses
+/// this type to feed clay-layout's measurement callback from parley.
 pub use layout::TextMeasure;
 pub use layout::TextSizing;
 pub use layout::TextStyle;
@@ -252,7 +251,6 @@ pub use panel::CoordinateSpace;
 pub use panel::DiegeticPanel;
 pub use panel::DiegeticPanelBuilder;
 pub use panel::DiegeticPanelCommands;
-pub use panel::DiegeticPanelGizmoGroup;
 pub use panel::DiegeticPerfStats;
 pub use panel::DroppedSdfSurfaces;
 pub use panel::Fit;

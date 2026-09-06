@@ -112,7 +112,8 @@ enum PanelRemoval {
 /// Records that Hana inserted `T` and the change tick of Hana's latest write.
 ///
 /// A different change tick means application code replaced or mutated `T`.
-/// Hana then relinquishes ownership and leaves that component untouched.
+/// [`Self::owns`] then returns `false`, the write and remove paths drop this
+/// ownership record, and `T` itself is left in place.
 #[derive(Component)]
 pub(crate) struct PanelComponentOwnership<T: Component> {
     owner:        Entity,

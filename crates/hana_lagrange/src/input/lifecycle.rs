@@ -59,8 +59,9 @@ use crate::system_sets::CameraInputPhase;
 /// quiet, bridging the per-frame gaps in bursty input (a trackpad emulating a
 /// mouse button as intermittent press/release, smooth-scroll arriving in
 /// bursts) so a control panel does not flicker. The same window holds the
-/// gamepad speed's return to `Normal`, so the singular variant does not flash
-/// when the `rb`/`lb` slow gate lands a frame apart from its stick or trigger.
+/// gamepad speed's return to `Normal`, so `Normal` is not reported for the
+/// frame or two when the `rb`/`lb` slow gate lands a frame apart from its
+/// stick or trigger.
 ///
 /// Reporting-only: it affects the reported camera interaction state and
 /// interaction events. Camera motion reads its input intent directly and is
@@ -787,10 +788,11 @@ fn push_state_transition<K: CameraInputLifecycleKind>(
 /// Computes the debounced reported speed and its pending-settle deadline.
 ///
 /// `Slow` reports immediately. A return to `Normal` — a fresh engage or a chord
-/// release — is held back by `window` so the singular variant does not flash for
-/// the frame or two a gamepad slow-gate chord straddles. Only the gamepad has a
-/// slow gate, so non-gamepad sources report their live speed at once. A `None`
-/// report means active-but-unsettled (suppress the singular until it is real).
+/// release — is held back by `window`, so `Normal` is not reported for the frame
+/// or two a gamepad slow-gate chord straddles. Only the gamepad has a slow gate,
+/// so non-gamepad sources report their live speed at once. A `None` report means
+/// no settled speed: either the kind is inactive, or it is active and still
+/// inside the settle window.
 fn settled_speed(
     previous: Option<ControlSpeed>,
     previous_deadline: Option<f32>,

@@ -4,7 +4,7 @@
 //! Input is delivered to an offscreen `OrbitCam` that renders into a 512x512
 //! image; the window camera shows that image on a rotating cube. The input
 //! surface metrics convert window-pixel mouse deltas into the 512x512
-//! texture-space deltas the offscreen camera expects.
+//! texture-space deltas the offscreen camera reads.
 //!
 //! Adapted from Bevy's `render_to_texture` example.
 //!

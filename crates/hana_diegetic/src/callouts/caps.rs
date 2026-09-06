@@ -7,7 +7,7 @@ use crate::layout::Dimension;
 pub enum ArrowStyle {
     /// Open chevron made from two line segments.
     Open,
-    /// Solid triangular arrowhead with a sharp point.
+    /// Solid triangular arrowhead, emitted as one filled triangle.
     Solid,
 }
 

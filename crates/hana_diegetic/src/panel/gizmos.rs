@@ -9,12 +9,9 @@ use bevy::prelude::Component;
 use bevy::prelude::Entity;
 use bevy::prelude::Gizmo;
 use bevy::prelude::GizmoAsset;
-use bevy::prelude::GizmoConfigGroup;
-use bevy::prelude::GizmoConfigStore;
 use bevy::prelude::GizmoLineConfig;
 use bevy::prelude::GizmoLineJoint;
 use bevy::prelude::Query;
-use bevy::prelude::Reflect;
 use bevy::prelude::Res;
 use bevy::prelude::ResMut;
 use bevy::prelude::Resource;
@@ -33,14 +30,8 @@ use super::diegetic_panel::PanelLayout;
 use crate::layout::BoundingBox;
 use crate::layout::RenderCommandKind;
 
-/// Gizmo group for diegetic panel debug wireframes.
-///
-/// Enable or disable via Bevy's [`GizmoConfigStore`].
-#[derive(Default, Reflect, GizmoConfigGroup)]
-pub struct DiegeticPanelGizmoGroup;
-
-/// Controls whether debug gizmos (text bounding boxes, element outlines)
-/// are drawn. Toggle at runtime to debug layout measurement and positioning.
+/// Controls whether text-bounds debug gizmos are drawn. Set it to [`Shown`](Self::Shown)
+/// at runtime to see the measured bounds and placement of every text run in a panel.
 #[derive(Resource, Default)]
 pub enum ShowTextGizmos {
     /// Debug gizmos are not drawn (default).
@@ -54,12 +45,6 @@ pub enum ShowTextGizmos {
 #[derive(Component)]
 pub(super) struct DebugGizmoChild;
 
-/// Enables perspective-scaled line widths on panel debug gizmos.
-pub(super) fn configure_panel_gizmos(mut config_store: ResMut<GizmoConfigStore>) {
-    let (config, _) = config_store.config_mut::<DiegeticPanelGizmoGroup>();
-    config.line.perspective = true;
-}
-
 struct GizmoRect<'a> {
     bounds:          &'a BoundingBox,
     points_to_world: f32,
@@ -69,6 +54,10 @@ struct GizmoRect<'a> {
     line_width:      f32,
 }
 
+/// Spawns one retained gizmo child holding a rectangle outline.
+///
+/// The `line_config` on the [`Gizmo`] component is the only thing the renderer reads for
+/// line appearance; retained gizmos consult no `GizmoConfigStore` group.
 fn spawn_rect_gizmo(
     commands: &mut Commands,
     panel_entity: Entity,
@@ -102,9 +91,12 @@ fn spawn_rect_gizmo(
     ));
 }
 
-/// Renders debug overlays (text bounding boxes, element outlines) as
-/// retained gizmos. Only active when [`ShowTextGizmos`] is enabled.
-/// Separate from layout gizmos so debug can be toggled independently.
+/// Spawns one retained gizmo rectangle per text render command, outlining that run's
+/// bounds in panel-local space.
+///
+/// Returns without drawing unless [`ShowTextGizmos`] is [`ShowTextGizmos::Shown`]. For
+/// every panel whose [`ComputedDiegeticPanel`] changed this frame, the previous frame's
+/// gizmo children are despawned before the new ones spawn.
 pub(super) fn render_debug_gizmos(
     changed_panels: Query<
         (Entity, &DiegeticPanel, &ComputedDiegeticPanel),
@@ -160,7 +152,7 @@ fn despawn_gizmo_children<T: Component>(
     }
 }
 
-/// Adds a rectangle outline to a `GizmoAsset` in panel-local coordinates.
+/// Adds a rectangle outline to a [`GizmoAsset`] in panel-local coordinates.
 fn add_rect_to_gizmo(
     asset: &mut GizmoAsset,
     bounds: &BoundingBox,

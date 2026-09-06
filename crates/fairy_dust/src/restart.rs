@@ -5,8 +5,8 @@
 //! relaunches the example as `cargo run --manifest-path <workspace>/Cargo.toml
 //! --example <name>`.
 //!
-//! Bypassing `AppExit` is deliberate: on macOS the winit run loop can fail to
-//! honor `AppExit::Success` cleanly, leaving the old window stuck. Unix builds
+//! `AppExit` is bypassed because on macOS the winit run loop can fail to honor
+//! `AppExit::Success` cleanly, leaving the old window stuck. Unix builds
 //! use `exec`, so the current Bevy process is replaced by cargo without running
 //! Bevy shutdown. Windows keeps a spawn-and-exit path.
 //!
@@ -75,8 +75,8 @@ fn request_restart(
     do_restart(encoded_pose);
 }
 
-/// No-op now that restart leaves the current app from the input handler.
-/// Retained so [`crate::SprinkleBuilder::run`] doesn't need a cfg branch.
+/// Does nothing: restart leaves the current process from the input handler.
+/// Kept so [`crate::SprinkleBuilder::run`] needs no cfg branch.
 pub(crate) const fn perform_restart_if_requested() {}
 
 #[cfg(unix)]
@@ -162,9 +162,9 @@ fn do_restart(_: Option<String>) {
     eprintln!("fairy_dust: restart not supported on this platform");
 }
 
-/// Recover the example name from the running binary's path.
+/// Recovers the example name from the running binary's path.
 ///
-/// Expects the path layout cargo produces for examples:
+/// Returns `None` unless the path has the layout cargo produces for examples:
 /// `<target>/<profile>/examples/<name>`.
 #[cfg(any(unix, windows))]
 fn derive_example_name(exe: &Path) -> Option<String> {

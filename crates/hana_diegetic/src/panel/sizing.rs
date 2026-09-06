@@ -1,4 +1,4 @@
-//! Typestate-driven panel sizing API (Design B‴).
+//! Typestate-driven panel sizing API.
 //!
 //! [`PanelSizing<M>`] is a sealed trait parameterised by a mode marker
 //! ([`super::builder::Screen`] or [`super::builder::World`]) with an
@@ -104,8 +104,9 @@ impl PhysicalUnit for Points {}
 impl Unit for Pixels {}
 impl PhysicalUnit for Pixels {}
 impl Unit for AnyUnit {}
-// AnyUnit is deliberately NOT `PhysicalUnit` — keeps `CompatibleUnits`
-// impls disjoint.
+// `AnyUnit` does not implement `PhysicalUnit`, which keeps the blanket
+// `CompatibleUnits` impls over `U: PhysicalUnit` disjoint from
+// `(AnyUnit, AnyUnit)`.
 
 // ── Value types ──────────────────────────────────────────────────────────────
 
@@ -160,7 +161,7 @@ pub trait PanelSizing<M: sealed::Mode>: Copy {
     /// Physical-unit marker for this value (or [`AnyUnit`] if unit-less).
     type Unit: sealed::Unit;
 
-    /// Convert to an engine [`Sizing`], resolving bare `f32` against the
+    /// Converts to an engine [`Sizing`], resolving bare `f32` against the
     /// panel's layout unit when needed.
     fn to_sizing(self) -> Sizing;
 }

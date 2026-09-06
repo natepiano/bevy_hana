@@ -92,9 +92,8 @@ const HEADER_HEIGHT: f32 = ROW_HEIGHT + 0.01;
 
 /// Column width in meters.
 ///
-/// This is an explicit layout constraint, not just an estimate. Panel width is
-/// budgeted from this value via `MAX_LAYOUT_WIDTH`, and each column is sized to
-/// this width in the layout tree.
+/// This width is applied, not approximated: panel width is budgeted from it via
+/// `MAX_LAYOUT_WIDTH`, and each column is sized to this width in the layout tree.
 const COLUMN_WIDTH: f32 = 1.0;
 /// Layout height per panel (meters).
 const LAYOUT_HEIGHT: f32 = 2.0;
@@ -168,7 +167,7 @@ const SOURCE_TEXT: &str = "bevy diegetic layout engine text rendering msdf atlas
 #[derive(Resource, Default)]
 struct StressControls {
     row_count:        usize,
-    /// Target row count — the row count we're animating toward.
+    /// Target row count — the count `row_count` animates toward.
     /// When `target > row_count`, rows are added at [`ROWS_PER_FRAME`].
     /// When `target < row_count`, rows are removed at [`ROWS_PER_FRAME`].
     target_row_count: usize,
@@ -203,7 +202,8 @@ struct PerfSnapshot {
     text_ms:   f32,
 }
 
-/// Tracks the last displayed status values so we only rebuild when they change.
+/// The last displayed status values, so the overlay tree is rebuilt only when a
+/// shown value changes.
 #[derive(Resource, Default)]
 struct LastDisplayedStatus {
     text: String,

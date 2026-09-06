@@ -16,9 +16,9 @@
 //! - `F` — toggle the standalone font-unit override: `Points` / inherit.
 //! - `H` — home the camera.
 //!
-//! `G` and `U` intentionally affect the world content only. Screen panels
-//! author stable panel values so rendering-focused global defaults cannot make
-//! example controls hard to read.
+//! `G` and `U` affect the world content only. Screen panels author stable panel
+//! values so rendering-focused global defaults cannot make example controls hard
+//! to read.
 
 use bevy::prelude::AlphaMode;
 use bevy::prelude::Assets;
@@ -210,7 +210,7 @@ fn main() {
         .init_resource::<HudSnapshotCache>()
         .add_systems(Startup, setup)
         // Each cascade toggle runs through Fairy Dust's shortcut binding, which
-        // fires only when no modifier is held — so bare `L` no longer also fires
+        // fires only when no modifier is held — so bare `L` does not also fire
         // on the `Ctrl+Shift+L` screen-panel chord.
         .with_shortcut(KeyCode::KeyG, cycle_global_alpha)
         .with_shortcut(KeyCode::KeyU, cycle_global_unit)

@@ -740,7 +740,7 @@ fn two_grow_children_split_evenly_vertical() {
 fn grow_with_min_max() {
     let mut b = LayoutBuilder::new(200.0, 100.0);
     b.with(El::row().width(Sizing::GROW).height(Sizing::GROW), |b| {
-        // This child wants to grow but is capped at 60.
+        // This child is Grow, capped at 60.
         b.with(
             El::new()
                 .width(Sizing::grow_range(0.0, 60.0))
@@ -784,8 +784,8 @@ fn fit_wraps_text_content() {
 fn fit_root_with_direct_text_child_resolves_width() {
     // Mirrors the WorldText / ScreenText one-element sugar: a Fit x Fit root
     // holding a single Fit text child directly (no intermediate El). The other
-    // fit tests wrap text in a Grow/fixed El, so this direct-text-leaf case was
-    // never exercised — it produced a zero-width root.
+    // fit tests wrap text in a Grow/fixed El, so this is the only coverage of a
+    // direct text leaf under a Fit root.
     let font_size = 16.0;
     let text = "Hello";
     let mut b = LayoutBuilder::with_root(El::new().width(Sizing::FIT).height(Sizing::FIT));
@@ -2745,8 +2745,8 @@ fn fit_parent_sees_grow_children_content_height() {
     let title_font_size = 7.0;
     let subtitle_font_size = 4.0;
     let text_row_height = line_height(title_font_size);
-    // Reproduces the header vertical-centering bug: a Fit-height parent
-    // with Grow-height children that contain text. The Fit parent must
+    // The header vertical-centering case: a Fit-height parent with
+    // Grow-height children that contain text. The Fit parent must
     // propagate the children's content size upward so it gets a real
     // height, not collapse to the spacer's 1.0.
     //
@@ -2806,22 +2806,19 @@ fn fit_parent_sees_grow_children_content_height() {
 
 // ── Clay parity: minDimensions propagation ────────────────────────────────
 //
-// Clay tracks a propagated `minDimensions` field on every element — the
-// recursive minimum size derived from nested content. Our engine does not
-// track this yet. These tests encode Clay's correct behavior and will fail
-// until we implement `minDimensions`.
+// Clay propagates a `minDimensions` field on every element — the recursive
+// minimum size derived from nested content. These tests assert this engine
+// matches it: compression and cross-axis sizing both floor a child at its
+// propagated content minimum.
 
 #[test]
 fn compression_respects_content_minimum_symmetric() {
     // Two Fit siblings each containing a Fixed(50) child in an 80-wide parent.
     // Total content = 100, overflow = 20.
     //
-    // Clay: `minDimensions` = 50 for each Fit wrapper (propagated from the
-    // Fixed child). Compression cannot reduce either below 50. Both stay at
-    // 50 — the parent overflows by 20.
-    //
-    // Our engine: `min_size()` = 0 (default Fit), so compression squashes
-    // both to 40.
+    // `minDimensions` = 50 for each Fit wrapper (propagated from the Fixed
+    // child), so compression cannot reduce either below 50. Both stay at 50 and
+    // the parent overflows by 20.
     let mut b = LayoutBuilder::new(80.0, 100.0);
     b.with(El::row().width(Sizing::GROW).height(Sizing::GROW), |b| {
         b.with(El::new().width(Sizing::FIT).height(Sizing::GROW), |b| {
@@ -2863,11 +2860,9 @@ fn compression_respects_content_minimum_asymmetric() {
     // Fit child A has Fixed(60) content, Fit child B has Fixed(30). Parent is 80.
     // Total = 90, overflow = 10.
     //
-    // Clay: A has `minDimensions` = 60, B has `minDimensions` = 30. Compression
-    // targets the largest (A at 60) but `minDimensions` prevents any reduction.
+    // A has `minDimensions` = 60, B has `minDimensions` = 30. Compression
+    // targets the largest (A at 60), but `minDimensions` blocks any reduction.
     // Both stay at their content size.
-    //
-    // Our engine: compresses A from 60 to 50 (largest-first, 10px distributed).
     let mut b = LayoutBuilder::new(80.0, 100.0);
     b.with(El::row().width(Sizing::GROW).height(Sizing::GROW), |b| {
         b.with(El::new().width(Sizing::FIT).height(Sizing::GROW), |b| {
@@ -2907,10 +2902,9 @@ fn cross_axis_grow_respects_content_minimum() {
     // Layout: TopToBottom parent (30 wide), Grow-width child containing
     // a Fixed(50) inner element.
     //
-    // Clay: cross-axis sets Grow to `MIN(parent-padding, max)` = 30, then
-    // applies `MAX(minDimensions=50, 30)` = 50. Content minimum wins.
-    //
-    // Our engine: Grow fills parent = 30. No content floor.
+    // Cross-axis sizing sets Grow to `MIN(parent-padding, max)` = 30, then
+    // applies `MAX(minDimensions=50, 30)` = 50, so the content minimum is the
+    // resulting width.
     let mut b = LayoutBuilder::new(30.0, 100.0);
     b.with(El::column().width(Sizing::GROW).height(Sizing::GROW), |b| {
         b.with(El::new().width(Sizing::GROW).height(Sizing::GROW), |b| {
@@ -2936,10 +2930,11 @@ fn cross_axis_grow_respects_content_minimum() {
 
 #[test]
 fn grow_body_compression_20_rows() {
-    // Reproduces the benchmark parity failure: root 160x160, TopToBottom,
-    // with header(Grow 10..20), divider(Fixed 4), body(Grow).
+    // The benchmark parity case: root 160x160, TopToBottom, with
+    // header(Grow 10..20), divider(Fixed 4), body(Grow).
     // 20 rows of text overflow the available space. Clay keeps body at its
-    // content height (248), header at content height (18). We should match.
+    // content height (248) and header at content height (18); this asserts the
+    // same values.
     let size = 160.0_f32;
     let measure = monospace_measure();
 
@@ -3023,7 +3018,7 @@ fn grow_body_compression_20_rows() {
     // Body: GROW, 20 rows of text → content height 248.
     // Content overflows the panel (18 + 4 + 248 = 270 > 134). The layout
     // engine keeps the content height rather than compressing the body;
-    // render-side systems decide what is visible in the current viewport.
+    // render-side systems clip the overflow.
     let header = &result.computed[1];
     let divider = &result.computed[8];
     let body = &result.computed[9];

@@ -244,7 +244,7 @@ fn panel_surface_bounds(result: &LayoutResult) -> Option<BoundingBox> {
 ///
 /// Screen panels resolve their own dynamic sizing earlier in the pipeline
 /// via `position_screen_space_panels` + `resolve_screen_axis`, so this
-/// system intentionally only touches world panels.
+/// system only touches world panels.
 pub(super) fn resolve_world_panel_fit(
     mut panels: Query<(
         Entity,

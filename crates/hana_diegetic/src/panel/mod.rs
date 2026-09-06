@@ -41,12 +41,10 @@ pub use arrangement::ArrangedPanel;
 use bevy::ecs::schedule::ApplyDeferred;
 use bevy::ecs::schedule::common_conditions::resource_exists;
 use bevy::prelude::App;
-use bevy::prelude::AppGizmoBuilder;
 use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::ObserverSystemExt;
 use bevy::prelude::Plugin;
 use bevy::prelude::PostUpdate;
-use bevy::prelude::Startup;
 use bevy::prelude::SystemSet;
 use bevy::prelude::Update;
 use bevy::transform::TransformSystems;
@@ -92,10 +90,10 @@ pub use events::PanelDimensionsChanged;
 pub(crate) use events::trigger_panel_dimensions_changed;
 pub(crate) use field::PanelFieldPresentation;
 pub use field::PanelFieldRecord;
-pub use gizmos::DiegeticPanelGizmoGroup;
 pub use gizmos::ShowTextGizmos;
 use hana_valence::AnchorResolveDiagnostics;
 use hana_valence::AnchorSystems;
+use hana_valence::HingePlugin;
 pub(crate) use lifecycle::PanelComponentOwnership;
 pub(crate) use lifecycle::PanelOwned;
 pub(crate) use lifecycle::PanelRenderLayersOwnership;
@@ -233,7 +231,11 @@ pub struct HeadlessLayoutPlugin;
 
 impl Plugin for HeadlessLayoutPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(DiagnosticsPlugin)
+        // Panels hinge onto panels, so this crate owns the hinge driver
+        // rather than leaving every application to remember it. `HingePlugin`
+        // needs neither assets nor scenes, so it composes headlessly.
+        app.add_plugins(HingePlugin)
+            .add_plugins(DiagnosticsPlugin)
             .add_plugins(cascade::cascade_plugin::<FontUnit>())
             // `HeadlessLayoutPlugin` registers the attribute cascades because
             // `DiegeticPanel` participates even when `RenderPlugin` is absent.
@@ -289,7 +291,7 @@ impl Plugin for HeadlessLayoutPlugin {
                         .before(TransformSystems::Propagate),
                     PanelSystems::AnimateAnchorPose
                         .in_set(AnchorSystems::AnimatePose)
-                        .before(hana_valence::hinge_to_pose),
+                        .before(AnchorSystems::HingeToPose),
                 ),
             )
             .add_systems(
@@ -317,12 +319,10 @@ pub(crate) struct PanelPlugin;
 impl Plugin for PanelPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ShowTextGizmos>()
-            .init_gizmo_group::<DiegeticPanelGizmoGroup>()
             .configure_sets(
                 Update,
                 PanelSystems::RenderGizmos.after(PanelSystems::ResolveWorldFit),
             )
-            .add_systems(Startup, gizmos::configure_panel_gizmos)
             .add_systems(
                 Update,
                 gizmos::render_debug_gizmos.in_set(PanelSystems::RenderGizmos),

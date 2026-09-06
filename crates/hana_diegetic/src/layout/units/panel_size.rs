@@ -2,7 +2,7 @@ use super::paper_size::PaperSize;
 use super::unit::HasUnit;
 use super::unit::Unit;
 
-/// Trait for types that can provide panel dimensions with their unit.
+/// Panel dimensions together with the unit they are expressed in.
 ///
 /// Returns `(width, height, unit)` where width and height are in the
 /// returned unit's coordinate space.

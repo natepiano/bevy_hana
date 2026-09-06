@@ -66,7 +66,7 @@ struct FairyDustAutoCascade;
 pub struct FairyDustStudioLightingSet;
 
 /// Configuration consumed by the studio-lighting startup system. Defaults
-/// match the original hard-coded rig; builder methods on
+/// match Fairy Dust's built-in rig; builder methods on
 /// [`crate::builder::StudioLightingBuilder`] override individual fields.
 #[derive(Resource, Clone, Copy)]
 pub(crate) struct StudioLightingConfig {

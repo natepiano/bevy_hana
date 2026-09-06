@@ -549,6 +549,9 @@ fn folded_separately(first: Entity, second: Entity) -> FoldGroups {
 }
 
 fn folding_arrangement(world: &mut World) -> Entity {
+    // Materialization writes baseline hinges, and `Hinge`'s hook refuses a
+    // world with no driver; an `App` would install `HingePlugin` for us.
+    world.insert_resource(crate::hinge::Pintle::installed());
     let controller = world.spawn_empty().id();
     let members = valid(ArrangementMemberEntities::try_new(
         FoldingProvider

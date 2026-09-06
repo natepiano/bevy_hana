@@ -452,9 +452,8 @@ fn build_one_element_tree(text: &str, style: &TextStyle, wrap_width: Option<f32>
     // The root must carry the sizing the panel resolves to: `Fit` width
     // (shrink-wrap to the text) when there is no wrap width, or a fixed wrap
     // width; height is always `Fit`. This root sizing must match what
-    // `DiegeticPanel::build` produces — a `Fixed(0, 0)` root (the old
-    // `LayoutBuilder::new(0.0, 0.0)`) overwrites the panel's `Fit` root and
-    // collapses the measured width to zero.
+    // `DiegeticPanel::build` produces — a `Fixed(0, 0)` root overwrites the
+    // panel's `Fit` root and collapses the measured width to zero.
     let width = wrap_width.map_or(Sizing::FIT, Sizing::fixed);
     let mut builder = LayoutBuilder::with_root(El::new().width(width).height(Sizing::FIT));
     let text = Text::new(text, style.clone());

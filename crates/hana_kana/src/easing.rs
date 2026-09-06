@@ -10,11 +10,12 @@ use bevy_lookup_curve::LookupCurve;
 use bevy_lookup_curve::Tangent;
 use thiserror::Error;
 
-/// Registers shared easing reflection types.
+/// Plugin slot for the shared easing types; `build` adds nothing.
 ///
-/// Every type this module defines is non-generic and uses Bevy's automatic
-/// reflection registration. The plugin remains repeatable for consumer plugin
-/// composition, but owns no assets, resources, or runtime state.
+/// Every type this module defines is non-generic, so Bevy registers its
+/// reflection automatically. The plugin owns no assets, resources, or runtime
+/// state, and `is_unique` returns `false`, so a consumer plugin can add it
+/// beside another that already did.
 pub struct EasingPlugin;
 
 impl Plugin for EasingPlugin {
@@ -206,7 +207,7 @@ impl EasingKnot {
     pub const fn slopes(self) -> EasingSlopes { self.slopes }
 }
 
-/// Whether a curve may remap whole-sequence or multi-stage progress.
+/// Whether a curve may remap a scope's progress onto the position axis.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Reflect)]
 pub enum EasingMapping {
     /// Output stays within `0..=1` and never decreases, so the curve can remap
@@ -370,7 +371,7 @@ impl EasingCurve {
     #[must_use]
     pub fn sample(&self, progress: f32) -> f32 { self.lookup.lookup(progress) }
 
-    /// Returns whether this curve can remap whole-sequence progress.
+    /// Returns whether this curve can remap a scope's progress.
     #[must_use]
     pub const fn mapping(&self) -> EasingMapping { self.mapping }
 
@@ -505,7 +506,7 @@ impl EasingSampler {
         }
     }
 
-    /// Classifies whether `easing` may remap whole-sequence progress.
+    /// Classifies whether `easing` may remap a scope's progress.
     #[must_use]
     pub fn mapping(&self, easing: &Easing) -> EasingMapping {
         match easing {

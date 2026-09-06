@@ -517,8 +517,8 @@ fn merge_levels(levels: &[&Appearance]) -> Appearance {
         .fold(Appearance::new(), |lower, higher| lower.merge_over(higher))
 }
 
-/// Replaces one widget's complete desired presentation override, touching
-/// mutable state only when the component value changes.
+/// Replaces one widget's complete presentation override, taking a mutable
+/// component reference only when the stored value differs from `desired`.
 pub(super) fn write_widget_overrides(
     widget: Entity,
     desired: WidgetVisualOverrides,

@@ -4,122 +4,53 @@ use bevy::platform::time::Instant;
 use bevy::prelude::Component;
 use bevy::prelude::Reflect;
 use bevy::prelude::ReflectComponent;
+use bevy::reflect::ReflectSerialize;
+use serde::Serialize;
+use thiserror::Error;
 
-use crate::ApplyPermit;
-use crate::BindingGeneration;
 use crate::DeviceAccessError;
-use crate::DeviceEndpoint;
-use crate::DeviceId;
-use crate::DeviceRevision;
-use crate::DeviceRevisionLookup;
+use crate::DriverContractError;
+use crate::DriverId;
 use crate::RetryOn;
 use crate::RoleKey;
+use crate::devices::DeviceRevisionLookup;
 use crate::reconcile::FrameClockReading;
 
-/// Identifier issued from the attempt registry's monotonic counter.
-///
-/// An `AttemptId` is never reused while the process runs, so a delayed provider poll cannot
-/// resolve a later attempt after the original attempt has finished.
-///
-/// Reflection sees the counter value opaquely, so a dynamic tuple struct cannot construct an
-/// identifier the registry never issued: a reflected poll for a fabricated attempt would otherwise
-/// resolve against an in-flight record belonging to a different role.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Reflect)]
+/// Public diagnostic identity for one process-local apply attempt.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Serialize, Reflect)]
 #[reflect(opaque)]
-pub struct AttemptId(u64);
+#[reflect(Serialize)]
+pub struct AttemptRef(u64);
 
-impl AttemptId {
+impl AttemptRef {
     /// Wrap the attempt registry's next counter value.
     ///
     /// Private to the crate because only `crate::Attempts` issues identifiers; a driver that could
-    /// mint one would be claiming an authorization the kernel never granted.
+    /// fabricate one would be claiming an authorization the kernel never granted.
     pub(crate) const fn new(value: u64) -> Self { Self(value) }
 
-    /// Read back the counter value this identifier wraps.
-    ///
-    /// Crate-private and used by `crate::Attempts` alone, so the registry can reclaim an identifier
-    /// it minted for a dispatch that never committed. Nothing outside the registry has a reason to
-    /// see the number: comparing identifiers is what every other caller does.
-    pub(crate) const fn value(self) -> u64 { self.0 }
+    /// Return the attempt registry's process-local number.
+    #[must_use]
+    pub const fn get(self) -> u64 { self.0 }
 }
 
-/// One in-flight endpoint operation and the authorization it was started under.
-///
-/// The record exists so every poll can re-answer "is this still the unit the kernel authorized?"
-/// without trusting the driver's own bookkeeping. Both re-checked fields are copied in at
-/// authorization time rather than read live, because a driver that reported against a replaced unit
-/// would otherwise look correct.
-#[derive(Clone, Debug, Reflect)]
-pub struct Attempt {
-    /// Registry-issued identifier the driver echoes back on every poll and completion.
-    pub id:                 AttemptId,
-    /// Application role this operation is running for, so a completion reaches the binding entity
-    /// that outlives the device.
-    pub role:               RoleKey,
-    /// Durable endpoint the operation addresses, retained so a poll can be compared with current
-    /// resolution rather than with whatever the driver believes it opened.
-    pub endpoint:           DeviceEndpoint,
-    /// The generation of the binding this attempt was dispatched for, stamped at authorization
-    /// time like the fields above. An attempt ending is only allowed to touch the binding
-    /// generation named here: `crate::Bindings::record_attempt_ending` refuses a stale ending, so
-    /// an attempt that outlives its binding cannot gate or fail-count the replacement.
-    pub binding_generation: BindingGeneration,
-    /// The authorisation this attempt was minted under. The kernel mints one value and both stores
-    /// it here and hands it to the driver, so there is no second copy that could disagree.
-    pub permit:             ApplyPermit,
-    /// The identity this attempt was authorised against.
-    /// Re-checked on every poll; a mismatch invalidates it.
-    pub expected_device_id: DeviceId,
-    /// This device's own revision at authorisation. A newer one invalidates.
-    ///
-    /// Per device rather than `crate::RiggingRevision`: the global counter advances on every pass
-    /// in which any reporter completed a scan, so validating against it would let one
-    /// reporter's routine scan abandon every attempt in the kernel, including attempts on
-    /// devices that reporter never names.
-    pub device_revision:    DeviceRevision,
-    /// Bounds the attempt end to end, not per step.
-    ///
-    /// `bevy_platform::time::Instant` rather than `std::time::Instant` because this record is
-    /// reflected and only the bevy type carries a `Reflect` impl; on native targets it is a
-    /// re-export of the std type, so call sites are unchanged.
-    pub deadline:           Instant,
-}
-
-/// Progress returned by a provider while the kernel polls an attempt.
-///
-/// Splitting the in-progress state from `AttemptOutcome` prevents a completion event from
-/// carrying `Pending` as though the attempt had ended.
+/// Terminal result reported through one typed attempt completion.
 #[derive(Clone, PartialEq, Eq, Debug, Reflect)]
-pub enum AttemptProgress {
-    /// The provider has not yet observed the requested configuration at its destination.
-    Pending,
-    /// The provider observed a terminal result for this attempt.
-    Finished(AttemptOutcome),
-}
-
-/// Terminal result reported by a provider for one attempt.
-///
-/// `Aborted` is terminal and does not auto-retry because the kernel uses it when an attempt no
-/// longer has authorization to continue, such as after a device departure or a safety gate
-/// closes.
-#[derive(Clone, PartialEq, Eq, Debug, Reflect)]
-pub enum AttemptOutcome {
-    /// The device reached the requested configuration, including a provider-defined tolerance.
-    Succeeded,
-    /// The driver started but the device or platform rejected continued access.
+pub enum DriverOutcomeStatus {
+    /// The driver established a configuration and named its relation to the dispatched value.
+    Succeeded(crate::AppliedKind),
+    /// The device or platform rejected continued access.
     Failed(DeviceAccessError),
-    /// The kernel stopped an attempt that must not continue or retry automatically.
-    Aborted,
-    /// The provider reached a different device or endpoint than the one the attempt addressed.
-    Substituted,
+    /// The driver ended a started operation for a typed client-owned reason.
+    Aborted(crate::DriverAbortReason),
 }
 
 /// Why an in-flight attempt may not continue.
 ///
-/// Named rather than a flag because the reasons finish the attempt differently: an abandoned
-/// attempt is `AttemptOutcome::Aborted` and never auto-retries, while a role that no longer exists
-/// has no binding left to move. Only `Self::RevisionAdvanced` consults `crate::OnAbort` — a lost
-/// claim makes reversion impossible and a deferred veto makes it unsafe.
+/// Named rather than a flag because the reasons finish the attempt differently: a revision advance
+/// authorizes a successor against the new revision, while a role that no longer exists has no
+/// binding left to move. Only `Self::RevisionAdvanced` consults `crate::OnAbort` — a lost claim
+/// makes reversion impossible and a deferred veto makes it unsafe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Reflect)]
 pub enum AttemptInvalidation {
     /// The device the attempt was authorized against is no longer the one the endpoint resolves to,
@@ -156,25 +87,83 @@ pub enum AttemptInvalidation {
     /// `crate::BindingGeneration` no longer matches the installed binding's. The replacement's own
     /// dispatch carries the new generation, so it can never select itself here.
     BindingReplaced,
+    /// The erased driver boundary failed before any typed [`EndpointDriver`](crate::EndpointDriver)
+    /// method could run for this attempt: the downcast found no registered driver for the id, or a
+    /// driver or configuration type that differs from the one the dispatch functions were built
+    /// for. No driver callback ran, so nothing was started that needs undoing.
+    DriverContractFailed,
 }
 
-/// The most recent attempt ending for a role, mirrored onto its binding entity.
+/// The most recent terminal result for a role, mirrored onto its binding entity.
 ///
-/// `crate::RoleState` alone cannot separate a role that is healthily waiting from one whose last
-/// attempt was aborted behind a retry gate that will never reopen. This component names the
-/// ending's outcome and — when the kernel invalidated the attempt — the `AttemptInvalidation`
-/// that says why, so a Bevy Remote Protocol query of the binding entity answers the question
-/// without instrumenting the kernel. The ended `AttemptId` is deliberately not carried: a runtime
-/// identifier registers no serialization, and one unserializable field makes the whole component
-/// unreadable over the remote protocol.
+/// Each variant admits one producer: a driver reports a [`DriverOutcomeStatus`], the kernel
+/// supplies an [`AttemptInvalidation`], and erased dispatch supplies a
+/// [`DriverContractFailureReport`]. Keeping those producers separate prevents a reported ending
+/// from carrying an invalidation and prevents an invalidated ending from omitting its reason.
 #[derive(Component, Clone, PartialEq, Eq, Debug, Reflect)]
 #[reflect(Component, PartialEq)]
-pub struct LastAttemptEnding {
-    /// The terminal result the attempt ended with.
-    pub outcome:      AttemptOutcome,
-    /// Why the kernel invalidated the attempt, for an `AttemptOutcome::Aborted` the abort pass
-    /// produced; `None` for endings a driver reported.
-    pub invalidation: Option<AttemptInvalidation>,
+pub enum AttemptEnding {
+    /// The endpoint driver reported this terminal outcome.
+    Reported(DriverOutcomeStatus),
+    /// Kernel validation ended the attempt for this reason before another driver poll.
+    Invalidated(AttemptInvalidation),
+    /// The erased driver boundary could not complete the typed driver call.
+    ContractFailed(DriverContractFailureReport),
+}
+
+/// Data-only report of one erased driver contract failure.
+///
+/// The report owns all diagnostic text so it can be retained in [`AttemptEnding`] without
+/// borrowing the driver registry or carrying a type-erased error value.
+#[derive(Clone, PartialEq, Eq, Debug, Reflect)]
+pub enum DriverContractFailureReport {
+    /// No endpoint driver registration owns the process-local route.
+    DriverNotRegistered {
+        /// Route that failed to select a registered driver.
+        driver: DriverId,
+    },
+    /// The erased registry entry did not contain the concrete driver type its functions require.
+    DriverTypeMismatch {
+        /// Concrete driver type required by the erased function.
+        expected_driver: String,
+    },
+    /// The retained configuration did not match the registered driver's configuration type.
+    ConfigurationTypeMismatch {
+        /// Concrete configuration type the driver accepts.
+        expected_configuration: String,
+        /// Reflected type path of the retained value.
+        received_configuration: String,
+    },
+    /// A restore request no longer had its checked last-known-good value.
+    LastKnownGoodConfigurationUnavailable {
+        /// Role whose restore value was unavailable.
+        role: RoleKey,
+    },
+}
+
+impl From<DriverContractError> for DriverContractFailureReport {
+    fn from(error: DriverContractError) -> Self {
+        match error {
+            DriverContractError::DriverNotRegistered { driver_id } => {
+                Self::DriverNotRegistered { driver: driver_id }
+            },
+            DriverContractError::DriverTypeMismatch { expected_driver } => {
+                Self::DriverTypeMismatch {
+                    expected_driver: expected_driver.to_owned(),
+                }
+            },
+            DriverContractError::ConfigurationTypeMismatch {
+                expected_configuration,
+                received_configuration,
+            } => Self::ConfigurationTypeMismatch {
+                expected_configuration: expected_configuration.to_owned(),
+                received_configuration,
+            },
+            DriverContractError::LastKnownGoodConfigurationUnavailable { role } => {
+                Self::LastKnownGoodConfigurationUnavailable { role }
+            },
+        }
+    }
 }
 
 /// Where one attempt stands against its own deadline and the kernel's bounded overrun budget.
@@ -184,7 +173,7 @@ pub struct LastAttemptEnding {
 /// tell a healthy attempt from a handle that names nothing. Being overdue is neither an error nor a
 /// failure, so the two overdue variants are separate states rather than one error case.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Reflect)]
-pub(crate) enum AttemptDeadlineStatus {
+enum AttemptDeadlineStatus {
     /// The registry retains no attempt for this identifier, so it either finished or was never
     /// issued. A caller that read this as "not overdue" would keep polling a driver forever.
     NoSuchAttempt,
@@ -192,14 +181,14 @@ pub(crate) enum AttemptDeadlineStatus {
     /// application startup and no elapsed time exists to judge it against.
     WithinDeadline,
     /// The attempt passed its deadline and is still inside `crate::RiggingLimits::apply_overrun`.
-    /// The kernel keeps polling: a projector that is genuinely converging deserves the slack.
+    /// The kernel keeps polling through that budget, so a projector still converging can finish.
     OverdueWithinOverrun {
         /// How far past its own deadline the attempt has run, which is the reading a diagnostic
         /// needs to tell a device that is nearly there from one that has barely started.
         past_deadline: Duration,
     },
     /// The attempt passed `deadline + crate::RiggingLimits::apply_overrun`, so the kernel stops
-    /// asking and finishes it `AttemptOutcome::Aborted`.
+    /// asking and records [`AttemptInvalidation::OverrunExhausted`].
     OverrunExhausted {
         /// How far past its own deadline the attempt ran before the kernel abandoned it.
         past_deadline: Duration,
@@ -263,51 +252,40 @@ impl RetryGate {
     }
 }
 
-/// The most recent configuration a safe readback established on one endpoint.
-///
-/// This enum distinguishes the absence of endpoint evidence from an established driver value.
-/// `RequestedConfiguration` is application intent; it must never fill this value after an apply
-/// because a driver can normalize or substitute the value that actually reached the hardware.
+/// The most recent configuration established by an accepted driver completion.
 #[derive(Default, Reflect)]
 pub enum LastKnownGoodConfiguration {
-    /// No successful safe readback has established what is on this endpoint.
+    /// No accepted success has established what is on this endpoint.
     #[default]
     NotEstablished,
-    /// A safe readback established this driver-specific endpoint value.
-    Known(#[reflect(ignore, default = "default_erased_configuration")] Box<dyn Reflect>),
+    /// The accepted value matches the application-authored request.
+    MatchesRequested,
+    /// The driver established this value instead of the dispatched configuration.
+    DiffersFromDispatched(
+        #[reflect(ignore, default = "default_erased_configuration")] Box<dyn Reflect>,
+    ),
 }
 
 impl LastKnownGoodConfiguration {
-    /// Erase one value returned by a successful safe endpoint readback.
-    #[must_use]
-    pub fn known(configuration: impl Reflect) -> Self { Self::Known(Box::new(configuration)) }
+    pub(crate) const fn is_established(&self) -> bool { !matches!(self, Self::NotEstablished) }
 
-    /// Report whether both sides hold the same established value, so a repeated readback of an
-    /// unchanged endpoint can be dropped instead of rewriting lifecycle state.
-    ///
-    /// A configuration type whose reflection declines to compare values answers `false`, which
-    /// keeps the newer readback.
-    pub(crate) fn holds_same_value(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::NotEstablished, Self::NotEstablished) => true,
-            (Self::Known(held), Self::Known(captured)) => {
-                held.reflect_partial_eq(captured.as_partial_reflect()) == Some(true)
-            },
-            _ => false,
-        }
-    }
-
-    pub(crate) fn as_reflect(&self) -> Result<&dyn Reflect, LastKnownGoodConfigurationAccessError> {
+    pub(crate) fn as_reflect<'a>(
+        &'a self,
+        requested: &'a dyn Reflect,
+    ) -> Result<&'a dyn Reflect, LastKnownGoodConfigurationAccessError> {
         match self {
             Self::NotEstablished => Err(LastKnownGoodConfigurationAccessError::NotEstablished),
-            Self::Known(configuration) => Ok(configuration.as_ref()),
+            Self::MatchesRequested => Ok(requested),
+            Self::DiffersFromDispatched(configuration) => Ok(configuration.as_ref()),
         }
     }
 }
 
 /// Reason erased dispatch could not borrow a readback value from lifecycle state.
-pub(crate) enum LastKnownGoodConfigurationAccessError {
-    /// No driver readback proved an endpoint value for the binding yet.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum LastKnownGoodConfigurationAccessError {
+    /// No accepted success established an endpoint value for the binding yet.
+    #[error("no accepted driver success has established a configuration")]
     NotEstablished,
 }
 
@@ -325,8 +303,8 @@ mod tests {
     use bevy::reflect::ReflectFromReflect;
     use bevy::reflect::tuple_struct::DynamicTupleStruct;
 
-    use super::AttemptId;
-    use super::LastAttemptEnding;
+    use super::AttemptEnding;
+    use super::AttemptRef;
     use super::LastKnownGoodConfiguration;
 
     #[derive(Debug, PartialEq, Eq, Reflect)]
@@ -346,7 +324,7 @@ mod tests {
     fn the_last_attempt_ending_component_registers_reflection_metadata() {
         let app = App::new();
         let type_registry = app.world().resource::<AppTypeRegistry>().read();
-        let type_id = TypeId::of::<LastAttemptEnding>();
+        let type_id = TypeId::of::<AttemptEnding>();
 
         assert!(type_registry.contains(type_id));
         assert!(
@@ -379,15 +357,21 @@ mod tests {
     }
 
     #[test]
-    fn known_configuration_recovers_the_provider_value_after_erasure() {
+    fn differing_configuration_recovers_the_provider_value_after_erasure() {
         let last_known_good =
-            LastKnownGoodConfiguration::known(ProviderConfiguration { frame_rate: 60 });
+            LastKnownGoodConfiguration::DiffersFromDispatched(Box::new(ProviderConfiguration {
+                frame_rate: 60,
+            }));
 
-        let recovered = last_known_good.as_reflect().ok().and_then(|configuration| {
-            configuration
-                .as_any()
-                .downcast_ref::<ProviderConfiguration>()
-        });
+        let requested = ProviderConfiguration { frame_rate: 30 };
+        let recovered = last_known_good
+            .as_reflect(&requested)
+            .ok()
+            .and_then(|configuration| {
+                configuration
+                    .as_any()
+                    .downcast_ref::<ProviderConfiguration>()
+            });
 
         assert_eq!(recovered, Some(&ProviderConfiguration { frame_rate: 60 }));
     }
@@ -401,10 +385,10 @@ mod tests {
     }
 
     #[test]
-    fn runtime_reflection_cannot_construct_an_attempt_identifier_the_registry_never_issued() {
+    fn runtime_reflection_cannot_construct_an_attempt_reference_the_registry_never_issued() {
         let mut dynamic_attempt = DynamicTupleStruct::default();
         dynamic_attempt.insert(7_u64);
 
-        assert!(AttemptId::from_reflect(&dynamic_attempt).is_none());
+        assert!(AttemptRef::from_reflect(&dynamic_attempt).is_none());
     }
 }

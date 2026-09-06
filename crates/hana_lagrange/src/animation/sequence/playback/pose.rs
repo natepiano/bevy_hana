@@ -181,11 +181,13 @@ pub(in crate::animation::sequence) struct LastAppliedCameraPose(
 
 /// Evaluates one prepared camera move at an already-selected easing path.
 ///
-/// `select_easing` receives the raw interval progress and returns the
-/// producer's decision. Authored stage easing is sampled only when that
-/// decision says it still applies; replacement output skips it. Resting
-/// positions return their captured endpoint exactly, so completion never
-/// re-interpolates a value close to the endpoint.
+/// `select_easing` takes the raw interval progress and returns a
+/// [`SequenceEasingSample`]. `AuthoredEasingApplies` samples the stage's
+/// authored easing at the progress it carries; `AuthoredEasingSuppressed`
+/// uses the producer's own eased value and never touches the authored easing;
+/// `CurveRejected` fails the evaluation. Resting positions return their
+/// captured endpoint exactly, so completion never re-interpolates a value
+/// close to the endpoint.
 pub(super) fn evaluate_camera_pose(
     sample: CameraMoveSample<'_>,
     select_easing: impl FnOnce(f32) -> SequenceEasingSample,

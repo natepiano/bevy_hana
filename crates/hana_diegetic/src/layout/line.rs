@@ -1,4 +1,4 @@
-//! Authored panel-local line primitives.
+//! Authored panel-local line and rectangle primitives.
 
 use bevy::asset::Handle;
 use bevy::color::Color;

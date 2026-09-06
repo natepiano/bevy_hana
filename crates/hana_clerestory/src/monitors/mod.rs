@@ -1,16 +1,18 @@
 mod current_monitor;
-mod device_association;
 mod display_product_name;
 mod identity;
+mod live_display_endpoint;
 #[cfg(feature = "monitor-probe")]
 mod monitor_probe;
 mod topology;
 
+use bevy::ecs::reflect::ReflectResource;
 use bevy::prelude::App;
 use bevy::prelude::ApplyDeferred;
 use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::Plugin;
 use bevy::prelude::PreStartup;
+use bevy::prelude::Reflect;
 use bevy::prelude::Res;
 use bevy::prelude::ResMut;
 use bevy::prelude::Resource;
@@ -19,15 +21,12 @@ use bevy::prelude::resource_changed;
 use bevy::prelude::warn;
 use bevy::winit::WinitMonitors;
 pub use current_monitor::CurrentMonitor;
+pub(crate) use current_monitor::CurrentMonitorEntity;
 use current_monitor::clear_monitor_selection_inputs;
 pub(crate) use current_monitor::current_monitor_from_association;
 pub(crate) use current_monitor::exact_monitor_association;
 pub(crate) use current_monitor::install_current_monitor_from_association;
 pub(crate) use current_monitor::update_current_monitor;
-pub use device_association::MonitorDeviceAssociation;
-pub use device_association::MonitorDeviceKeyLookup;
-pub(crate) use device_association::MonitorDeviceLookup;
-pub use device_association::MonitorReportedHandleLookup;
 pub use display_product_name::DisplayProductName;
 use hana_rigging::prelude::AuthoritativeReporterCoverage;
 use hana_rigging::prelude::CoveredDeviceIdentitySpace;
@@ -38,21 +37,25 @@ use hana_rigging::prelude::ReporterCoverage;
 use hana_rigging::prelude::ReporterId;
 use hana_rigging::prelude::ReporterRegistration;
 use hana_rigging::prelude::RiggingAppExt;
+pub use identity::DisplayFingerprint;
+pub use identity::DisplayIdentity;
+pub(crate) use identity::DisplayIdentityEvidence;
 use identity::MonitorConfiguration;
-#[cfg(any(test, feature = "test"))]
-pub(crate) use identity::PanelFingerprint;
-pub(crate) use identity::PanelIdentity;
-pub(crate) use identity::PanelIdentityEvidence;
+pub use live_display_endpoint::LiveDisplayContradictionCount;
+pub use live_display_endpoint::LiveDisplayDevices;
+pub use live_display_endpoint::LiveDisplayEndpoint;
+pub use live_display_endpoint::LiveDisplayEndpointLookup;
+pub use live_display_endpoint::LiveDisplayMatchError;
+pub use live_display_endpoint::LiveDisplayMonitor;
 pub use topology::CurrentMonitorIndex;
 pub(crate) use topology::DisplayDeviceEvidence;
 pub(crate) use topology::DisplayTopologyObservation;
 pub(crate) use topology::EnumeratedDisplayEvidence;
-#[cfg(test)]
+#[cfg(any(test, feature = "test"))]
 pub(crate) use topology::InjectedMonitorEvidence;
-#[cfg(test)]
+#[cfg(any(test, feature = "test"))]
 pub(crate) use topology::InjectedWinitMonitorOrder;
 pub use topology::LiveMonitor;
-#[cfg(test)]
 pub(crate) use topology::MonitorConnected;
 pub use topology::MonitorDescriptor;
 #[cfg(test)]
@@ -68,9 +71,9 @@ use crate::Platform;
 use crate::constants::MONITOR_DISCOVERY_BACKSTOP;
 #[cfg(any(test, feature = "test"))]
 use crate::display_test_adapter;
-use crate::reporter;
 #[cfg(any(test, feature = "test"))]
-use crate::reporter::InjectedFreshWinitDisplays;
+use crate::display_test_adapter::DisplayTestAdapterInstallation;
+use crate::reporter;
 use crate::reporter::MonitorReporter;
 
 /// Plugin that manages the `Monitors` resource.
@@ -78,6 +81,12 @@ pub(crate) struct MonitorPlugin;
 
 impl Plugin for MonitorPlugin {
     fn build(&self, app: &mut App) {
+        #[cfg(any(test, feature = "test"))]
+        let display_enumeration_source = display_enumeration_source_for_test_adapter_installation(
+            display_test_adapter::DisplayTestAdapter::installation(app.world()),
+        );
+        #[cfg(not(any(test, feature = "test")))]
+        let display_enumeration_source = DisplayEnumerationSource::LiveWinit;
         let configuration = MonitorConfiguration::register(*app.world().resource::<Platform>());
         if let Ok(edid_serial_scheme) = reporter::edid_serial_scheme() {
             app.register_device_scheme(edid_serial_scheme);
@@ -93,19 +102,15 @@ impl Plugin for MonitorPlugin {
                         kind: DeviceKind::Display,
                     },
                 )),
+                std::time::Duration::from_secs(10),
             ),
         );
         app.insert_resource(configuration)
-            .insert_resource(MonitorReporterId(monitor_reporter_id))
-            .init_resource::<MonitorDeviceAssociation>()
+            .insert_resource(display_enumeration_source)
+            .insert_resource(MonitorReporterId::new(monitor_reporter_id))
             .init_resource::<DisplayTopologyObservation>()
             .add_observer(clear_monitor_selection_inputs)
             .add_observer(install_current_monitor_from_association)
-            .add_systems(
-                PreStartup,
-                refresh_monitor_device_association
-                    .after(ClerestoryPreStartupSet::MonitorsInitialized),
-            )
             .add_systems(
                 PreStartup,
                 init_monitors.in_set(ClerestoryPreStartupSet::MonitorsInitialized),
@@ -115,7 +120,6 @@ impl Plugin for MonitorPlugin {
                 (
                     update_monitors,
                     ApplyDeferred,
-                    refresh_monitor_device_association,
                     mark_monitor_reporter_dirty.run_if(resource_changed::<MonitorTopologyRevision>),
                 )
                     .chain()
@@ -128,8 +132,6 @@ impl Plugin for MonitorPlugin {
                     .in_set(ClerestoryUpdateSet::CurrentMonitor),
             );
         #[cfg(any(test, feature = "test"))]
-        app.init_resource::<InjectedFreshWinitDisplays>();
-        #[cfg(any(test, feature = "test"))]
         display_test_adapter::install_scripted_display_topology(app);
     }
 
@@ -141,13 +143,51 @@ impl Plugin for MonitorPlugin {
     }
 }
 
-/// Keep the exact reporter-key bridge aligned with the installed monitor topology.
-fn refresh_monitor_device_association(
-    monitors: Res<Monitors>,
-    mut association: ResMut<MonitorDeviceAssociation>,
-) {
-    association.refresh(&monitors);
+/// Compile-time witness that production display enumeration selects live winit.
+#[cfg(not(test))]
+#[doc(hidden)]
+pub struct LiveWinitProductionBackendSelection;
+
+/// Display enumeration source selected when `MonitorPlugin` is installed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Reflect, Resource)]
+#[reflect(Resource)]
+#[type_path = "hana_clerestory::monitors"]
+pub enum DisplayEnumerationSource {
+    /// The production reporter reads the current display list from winit.
+    LiveWinit,
+    /// A caller explicitly installed `DisplayTestAdapter`.
+    ExplicitTestAdapter,
+    /// The injected display resource exists without an explicitly installed adapter.
+    InjectedWithoutExplicitAdapter,
+    /// The adapter resource exists without its injected display resource.
+    ExplicitAdapterWithoutInjectedSource,
 }
+
+#[cfg(any(test, feature = "test"))]
+const fn display_enumeration_source_for_test_adapter_installation(
+    display_test_adapter_installation: DisplayTestAdapterInstallation,
+) -> DisplayEnumerationSource {
+    match display_test_adapter_installation {
+        DisplayTestAdapterInstallation::ExplicitlyInstalled => {
+            DisplayEnumerationSource::ExplicitTestAdapter
+        },
+        DisplayTestAdapterInstallation::NotInstalled => DisplayEnumerationSource::LiveWinit,
+        DisplayTestAdapterInstallation::InjectedWithoutExplicitAdapter => {
+            DisplayEnumerationSource::InjectedWithoutExplicitAdapter
+        },
+        DisplayTestAdapterInstallation::ExplicitAdapterWithoutInjectedSource => {
+            DisplayEnumerationSource::ExplicitAdapterWithoutInjectedSource
+        },
+    }
+}
+
+#[cfg(all(feature = "test", not(test)))]
+const _: () = assert!(matches!(
+    display_enumeration_source_for_test_adapter_installation(
+        display_test_adapter::DisplayTestAdapterInstallation::NotInstalled,
+    ),
+    DisplayEnumerationSource::LiveWinit,
+));
 
 /// Process-local handle the rigging kernel issued for [`MonitorReporter`].
 ///
@@ -157,8 +197,16 @@ fn refresh_monitor_device_association(
 #[derive(Resource)]
 pub(crate) struct MonitorReporterId(ReporterId);
 
-#[cfg(any(test, feature = "test"))]
 impl MonitorReporterId {
+    /// Name the reporter the window driver resolves its display capability under.
+    ///
+    /// `MonitorPlugin` inserts this resource for the reporter it registers, which is the only
+    /// producer in production. A test that drives the driver under a reporter of its own —
+    /// the conformance walk's scripted reporter — overrides the resource with this, so
+    /// `resolve_target`, which reads it at call time, resolves the capability the walk publishes
+    /// rather than the one the shipped monitor reporter publishes beside it.
+    pub(crate) const fn new(reporter: ReporterId) -> Self { Self(reporter) }
+
     /// Kernel handle the display reporter was registered under.
     pub(crate) const fn get(&self) -> ReporterId { self.0 }
 }
@@ -187,7 +235,7 @@ impl MonitorDiscoveryRequestCoverage {
 ///
 /// `MonitorTopologyRevision` advances only when the operating system's display-configuration path
 /// produced a real change, so this is the notification the `DiscoveryCadence::EventDriven`
-/// registration expects. Without it a reconnected panel would wait out the backstop.
+/// registration relies on. Without it a reconnected display would wait out the backstop.
 fn mark_monitor_reporter_dirty(
     revision: Res<MonitorTopologyRevision>,
     monitor_reporter_id: Res<MonitorReporterId>,
@@ -218,8 +266,9 @@ mod tests {
     use bevy::winit::WinitPlugin;
     use hana_rigging::prelude::CompletedDiscoveryOutcome;
     use hana_rigging::prelude::DiscoveryFinished;
-    use hana_rigging::prelude::DiscoveryStatus;
-    use hana_rigging::prelude::ReporterActivity;
+    use hana_rigging::prelude::FirstCompleteSetStatus;
+    use hana_rigging::prelude::ReporterActivityView;
+    use hana_rigging::prelude::ReporterHealth;
     use hana_rigging::prelude::RiggingPlugin;
     use hana_rigging::prelude::RiggingSystems;
     use hana_rigging::prelude::StartupDiscoveryChanged;
@@ -228,6 +277,7 @@ mod tests {
     use topology::InjectedWinitMonitorOrder;
 
     use super::*;
+    use crate::reporter::InjectedFreshWinitDisplays;
 
     const IDLE_UPDATES: usize = 3;
     const TOPOLOGY_CHANGE_UPDATES: usize = 4;
@@ -318,7 +368,13 @@ mod tests {
             match RESULT.get() {
                 Some(Ok(())) => {},
                 Some(Err(message)) => panic!("{message}"),
-                None => panic!("macOS main-thread WinitPlugin contract did not run"),
+                None => panic!(
+                    "the main-thread WinitPlugin contract did not run. It is started by a \
+                     `__mod_init_func` initializer that looks for this test's name in the \
+                     process arguments, so it only runs under a runner that gives each test \
+                     its own process. Use `cargo nextest run`, which is what CI uses; a plain \
+                     `cargo test` over the whole crate reaches here instead"
+                ),
             }
         }
     }
@@ -387,6 +443,7 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(Platform::X11)
             .insert_resource(WinitMonitors::default())
+            .init_resource::<InjectedFreshWinitDisplays>()
             .init_resource::<InjectedMonitorEvidence>()
             .init_resource::<InjectedWinitMonitorOrder>()
             .init_resource::<DiscoveryLifecycleObservations>()
@@ -417,37 +474,34 @@ mod tests {
     }
 
     fn completed_batches(app: &App, reporter_id: ReporterId) -> u64 {
-        let reporter_status = app
-            .world()
-            .resource::<DiscoveryStatus>()
-            .reporter_status(reporter_id);
-        assert!(reporter_status.is_ok());
-        reporter_status
-            .ok()
-            .map_or(0, |reporter_status| reporter_status.completed_batches)
+        reporter_health(app, reporter_id).map_or(0, ReporterHealth::completed_runs)
+    }
+
+    fn reporter_health(app: &App, reporter_id: ReporterId) -> Option<&ReporterHealth> {
+        app.world()
+            .iter_entities()
+            .filter_map(|entity| entity.get::<ReporterHealth>())
+            .find(|health| health.belongs_to(reporter_id))
     }
 
     fn assert_reporter_lifecycle(reporter_collection_order: ReporterCollectionOrder) {
         let mut app = monitor_reporter_app(reporter_collection_order);
         let reporter_id = app.world().resource::<MonitorReporterId>().0;
         assert!(matches!(
-            app.world().resource::<DiscoveryStatus>().startup,
-            StartupDiscoveryState::Discovering
+            reporter_health(&app, reporter_id).map(ReporterHealth::first_complete_set),
+            Some(FirstCompleteSetStatus::Waiting(_))
         ));
 
         app.update();
         assert!(matches!(
-            app.world()
-                .resource::<DiscoveryStatus>()
-                .reporter_status(reporter_id),
-            Ok(reporter_status)
-                if matches!(&reporter_status.activity, ReporterActivity::Queued { .. })
+            reporter_health(&app, reporter_id).map(ReporterHealth::activity),
+            Some(ReporterActivityView::Queued { .. })
         ));
         app.update();
 
         assert!(matches!(
-            app.world().resource::<DiscoveryStatus>().startup,
-            StartupDiscoveryState::Ready
+            reporter_health(&app, reporter_id).map(ReporterHealth::first_complete_set),
+            Some(FirstCompleteSetStatus::Completed { .. })
         ));
         assert_eq!(completed_batches(&app, reporter_id), 1);
         {
@@ -466,15 +520,22 @@ mod tests {
             assert_eq!(observations.startup, [StartupDiscoveryState::Ready]);
         }
 
-        app.world_mut().spawn(Monitor {
-            name:                    None,
-            physical_height:         1_080,
-            physical_width:          1_920,
-            physical_position:       IVec2::ZERO,
-            refresh_rate_millihertz: None,
-            scale_factor:            1.0,
-            video_modes:             Vec::new(),
-        });
+        let monitor_entity = app
+            .world_mut()
+            .spawn(Monitor {
+                name:                    None,
+                physical_height:         1_080,
+                physical_width:          1_920,
+                physical_position:       IVec2::ZERO,
+                refresh_rate_millihertz: None,
+                scale_factor:            1.0,
+                video_modes:             Vec::new(),
+            })
+            .id();
+        app.world_mut()
+            .resource_mut::<InjectedFreshWinitDisplays>()
+            .entities
+            .push(monitor_entity);
         for _ in 0..TOPOLOGY_CHANGE_UPDATES {
             app.update();
         }

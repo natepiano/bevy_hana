@@ -14,8 +14,8 @@ use crate::render::draw_order::DrawZIndexRank;
 pub struct PanelTextLayout {
     /// Panel-local id of the source text run, plus the line ordinal within that
     /// run (`0` for an unwrapped run). Together they form the reification reuse
-    /// key, replacing the former positional `(element_idx, command_index)` pair
-    /// so a named run survives a sibling reorder.
+    /// key, and because neither depends on position in the command stream, a
+    /// named run survives a sibling reorder.
     pub id:               PanelElementId,
     /// Line ordinal of this command within its run (`0`-based), so a wrapped
     /// multi-line run reuses each line stably.
@@ -25,11 +25,11 @@ pub struct PanelTextLayout {
     /// Dense panel-local `DrawOrderIndex`, stored as a `usize` for text
     /// batching.
     pub draw_ordinal:     usize,
-    /// Legacy field name for the text run's non-OIT `ClipDepthNudge`.
+    /// The text run's non-OIT clip-depth nudge, in layer-units.
     ///
-    /// This is not the batch material's `StandardMaterial::depth_bias`; text
-    /// batch materials derive that value from `PanelTextDrawZIndexRank`.
-    pub depth_bias:       f32,
+    /// Distinct from the batch material's `StandardMaterial::depth_bias`, which
+    /// text batch materials derive from `PanelTextDrawZIndexRank`.
+    pub clip_depth_nudge: f32,
     /// OIT `position.z` offset projected from the run's `DrawOrderIndex`.
     pub oit_depth_offset: f32,
     /// Layout-computed position and size in layout coordinates.
@@ -65,7 +65,7 @@ impl PanelTextLayout {
         let Self {
             bounds,
             draw_ordinal,
-            depth_bias,
+            clip_depth_nudge,
             oit_depth_offset,
             scale_x,
             scale_y,
@@ -79,7 +79,7 @@ impl PanelTextLayout {
 
         bbox_bits(bounds) == bbox_bits(&other.bounds)
             && *draw_ordinal == other.draw_ordinal
-            && depth_bias.to_bits() == other.depth_bias.to_bits()
+            && clip_depth_nudge.to_bits() == other.clip_depth_nudge.to_bits()
             && oit_depth_offset.to_bits() == other.oit_depth_offset.to_bits()
             && scale_x.to_bits() == other.scale_x.to_bits()
             && scale_y.to_bits() == other.scale_y.to_bits()
@@ -118,7 +118,7 @@ mod tests {
             line_index:       0,
             element_idx:      0,
             draw_ordinal:     0,
-            depth_bias:       0.0,
+            clip_depth_nudge: 0.0,
             oit_depth_offset: 0.0,
             bounds:           bbox(1.0, 2.0, 30.0, 12.0),
             scale_x:          0.5,
@@ -156,7 +156,7 @@ mod tests {
         let base = sample_layout();
         let mut reordered = sample_layout();
         reordered.draw_ordinal = 3;
-        reordered.depth_bias = 3.0;
+        reordered.clip_depth_nudge = 3.0;
         reordered.oit_depth_offset = 0.000_001;
         assert!(!base.gating_eq(&reordered));
     }

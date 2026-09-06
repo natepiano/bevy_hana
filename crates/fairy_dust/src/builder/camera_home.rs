@@ -110,7 +110,7 @@ impl<S> CameraHomeBuilder<S> {
     #[must_use]
     pub fn with_brp_extras(self) -> SprinkleBuilder<S> { self.finish().with_brp_extras() }
 
-    /// Finalizes the current home registration and adds the smart camera control panel.
+    /// Finalizes the current home registration and adds the camera control panel.
     #[must_use]
     pub fn with_camera_control_panel(self) -> SprinkleBuilder<S> {
         self.finish().with_camera_control_panel()

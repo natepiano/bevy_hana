@@ -53,8 +53,8 @@ pub(super) struct FitParameters {
 /// then evaluates margins at that centered position. Returns the fit solution where
 /// the constraining margin equals the target and the silhouette is centered.
 ///
-/// Note: A lateral camera shift doesn't change point depths, so the centering is geometrically
-/// exact for the constraining margin check.
+/// A lateral camera shift does not change point depths, so the centering is
+/// geometrically exact for the constraining margin check.
 pub fn calculate_fit(
     points: &[Vec3],
     geometric_center: Vec3,
@@ -492,8 +492,9 @@ mod tests {
     }
 
     /// Flat quad in XZ at Y=0, camera at pitch=0 (edge-on). The vertical screen
-    /// extent is zero, which previously caused `calculate_target_margins` to
-    /// divide by zero and the binary search to converge on an absurd radius.
+    /// extent is zero; without the degenerate-extent guard in
+    /// `calculate_target_margins` that divides by zero and the binary search
+    /// converges on an absurd radius.
     #[test]
     fn edge_on_flat_plane_produces_reasonable_radius() {
         let projection = default_perspective();

@@ -22,6 +22,7 @@ use bevy::prelude::Query;
 use bevy::prelude::Resource;
 use bevy::prelude::Single;
 use bevy::prelude::With;
+use bevy::prelude::Without;
 use bevy::prelude::debug;
 use bevy::prelude::warn;
 use bevy::window::PrimaryWindow;
@@ -109,8 +110,8 @@ impl Drop for ClearOnDrop {
 
 /// Handle `WM_DPICHANGED` using Microsoft's recommended simple approach.
 ///
-/// The `lparam` contains a pointer to a `RECT` with the suggested new size/position.
-/// We simply apply it using `SetWindowPos`.
+/// The `lparam` holds a pointer to a `RECT` with the suggested new size and position, which is
+/// applied with `SetWindowPos`.
 fn handle_dpi_changed(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     // SAFETY: `lparam` is a valid pointer to `RECT` per the `WM_DPICHANGED` contract.
     let suggested_rect = unsafe { &*(lparam.0 as *const RECT) };
@@ -187,7 +188,7 @@ unsafe extern "system" fn subclass_proc(
     unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
 }
 
-/// System to install the DPI fix subclass on the primary window.
+/// Install the DPI fix subclass on the primary window.
 pub(crate) fn install_dpi_fix(
     mut commands: Commands,
     window_entity: Single<Entity, With<PrimaryWindow>>,
@@ -218,9 +219,10 @@ pub(crate) fn install_dpi_fix(
     }
 }
 
-/// Install DPI fix on newly added `ManagedWindow` entities.
+/// Install the DPI fix on each newly managed secondary window; `install_dpi_fix` covers the
+/// primary window.
 pub(crate) fn install_dpi_fix_on_managed(
-    new_windows: Query<Entity, Added<ManagedWindow>>,
+    new_windows: Query<Entity, (Added<ManagedWindow>, Without<PrimaryWindow>)>,
     _: NonSendMarker,
 ) {
     for entity in &new_windows {

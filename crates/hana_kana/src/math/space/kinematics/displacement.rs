@@ -22,7 +22,8 @@ semantic_newtype::semantic_newtype!(
     /// let double_step = step + step;
     /// assert_eq!(double_step.into_inner(), Vec3::new(0.0, 0.0, -2.0));
     /// ```
-    Displacement, Vec3
+    Displacement,
+    Vec3
 );
 
 #[cfg(test)]

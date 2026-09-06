@@ -92,7 +92,9 @@ pub(super) fn bounds_label_position(upper_left: ScreenPosition) -> ScreenPositio
     )
 }
 
-/// Applies anchored placement for a margin label node based on edge semantics.
+/// Pins a margin label node to the [`Edge`] its margin belongs to: `Left` and
+/// `Top` anchor from the viewport's left and top, `Right` from the right, and
+/// `Bottom` from the bottom, so each label stays put as the viewport resizes.
 fn apply_margin_label_anchor(
     node: &mut Node,
     edge: Edge,

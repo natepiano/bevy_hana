@@ -32,10 +32,9 @@ use crate::layout::TextMeasure;
 /// registry.
 ///
 /// The default measurer estimates text dimensions using a fixed character
-/// width (60% of font size). Custom measurers are useful when bridging
-/// to external layout engines. See the `side_by_side` example for a
-/// real-world case where clay-layout delegates measurement through this
-/// interface.
+/// width (60% of font size). A custom measurer bridges to an external
+/// layout engine; the `side_by_side` example has clay-layout delegate
+/// measurement through this interface.
 ///
 /// # Example
 ///

@@ -1,7 +1,7 @@
 //! `StableTransparency` — camera marker that opts into OIT + `Msaa::Off`
 //! for view-angle-stable `AlphaMode::Blend` ordering on coplanar text.
 //!
-//! # When to reach for it
+//! # When to use it
 //!
 //! Slug's analytic coverage AA is the crate default: text is `AlphaMode::Blend`
 //! and antialiases per-pixel without MSAA. Blend sorts view-dependently, so
@@ -26,7 +26,7 @@
 //!     consistent.
 //!   - On remove: strip OIT and restore `Msaa::default()` everywhere it forced `Off`.
 //!
-//! # Why so aggressive about MSAA
+//! # Why MSAA is forced off on every camera in the window
 //!
 //! OIT and MSAA cannot coexist on cameras that share a framebuffer. Bevy's OIT
 //! plugin panics on a single camera that has both; even a sibling camera with
@@ -138,6 +138,9 @@ pub(super) fn on_stable_transparency_added(
     }
 }
 
+/// Turns OIT off when `StableTransparency` is removed: strips
+/// `OrderIndependentTransparencySettings` and restores `Msaa::default()` on the
+/// camera and on every `ScreenSpaceCamera`.
 pub(super) fn on_stable_transparency_removed(
     trigger: On<Remove, StableTransparency>,
     mut overlays: Query<Entity, With<ScreenSpaceCamera>>,
@@ -159,7 +162,7 @@ pub(super) fn on_stable_transparency_removed(
 /// Fires when a new `ScreenSpaceCamera` is added. If any camera already has
 /// `OrderIndependentTransparencySettings`, the framebuffer is in OIT mode and
 /// every camera sharing it must run with OIT + `Msaa::Off`. The OIT half matters
-/// for screen-space panel ordering: same-z-index SDF/text/shape batches now keep
+/// for screen-space panel ordering: same-z-index SDF, text and geometry batches keep
 /// Bevy's hardware `depth_bias` at one value per `DrawZIndexRank`, so the
 /// overlay camera must use the shader-authored OIT offsets instead of non-OIT
 /// transparent draw-call sorting.

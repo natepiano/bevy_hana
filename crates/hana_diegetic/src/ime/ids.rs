@@ -60,7 +60,7 @@ impl ImeValueRevision {
 /// Opaque, unforgeable identity for a text element that carries no
 /// author-assigned name.
 ///
-/// Minted only by the layout builder's per-build order counter (see
+/// Assigned only by the layout builder's per-build order counter (see
 /// [`PanelElementId::auto`]); the inner value is private, so code outside this
 /// crate cannot construct one. That makes an [`PanelElementId::Auto`] id incapable
 /// of colliding with an author's [`PanelElementId::Named`] id by construction.
@@ -78,14 +78,14 @@ impl AutoElementId {
 /// Either an author-assigned [`Named`](Self::Named) id — the only variant a
 /// caller can build, via [`PanelElementId::named`] or the `From<&str>` /
 /// `From<String>` conversions — or an [`Auto`](Self::Auto) id the layout builder
-/// mints for an unnamed text element. Because every public constructor yields
+/// assigns to an unnamed text element. Because every public constructor yields
 /// `Named`, no string can forge an `Auto`, so the two id families share one
 /// panel-local namespace without ever colliding.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum PanelElementId {
     /// Author-assigned, publicly addressable name.
     Named(String),
-    /// Builder-minted positional id for an unnamed text run; not publicly
+    /// Builder-assigned positional id for an unnamed text run; not publicly
     /// addressable.
     Auto(AutoElementId),
 }
@@ -95,7 +95,7 @@ impl PanelElementId {
     #[must_use]
     pub fn named(value: impl Into<String>) -> Self { Self::Named(value.into()) }
 
-    /// Mints a builder-order auto id for an unnamed text run.
+    /// Creates a builder-order auto id for an unnamed text run.
     ///
     /// Crate-internal: the only path that produces an [`Auto`](Self::Auto)
     /// variant, keeping it unforgeable from outside.

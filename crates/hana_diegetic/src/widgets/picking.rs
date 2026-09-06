@@ -66,7 +66,7 @@ impl FacePicking {
     /// Faces whose blocking of lower diegetic panels needs no widget matching:
     /// the panel background is itself a hit surface, so any lower panel is
     /// always blocked. [`Self::WidgetsOnly`] is excluded — it blocks only when a
-    /// widget is hit, which is unknown until widgets are matched.
+    /// widget is hit, and that is not resolved until widgets are matched.
     const fn always_blocks_lower(self) -> bool {
         matches!(self, Self::Interactive | Self::PanelOnly)
     }

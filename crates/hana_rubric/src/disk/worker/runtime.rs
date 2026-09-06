@@ -1,4 +1,5 @@
-//! Dedicated filesystem worker for user keymap snapshots.
+//! Dedicated filesystem worker that reads the user keymap and delivers each complete state to
+//! the application thread.
 
 use std::fs;
 use std::fs::OpenOptions;
@@ -229,8 +230,8 @@ impl DiskWorker {
         self.status.watching.store(false, Ordering::Release);
     }
 
-    /// Parks the worker in the window a test needs to write into: after [`Self::recreate_watcher`]
-    /// arms the watch, before [`Self::read_user_keymap`] performs the first read.
+    /// Parks the worker between [`Self::recreate_watcher`] arming the watch and
+    /// [`Self::read_user_keymap`] performing the first read, so a test can write into that window.
     #[cfg(test)]
     fn hold_first_read(&self) {
         if self.watch_mode.holds_first_read() {

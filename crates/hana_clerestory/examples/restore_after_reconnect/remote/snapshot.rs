@@ -7,27 +7,30 @@ use bevy::prelude::ResMut;
 use bevy::prelude::Resource;
 use bevy::prelude::Window;
 use bevy::prelude::World;
+use bevy::prelude::error;
 use bevy::window::OnMonitor;
 use bevy::window::WindowPosition;
 use hana_clerestory::CurrentMonitor;
+use hana_clerestory::LiveDisplayContradictionCount;
+use hana_clerestory::LiveDisplayEndpoint;
+use hana_clerestory::LiveDisplayEndpointLookup;
+use hana_clerestory::LiveDisplayMatchError;
 use hana_clerestory::MonitorDescriptor;
-use hana_clerestory::MonitorDeviceAssociation;
-use hana_clerestory::MonitorDeviceKeyLookup;
 use hana_clerestory::Monitors;
 use hana_rigging::prelude::Bindings;
+use hana_rigging::prelude::DeviceKey;
 use hana_rigging::prelude::RecoveryPolicy;
-use hana_rigging::prelude::RoleKey;
-use hana_rigging::prelude::RoleState;
+use hana_rigging::prelude::RoleKeyError;
+use hana_rigging::prelude::RoleStatus;
+use hana_rigging::prelude::RoleStatusView;
 use serde::Serialize;
+use serde::Serializer;
 
 use super::ProbeSession;
-use crate::ProbeMonitorIndex;
+use crate::ProbeMonitorSelection;
 use crate::ProbeStartupMode;
-use crate::constants::APPLICATION_WINDOW_ROLE;
-use crate::constants::AUTOMATIC_WINDOW_ROLE;
 use crate::constants::FIELD_SELECTED_MONITOR_INDEX;
 use crate::constants::FIELD_WINDOW_KEY;
-use crate::constants::KIND_RECOVERY_ACCEPTED;
 use crate::constants::KIND_RECOVERY_AVAILABLE;
 use crate::constants::KIND_RECOVERY_CANCELLATION_REQUESTED;
 use crate::constants::KIND_RECOVERY_MISMATCH;
@@ -35,7 +38,6 @@ use crate::constants::KIND_RECOVERY_PENDING;
 use crate::constants::KIND_RECOVERY_READY;
 use crate::constants::KIND_RECOVERY_RESTORED;
 use crate::constants::KIND_WINDOW_CREATED;
-use crate::constants::PRIMARY_WINDOW_ROLE;
 use crate::constants::PROBE_SCHEMA_VERSION;
 use crate::constants::PROBE_WINDOW_COUNT;
 use crate::constants::PRODUCER_RECOVERY_READY;
@@ -43,34 +45,109 @@ use crate::control::CommandReceipt;
 use crate::control::CommandReceipts;
 use crate::setup::ProbeWindowRegistrationComplete;
 use crate::setup::ProbeWindowRole;
+use crate::setup::ProbeWindowScenario;
 use crate::trace::ProbeTrace;
 use crate::trace::TraceRecord;
+
+enum MonitorName {
+    Reported(String),
+    Unavailable,
+}
+
+impl From<Option<String>> for MonitorName {
+    fn from(name: Option<String>) -> Self { name.map_or(Self::Unavailable, Self::Reported) }
+}
+
+impl Serialize for MonitorName {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Reported(name) => serializer.serialize_some(name),
+            Self::Unavailable => serializer.serialize_none(),
+        }
+    }
+}
+
+enum MonitorIdentityEvidence {
+    Verified(String),
+    Unverified,
+}
+
+impl Serialize for MonitorIdentityEvidence {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Verified(identity) => serializer.serialize_some(identity),
+            Self::Unverified => serializer.serialize_none(),
+        }
+    }
+}
 
 #[derive(Serialize)]
 struct MonitorSnapshot {
     entity:            u64,
-    name:              Option<String>,
+    name:              MonitorName,
     identity:          String,
-    verified_id:       Option<String>,
+    verified_id:       MonitorIdentityEvidence,
     index:             usize,
     scale:             f64,
     physical_position: [i32; 2],
     physical_size:     [u32; 2],
 }
 
+struct ProjectedDisplayKeys(Vec<(DeviceKey, MonitorDescriptor)>);
+
+impl ProjectedDisplayKeys {
+    fn from_world(world: &mut World) -> Self {
+        let mut live_displays = world.query::<(&DeviceKey, &LiveDisplayEndpoint)>();
+        Self(
+            live_displays
+                .iter(world)
+                .map(|(device_key, endpoint)| (device_key.clone(), endpoint.descriptor))
+                .collect(),
+        )
+    }
+
+    fn key_for_descriptor(
+        &self,
+        descriptor: MonitorDescriptor,
+    ) -> Result<DeviceKey, LiveDisplayMatchError> {
+        let mut matching = self
+            .0
+            .iter()
+            .filter(|(_, candidate)| *candidate == descriptor)
+            .map(|(device_key, _)| device_key.clone());
+        let Some(first) = matching.next() else {
+            return Err(LiveDisplayMatchError::NoLiveDisplayMatches);
+        };
+        let Some(_) = matching.next() else {
+            return Ok(first);
+        };
+        let count = LiveDisplayContradictionCount::from_second_and_remaining(matching.count());
+        Err(LiveDisplayMatchError::SeveralLiveDisplaysMatch { count })
+    }
+}
+
 impl MonitorSnapshot {
     fn from_descriptor(
         entity: Entity,
-        name: Option<String>,
+        name: MonitorName,
         descriptor: MonitorDescriptor,
-        association: &MonitorDeviceAssociation,
+        device_key: Result<DeviceKey, LiveDisplayMatchError>,
     ) -> Self {
-        let (identity, verified_id) = match association.device_for_descriptor(descriptor) {
-            MonitorDeviceKeyLookup::Exact(device_key) => (
+        let (identity, verified_id) = match device_key {
+            Ok(device_key) => (
                 format!("Verified({device_key:?})"),
-                Some(format!("{device_key:?}")),
+                MonitorIdentityEvidence::Verified(format!("{device_key:?}")),
             ),
-            MonitorDeviceKeyLookup::Unresolved => (String::from("Unverified"), None),
+            Err(_) => (
+                String::from("Unverified"),
+                MonitorIdentityEvidence::Unverified,
+            ),
         };
         Self {
             entity: entity.to_bits(),
@@ -90,7 +167,6 @@ impl MonitorSnapshot {
 
 #[derive(Default, Serialize)]
 struct RecoveryCounts {
-    accepted:     usize,
     pending:      usize,
     available:    usize,
     restored:     usize,
@@ -182,10 +258,10 @@ impl From<Option<bool>> for NativeFullscreen {
 struct WindowSnapshot {
     key:                 String,
     entity:              u64,
-    recovery_policy:     Option<String>,
-    current_monitor:     Option<MonitorSnapshot>,
+    recovery_policy:     RecoveryPolicyObservation,
+    current_monitor:     ProbeMonitorObservation,
     requested_mode:      String,
-    effective_mode:      Option<String>,
+    effective_mode:      EffectiveWindowModeObservation,
     position:            String,
     physical_size:       [u32; 2],
     #[serde(rename = "decorated")]
@@ -197,6 +273,87 @@ struct WindowSnapshot {
     monitor_coverage:    MonitorCoverage,
     replacement_count:   usize,
     recovery_counts:     RecoveryCounts,
+}
+
+enum RecoveryPolicyObservation {
+    Authored(String),
+    Unavailable,
+}
+
+impl Serialize for RecoveryPolicyObservation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Authored(policy) => serializer.serialize_some(policy),
+            Self::Unavailable => serializer.serialize_none(),
+        }
+    }
+}
+
+enum ProbeMonitorObservation {
+    Available(MonitorSnapshot),
+    Unavailable,
+}
+
+impl Serialize for ProbeMonitorObservation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Available(monitor) => serializer.serialize_some(monitor),
+            Self::Unavailable => serializer.serialize_none(),
+        }
+    }
+}
+
+enum EffectiveWindowModeObservation {
+    Available(String),
+    Unavailable,
+}
+
+impl Serialize for EffectiveWindowModeObservation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Available(mode) => serializer.serialize_some(mode),
+            Self::Unavailable => serializer.serialize_none(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CurrentMonitorObservation {
+    Available(CurrentMonitor),
+    Unavailable,
+}
+
+impl From<Option<CurrentMonitor>> for CurrentMonitorObservation {
+    fn from(current_monitor: Option<CurrentMonitor>) -> Self {
+        current_monitor.map_or(Self::Unavailable, Self::Available)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum OnMonitorObservation {
+    Available(Entity),
+    Unavailable,
+}
+
+#[derive(Clone, Copy)]
+enum MonitorDescriptorObservation {
+    Available(MonitorDescriptor),
+    Unavailable,
+}
+
+impl From<Option<Entity>> for OnMonitorObservation {
+    fn from(on_monitor: Option<Entity>) -> Self {
+        on_monitor.map_or(Self::Unavailable, Self::Available)
+    }
 }
 
 #[derive(Serialize)]
@@ -216,16 +373,6 @@ pub(super) struct ProbeSnapshot {
     command_receipts:       Vec<CommandReceipt>,
 }
 
-fn role_key(role: ProbeWindowRole) -> Option<RoleKey> {
-    let value = match role {
-        ProbeWindowRole::Primary => PRIMARY_WINDOW_ROLE,
-        ProbeWindowRole::Automatic => AUTOMATIC_WINDOW_ROLE,
-        ProbeWindowRole::Application => APPLICATION_WINDOW_ROLE,
-        ProbeWindowRole::Control => return None,
-    };
-    RoleKey::new(value).ok()
-}
-
 fn record_count(records: &[TraceRecord], kind: &str, window_key: &str) -> usize {
     records
         .iter()
@@ -241,7 +388,6 @@ fn record_count(records: &[TraceRecord], kind: &str, window_key: &str) -> usize 
 
 fn recovery_counts(records: &[TraceRecord], window_key: &str) -> RecoveryCounts {
     RecoveryCounts {
-        accepted:     record_count(records, KIND_RECOVERY_ACCEPTED, window_key),
         pending:      record_count(records, KIND_RECOVERY_PENDING, window_key),
         available:    record_count(records, KIND_RECOVERY_AVAILABLE, window_key),
         restored:     record_count(records, KIND_RECOVERY_RESTORED, window_key),
@@ -252,29 +398,76 @@ fn recovery_counts(records: &[TraceRecord], window_key: &str) -> RecoveryCounts 
 
 fn binding_ready(
     bindings: &Bindings,
-    role: ProbeWindowRole,
+    role_statuses: &Query<&RoleStatus>,
+    scenario: ProbeWindowScenario,
     expected_policy: RecoveryPolicy,
-) -> bool {
-    role_key(role).is_some_and(|role| {
-        bindings.binding(&role).is_ok_and(|binding| {
-            binding.recovery == expected_policy && binding.state == RoleState::Ready
-        })
-    })
+) -> Result<bool, RoleKeyError> {
+    let ProbeWindowRole::KernelRole(role) = scenario.role()? else {
+        return Ok(false);
+    };
+    Ok(bindings.binding(&role).is_ok_and(|binding| {
+        binding.recovery == expected_policy
+            && bindings.role_entity(&role).is_ok_and(|entity| {
+                role_statuses
+                    .get(entity)
+                    .is_ok_and(|status| matches!(status.view(), RoleStatusView::Established { .. }))
+            })
+    }))
 }
 
-fn accepted_recorded(records: &[TraceRecord], role: ProbeWindowRole) -> bool {
-    record_count(records, KIND_RECOVERY_ACCEPTED, role.key()) == 1
+fn common_roles_ready(
+    bindings: &Bindings,
+    role_statuses: &Query<&RoleStatus>,
+) -> Result<bool, RoleKeyError> {
+    Ok(binding_ready(
+        bindings,
+        role_statuses,
+        ProbeWindowScenario::PrimaryAutomaticReturn,
+        RecoveryPolicy::ReapplyOnReturn,
+    )? && binding_ready(
+        bindings,
+        role_statuses,
+        ProbeWindowScenario::ApplicationRequestedReturn,
+        RecoveryPolicy::ReapplyOnRequest,
+    )? && binding_ready(
+        bindings,
+        role_statuses,
+        ProbeWindowScenario::RestoreOnly,
+        RecoveryPolicy::Forget,
+    )?)
 }
 
-/// Records the one-way readiness transition only after exact bindings and monitor placement exist.
+fn automatic_role_ready(
+    startup_mode: ProbeStartupMode,
+    bindings: &Bindings,
+    role_statuses: &Query<&RoleStatus>,
+) -> Result<bool, RoleKeyError> {
+    match startup_mode {
+        ProbeStartupMode::Exclusive => match ProbeWindowScenario::ManagedAutomaticReturn.role()? {
+            ProbeWindowRole::KernelRole(role) => Ok(bindings.binding(&role).is_err()),
+            ProbeWindowRole::UnmanagedControl => Ok(false),
+        },
+        ProbeStartupMode::Windowed | ProbeStartupMode::Borderless => binding_ready(
+            bindings,
+            role_statuses,
+            ProbeWindowScenario::ManagedAutomaticReturn,
+            RecoveryPolicy::ReapplyOnReturn,
+        ),
+    }
+}
+
+/// Sets [`ProbeReadiness`] to `Ready` once every probe window is registered and sitting on the
+/// selected monitor, that monitor resolves to a device key, and every probe role's binding is in
+/// place. A run already at `Ready` returns without recording again.
 pub(crate) fn record_probe_readiness(
     startup_mode: Res<ProbeStartupMode>,
-    monitor_index: Res<ProbeMonitorIndex>,
+    monitor_selection: Res<ProbeMonitorSelection>,
     monitors: Res<Monitors>,
-    association: Res<MonitorDeviceAssociation>,
+    live_display_endpoints: LiveDisplayEndpointLookup,
     bindings: Res<Bindings>,
+    role_statuses: Query<&RoleStatus>,
     windows: Query<(
-        &ProbeWindowRole,
+        &ProbeWindowScenario,
         &OnMonitor,
         Has<ProbeWindowRegistrationComplete>,
     )>,
@@ -285,16 +478,15 @@ pub(crate) fn record_probe_readiness(
     if *readiness == ProbeReadiness::Ready {
         return;
     }
-    let Some(target) = monitors
-        .iter()
-        .find(|monitor| monitor.descriptor.index.adapter_value() == monitor_index.0)
-    else {
+    let Some(target) = monitors.iter().find(|monitor| {
+        monitor.descriptor.index.adapter_value() == monitor_selection.selected_monitor_index()
+    }) else {
         return;
     };
-    if matches!(
-        association.device_for_descriptor(*target.descriptor),
-        MonitorDeviceKeyLookup::Unresolved
-    ) {
+    if live_display_endpoints
+        .key_for_descriptor(*target.descriptor)
+        .is_err()
+    {
         return;
     }
     let all_windows_placed = windows
@@ -303,29 +495,21 @@ pub(crate) fn record_probe_readiness(
     if windows.iter().count() != PROBE_WINDOW_COUNT || !all_windows_placed {
         return;
     }
-    let records = trace.records();
-    let common_roles_ready = binding_ready(
-        &bindings,
-        ProbeWindowRole::Primary,
-        RecoveryPolicy::ReapplyOnReturn,
-    ) && binding_ready(
-        &bindings,
-        ProbeWindowRole::Application,
-        RecoveryPolicy::ReapplyOnRequest,
-    ) && accepted_recorded(&records, ProbeWindowRole::Primary)
-        && accepted_recorded(&records, ProbeWindowRole::Application);
+    let common_roles_ready = match common_roles_ready(&bindings, &role_statuses) {
+        Ok(common_roles_ready) => common_roles_ready,
+        Err(error) => {
+            error!("[record_probe_readiness] common probe role invariant failed: {error}");
+            return;
+        },
+    };
     if !common_roles_ready {
         return;
     }
-    let automatic_ready = match *startup_mode {
-        ProbeStartupMode::Exclusive => role_key(ProbeWindowRole::Automatic)
-            .is_some_and(|role| bindings.binding(&role).is_err()),
-        ProbeStartupMode::Windowed | ProbeStartupMode::Borderless => {
-            binding_ready(
-                &bindings,
-                ProbeWindowRole::Automatic,
-                RecoveryPolicy::ReapplyOnReturn,
-            ) && accepted_recorded(&records, ProbeWindowRole::Automatic)
+    let automatic_ready = match automatic_role_ready(*startup_mode, &bindings, &role_statuses) {
+        Ok(automatic_ready) => automatic_ready,
+        Err(error) => {
+            error!("[record_probe_readiness] automatic probe role invariant failed: {error}");
+            return;
         },
     };
     if !automatic_ready {
@@ -337,40 +521,43 @@ pub(crate) fn record_probe_readiness(
         KIND_RECOVERY_READY,
         vec![(
             FIELD_SELECTED_MONITOR_INDEX.into(),
-            monitor_index.0.to_string(),
+            monitor_selection.selected_monitor_index().to_string(),
         )],
     );
     *readiness = ProbeReadiness::Ready;
 }
 
-pub(super) fn snapshot(world: &mut World) -> ProbeSnapshot {
+pub(super) fn snapshot(world: &mut World) -> Result<ProbeSnapshot, RoleKeyError> {
     let window_values = {
         let mut windows_query = world.query::<(
             Entity,
             &Window,
-            &ProbeWindowRole,
+            &ProbeWindowScenario,
             Option<&CurrentMonitor>,
             Option<&OnMonitor>,
         )>();
         windows_query
             .iter(world)
-            .filter(|(_, _, role, ..)| **role != ProbeWindowRole::Control)
-            .map(|(entity, window, role, current_monitor, on_monitor)| {
+            .filter(|(_, _, scenario, ..)| **scenario != ProbeWindowScenario::UnmanagedControl)
+            .map(|(entity, window, scenario, current_monitor, on_monitor)| {
                 (
                     entity,
                     window.clone(),
-                    *role,
-                    current_monitor.copied(),
-                    on_monitor.map(|on_monitor| on_monitor.0),
+                    *scenario,
+                    CurrentMonitorObservation::from(current_monitor.copied()),
+                    OnMonitorObservation::from(on_monitor.map(|on_monitor| on_monitor.0)),
                 )
             })
             .collect::<Vec<_>>()
     };
+    let projected_display_keys = ProjectedDisplayKeys::from_world(world);
     let session = world.resource::<ProbeSession>();
     let run_id = session.run_id.clone();
     let boot_nonce = session.boot_nonce.clone();
     let startup_mode = world.resource::<ProbeStartupMode>().selector();
-    let selected_monitor_index = world.resource::<ProbeMonitorIndex>().0;
+    let selected_monitor_index = world
+        .resource::<ProbeMonitorSelection>()
+        .selected_monitor_index();
     let topology_revision = world
         .resource::<hana_clerestory::MonitorTopologyRevision>()
         .get();
@@ -388,35 +575,41 @@ pub(super) fn snapshot(world: &mut World) -> ProbeSnapshot {
         .values()
         .cloned()
         .collect();
-    let association = world.resource::<MonitorDeviceAssociation>();
     let monitors_resource = world.resource::<Monitors>();
     let monitors = monitors_resource
         .iter()
         .map(|monitor| {
-            let name = world
-                .get::<bevy::window::Monitor>(monitor.entity)
-                .and_then(|monitor| monitor.name.clone());
-            MonitorSnapshot::from_descriptor(monitor.entity, name, *monitor.descriptor, association)
+            let monitor_name = MonitorName::from(
+                world
+                    .get::<bevy::window::Monitor>(monitor.entity)
+                    .and_then(|monitor| monitor.name.clone()),
+            );
+            MonitorSnapshot::from_descriptor(
+                monitor.entity,
+                monitor_name,
+                *monitor.descriptor,
+                projected_display_keys.key_for_descriptor(*monitor.descriptor),
+            )
         })
         .collect();
     let bindings = world.resource::<Bindings>();
     let windows = window_values
         .iter()
-        .map(|(entity, window, role, current_monitor, on_monitor)| {
+        .map(|(entity, window, scenario, current_monitor, on_monitor)| {
             window_snapshot(
                 *entity,
                 window,
-                *role,
+                *scenario,
                 *current_monitor,
                 *on_monitor,
                 monitors_resource,
-                association,
+                &projected_display_keys,
                 bindings,
                 &records,
             )
         })
-        .collect();
-    ProbeSnapshot {
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ProbeSnapshot {
         schema_version: PROBE_SCHEMA_VERSION,
         run_id,
         boot_nonce,
@@ -429,84 +622,116 @@ pub(super) fn snapshot(world: &mut World) -> ProbeSnapshot {
         windows,
         terminal_failure,
         command_receipts,
-    }
+    })
 }
 
 fn current_monitor_snapshot(
-    current_monitor: Option<CurrentMonitor>,
-    on_monitor: Option<Entity>,
+    current_monitor: CurrentMonitorObservation,
+    on_monitor: OnMonitorObservation,
     monitors: &Monitors,
-    association: &MonitorDeviceAssociation,
-) -> Option<MonitorSnapshot> {
-    let descriptor = current_monitor
-        .map(|current_monitor| current_monitor.descriptor)
-        .or_else(|| {
-            on_monitor.and_then(|on_monitor| {
-                monitors
-                    .iter()
-                    .find(|monitor| monitor.entity == on_monitor)
-                    .map(|monitor| *monitor.descriptor)
-            })
-        })?;
-    let entity = on_monitor.or_else(|| {
-        monitors
-            .iter()
-            .find(|monitor| *monitor.descriptor == descriptor)
-            .map(|monitor| monitor.entity)
-    })?;
-    Some(MonitorSnapshot::from_descriptor(
+    projected_display_keys: &ProjectedDisplayKeys,
+) -> ProbeMonitorObservation {
+    let MonitorDescriptorObservation::Available(descriptor) =
+        monitor_descriptor_observation(current_monitor, on_monitor, monitors)
+    else {
+        return ProbeMonitorObservation::Unavailable;
+    };
+    let entity = match on_monitor {
+        OnMonitorObservation::Available(entity) => entity,
+        OnMonitorObservation::Unavailable => {
+            let Some(entity) = monitors
+                .iter()
+                .find(|monitor| *monitor.descriptor == descriptor)
+                .map(|monitor| monitor.entity)
+            else {
+                return ProbeMonitorObservation::Unavailable;
+            };
+            entity
+        },
+    };
+    ProbeMonitorObservation::Available(MonitorSnapshot::from_descriptor(
         entity,
-        None,
+        MonitorName::Unavailable,
         descriptor,
-        association,
+        projected_display_keys.key_for_descriptor(descriptor),
     ))
+}
+
+fn monitor_descriptor_observation(
+    current_monitor: CurrentMonitorObservation,
+    on_monitor: OnMonitorObservation,
+    monitors: &Monitors,
+) -> MonitorDescriptorObservation {
+    match current_monitor {
+        CurrentMonitorObservation::Available(current_monitor) => {
+            MonitorDescriptorObservation::Available(current_monitor.descriptor)
+        },
+        CurrentMonitorObservation::Unavailable => match on_monitor {
+            OnMonitorObservation::Available(on_monitor) => monitors
+                .iter()
+                .find(|monitor| monitor.entity == on_monitor)
+                .map_or(MonitorDescriptorObservation::Unavailable, |monitor| {
+                    MonitorDescriptorObservation::Available(*monitor.descriptor)
+                }),
+            OnMonitorObservation::Unavailable => MonitorDescriptorObservation::Unavailable,
+        },
+    }
 }
 
 fn window_snapshot(
     entity: Entity,
     window: &Window,
-    role: ProbeWindowRole,
-    current_monitor: Option<CurrentMonitor>,
-    on_monitor: Option<Entity>,
+    scenario: ProbeWindowScenario,
+    current_monitor: CurrentMonitorObservation,
+    on_monitor: OnMonitorObservation,
     monitors: &Monitors,
-    association: &MonitorDeviceAssociation,
+    projected_display_keys: &ProjectedDisplayKeys,
     bindings: &Bindings,
     records: &[TraceRecord],
-) -> WindowSnapshot {
-    let binding = role_key(role).and_then(|role| bindings.binding(&role).ok());
-    let descriptor = current_monitor
-        .map(|current_monitor| current_monitor.descriptor)
-        .or_else(|| {
-            on_monitor.and_then(|on_monitor| {
-                monitors
-                    .iter()
-                    .find(|monitor| monitor.entity == on_monitor)
-                    .map(|monitor| *monitor.descriptor)
-            })
-        });
-    let monitor_coverage: MonitorCoverage = descriptor
-        .is_some_and(|descriptor| {
+) -> Result<WindowSnapshot, RoleKeyError> {
+    let recovery_policy = match scenario.role()? {
+        ProbeWindowRole::KernelRole(role) => bindings
+            .binding(&role)
+            .map_or(RecoveryPolicyObservation::Unavailable, |binding| {
+                RecoveryPolicyObservation::Authored(format!("{:?}", binding.recovery))
+            }),
+        ProbeWindowRole::UnmanagedControl => RecoveryPolicyObservation::Unavailable,
+    };
+    let descriptor_observation =
+        monitor_descriptor_observation(current_monitor, on_monitor, monitors);
+    let monitor_coverage: MonitorCoverage = matches!(
+        descriptor_observation,
+        MonitorDescriptorObservation::Available(descriptor)
+            if {
             window.resolution.physical_size() == descriptor.physical_size
                 && match window.position {
                     WindowPosition::At(position) => position == descriptor.physical_position,
                     WindowPosition::Automatic | WindowPosition::Centered(_) => false,
                 }
-        })
-        .into();
-    let created = record_count(records, KIND_WINDOW_CREATED, role.key());
-    WindowSnapshot {
-        key: role.key().into(),
+            }
+    )
+    .into();
+    let created = record_count(records, KIND_WINDOW_CREATED, scenario.key());
+    Ok(WindowSnapshot {
+        key: scenario.key().into(),
         entity: entity.to_bits(),
-        recovery_policy: binding.map(|binding| format!("{:?}", binding.recovery)),
+        recovery_policy,
         current_monitor: current_monitor_snapshot(
             current_monitor,
             on_monitor,
             monitors,
-            association,
+            projected_display_keys,
         ),
         requested_mode: format!("{:?}", window.mode),
-        effective_mode: current_monitor
-            .map(|current_monitor| format!("{:?}", current_monitor.effective_window_mode)),
+        effective_mode: match current_monitor {
+            CurrentMonitorObservation::Available(current_monitor) => {
+                EffectiveWindowModeObservation::Available(format!(
+                    "{:?}",
+                    current_monitor.effective_window_mode
+                ))
+            },
+            CurrentMonitorObservation::Unavailable => EffectiveWindowModeObservation::Unavailable,
+        },
         position: format!("{:?}", window.position),
         physical_size: [
             window.resolution.physical_width(),
@@ -517,8 +742,8 @@ fn window_snapshot(
         native_fullscreen: native_fullscreen(entity),
         monitor_coverage,
         replacement_count: created.saturating_sub(1),
-        recovery_counts: recovery_counts(records, role.key()),
-    }
+        recovery_counts: recovery_counts(records, scenario.key()),
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -552,6 +777,9 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+    use crate::constants::PROBE_WINDOW_HEIGHT;
+    use crate::constants::PROBE_WINDOW_WIDTH;
+    use crate::constants::RESTORE_ONLY_WINDOW_KEY;
 
     #[test]
     fn snapshot_wire_keeps_readiness_and_nested_monitor_window_fields()
@@ -567,9 +795,9 @@ mod tests {
             record_cursor:          3,
             monitors:               vec![MonitorSnapshot {
                 entity:            4,
-                name:              Some("display".into()),
+                name:              MonitorName::Reported("display".into()),
                 identity:          "Verified(display)".into(),
-                verified_id:       Some("display".into()),
+                verified_id:       MonitorIdentityEvidence::Verified("display".into()),
                 index:             1,
                 scale:             2.0,
                 physical_position: [0, 0],
@@ -578,19 +806,19 @@ mod tests {
             windows:                vec![WindowSnapshot {
                 key:                 "primary".into(),
                 entity:              5,
-                recovery_policy:     Some("ReapplyOnReturn".into()),
-                current_monitor:     Some(MonitorSnapshot {
+                recovery_policy:     RecoveryPolicyObservation::Authored("ReapplyOnReturn".into()),
+                current_monitor:     ProbeMonitorObservation::Available(MonitorSnapshot {
                     entity:            4,
-                    name:              None,
+                    name:              MonitorName::Unavailable,
                     identity:          "Verified(display)".into(),
-                    verified_id:       Some("display".into()),
+                    verified_id:       MonitorIdentityEvidence::Verified("display".into()),
                     index:             1,
                     scale:             2.0,
                     physical_position: [0, 0],
                     physical_size:     [1_920, 1_080],
                 }),
                 requested_mode:      "Windowed".into(),
-                effective_mode:      Some("Windowed".into()),
+                effective_mode:      EffectiveWindowModeObservation::Available("Windowed".into()),
                 position:            "At(IVec2(0, 0))".into(),
                 physical_size:       [800, 540],
                 decoration_presence: Presence::Present,
@@ -617,6 +845,45 @@ mod tests {
         );
         assert!(value["windows"][0].get("recovery_counts").is_some());
         assert!(value.get("terminal_failure").is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_wire_keeps_semantic_absence_as_null() -> Result<(), serde_json::Error> {
+        let monitor_snapshot = MonitorSnapshot {
+            entity:            1,
+            name:              MonitorName::Unavailable,
+            identity:          "Unverified".into(),
+            verified_id:       MonitorIdentityEvidence::Unverified,
+            index:             0,
+            scale:             1.0,
+            physical_position: [0, 0],
+            physical_size:     [1_920, 1_080],
+        };
+        let window_snapshot = WindowSnapshot {
+            key:                 RESTORE_ONLY_WINDOW_KEY.into(),
+            entity:              2,
+            recovery_policy:     RecoveryPolicyObservation::Unavailable,
+            current_monitor:     ProbeMonitorObservation::Unavailable,
+            requested_mode:      "Windowed".into(),
+            effective_mode:      EffectiveWindowModeObservation::Unavailable,
+            position:            "Automatic".into(),
+            physical_size:       [PROBE_WINDOW_WIDTH, PROBE_WINDOW_HEIGHT],
+            decoration_presence: Presence::Present,
+            focus:               Focus::Unfocused,
+            native_fullscreen:   NativeFullscreen::Unavailable,
+            monitor_coverage:    MonitorCoverage::Partial,
+            replacement_count:   0,
+            recovery_counts:     RecoveryCounts::default(),
+        };
+
+        let monitor_value = serde_json::to_value(monitor_snapshot)?;
+        let window_value = serde_json::to_value(window_snapshot)?;
+        assert!(monitor_value["name"].is_null());
+        assert!(monitor_value["verified_id"].is_null());
+        assert!(window_value["recovery_policy"].is_null());
+        assert!(window_value["current_monitor"].is_null());
+        assert!(window_value["effective_mode"].is_null());
         Ok(())
     }
 }

@@ -23,8 +23,8 @@ pub enum ObservedPhysicalPosition {
 
 /// A physical window position that Clerestory asked the platform to reach.
 ///
-/// The variants retain why an expected coordinate does not exist, rather than implying that every
-/// missing value is a platform failure.
+/// Every variant other than `Specified` records why no coordinate exists: the compositor owns
+/// placement, the saved record held no position, or a legacy coordinate was discarded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Reflect)]
 pub enum ExpectedPhysicalPosition {
     /// A saved placement and a live monitor produced this physical-pixel target.
@@ -66,7 +66,7 @@ pub enum ObservedLogicalPosition {
 ///
 /// This is an [`EntityEvent`] triggered on the window entity at the end of the restore
 /// process, after position, size, and window mode have been applied. Dependent crates can
-/// observe this event to know the final restored window state.
+/// observe this event to read the final restored window state.
 ///
 /// Use an observer to receive this event:
 /// ```ignore
@@ -97,9 +97,8 @@ pub struct WindowRestored {
     /// Physical position Clerestory asked the platform to reach.
     pub physical_position: ExpectedPhysicalPosition,
     /// Target position in logical pixels, as the desktop numbers it at the target monitor's
-    /// live scale.
-    ///
-    /// Logical position Clerestory expected after applying the saved placement.
+    /// live scale — the position Clerestory asked the platform to reach after applying the
+    /// saved placement.
     pub logical_position:  ExpectedLogicalPosition,
     /// Target physical size that was applied (content area).
     pub physical_size:     UVec2,
@@ -120,10 +119,9 @@ pub struct WindowRestored {
 /// ## Sources
 ///
 /// **Expected values** come from `TargetPosition`, which is computed
-/// from the saved RON state file at startup. These represent what the restore *intended* to
-/// achieve.
+/// from the saved RON state file at startup. These are the values the restore requested.
 ///
-/// **Actual values** come from two live ECS sources, each chosen for accuracy:
+/// **Actual values** come from two live ECS sources:
 ///
 /// - **`monitor_index`** → [`CurrentMonitor`](crate::CurrentMonitor) component, maintained by
 ///   `update_current_monitor`, which queries winit's `current_monitor()` and maps it to the
@@ -137,18 +135,18 @@ pub struct WindowRestored {
 ///   mismatch is the scale factor still reflecting the launch monitor while `CurrentMonitor` has
 ///   already updated to the target monitor.
 ///
-/// This intentional split means a mismatch signals that the window hasn't fully settled
-/// — the compositor accepted the request but winit hasn't yet delivered all the
-/// resulting state changes.
+/// Because those two sources update at different times, a mismatch means the window has
+/// not fully settled: the compositor accepted the request and winit has not yet delivered
+/// every resulting state change.
 ///
 /// ## Field layout
 ///
-/// The `expected_*` / `actual_*` pairs are deliberately flat rather than grouped into
-/// nested comparison structs — the event is primarily consumed via reflection (BRP /
-/// observers), where flat fields are easier to address than nested ones. The
-/// `restore_window` example adapts this flat shape into nested `*Mismatch` types in
-/// `examples/restore_window/events.rs`; any future reshape of the fields here must
-/// update that adapter in tandem.
+/// The `expected_*` / `actual_*` pairs are flat rather than grouped into nested comparison
+/// structs — the event is mostly consumed through reflection (BRP / observers), where a
+/// flat field is addressed by one path segment and a nested one by several. The
+/// `restore_window` example converts these flat fields into nested `*Mismatch` types in
+/// `examples/restore_window/events.rs`; changing the fields here requires changing that
+/// adapter with them.
 #[derive(EntityEvent, Debug, Clone, Reflect)]
 #[reflect(Event)]
 pub struct WindowRestoreMismatch {

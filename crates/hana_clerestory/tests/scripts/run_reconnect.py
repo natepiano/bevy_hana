@@ -29,7 +29,8 @@ from clerestory_test.probe_client import ProbeClient
 
 
 AUTOMATIC_WINDOW_KEYS = ("primary", "hotplug-automatic")
-# Monitor index a probe starts on before the snapshot says which panels the host can fingerprint.
+FALLBACK_WINDOW_KEYS = AUTOMATIC_WINDOW_KEYS + ("hotplug-restore-only",)
+# Monitor index a probe starts on before the snapshot says which displays the host can fingerprint.
 BOOTSTRAP_MONITOR_INDEX = 0
 # Subdirectory holding the second probe's artifacts when the bootstrap monitor is unidentifiable,
 # so its logs and `windows.ron` do not overwrite the bootstrap probe's.
@@ -153,9 +154,9 @@ class ProbeProcess:
         """Launch the probe and wait for its ready snapshot.
 
         Pinning resolves the target monitor by verified id afterwards, which is what keeps a
-        reconnect case following the same panel once a disconnect renumbers the winit indices.
+        reconnect case following the same display once a disconnect renumbers the winit indices.
         Cases that never re-resolve the target pass `pin_verified_identity=False` so a host
-        whose panels expose no EDID can still run them; the cases that do depend on identity
+        whose displays expose no EDID can still run them; the cases that do depend on identity
         demand it themselves and still fail loudly when it is missing.
         """
         self.artifact_directory.mkdir(parents=True, exist_ok=True)
@@ -470,7 +471,7 @@ def run_cycle(
     expect_application_return: bool = False,
     expect_native_fullscreen: bool = False,
     automatic_return_keys: tuple[str, ...] = AUTOMATIC_WINDOW_KEYS,
-    fallback_window_keys: tuple[str, ...] = AUTOMATIC_WINDOW_KEYS,
+    fallback_window_keys: tuple[str, ...] = FALLBACK_WINDOW_KEYS,
 ) -> CycleEvidence:
     initial_target = probe.target_monitor(initial_snapshot)
     initial_verified_id = verified_id(initial_target)
@@ -568,6 +569,62 @@ def current_monitor_matches(window: dict[str, object], target_verified_id: str) 
     return cast("dict[str, object]", current_monitor).get("verified_id") == target_verified_id
 
 
+def current_monitor_signature(
+    monitor: dict[str, object],
+) -> tuple[object, object, object]:
+    return (monitor.get("identity"), monitor.get("index"), monitor.get("physical_position"))
+
+
+def restore_only_fallback_assertion(
+    fallback_windows: dict[str, dict[str, object]],
+    returned_windows: dict[str, dict[str, object]],
+) -> AssertionResult:
+    monitor_signatures: dict[str, tuple[object, object, object]] = {}
+    for snapshot_name, windows in (
+        ("fallback", fallback_windows),
+        ("returned", returned_windows),
+    ):
+        window = windows.get("hotplug-restore-only")
+        if window is None:
+            return AssertionResult(
+                "restore-only-stayed-on-fallback",
+                False,
+                f"the restore-only window is absent from the {snapshot_name} snapshot",
+            )
+        current_monitor = window.get("current_monitor")
+        if not isinstance(current_monitor, dict):
+            return AssertionResult(
+                "restore-only-stayed-on-fallback",
+                False,
+                f"the restore-only window has no current monitor in the {snapshot_name} snapshot",
+            )
+        monitor = cast("dict[str, object]", current_monitor)
+        missing_fields = [
+            field
+            for field in ("identity", "index", "physical_position")
+            if field not in monitor
+        ]
+        if missing_fields:
+            return AssertionResult(
+                "restore-only-stayed-on-fallback",
+                False,
+                f"the restore-only current monitor in the {snapshot_name} snapshot is missing "
+                + ", ".join(missing_fields),
+            )
+        monitor_signatures[snapshot_name] = current_monitor_signature(monitor)
+
+    fallback_signature = monitor_signatures["fallback"]
+    returned_signature = monitor_signatures["returned"]
+    unchanged = fallback_signature == returned_signature
+    detail = (
+        f"the restore-only window retained fallback monitor {fallback_signature!r}"
+        if unchanged
+        else "the restore-only window changed monitor from "
+        f"{fallback_signature!r} to {returned_signature!r}"
+    )
+    return AssertionResult("restore-only-stayed-on-fallback", unchanged, detail)
+
+
 def generic_cycle_assertions(
     evidence: CycleEvidence,
     automatic_window_keys: tuple[str, ...] = AUTOMATIC_WINDOW_KEYS,
@@ -598,6 +655,7 @@ def generic_cycle_assertions(
             all(window_key_count(evidence.returned, key) == 1 for key in automatic_window_keys),
             f"exactly one snapshot entry exists for {', '.join(automatic_window_keys)}",
         ),
+        restore_only_fallback_assertion(fallback_windows, returned_windows),
         AssertionResult(
             "no-recovery-mismatch",
             evidence.returned.get("terminal_failure") == "absent",
@@ -612,9 +670,6 @@ def automatic_cancellation_assertions(
     initial: dict[str, object],
 ) -> list[AssertionResult]:
     initial_verified_id = verified_id(probe.target_monitor(initial))
-    initial_automatic = windows_by_key(initial).get("hotplug-automatic", {})
-    initial_recovery = _recovery_counts(initial_automatic)
-    accepted_before = initial_recovery.get("accepted") if initial_recovery is not None else None
     cursor = _as_int(initial.get("record_cursor", 0))
     power.power_off()
     power.wait_for_inventory(0, MONITOR_CHANGE_TIMEOUT_SECONDS)
@@ -708,7 +763,7 @@ def automatic_cancellation_assertions(
             "mode": "windowed",
         },
     )
-    before_cancellation, _ = wait_for_probe_state(
+    _, _ = wait_for_probe_state(
         probe,
         cursor,
         "fallback windowed mode",
@@ -746,10 +801,6 @@ def automatic_cancellation_assertions(
         ),
         RECOVERY_TIMEOUT_SECONDS,
     )
-    after_recovery = _recovery_counts(
-        windows_by_key(before_cancellation).get("hotplug-automatic", {})
-    )
-    accepted_after = after_recovery.get("accepted") if after_recovery is not None else None
     receipts = [
         move_receipt,
         resize_receipt,
@@ -762,11 +813,6 @@ def automatic_cancellation_assertions(
             "authenticated-controls-applied",
             all(receipt.get("status") == "applied" for receipt in receipts),
             "move, resize, both mode changes, and cancellation were applied",
-        ),
-        AssertionResult(
-            "geometry-and-mode-preserved-registration",
-            accepted_after == accepted_before,
-            f"accepted count remained {accepted_before}",
         ),
         AssertionResult(
             "managed-automatic-stayed-on-fallback",
@@ -852,16 +898,15 @@ def _retarget_to_verified_monitor(
 ) -> tuple[ProbeProcess, dict[str, object]]:
     """Restart `probe` on a monitor the app fingerprinted, when it did not start on one.
 
-    `accept_eligible_registrations` skips a window whose monitor identity is `Unverified`, so no
-    `recovery-accepted` record is ever written for a panel the host cannot fingerprint and
-    `retained-recovery-trace` cannot pass against it. Apple's internal panels publish no EDID at
-    all, which leaves monitor 0 on a MacBook permanently unidentifiable while an attached external
-    panel identifies normally, so the bootstrap index alone is not a usable target.
+    `accept_eligible_registrations` skips a window whose monitor identity is `Unverified`, so the
+    probe cannot install every expected recovery binding or emit `recovery-ready` for a display the
+    host cannot fingerprint. Apple's internal displays publish no EDID at all, which leaves monitor
+    0 on a MacBook permanently unidentifiable while an attached external display identifies
+    normally, so the bootstrap index alone is not a usable target.
 
     A host that fingerprints no monitor keeps the bootstrap probe and fails
-    `retained-recovery-trace`. That is the accurate outcome rather than a missing capability:
-    reconnect recovery arms nowhere on such a host, and reporting the case as unavailable would
-    let a real regression in registration acceptance pass as a host limitation.
+    `retained-readiness-trace`. Reconnect recovery arms nowhere on such a host, so reporting the
+    case as unavailable would hide a recovery-readiness failure as a host limitation.
     """
     target_index = verified_monitor_index(snapshot)
     if target_index is None or target_index == probe.monitor_index:
@@ -887,7 +932,7 @@ def run_zero_window_case(
     )
     try:
         # This case closes every window and asserts liveness, record retention, command
-        # idempotence, and reconstruction. Only `retained-recovery-trace` depends on the target
+        # idempotence, and reconstruction. Only `retained-readiness-trace` depends on the target
         # monitor's identity, so the probe starts unpinned on the bootstrap index and moves to a
         # fingerprinted monitor only when the bootstrap one turns out not to be fingerprinted.
         initial = probe.start(pin_verified_identity=False)
@@ -895,10 +940,12 @@ def run_zero_window_case(
             probe, initial, executable, artifact_directory, suite_run_id
         )
         initial_cursor = _as_int(initial.get("record_cursor", 0))
-        for selector in ("control", "application", "automatic", "primary"):
+        close_receipts: dict[str, dict[str, object]] = {}
+        for selector in ("control", "restore-only", "application", "automatic", "primary"):
             receipt = probe.client.command(
                 f"close-{selector}", {"kind": "close", "window": selector}
             )
+            close_receipts[selector] = receipt
             if receipt.get("status") != "applied":
                 raise RuntimeError(f"close-{selector} was not applied: {receipt}")
 
@@ -931,9 +978,15 @@ def run_zero_window_case(
                 "the owned process returned an authenticated snapshot with zero windows",
             ),
             AssertionResult(
-                "retained-recovery-trace",
-                any(record.get("kind") == "recovery-accepted" for record in records),
-                "accepted recovery records remained readable after every window closed",
+                "retained-readiness-trace",
+                any(record.get("kind") == "recovery-ready" for record in records),
+                "the recovery readiness record remained readable after every window closed",
+            ),
+            AssertionResult(
+                "restore-only-window-closed",
+                close_receipts["restore-only"].get("status") == "applied"
+                and "hotplug-restore-only" not in windows_by_key(empty),
+                "the restore-only selector closed its fallback window",
             ),
             AssertionResult(
                 "idempotent-command-replay",
@@ -965,10 +1018,6 @@ def windowed_cases(
     )
     try:
         snapshot = probe.start()
-        acceptance: dict[str, object] = {}
-        for key in AUTOMATIC_WINDOW_KEYS:
-            counts = _recovery_counts(windows_by_key(snapshot)[key])
-            acceptance[key] = counts.get("accepted") if counts is not None else None
         progress("windowed physical cycle 1/3")
         first = run_cycle(
             probe,
@@ -1022,12 +1071,6 @@ def windowed_cases(
                 )
                 evidence.append(cycle_evidence)
                 snapshot = cycle_evidence.returned
-            final_windows = windows_by_key(evidence[-1].returned)
-            unchanged_acceptance = all(
-                (final_counts := _recovery_counts(final_windows[key])) is not None
-                and final_counts.get("accepted") == acceptance[key]
-                for key in AUTOMATIC_WINDOW_KEYS
-            )
             progress(
                 "windowed cancellation cycle: authenticated move, resize, mode, and cancel"
             )
@@ -1042,11 +1085,6 @@ def windowed_cases(
                     for assertion in generic_cycle_assertions(cycle)
                 ]
                 + [
-                    AssertionResult(
-                        "accepted-generation-count-unchanged",
-                        unchanged_acceptance,
-                        f"initial accepted counts remained {acceptance}",
-                    ),
                     AssertionResult(
                         "application-controlled-first-return",
                         current_monitor_matches(
@@ -1135,15 +1173,6 @@ def one_cycle_case(
                         "managed automatic covered the target display before power loss",
                     ),
                 ]
-            )
-        if exclusive:
-            initial_counts = _recovery_counts(initial_windows.get("hotplug-automatic", {}))
-            assertions.append(
-                AssertionResult(
-                    "exclusive-automatic-unarmed",
-                    initial_counts is not None and initial_counts.get("accepted") == 0,
-                    "exclusive managed automatic has no accepted recovery",
-                )
             )
         evidence = run_cycle(
             probe,

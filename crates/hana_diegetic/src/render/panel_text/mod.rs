@@ -64,8 +64,10 @@ use crate::widgets::VisualOverrideIndex;
 pub(super) struct PreparedPanelText {
     /// Prepared text run.
     pub prepared:    PreparedTextRun,
-    /// Text-style snapshot used by `shape_panel_text_children` to decide
-    /// whether a `Changed<TextStyle>` event affects glyph geometry.
+    /// The [`TextStyle`] this run was shaped with. `shape_panel_text_children`
+    /// compares the current style against it with `gating_eq`; when the
+    /// geometry-affecting fields still match, a `Changed<TextStyle>` refreshes
+    /// the render fields without reshaping.
     pub style_gate:  TextStyle,
     /// Glyph render mode for this text element.
     pub render_mode: GlyphRenderMode,

@@ -100,7 +100,7 @@ struct WindowRestoredReceived {
     monitor:           usize,
 }
 
-/// Adapts the flat `expected_*` / `actual_*` shape of `WindowRestoreMismatch` into
+/// Adapts the flat `expected_*` / `actual_*` fields of `WindowRestoreMismatch` into
 /// nested comparison structs for BRP inspection. If the public event's field layout
 /// changes, this resource's unpacking (in `on_window_restore_mismatch`) must change with it.
 #[derive(Resource, Debug, Clone, Reflect)]

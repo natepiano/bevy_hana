@@ -179,10 +179,9 @@ impl SequenceStages {
     /// Returns each stage's identity paired with its exact authored extent, in
     /// stage order.
     ///
-    /// The pairing is infallible where [`Self::span`] is not: both values are
-    /// built from the same position in this description's own stages, so no
-    /// identity makes the round trip out and back that a stale revision or an
-    /// unknown ordinal could fail.
+    /// This returns no error where [`Self::span`] can: each pair comes from one
+    /// position in this description's own stages, so no identity is handed back
+    /// in to be checked against a revision or an ordinal.
     pub fn stage_ids_with_spans(
         &self,
     ) -> impl Iterator<Item = (SequenceStageId, SequenceStageSpan)> {

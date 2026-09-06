@@ -132,8 +132,9 @@ pub(crate) enum HomeTitleBarControl {
     Hidden,
 }
 
-/// Stashed home configuration. Read by the title-bar installer to decide
-/// whether to prepend the `H Home` chip.
+/// Home configuration recorded at install. The title-bar installer reads
+/// `title_bar_control` from it and prepends the `H Home` chip when it is
+/// [`HomeTitleBarControl::Shown`].
 #[derive(Resource, Clone)]
 pub(crate) struct CameraHomeConfig {
     pub yaw:               f32,
@@ -402,9 +403,9 @@ const fn home_fit(
         .duration(duration)
 }
 
-/// Whether the snap can fire: with marked entities present, wait until at
-/// least one (or one of its descendants) has an [`Aabb`] so the union the
-/// cube was sized to is meaningful.
+/// Reports whether at least one [`CameraHomeTarget`] entity, or one of its
+/// descendants, has an [`Aabb`] yet, so the union the cube was sized to covers
+/// real geometry.
 fn target_meshes_ready(
     targets: &Query<Entity, With<CameraHomeTarget>>,
     children: &Query<&Children>,
@@ -418,8 +419,9 @@ fn target_meshes_ready(
 }
 
 /// Snaps the camera to the home target once its meshes exist, exactly once. A
-/// saved restart pose wins — it restores the prior window pose instead of the
-/// snap. A [`CameraHomeTarget`] waits for its glyphs/meshes.
+/// saved restart pose takes precedence: [`RestoreWindowAnimation`] fires instead
+/// of the snap, restoring the prior window pose. A [`CameraHomeTarget`] waits
+/// for its glyphs/meshes.
 fn snap_home_on_ready(
     mut commands: Commands,
     home: Option<Res<CameraHomeEntity>>,

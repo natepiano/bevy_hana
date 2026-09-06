@@ -3,6 +3,8 @@
 //! After a window restore is applied, monitors the actual window state each frame
 //! to confirm the compositor delivered matching values (or detect mismatches).
 
+use std::time::Duration;
+
 use bevy::prelude::Commands;
 use bevy::prelude::Entity;
 use bevy::prelude::IVec2;
@@ -11,8 +13,6 @@ use bevy::prelude::Reflect;
 use bevy::prelude::Res;
 use bevy::prelude::ResMut;
 use bevy::prelude::Time;
-use bevy::prelude::Timer;
-use bevy::prelude::TimerMode;
 use bevy::prelude::UVec2;
 use bevy::prelude::Window;
 use bevy::prelude::WindowPosition;
@@ -22,21 +22,23 @@ use bevy::prelude::warn;
 use bevy::window::WindowMode;
 use hana_kana::ToI32;
 use hana_kana::ToU32;
-use hana_rigging::prelude::AttemptOutcome;
 use hana_rigging::prelude::RoleKey;
 
-use super::RestorePreparation;
-use super::RestorePreparationSource;
-use super::WindowApplyConfiguration;
+use super::WindowRestoreAttempt;
 use super::target_position::PreparedPositionMeaning;
 use super::target_position::TargetPosition;
+use super::target_position::WindowSettleProgress;
 use super::winit_info::X11FrameCompensated;
 use crate::Platform;
 use crate::constants::MILLIS_PER_SECOND;
 use crate::constants::PRIMARY_MONITOR_INDEX;
 use crate::constants::SETTLE_STABILITY_SECS;
 use crate::constants::SETTLE_TIMEOUT_SECS;
-use crate::driver::WindowDriverAttemptResults;
+use crate::deadline::OperatingSystemWorkDeadline;
+use crate::deadline::OperatingSystemWorkDeadlineStatus;
+use crate::deadline::WindowStabilityInterval;
+use crate::deadline::WindowStabilityIntervalStatus;
+use crate::driver::WindowRoleDriverState;
 use crate::events::ExpectedLogicalPosition;
 use crate::events::ExpectedPhysicalPosition;
 use crate::events::ObservedLogicalPosition;
@@ -45,12 +47,13 @@ use crate::events::WindowRestoreMismatch;
 use crate::events::WindowRestored;
 use crate::monitors::CurrentMonitor;
 use crate::monitors::CurrentMonitorIndex;
+use crate::persistence::EstablishedWindowPlacement;
 use crate::recovery::WindowFallbackRecoveryState;
 
 /// Window-state observation used to detect changes between frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Reflect)]
 struct SettleObservation {
-    physical_position: Option<IVec2>,
+    physical_position: ObservedPhysicalPosition,
     physical_size:     UVec2,
     window_mode:       WindowMode,
     monitor:           CurrentMonitorIndex,
@@ -60,11 +63,19 @@ struct SettleObservation {
 #[derive(Debug, Clone, Reflect)]
 pub(crate) struct SettleState {
     /// Hard deadline timer — fires mismatch if stability is never reached.
-    total_timeout:    Timer,
+    total_timeout:    OperatingSystemWorkDeadline,
     /// Resets whenever any compared value changes between frames.
-    stability_timer:  Timer,
+    stability_timer:  WindowStabilityInterval,
     /// Last frame's compared values, used to detect changes.
-    last_observation: Option<SettleObservation>,
+    last_observation: SettleObservationHistory,
+    /// Total settle duration retained only for diagnostics.
+    total_elapsed:    Duration,
+}
+
+#[derive(Debug, Clone, Reflect)]
+enum SettleObservationHistory {
+    NotObserved,
+    Previous(SettleObservation),
 }
 
 impl SettleState {
@@ -72,9 +83,10 @@ impl SettleState {
     #[must_use]
     pub(super) fn new() -> Self {
         Self {
-            total_timeout:    Timer::from_seconds(SETTLE_TIMEOUT_SECS, TimerMode::Once),
-            stability_timer:  Timer::from_seconds(SETTLE_STABILITY_SECS, TimerMode::Once),
-            last_observation: None,
+            total_timeout:    OperatingSystemWorkDeadline::new(SETTLE_TIMEOUT_SECS),
+            stability_timer:  WindowStabilityInterval::new(SETTLE_STABILITY_SECS),
+            last_observation: SettleObservationHistory::NotObserved,
+            total_elapsed:    Duration::ZERO,
         }
     }
 }
@@ -109,16 +121,11 @@ impl SettleComparison {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TimeoutState {
-    Active,
-    TimedOut,
-}
-
 #[derive(Clone, Copy)]
 enum ChangeHandling {
     Skip,
-    Continue,
+    ChangedAtDeadline,
+    Unchanged,
 }
 
 /// Bundled actual values for settle mismatch reporting.
@@ -128,32 +135,68 @@ struct SettleActual {
     logical_size:       UVec2,
 }
 
-/// Extracted target values for settle resolution, avoiding too-many-arguments.
+/// Placement information available when a window settles away from its requested target.
+enum SettlePlacementEvidence {
+    /// The live window and current monitor produced an exact placement value.
+    ReadBack(EstablishedWindowPlacement),
+    /// The settle ended without a current monitor from which to produce a placement.
+    NotProduced,
+}
+
+/// Target values for settle resolution, grouped so they pass as one argument.
 struct SettleTarget {
-    physical_position: Option<IVec2>,
-    logical_position:  Option<IVec2>,
+    physical_position: ExpectedPhysicalPosition,
+    logical_position:  ExpectedLogicalPosition,
     logical_size:      UVec2,
     physical_size:     UVec2,
     window_mode:       WindowMode,
     monitor:           CurrentMonitorIndex,
     scale:             f64,
-    position_meaning:  PreparedPositionMeaning,
 }
 
 impl SettleTarget {
-    fn from_target_position(
+    const fn from_target_position(
         target_position: &TargetPosition,
         position_meaning: PreparedPositionMeaning,
         platform: Platform,
     ) -> Self {
-        let position_available = platform.position_available();
+        let physical_position = match position_meaning {
+            PreparedPositionMeaning::Specified if platform.position_available() => {
+                match target_position.physical_position() {
+                    specified @ ExpectedPhysicalPosition::Specified(_) => specified,
+                    ExpectedPhysicalPosition::PlatformCannotPosition
+                    | ExpectedPhysicalPosition::NotSaved
+                    | ExpectedPhysicalPosition::DiscardedLegacy => {
+                        ExpectedPhysicalPosition::NotSaved
+                    },
+                }
+            },
+            PreparedPositionMeaning::Specified
+            | PreparedPositionMeaning::PlatformCannotPosition => {
+                ExpectedPhysicalPosition::PlatformCannotPosition
+            },
+            PreparedPositionMeaning::NotSaved => ExpectedPhysicalPosition::NotSaved,
+            PreparedPositionMeaning::DiscardedLegacy => ExpectedPhysicalPosition::DiscardedLegacy,
+        };
+        let logical_position = match position_meaning {
+            PreparedPositionMeaning::Specified if platform.position_available() => {
+                match target_position.logical_position() {
+                    specified @ ExpectedLogicalPosition::Specified(_) => specified,
+                    ExpectedLogicalPosition::PlatformCannotPosition
+                    | ExpectedLogicalPosition::NotSaved
+                    | ExpectedLogicalPosition::DiscardedLegacy => ExpectedLogicalPosition::NotSaved,
+                }
+            },
+            PreparedPositionMeaning::Specified
+            | PreparedPositionMeaning::PlatformCannotPosition => {
+                ExpectedLogicalPosition::PlatformCannotPosition
+            },
+            PreparedPositionMeaning::NotSaved => ExpectedLogicalPosition::NotSaved,
+            PreparedPositionMeaning::DiscardedLegacy => ExpectedLogicalPosition::DiscardedLegacy,
+        };
         Self {
-            physical_position: position_available
-                .then_some(target_position.physical_position)
-                .flatten(),
-            logical_position: position_available
-                .then_some(target_position.logical_position)
-                .flatten(),
+            physical_position,
+            logical_position,
             logical_size: target_position.logical_size,
             physical_size: target_position.physical_size,
             window_mode: target_position
@@ -161,39 +204,16 @@ impl SettleTarget {
                 .to_window_mode(target_position.monitor_index),
             monitor: target_position.monitor_index,
             scale: target_position.target_scale,
-            position_meaning,
         }
     }
 }
 
 const fn expected_physical_position(target: &SettleTarget) -> ExpectedPhysicalPosition {
-    match (target.position_meaning, target.physical_position) {
-        (PreparedPositionMeaning::Specified, Some(position)) => {
-            ExpectedPhysicalPosition::Specified(position)
-        },
-        (PreparedPositionMeaning::PlatformCannotPosition, _) => {
-            ExpectedPhysicalPosition::PlatformCannotPosition
-        },
-        (PreparedPositionMeaning::NotSaved, _) | (PreparedPositionMeaning::Specified, None) => {
-            ExpectedPhysicalPosition::NotSaved
-        },
-        (PreparedPositionMeaning::DiscardedLegacy, _) => ExpectedPhysicalPosition::DiscardedLegacy,
-    }
+    target.physical_position
 }
 
 const fn expected_logical_position(target: &SettleTarget) -> ExpectedLogicalPosition {
-    match (target.position_meaning, target.logical_position) {
-        (PreparedPositionMeaning::Specified, Some(position)) => {
-            ExpectedLogicalPosition::Specified(position)
-        },
-        (PreparedPositionMeaning::PlatformCannotPosition, _) => {
-            ExpectedLogicalPosition::PlatformCannotPosition
-        },
-        (PreparedPositionMeaning::NotSaved, _) | (PreparedPositionMeaning::Specified, None) => {
-            ExpectedLogicalPosition::NotSaved
-        },
-        (PreparedPositionMeaning::DiscardedLegacy, _) => ExpectedLogicalPosition::DiscardedLegacy,
-    }
+    target.logical_position
 }
 
 fn observed_physical_position(position: Option<IVec2>) -> ObservedPhysicalPosition {
@@ -204,15 +224,20 @@ fn observed_physical_position(position: Option<IVec2>) -> ObservedPhysicalPositi
 }
 
 fn observed_logical_position(
-    physical_position: Option<IVec2>,
+    physical_position: ObservedPhysicalPosition,
     scale: f64,
 ) -> ObservedLogicalPosition {
-    physical_position.map_or(ObservedLogicalPosition::PlatformCannotReport, |position| {
-        ObservedLogicalPosition::Observed(IVec2::new(
-            (f64::from(position.x) / scale).round().to_i32(),
-            (f64::from(position.y) / scale).round().to_i32(),
-        ))
-    })
+    match physical_position {
+        ObservedPhysicalPosition::Observed(position) => {
+            ObservedLogicalPosition::Observed(IVec2::new(
+                (f64::from(position.x) / scale).round().to_i32(),
+                (f64::from(position.y) / scale).round().to_i32(),
+            ))
+        },
+        ObservedPhysicalPosition::PlatformCannotReport => {
+            ObservedLogicalPosition::PlatformCannotReport
+        },
+    }
 }
 
 /// Observe the current window state, returning compared values and the actual scale factor.
@@ -237,7 +262,7 @@ fn observe_actual_state(
     );
     (
         SettleObservation {
-            physical_position,
+            physical_position: observed_physical_position(physical_position),
             physical_size,
             window_mode: window.mode,
             monitor: current_monitor.map_or_else(
@@ -258,7 +283,7 @@ fn observe_actual_state(
 /// scales differ between backends (e.g. Wayland scale 1 vs `XWayland` scale 2).
 fn check_settle_matches(
     target_position: &TargetPosition,
-    target_physical_position: Option<IVec2>,
+    target_physical_position: ExpectedPhysicalPosition,
     target_physical_size: UVec2,
     target_window_mode: WindowMode,
     target_monitor: CurrentMonitorIndex,
@@ -271,11 +296,19 @@ fn check_settle_matches(
     // - no saved position (window was anchored via `WindowPosition::Centered`; the resulting `At`
     //   position is OS-chosen and not part of the comparison)
     // - X11 W6 frame-vs-client coordinate mismatch
-    let skip_position = is_fullscreen
-        || target_physical_position.is_none()
-        || !platform.position_reliable_for_settle();
-    let position_matches =
-        skip_position || target_physical_position == settle_observation.physical_position;
+    let position_matches = is_fullscreen
+        || !platform.position_reliable_for_settle()
+        || !matches!(
+            target_physical_position,
+            ExpectedPhysicalPosition::Specified(_)
+        )
+        || matches!(
+            (target_physical_position, settle_observation.physical_position),
+            (
+                ExpectedPhysicalPosition::Specified(expected),
+                ObservedPhysicalPosition::Observed(observed)
+            ) if expected == observed
+        );
     let size_match = is_fullscreen || target_physical_size == settle_observation.physical_size;
     let mode_match = platform.modes_match(target_window_mode, settle_observation.window_mode);
     let monitor_match = target_monitor == settle_observation.monitor;
@@ -294,24 +327,30 @@ fn detect_settle_change(
     settle_observation: SettleObservation,
     role: &RoleKey,
     total_elapsed_ms: f32,
-    timeout_state: TimeoutState,
+    deadline_status: OperatingSystemWorkDeadlineStatus,
 ) -> ChangeHandling {
-    let changed = settle.last_observation.as_ref() != Some(&settle_observation);
+    let changed = match &settle.last_observation {
+        SettleObservationHistory::NotObserved => true,
+        SettleObservationHistory::Previous(previous) => previous != &settle_observation,
+    };
     if changed {
-        if settle.last_observation.is_some() {
+        if matches!(
+            &settle.last_observation,
+            SettleObservationHistory::Previous(_)
+        ) {
             debug!(
                 "[check_restore_settling] [{role}] {total_elapsed_ms:.0}ms: values changed, \
                  resetting stability timer"
             );
         }
         settle.stability_timer.reset();
-        settle.last_observation = Some(settle_observation);
-        match timeout_state {
-            TimeoutState::TimedOut => ChangeHandling::Continue,
-            TimeoutState::Active => ChangeHandling::Skip,
+        settle.last_observation = SettleObservationHistory::Previous(settle_observation);
+        match deadline_status {
+            OperatingSystemWorkDeadlineStatus::Expired => ChangeHandling::ChangedAtDeadline,
+            OperatingSystemWorkDeadlineStatus::Pending => ChangeHandling::Skip,
         }
     } else {
-        ChangeHandling::Continue
+        ChangeHandling::Unchanged
     }
 }
 
@@ -325,7 +364,7 @@ fn detect_settle_change(
 /// - **Total timeout** (2s): hard deadline. Fires `WindowRestoreMismatch` if stability is never
 ///   reached during startup restoration.
 ///
-/// Runs while `TargetPosition` entities exist (same gate as `restore_windows`).
+/// Runs while `TargetPosition` entities exist (same gate as `place_window_at_saved_geometry`).
 /// Only processes entities that have a `settle_state` set.
 pub(crate) fn check_restore_settling(
     mut commands: Commands,
@@ -336,57 +375,48 @@ pub(crate) fn check_restore_settling(
             &mut TargetPosition,
             &Window,
             Option<&CurrentMonitor>,
-            &RestorePreparation,
+            &WindowRestoreAttempt,
             &PreparedPositionMeaning,
         ),
         With<X11FrameCompensated>,
     >,
     platform: Res<Platform>,
-    mut results: ResMut<WindowDriverAttemptResults>,
+    mut driver_state: ResMut<WindowRoleDriverState>,
     mut fallback: ResMut<WindowFallbackRecoveryState>,
 ) {
-    for (
-        entity,
-        mut target_position,
-        window,
-        current_monitor,
-        restore_preparation,
-        position_meaning,
-    ) in &mut windows
+    for (entity, mut target_position, window, current_monitor, restore_attempt, position_meaning) in
+        &mut windows
     {
         let settle_target =
             SettleTarget::from_target_position(&target_position, *position_meaning, *platform);
-        let role = restore_preparation.role().clone();
+        let role = restore_attempt.role().clone();
         let (current_observation, actual_scale) =
             observe_actual_state(window, current_monitor, *platform);
 
-        let Some(settle) = target_position.settle_state.as_mut() else {
+        let WindowSettleProgress::Settling(settle) = &mut target_position.window_settle_progress
+        else {
             continue;
         };
-        settle.total_timeout.tick(time.delta());
-        settle.stability_timer.tick(time.delta());
+        let deadline_status = settle.total_timeout.advance(time.delta());
+        let stability_status = settle.stability_timer.advance(time.delta());
+        settle.total_elapsed += time.delta();
 
-        let total_elapsed_ms = settle.total_timeout.elapsed_secs() * MILLIS_PER_SECOND;
+        let total_elapsed_ms = settle.total_elapsed.as_secs_f32() * MILLIS_PER_SECOND;
         let stability_elapsed_ms = settle.stability_timer.elapsed_secs() * MILLIS_PER_SECOND;
-        let timeout_state = if settle.total_timeout.is_finished() {
-            TimeoutState::TimedOut
-        } else {
-            TimeoutState::Active
+        let change_handling = detect_settle_change(
+            settle,
+            current_observation,
+            &role,
+            total_elapsed_ms,
+            deadline_status,
+        );
+        let stable = match change_handling {
+            ChangeHandling::Skip => continue,
+            ChangeHandling::ChangedAtDeadline => false,
+            ChangeHandling::Unchanged => {
+                matches!(stability_status, WindowStabilityIntervalStatus::Stable)
+            },
         };
-
-        if matches!(
-            detect_settle_change(
-                settle,
-                current_observation,
-                &role,
-                total_elapsed_ms,
-                timeout_state,
-            ),
-            ChangeHandling::Skip
-        ) {
-            continue;
-        }
-        let stable = settle.stability_timer.is_finished();
         let comparison = check_settle_matches(
             &target_position,
             settle_target.physical_position,
@@ -420,26 +450,54 @@ pub(crate) fn check_restore_settling(
             emit_settle_success(
                 &mut commands,
                 entity,
-                restore_preparation,
+                restore_attempt,
                 &settle_target,
                 total_elapsed_ms,
                 stability_elapsed_ms,
-                &mut results,
+                &mut driver_state,
                 &mut fallback,
             );
-        } else if stable || timeout_state == TimeoutState::TimedOut {
+        } else if stable || matches!(deadline_status, OperatingSystemWorkDeadlineStatus::Expired) {
+            let placement_evidence =
+                current_monitor.map_or(SettlePlacementEvidence::NotProduced, |current_monitor| {
+                    SettlePlacementEvidence::ReadBack(established_placement_from_readback(
+                        window,
+                        current_monitor,
+                        &current_observation,
+                        *platform,
+                    ))
+                });
             emit_settle_mismatch(
                 &mut commands,
                 entity,
-                restore_preparation,
+                restore_attempt,
                 &settle_target,
                 &build_settle_actual(window, current_observation, actual_scale),
+                placement_evidence,
                 total_elapsed_ms,
-                &mut results,
+                &mut driver_state,
                 &mut fallback,
             );
         }
     }
+}
+
+fn established_placement_from_readback(
+    window: &Window,
+    current_monitor: &CurrentMonitor,
+    current_observation: &SettleObservation,
+    platform: Platform,
+) -> EstablishedWindowPlacement {
+    let physical_position = match current_observation.physical_position {
+        ObservedPhysicalPosition::Observed(position) => Some(position),
+        ObservedPhysicalPosition::PlatformCannotReport => None,
+    };
+    crate::persistence::EstablishedWindowPlacement::from_readback(
+        window,
+        current_monitor,
+        physical_position,
+        platform,
+    )
 }
 
 fn build_settle_actual(
@@ -461,14 +519,14 @@ fn build_settle_actual(
 fn emit_settle_success(
     commands: &mut Commands,
     entity: Entity,
-    restore_preparation: &RestorePreparation,
+    restore_attempt: &WindowRestoreAttempt,
     settle_target: &SettleTarget,
     total_elapsed_ms: f32,
     stability_elapsed_ms: f32,
-    results: &mut WindowDriverAttemptResults,
+    driver_state: &mut WindowRoleDriverState,
     fallback: &mut WindowFallbackRecoveryState,
 ) {
-    let role = restore_preparation.role().clone();
+    let role = restore_attempt.role().clone();
     debug!(
         "[check_restore_settling] [{role}] Settled after {total_elapsed_ms:.0}ms \
          (stable for {stability_elapsed_ms:.0}ms)"
@@ -484,13 +542,12 @@ fn emit_settle_success(
         monitor_index: settle_target.monitor.adapter_value(),
     };
     commands.trigger(restored);
-    record_attempt_outcome(results, restore_preparation, AttemptOutcome::Succeeded);
+    driver_state.finish_as_dispatched(restore_attempt.attempt());
     fallback.finish(&role);
     commands
         .entity(entity)
         .remove::<TargetPosition>()
-        .remove::<RestorePreparation>()
-        .remove::<WindowApplyConfiguration>()
+        .remove::<WindowRestoreAttempt>()
         .remove::<PreparedPositionMeaning>()
         .remove::<X11FrameCompensated>();
 }
@@ -500,14 +557,15 @@ fn emit_settle_success(
 fn emit_settle_mismatch(
     commands: &mut Commands,
     entity: Entity,
-    restore_preparation: &RestorePreparation,
+    restore_attempt: &WindowRestoreAttempt,
     settle_target: &SettleTarget,
     settle_actual: &SettleActual,
+    placement_evidence: SettlePlacementEvidence,
     total_elapsed_ms: f32,
-    results: &mut WindowDriverAttemptResults,
+    driver_state: &mut WindowRoleDriverState,
     fallback: &mut WindowFallbackRecoveryState,
 ) {
-    let role = restore_preparation.role().clone();
+    let role = restore_attempt.role().clone();
     warn!(
         "[check_restore_settling] [{role}] Settle timeout after {total_elapsed_ms:.0}ms — \
         mismatch remains: \
@@ -531,9 +589,7 @@ fn emit_settle_mismatch(
         entity,
         role: role.clone(),
         expected_physical_position: expected_physical_position(settle_target),
-        actual_physical_position: observed_physical_position(
-            settle_actual.settle_observation.physical_position,
-        ),
+        actual_physical_position: settle_actual.settle_observation.physical_position,
         expected_logical_position: expected_logical_position(settle_target),
         actual_logical_position: observed_logical_position(
             settle_actual.settle_observation.physical_position,
@@ -551,31 +607,23 @@ fn emit_settle_mismatch(
         actual_scale: settle_actual.scale,
     };
     commands.trigger(mismatch);
-    // The window is stable somewhere the apply did not put it — macOS constrained the frame to
-    // fit the display, or the user dragged it mid-restore. Either way that placement is reality
-    // and reality wins: `Substituted` settles the role as `Ready` with no captured value, so the
-    // kernel's next safe capture reads the window as it actually is and persistence records it.
-    // `Failed` would instead park the role and silently disable window persistence for the whole
-    // session.
-    record_attempt_outcome(results, restore_preparation, AttemptOutcome::Substituted);
+    match placement_evidence {
+        SettlePlacementEvidence::ReadBack(placement) => {
+            driver_state.finish_with_readback(restore_attempt.attempt(), placement);
+        },
+        SettlePlacementEvidence::NotProduced => {
+            // The record comes back so nothing it left behind is dropped in silence; the markers
+            // it put on this window come off a few lines below, which is the whole of that.
+            let _ = driver_state.abort_attempt(restore_attempt.attempt());
+        },
+    }
     fallback.finish(&role);
     commands
         .entity(entity)
         .remove::<TargetPosition>()
-        .remove::<RestorePreparation>()
-        .remove::<WindowApplyConfiguration>()
+        .remove::<WindowRestoreAttempt>()
         .remove::<PreparedPositionMeaning>()
         .remove::<X11FrameCompensated>();
-}
-
-/// Store one driver outcome only for the kernel attempt that requested this preparation.
-fn record_attempt_outcome(
-    results: &mut WindowDriverAttemptResults,
-    preparation: &RestorePreparation,
-    outcome: AttemptOutcome,
-) {
-    let RestorePreparationSource::KernelAttempt(attempt) = preparation.source();
-    results.record(attempt, outcome);
 }
 
 #[cfg(test)]
@@ -583,15 +631,32 @@ mod tests {
     use super::*;
 
     fn target(position_meaning: PreparedPositionMeaning) -> SettleTarget {
+        let (physical_position, logical_position) = match position_meaning {
+            PreparedPositionMeaning::Specified => (
+                ExpectedPhysicalPosition::Specified(IVec2::new(20, 40)),
+                ExpectedLogicalPosition::Specified(IVec2::new(10, 20)),
+            ),
+            PreparedPositionMeaning::PlatformCannotPosition => (
+                ExpectedPhysicalPosition::PlatformCannotPosition,
+                ExpectedLogicalPosition::PlatformCannotPosition,
+            ),
+            PreparedPositionMeaning::NotSaved => (
+                ExpectedPhysicalPosition::NotSaved,
+                ExpectedLogicalPosition::NotSaved,
+            ),
+            PreparedPositionMeaning::DiscardedLegacy => (
+                ExpectedPhysicalPosition::DiscardedLegacy,
+                ExpectedLogicalPosition::DiscardedLegacy,
+            ),
+        };
         SettleTarget {
-            physical_position: Some(IVec2::new(20, 40)),
-            logical_position: Some(IVec2::new(10, 20)),
+            physical_position,
+            logical_position,
             logical_size: UVec2::new(800, 600),
             physical_size: UVec2::new(1_600, 1_200),
             window_mode: WindowMode::Windowed,
             monitor: CurrentMonitorIndex::from_current_enumeration(2),
             scale: 2.0,
-            position_meaning,
         }
     }
 
@@ -645,7 +710,7 @@ mod tests {
             ObservedPhysicalPosition::PlatformCannotReport
         );
         assert_eq!(
-            observed_logical_position(None, 2.0),
+            observed_logical_position(ObservedPhysicalPosition::PlatformCannotReport, 2.0),
             ObservedLogicalPosition::PlatformCannotReport
         );
         assert_eq!(
@@ -653,7 +718,7 @@ mod tests {
             ObservedPhysicalPosition::Observed(IVec2::new(20, 40))
         );
         assert_eq!(
-            observed_logical_position(Some(IVec2::new(20, 40)), 2.0),
+            observed_logical_position(ObservedPhysicalPosition::Observed(IVec2::new(20, 40)), 2.0,),
             ObservedLogicalPosition::Observed(IVec2::new(10, 20))
         );
     }

@@ -476,11 +476,12 @@ impl DiegeticPanel {
         Ok(())
     }
 
-    /// Replaces the layout tree and takes the conservative full-layout path.
+    /// Replaces the layout tree and clears the text-run index, so the next layout
+    /// pass runs a full solve.
     ///
-    /// For optimized visual-only updates, prefer
-    /// [`DiegeticPanelCommands::set_tree`]. A direct component
-    /// method cannot update the sibling change-classification component.
+    /// A method on the component alone cannot write the sibling
+    /// change-classification component, so a visual-only edit that skips the full
+    /// solve goes through [`DiegeticPanelCommands::set_tree`] instead.
     pub(crate) fn replace_tree_full_rebuild(&mut self, tree: LayoutTree) {
         self.tree.replace(tree);
         self.text_index.clear();
@@ -1909,7 +1910,7 @@ impl ComputedDiegeticPanel {
     /// Returns whether this panel's layout has been solved.
     ///
     /// Match on [`layout`](Self::layout) instead when the solved
-    /// [`LayoutResult`] is needed; this is for the callers that only gate on
+    /// `LayoutResult` is needed; this is for the callers that only gate on
     /// readiness.
     #[must_use]
     pub const fn is_solved(&self) -> bool { self.layout.solved().is_some() }

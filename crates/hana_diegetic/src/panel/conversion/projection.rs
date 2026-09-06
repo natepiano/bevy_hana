@@ -37,9 +37,9 @@ use crate::screen_space;
 
 /// Read-only access to panel projection helpers.
 ///
-/// `project_to_screen` answers where a panel currently appears in logical
-/// screen pixels. `project_to_world` answers where that current screen footprint
-/// would sit on a supplied world target plane.
+/// [`Self::project_to_screen`] returns where a panel currently appears in logical
+/// screen pixels. [`Self::project_to_world`] returns where that current screen
+/// footprint would sit on a supplied world target plane.
 #[derive(SystemParam)]
 pub struct PanelProjectionParam<'w, 's> {
     panels: Query<
@@ -437,7 +437,7 @@ pub struct PanelWorldProjection {
     pub world_width:         Option<f32>,
     /// Target world height in meters.
     pub world_height:        Option<f32>,
-    /// Whether applying this projection should restore saved world-authored panel data.
+    /// Whether applying this projection restores saved world-authored panel data.
     pub restore_saved_world: SavedWorldRestoreMode,
 }
 

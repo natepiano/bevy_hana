@@ -1,7 +1,8 @@
 //! Hardware-free device reporting for `hana_rigging`.
 //!
-//! A `ScriptedReporter` replays a hand-written list of whole-set scans, so a test or an example can
-//! make a device arrive, depart, change claim, or fail enumeration without any hardware attached.
+//! A [`ScriptedReporter`] replays a hand-written list of whole-set scans, so a test or an example
+//! can make a device arrive, depart, change claim, or fail enumeration without any hardware
+//! attached.
 //! Real hardware cannot serve this purpose: a runner cannot unplug a monitor on command, the
 //! attached set differs per machine, and states worth testing — a duplicate key in one scan, two
 //! reporters disagreeing about a capability, a unit swapped on the same port — cannot be produced
@@ -11,20 +12,41 @@
 //! outside `crates/hana_rigging/tests` because each file there compiles to its own binary that
 //! nothing else can depend on, while the consumers are other crates and another repository.
 //!
-//! `ScriptedDevice` exists rather than a bare `hana_rigging::DeviceRecord` for two reasons. A
+//! [`ScriptedDevice`] exists rather than a bare [`hana_rigging::DeviceRecord`] for two reasons. A
 //! record has nine required fields and no defaults, so every scripted scan would restate the four
-//! evidence fields it does not care about; and `hana_rigging::Capabilities` holds
+//! evidence fields it does not vary; and [`hana_rigging::Capabilities`] holds
 //! `Box<dyn Reflect>`, which Bevy 0.19 cannot clone, so a template that is replayed more than once
 //! has to build its declaration on demand instead of holding one.
+
+/// A walk that proves any endpoint driver against the kernel's whole lifecycle.
+mod conformance;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use bevy::app::App;
+use bevy::prelude::Component;
+use bevy::prelude::FromReflect;
+use bevy::prelude::Reflect;
 use bevy::prelude::World;
+pub use conformance::CapabilityDeclaration;
+pub use conformance::ConformanceFailure;
+pub use conformance::ConformanceRefusal;
+pub use conformance::ConformanceReport;
+pub use conformance::ConformanceStep;
+pub use conformance::ConformanceStop;
+pub use conformance::ConformanceSubject;
+pub use conformance::RecordedCleanup;
+pub use conformance::RecordedCleanups;
+pub use conformance::run;
+use hana_rigging::ApplyContext;
 use hana_rigging::AttachmentPath;
+use hana_rigging::AttemptCompletion;
+use hana_rigging::AttemptInvalidation;
+use hana_rigging::AttemptRef;
 use hana_rigging::Capabilities;
 use hana_rigging::Claim;
 use hana_rigging::DeviceAccessError;
@@ -38,39 +60,52 @@ use hana_rigging::DeviceScan;
 use hana_rigging::DiscoveryControl;
 use hana_rigging::DiscoveryJob;
 use hana_rigging::DiscoveryProgress;
-use hana_rigging::DiscoveryStatus;
 use hana_rigging::DiscoveryWork;
+use hana_rigging::DriverCleanupRoleEntity;
+use hana_rigging::DriverCompletion;
+use hana_rigging::EndpointDriver;
+use hana_rigging::EstablishedContext;
 use hana_rigging::MainThreadDiscoveryJob;
 use hana_rigging::PlatformDeviceHandle;
 use hana_rigging::Presence;
+use hana_rigging::ReportAcceptanceProjection;
 use hana_rigging::ReportedAs;
 use hana_rigging::ReportedId;
 use hana_rigging::ReportedIdError;
 use hana_rigging::ReportedParent;
 use hana_rigging::ReportedSerial;
-use hana_rigging::ReporterActivity;
+use hana_rigging::ReporterActivityView;
+use hana_rigging::ReporterDeferral;
+use hana_rigging::ReporterHealth;
 use hana_rigging::ReporterId;
+use hana_rigging::RoleKey;
 use hana_rigging::SchemeName;
 use hana_rigging::SchemeNameError;
+use hana_rigging::SessionDatumArrivalEvidence;
+use hana_rigging::SessionLease;
+use hana_rigging::SessionRef;
+use hana_rigging::SessionReleaseCause;
+use hana_rigging::TargetResolution;
+use hana_rigging::TargetResolutionContext;
 use thiserror::Error;
 
-/// How many frames `advance_reporter` will run before giving up on one requested scan.
+/// How many frames [`advance_reporter`] runs before it reports one requested scan as stalled.
 ///
 /// A scheduled reporter needs one update to prepare and run its job and one more for the kernel to
-/// accept the completed set, so a run that has not landed within this many frames has stalled for a
-/// reason the caller wants reported rather than waited out.
+/// accept the completed set. A run that has not landed within this many frames returns
+/// [`ScriptedAdvanceError::Stalled`] instead of consuming more frames.
 const SCAN_FRAME_CEILING: u32 = 16;
 
 /// A capability declaration rebuilt on demand for each replay of one scripted device.
-type CapabilityBuilder = Arc<dyn Fn() -> Capabilities + Send + Sync>;
+pub(crate) type CapabilityBuilder = Arc<dyn Fn() -> Capabilities + Send + Sync>;
 
 /// Failure building a durable key from scheme text.
 #[derive(Debug, Error)]
 pub enum ScriptedKeyError {
-    /// The scheme name was rejected by `hana_rigging::SchemeName`.
+    /// The scheme name was rejected by [`hana_rigging::SchemeName`].
     #[error("scripted scheme name rejected: {0}")]
     Scheme(#[from] SchemeNameError),
-    /// The reported value was rejected by `hana_rigging::ReportedId`.
+    /// The reported value was rejected by [`hana_rigging::ReportedId`].
     #[error("scripted reported id rejected: {0}")]
     ReportedId(#[from] ReportedIdError),
 }
@@ -89,11 +124,296 @@ pub enum ScriptedAdvanceError {
     Stalled,
 }
 
-/// Build the durable key a scripted reporter mints for one reported unit.
+/// Failure selecting an authority retained by a [`ScriptedDriver`].
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ScriptedDriverControlError {
+    /// No pending attempt has this process-local reference.
+    #[error("the scripted driver has no pending attempt {attempt:?}")]
+    UnknownAttempt {
+        /// Attempt reference supplied by the caller.
+        attempt: AttemptRef,
+    },
+    /// No established session belongs to this role.
+    #[error("the scripted driver has no established session for role `{role}`")]
+    UnknownSession {
+        /// Durable role key supplied by the caller.
+        role: RoleKey,
+    },
+}
+
+/// Endpoint driver that retains completions until its paired control finishes them.
+///
+/// A test advances Bevy's manual frame time, runs one update so the kernel publishes that frame
+/// instant to its authorities, and then calls [`ScriptedDriverControl::finish_attempt`]. This
+/// stamps the result at that scripted frame without consulting a second clock.
+pub struct ScriptedDriver<Configuration> {
+    state: Arc<Mutex<ScriptedDriverState<Configuration>>>,
+}
+
+/// Test-side control for completions and leases retained by a [`ScriptedDriver`].
+pub struct ScriptedDriverControl<Configuration> {
+    state: Arc<Mutex<ScriptedDriverState<Configuration>>>,
+}
+
+struct ScriptedDriverState<Configuration> {
+    attempts:      VecDeque<(AttemptRef, AttemptCompletion<Configuration>)>,
+    sessions:      Vec<(RoleKey, SessionLease<Configuration>)>,
+    cancellations: Vec<(AttemptRef, AttemptInvalidation)>,
+    releases:      Vec<(SessionRef, SessionReleaseCause)>,
+}
+
+impl<Configuration> Default for ScriptedDriverState<Configuration> {
+    fn default() -> Self {
+        Self {
+            attempts:      VecDeque::new(),
+            sessions:      Vec::new(),
+            cancellations: Vec::new(),
+            releases:      Vec::new(),
+        }
+    }
+}
+
+impl<Configuration> Clone for ScriptedDriverControl<Configuration> {
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+impl<Configuration> ScriptedDriver<Configuration> {
+    /// Create one driver and the control that owns its scripted actions.
+    #[must_use]
+    pub fn new() -> (Self, ScriptedDriverControl<Configuration>) {
+        let state = Arc::new(Mutex::new(ScriptedDriverState::default()));
+        (
+            Self {
+                state: Arc::clone(&state),
+            },
+            ScriptedDriverControl { state },
+        )
+    }
+}
+
+impl<Configuration> ScriptedDriverControl<Configuration>
+where
+    Configuration: Reflect,
+{
+    /// Return the pending attempt references in dispatch order.
+    #[must_use]
+    pub fn pending_attempts(&self) -> Vec<AttemptRef> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .attempts
+            .iter()
+            .map(|(attempt, _)| *attempt)
+            .collect()
+    }
+
+    /// Finish one selected attempt at the frame instant most recently published by the kernel.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScriptedDriverControlError::UnknownAttempt`] when the driver no longer owns that
+    /// completion.
+    pub fn finish_attempt(
+        &self,
+        attempt: AttemptRef,
+        completion: DriverCompletion<Configuration>,
+    ) -> Result<(), ScriptedDriverControlError> {
+        let authority = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let index = state
+                .attempts
+                .iter()
+                .position(|(candidate, _)| *candidate == attempt)
+                .ok_or(ScriptedDriverControlError::UnknownAttempt { attempt })?;
+            state
+                .attempts
+                .remove(index)
+                .map(|(_, authority)| authority)
+                .ok_or(ScriptedDriverControlError::UnknownAttempt { attempt })?
+        };
+        authority.finish(completion);
+        Ok(())
+    }
+
+    /// Return every cancellation received by the driver.
+    #[must_use]
+    pub fn cancellations(&self) -> Vec<(AttemptRef, AttemptInvalidation)> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cancellations
+            .clone()
+    }
+
+    /// Return every session release received by the driver.
+    #[must_use]
+    pub fn releases(&self) -> Vec<(SessionRef, SessionReleaseCause)> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .releases
+            .clone()
+    }
+
+    /// Return the session reference retained for one role.
+    #[must_use]
+    pub fn session_ref(&self, role: &RoleKey) -> Option<SessionRef> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sessions
+            .iter()
+            .find_map(|(candidate, lease)| (candidate == role).then(|| lease.session_ref()))
+    }
+
+    /// Report a changed configuration through the lease retained for `role`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScriptedDriverControlError::UnknownSession`] when no retained lease belongs to
+    /// the role.
+    pub fn configuration_changed(
+        &self,
+        role: &RoleKey,
+        configuration: Configuration,
+    ) -> Result<(), ScriptedDriverControlError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lease = state
+            .sessions
+            .iter_mut()
+            .find_map(|(candidate, lease)| (candidate == role).then_some(lease))
+            .ok_or_else(|| ScriptedDriverControlError::UnknownSession { role: role.clone() })?;
+        lease.configuration_changed(configuration);
+        drop(state);
+        Ok(())
+    }
+
+    /// Consume the lease retained for `role` and report device-access loss.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScriptedDriverControlError::UnknownSession`] when no retained lease belongs to
+    /// the role.
+    pub fn report_loss(
+        &self,
+        role: &RoleKey,
+        error: DeviceAccessError,
+    ) -> Result<(), ScriptedDriverControlError> {
+        let lease = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let index = state
+                .sessions
+                .iter()
+                .position(|(candidate, _)| candidate == role)
+                .ok_or_else(|| ScriptedDriverControlError::UnknownSession { role: role.clone() })?;
+            state.sessions.remove(index).1
+        };
+        lease.report_loss(error);
+        Ok(())
+    }
+}
+
+impl<Configuration> EndpointDriver for ScriptedDriver<Configuration>
+where
+    Configuration: Reflect + FromReflect + Component,
+{
+    type Configuration = Configuration;
+    type Target = ();
+
+    fn resolve_target(
+        &mut self,
+        _: &mut World,
+        _: &TargetResolutionContext<'_>,
+        _: &Self::Configuration,
+    ) -> TargetResolution<Self::Target> {
+        TargetResolution::Reached(())
+    }
+
+    fn start_apply(
+        &mut self,
+        _: &mut World,
+        context: ApplyContext<'_, Self::Configuration>,
+        _: &Self::Configuration,
+        (): Self::Target,
+    ) {
+        let attempt = context.attempt();
+        let completion = context.into_completion();
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .attempts
+            .push_back((attempt, completion));
+    }
+
+    fn established(&mut self, _: &mut World, context: EstablishedContext<'_, Self::Configuration>) {
+        let role = context.role().clone();
+        let lease = context.into_lease(SessionDatumArrivalEvidence::NoDatumObserved);
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sessions
+            .push((role, lease));
+    }
+
+    fn cancel_apply(
+        &mut self,
+        _: &mut World,
+        _: &RoleKey,
+        _: DriverCleanupRoleEntity,
+        attempt: AttemptRef,
+        cause: AttemptInvalidation,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.cancellations.push((attempt, cause));
+        if let Some(index) = state
+            .attempts
+            .iter()
+            .position(|(candidate, _)| *candidate == attempt)
+        {
+            state.attempts.remove(index);
+        }
+    }
+
+    fn release_session(
+        &mut self,
+        _: &mut World,
+        role: &RoleKey,
+        _: DriverCleanupRoleEntity,
+        session: SessionRef,
+        cause: SessionReleaseCause,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.releases.push((session, cause));
+        state
+            .sessions
+            .retain(|(candidate, lease)| candidate != role || lease.session_ref() != session);
+    }
+}
+
+/// Build the durable key a scripted reporter creates for one reported unit.
 ///
 /// # Errors
 ///
-/// Returns `ScriptedKeyError` when `scheme` or `value` is not an acceptable identity component.
+/// Returns [`ScriptedKeyError`] when `scheme` or `value` is not an acceptable identity component.
 pub fn reported_key(
     kind: DeviceKind,
     scheme: &str,
@@ -111,7 +431,7 @@ pub fn reported_key(
 /// One unit as a scripted reporter will report it, replayable any number of times.
 ///
 /// Every evidence field defaults to the variant that says the platform reported nothing, and the
-/// parent defaults to a root, so a scan that only cares about presence and claim states only those.
+/// parent defaults to a root, so a scan that varies only presence and claim states only those.
 #[derive(Clone)]
 pub struct ScriptedDevice {
     reported_as:            ReportedAs,
@@ -138,6 +458,15 @@ impl ScriptedDevice {
         Self::new(ReportedAs::Keyed(device_key), Presence::Absent)
     }
 
+    /// Report a durably named unit whose reporter can no longer reach it.
+    #[must_use]
+    pub fn unreachable(device_key: DeviceKey, since: Duration) -> Self {
+        Self::new(
+            ReportedAs::Keyed(device_key),
+            Presence::Unreachable { since },
+        )
+    }
+
     /// Report a unit the reporter recognizes but cannot name durably.
     ///
     /// Reconciliation keeps this record only when it joins a keyed one, so a scripted
@@ -147,7 +476,7 @@ impl ScriptedDevice {
         Self::new(ReportedAs::MatchEvidenceOnly, presence)
     }
 
-    /// Report a unit under any naming status and reachability the caller wants to script.
+    /// Report a unit under any combination of naming status and reachability.
     #[must_use]
     pub fn new(reported_as: ReportedAs, presence: Presence) -> Self {
         Self {
@@ -243,8 +572,17 @@ impl ScriptedDevice {
 pub enum ScriptedScan {
     /// The reporter enumerated successfully and these are all the units it can currently see.
     Complete(Vec<ScriptedDevice>),
+    /// The reporter enumerated successfully through the complete-with-projection contract.
+    CompleteWithProjection(Vec<ScriptedDevice>),
+    /// A reporter prerequisite is not ready yet.
+    Deferred(ReporterDeferral),
     /// Enumeration failed before the reporter established its whole current set.
     Failed(DeviceAccessError),
+    /// The current platform has no implementation for this reporter.
+    Unsupported {
+        /// Text naming the unsupported platform contract.
+        detail: String,
+    },
 }
 
 impl ScriptedScan {
@@ -256,7 +594,18 @@ impl ScriptedScan {
                     .map(ScriptedDevice::record)
                     .collect(),
             ),
+            Self::CompleteWithProjection(scripted_devices) => DeviceScan::CompleteWithProjection {
+                devices:                      scripted_devices
+                    .iter()
+                    .map(ScriptedDevice::record)
+                    .collect(),
+                report_acceptance_projection: ReportAcceptanceProjection::new(|_| {}),
+            },
+            Self::Deferred(reporter_deferral) => DeviceScan::Deferred(*reporter_deferral),
             Self::Failed(device_access_error) => DeviceScan::Failed(device_access_error.clone()),
+            Self::Unsupported { detail } => DeviceScan::Failed(DeviceAccessError::Unsupported {
+                detail: detail.clone(),
+            }),
         }
     }
 }
@@ -302,8 +651,8 @@ impl ScriptedReporter {
     /// Replay the same list, but on the I/O pool, reporting `progress` and then holding at the
     /// gate.
     ///
-    /// The scans of `ScriptedReporter::new` are `DiscoveryWork::Immediate`, so they complete inside
-    /// the same admission call that started them and the kernel never observes the reporter
+    /// The scans of [`ScriptedReporter::new`] are [`DiscoveryWork::Immediate`], so they complete
+    /// inside the same admission call that started them and the kernel never observes the reporter
     /// running. A gated reporter is what a test uses to read a run that is still in flight —
     /// the progress the scheduler retains, the counts its batch carries, and the events derived
     /// from both.
@@ -345,7 +694,7 @@ impl DeviceReporter for ScriptedReporter {
     }
 }
 
-/// Releases one held scan of a `ScriptedReporter::gated` reporter.
+/// Releases one held scan of a [`ScriptedReporter::gated`] reporter.
 ///
 /// Releases are counted rather than signalled, so a test may release before or after the job
 /// reaches the gate and neither ordering can lose the release or deadlock the I/O pool thread.
@@ -403,7 +752,7 @@ impl ScriptedRunGate {
 ///
 /// # Errors
 ///
-/// Returns `ScriptedAdvanceError` when the kernel refuses the request, when the reporter has no
+/// Returns [`ScriptedAdvanceError`] when the kernel refuses the request, when the reporter has no
 /// retained status, or when the run has not been accepted within `SCAN_FRAME_CEILING` frames.
 pub fn advance_reporter(app: &mut App, reporter: ReporterId) -> Result<(), ScriptedAdvanceError> {
     let completed_before = completed_batches(app, reporter)?;
@@ -424,14 +773,14 @@ pub fn advance_reporter(app: &mut App, reporter: ReporterId) -> Result<(), Scrip
 
 /// Ask one gated reporter for a run and advance frames until the kernel reports it running.
 ///
-/// Only a `ScriptedReporter::gated` reporter can reach this state: an immediate scan completes
+/// Only a [`ScriptedReporter::gated`] reporter can reach this state: an immediate scan completes
 /// inside the admission call that started it, so the kernel retains no running activity for it.
 /// The run is left in flight, which is what lets a caller read a batch mid-run and then release it
-/// with `ScriptedRunGate::release` and `advance_until_accepted`.
+/// with [`ScriptedRunGate::release`] and [`advance_until_accepted`].
 ///
 /// # Errors
 ///
-/// Returns `ScriptedAdvanceError` when the kernel refuses the request, when the reporter has no
+/// Returns [`ScriptedAdvanceError`] when the kernel refuses the request, when the reporter has no
 /// retained status, or when the run has not started within `SCAN_FRAME_CEILING` frames.
 pub fn advance_until_running(
     app: &mut App,
@@ -454,13 +803,13 @@ pub fn advance_until_running(
 
 /// Advance frames until the kernel has accepted the run already in flight.
 ///
-/// The counterpart to `advance_until_running`: the request has already been made, so this waits on
-/// the completion count alone.
+/// The counterpart to [`advance_until_running`]: the request has already been made, so this waits
+/// on the completion count alone.
 ///
 /// # Errors
 ///
-/// Returns `ScriptedAdvanceError` when the reporter has no retained status, or when the run has not
-/// been accepted within `SCAN_FRAME_CEILING` frames.
+/// Returns [`ScriptedAdvanceError`] when the reporter has no retained status, or when the run has
+/// not been accepted within `SCAN_FRAME_CEILING` frames.
 pub fn advance_until_accepted(
     app: &mut App,
     reporter: ReporterId,
@@ -478,28 +827,29 @@ pub fn advance_until_accepted(
 
 /// Read whether one reporter's retained activity is a run the kernel currently holds.
 fn is_running(app: &App, reporter: ReporterId) -> Result<bool, ScriptedAdvanceError> {
-    app.world()
-        .resource::<DiscoveryStatus>()
-        .reporter_status(reporter)
-        .map(|reporter_discovery_status| {
-            matches!(
-                reporter_discovery_status.activity,
-                ReporterActivity::Running { .. }
-            )
-        })
-        .map_err(|error| ScriptedAdvanceError::NoStatus(error.to_string()))
+    reporter_health(app, reporter)
+        .map(|health| matches!(health.activity(), ReporterActivityView::Running { .. }))
 }
 
 /// Read how many whole-set batches one reporter has finished accepting.
 fn completed_batches(app: &App, reporter: ReporterId) -> Result<u64, ScriptedAdvanceError> {
-    app.world()
-        .resource::<DiscoveryStatus>()
-        .reporter_status(reporter)
-        .map(|reporter_discovery_status| reporter_discovery_status.completed_batches)
-        .map_err(|error| ScriptedAdvanceError::NoStatus(error.to_string()))
+    reporter_health(app, reporter).map(ReporterHealth::completed_runs)
 }
 
-/// Build a `ScriptedScan::Complete` from a list of scripted devices.
+fn reporter_health(
+    app: &App,
+    reporter: ReporterId,
+) -> Result<&ReporterHealth, ScriptedAdvanceError> {
+    app.world()
+        .iter_entities()
+        .filter_map(|entity| entity.get::<ReporterHealth>())
+        .find(|health| health.belongs_to(reporter))
+        .ok_or_else(|| {
+            ScriptedAdvanceError::NoStatus(String::from("reporter has no health component"))
+        })
+}
+
+/// Build a [`ScriptedScan::Complete`] from a list of scripted devices.
 ///
 /// The macro exists so a scan reads as the whole set it is: a reporter always reports everything it
 /// can currently see, and a device left out of the list is the departure evidence.
@@ -508,4 +858,42 @@ macro_rules! scan {
     [$($scripted_device:expr),* $(,)?] => {
         $crate::ScriptedScan::Complete(vec![$($scripted_device),*])
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use bevy::ecs::reflect::ReflectComponent;
+    use bevy::prelude::Component;
+    use bevy::prelude::Reflect;
+    use hana_rigging::Capabilities;
+    use hana_rigging::Presence;
+    use hana_rigging::ReportedAs;
+
+    use super::ScriptedDevice;
+
+    #[derive(Component, PartialEq, Reflect)]
+    #[reflect(Component)]
+    struct ReplayedCapability;
+
+    #[test]
+    fn evidence_only_device_rebuilds_its_capability_for_each_replay() {
+        let rebuilds = Arc::new(AtomicUsize::new(0));
+        let counted_rebuilds = Arc::clone(&rebuilds);
+        let device =
+            ScriptedDevice::match_evidence_only(Presence::Present).with_capabilities(move || {
+                counted_rebuilds.fetch_add(1, Ordering::Relaxed);
+                Capabilities::new().with(ReplayedCapability)
+            });
+
+        let first = device.record();
+        let second = device.record();
+
+        assert_eq!(first.reported_as, ReportedAs::MatchEvidenceOnly);
+        assert_eq!(second.reported_as, ReportedAs::MatchEvidenceOnly);
+        assert_eq!(rebuilds.load(Ordering::Relaxed), 2);
+    }
 }

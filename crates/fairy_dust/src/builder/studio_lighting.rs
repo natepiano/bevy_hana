@@ -58,9 +58,9 @@ impl<S> StudioLightingBuilder<S> {
 
     /// Sets the key light illuminance in lux.
     ///
-    /// Defaults to the studio rig's calibrated key light value. Use this when
-    /// an example wants the studio direction, fill, point light, and shadow
-    /// settings, but needs a specific key-light brightness for comparison.
+    /// Defaults to the studio rig's key-light value of 13,500 lux. Use this for
+    /// an example that keeps the studio direction, fill, point light, and shadow
+    /// settings but needs a specific key-light brightness for comparison.
     #[must_use]
     pub const fn key_light_illuminance(mut self, illuminance: f32) -> Self {
         self.config.key_light_illuminance = illuminance;

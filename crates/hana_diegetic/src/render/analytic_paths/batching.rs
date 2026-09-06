@@ -52,7 +52,7 @@ use crate::text::RunStorageKey;
 
 /// Map key for one `PathBatchResources` entry in an analytic-path batch store.
 ///
-/// Scalar/vector PBR values are deliberately absent: a `PathRenderRecord`
+/// Scalar/vector PBR values are absent: a `PathRenderRecord`
 /// carries the current frame's material table row, while this key carries only
 /// sort, pass, pipeline, and resource facts that must agree inside one draw.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -192,9 +192,9 @@ impl GeometryDirty {
 /// byte length never changes between growths: bevy re-creates the wgpu buffer
 /// when the length changes (`bevy_render/src/storage.rs` `prepare_asset`),
 /// and the material's bind group would keep pointing at the old buffer —
-/// whether a same-frame material re-prepare sees the new buffer is a prepare
-/// -order race. Constant-length uploads always write the existing buffer in
-/// place, which existing bind groups observe. A capacity growth creates new
+/// whether a same-frame material re-prepare reads the new buffer depends on
+/// prepare order. Constant-length uploads always write the existing buffer in
+/// place, which existing bind groups read. A capacity growth creates new
 /// buffer assets and rewrites the material's handles, which re-prepares
 /// reliably (a missing render asset retries next frame).
 #[derive(Debug)]
@@ -270,7 +270,7 @@ impl TextRunBatch {
     #[must_use]
     pub(in crate::render) fn path_record_count(&self) -> u32 { self.path_records.len().to_u32() }
 
-    /// Whether the last member run has left.
+    /// Whether the batch holds no member runs.
     #[must_use]
     const fn is_empty(&self) -> bool { self.runs.is_empty() }
 

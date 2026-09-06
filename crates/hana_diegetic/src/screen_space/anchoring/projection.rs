@@ -6,9 +6,9 @@ use bevy::prelude::Vec2;
 
 /// Projects `hana_valence::AnchorPose::rotation` onto the shared screen plane.
 ///
-/// Screen honors in-plane rotation; out-of-plane rotation has no screen
-/// effect. The panel cannot leave the plane, so the screen resolver keeps only
-/// the quaternion twist around the view normal.
+/// In-plane rotation is applied; out-of-plane rotation has no screen effect.
+/// The panel cannot leave the plane, so the screen resolver keeps only the
+/// quaternion twist around the view normal.
 pub(super) fn screen_in_plane_angle(rotation: Quat) -> f32 {
     let Some(twist) = Vec2::new(rotation.w, rotation.z).try_normalize() else {
         return 0.0;

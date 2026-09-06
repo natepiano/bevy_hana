@@ -1099,8 +1099,8 @@ mod tests {
                 (reader.world(source), reader.world(target))
             })
             .expect("panel reader system runs");
-        let source_handle = handles.0.expect("source world panel handle is minted");
-        let target_handle = handles.1.expect("target world panel handle is minted");
+        let source_handle = handles.0.expect("source world panel handle is assigned");
+        let target_handle = handles.1.expect("target world panel handle is assigned");
         app.world_mut().entity_mut(target).insert(screen_panel());
 
         app.world_mut()

@@ -17,7 +17,7 @@ use bevy::window::VideoMode;
 use bevy::window::VideoModeSelection;
 use bevy::window::WindowMode;
 use hana_clerestory::CurrentMonitor;
-use hana_clerestory::ManagedWindow;
+use hana_clerestory::ManagedWindowName;
 use hana_clerestory::ManagedWindowPersistence;
 
 use super::events::ClearStateAndQuit;
@@ -102,7 +102,7 @@ pub(crate) fn on_toggle_persistence(
 
 pub(crate) fn on_clear_state_and_quit(
     _trigger: On<ClearStateAndQuit>,
-    managed_entities: Query<Entity, With<ManagedWindow>>,
+    managed_entities: Query<Entity, With<ManagedWindowName>>,
     mut commands: Commands,
     mut app_exit: MessageWriter<AppExit>,
 ) {
@@ -118,7 +118,7 @@ pub(crate) fn on_clear_state_and_quit(
 
 pub(crate) fn on_quit_app(
     _trigger: On<QuitApp>,
-    managed_entities: Query<Entity, With<ManagedWindow>>,
+    managed_entities: Query<Entity, With<ManagedWindowName>>,
     mut commands: Commands,
     mut app_exit: MessageWriter<AppExit>,
 ) {

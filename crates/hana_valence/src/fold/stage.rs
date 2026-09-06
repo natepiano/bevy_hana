@@ -122,7 +122,7 @@ impl FoldStage {
     /// Returns the timing of the member this stage lasts longest for.
     ///
     /// Members are compared by their exact [`FoldTiming::end`], so a later
-    /// starting member with a short movement can still decide the stage extent.
+    /// starting member with a short movement can still set the stage extent.
     pub(super) fn longest_member_timing<'timing>(
         &'timing self,
         default_timing: &'timing FoldTiming,

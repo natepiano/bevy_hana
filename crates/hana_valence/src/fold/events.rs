@@ -238,7 +238,7 @@ enum UnansweredBoundaryLookup {
 /// Emits one event per boundary this update's raw traversal crossed.
 ///
 /// [`SequenceUpdate::NoTraversal`] emits nothing, which covers a hold, an
-/// unchanged position, and movement the shared layer refused to apply. Every
+/// unchanged position, and movement the shared layer did not apply. Every
 /// other update yields its crossed ledger ordinals in the traversal's own
 /// direction, so a large seek emits every boundary between the two positions
 /// and a multi-wrap traversal emits every crossing of every repetition.

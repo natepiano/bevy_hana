@@ -1,9 +1,9 @@
-//! Text-write stress test — 100 standalone `DiegeticText` labels, each retext
-//! every frame through the `DiegeticTextMut` write path.
+//! Text-write stress test — 100 standalone [`DiegeticText`] labels, each retext
+//! every frame through the [`DiegeticTextMut`] write path.
 //!
 //! This is the canonical subject for the write-path half of the perf gate: a
 //! 10×10 grid of world-space labels, every one mutated per frame via
-//! `DiegeticTextMut::for_each_mut`, so a tree-authoritative write and its
+//! [`DiegeticTextMut::for_each_mut`], so a tree-authoritative write and its
 //! relayout fire on all 100 labels each frame — the worst-case
 //! `O(n_changed)` load. The companion `diegetic_panel_stress` example profiles
 //! the other axis (panel tree-build / `set_tree` churn).
@@ -234,9 +234,9 @@ fn text_stress_title_bar() -> TitleBar {
 
 // ── Text write path — DiegeticText labels retext each frame via DiegeticTextMut ───
 
-// How it works: `spawn_labels` runs once at startup, spawning a
-// GRID_SIDE × GRID_SIDE grid of standalone `DiegeticText` world labels, each
-// tagged `StressLabel(index)`. Each frame `toggle_mutation` reads Space to flip
+// `spawn_labels` runs once at startup, spawning a GRID_SIDE × GRID_SIDE grid of
+// standalone `DiegeticText` world labels, each tagged `StressLabel(index)`.
+// Each frame `toggle_mutation` reads Space to flip
 // `Mutating`, `advance_frame` bumps `FrameCounter`, and `mutate_labels` walks
 // every label through `DiegeticTextMut::for_each_mut`, rewriting its string with
 // `set_text` — a tree-authoritative write plus relayout on all 100 labels, the
@@ -283,7 +283,7 @@ impl Default for Mutating {
 }
 
 /// Spawns the `GRID_SIDE × GRID_SIDE` grid of standalone world labels, each a
-/// `DiegeticText` carrying a `StressLabel(index)` marker.
+/// [`DiegeticText`] carrying a [`StressLabel`] marker holding its grid index.
 fn spawn_labels(mut commands: Commands) {
     let half = (GRID_SIDE.to_f32() - 1.0) * 0.5;
     for index in 0..LABEL_COUNT {
@@ -314,10 +314,10 @@ fn advance_frame(mutating: Res<Mutating>, mut frame: ResMut<FrameCounter>) {
     }
 }
 
-/// Retexts every label through the `DiegeticTextMut` write path. `for_each_mut`
-/// yields each label's marker (its grid index) and a `TextEdit` handle, so all
-/// 100 strings change in one pass — the `O(n_changed)` worst case the gate
-/// targets.
+/// Retexts every label through the [`DiegeticTextMut`] write path.
+/// [`DiegeticTextMut::for_each_mut`] yields each label's marker (its grid index)
+/// and a `TextEdit` handle, so all 100 strings change in one pass — the
+/// `O(n_changed)` worst case the gate targets.
 fn mutate_labels(
     mutating: Res<Mutating>,
     frame: Res<FrameCounter>,
@@ -1126,8 +1126,8 @@ const INITIAL_METRICS: [&str; METRIC_COUNT] = ["--"; METRIC_COUNT];
 #[derive(Component)]
 struct StatusPanel;
 
-/// Marker for the upper-right glyph-batch stats panel (Step-2 proof
-/// counters), separate from the GPU pipeline so its wide rows don't stretch it.
+/// Marker for the upper-right glyph-batch stats panel, separate from the GPU
+/// pipeline panel so its wide rows don't stretch it.
 #[derive(Component)]
 struct BatchStatsPanel;
 
@@ -1656,7 +1656,8 @@ fn format_perf_snapshot(snapshot: PerfSnapshot) -> [String; METRIC_COUNT] {
     ]
 }
 
-/// The Step-2 proof-counter values shown in the upper-right panel.
+/// The batch, record, upload, and shadow-draw counts shown in the upper-right
+/// panel.
 #[derive(Default)]
 struct BatchStatsValues {
     text_batches:      usize,
@@ -2529,10 +2530,10 @@ fn render_lane_segments(b: &GpuPipelineBars) -> Vec<TimelineSegment> {
 
 /// GPU lane, one frame: `current` pressure until `get_current_texture` releases,
 /// `available` while the CPU records camera graphs and completes the submit
-/// set, then `next` pressure. This conservative boundary waits until the submit
-/// bracket ends instead of assuming the internal `RenderQueue::submit` call
-/// happened at the start of the set. This lane is Bevy queue pressure inferred
-/// from CPU-side frame marks, not measured hardware execution.
+/// set, then `next` pressure. `next` starts at the end of the submit set rather
+/// than at its start, because the frame marks do not record when the internal
+/// `RenderQueue::submit` call ran inside the set. This lane is Bevy queue
+/// pressure inferred from CPU-side frame marks, not measured hardware execution.
 fn gpu_lane_segments(b: &GpuPipelineBars) -> Vec<TimelineSegment> {
     let period = b.axis.max(GPU_PIPELINE_MIN_AXIS_MS);
     let current_end = (b.prep + b.gpu_wait).clamp(0.0, period);

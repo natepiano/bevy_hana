@@ -32,12 +32,13 @@ pub use triggers::ZoomEnd;
 pub use triggers::ZoomReason;
 pub use triggers::ZoomToFit;
 
-/// `FitPlugin` registers the camera-fit domain's shared target lifecycle, unified fit/look
-/// request observers, and the optional debug overlay when the `fit_overlay`
-/// feature is enabled. The request observers are shared across camera kinds and
-/// are also registered idempotently by the [`CameraKind`](crate::CameraKind)
-/// compatibility hooks. The core fit solve is pure logic with nothing to
-/// register.
+/// Registers the camera-fit domain's shared target lifecycle, the unified
+/// fit/look request observers, and the optional debug overlay when the
+/// `fit_overlay` feature is enabled. The request observers do not vary by
+/// camera kind, and the [`CameraKind`](crate::CameraKind) registration methods
+/// add the same observer plugin when the app does not already have it, so
+/// installing both this plugin and both camera kinds still installs them once.
+/// The fit solve itself is plain functions with nothing to register.
 pub(crate) struct FitPlugin;
 
 impl Plugin for FitPlugin {
@@ -52,7 +53,7 @@ impl Plugin for FitPlugin {
     }
 }
 
-/// `UnifiedFitRequestObserversPlugin` owns one observer for each public fit and look request.
+/// Owns one observer for each public fit and look request.
 pub(crate) struct UnifiedFitRequestObserversPlugin;
 
 impl Plugin for UnifiedFitRequestObserversPlugin {

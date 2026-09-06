@@ -33,7 +33,9 @@ pub(super) fn calculate_from_translation_and_focus(
     (yaw, pitch, radius)
 }
 
-/// Update `transform` based on yaw, pitch, and the camera's focus and radius
+/// Writes `transform` from yaw, pitch, and the camera's focus and radius, and
+/// applies the radius to the projection: orthographic scale for
+/// `Projection::Orthographic`, near clip plane for `Projection::Perspective`.
 pub(super) fn update_orbit_transform(
     yaw: f32,
     pitch: f32,

@@ -24,7 +24,7 @@ pub enum ReportedSerial {
     /// The unit supplied this serial, such as the EDID serial from a display panel or the USB
     /// serial from an audio interface.
     ///
-    /// `ReportedId` preserves the provider-defined text so it can participate in the registered
+    /// [`ReportedId`] preserves the provider-defined text so it can participate in the registered
     /// identity scheme without the kernel assigning a different meaning to it.
     Provided(ReportedId),
     /// The unit itself exposes no serial, as with a serial-less webcam or panel whose firmware has
@@ -37,14 +37,14 @@ pub enum ReportedSerial {
     /// exposes capture devices but omits their USB serials.
     ///
     /// Another provider or operating system may be able to report a serial for the same physical
-    /// unit, so this differs from `ReportedSerial::NotExposedByUnit`.
+    /// unit, so this differs from [`ReportedSerial::NotExposedByUnit`].
     PlatformCannotReport,
 }
 
 /// Reconciliation conclusion that states whether a live unit corresponds to its durable
-/// `DeviceKey`.
+/// [`DeviceKey`].
 ///
-/// `DeviceKey` is the durable identity, while `IdentityVerdict` records the kernel's conclusion
+/// [`DeviceKey`] is the durable identity, while [`IdentityVerdict`] records the kernel's conclusion
 /// about one live unit. Computing the verdict during reconciliation prevents a raw provider claim
 /// from contradicting the key. This enum is non-exhaustive because future reconciliation evidence
 /// can require another conclusion; applications must retain a wildcard arm when matching it.
@@ -52,18 +52,19 @@ pub enum ReportedSerial {
 #[derive(Clone, PartialEq, Eq, Debug, Component, Reflect)]
 #[reflect(Component, PartialEq)]
 pub enum IdentityVerdict {
-    /// A `crate::DeviceIdSource::Reported` key matched one live unit uniquely, as when a display
-    /// panel reports the EDID serial a saved layout was written against.
+    /// A [`DeviceIdSource::Reported`] key matched one live unit uniquely, as when a display panel
+    /// reports the EDID serial a saved layout was written against.
     ///
-    /// `Proven` can mint an authorization for in-service use because a value reported by the unit
+    /// `Proven` can issue an authorization for in-service use because a value reported by the unit
     /// establishes which physical device receives output.
     Proven,
-    /// A `crate::DeviceIdSource::Synthesized` key matched one live unit uniquely.
+    /// A [`DeviceIdSource::Synthesized`] key matched one live unit uniquely.
     ///
-    /// This restores a saved configuration, such as returning a window to its monitor, but never
-    /// drives output. It is the usual result for webcams and serial-less panels whose location
-    /// hints can change after a later scan.
-    RestoreOnly,
+    /// The key's scheme identifies a unit or location and exactly one unit matched in this scan.
+    /// Like `Proven` and `Authored`, `Presumed` can authorize service after availability and claim
+    /// checks succeed. Identity questions remain responsible for doubting a displaced or wrong
+    /// unit.
+    Presumed,
     /// A human assigned this durable address because the unit reports no usable identity.
     ///
     /// The authored patch is authoritative by construction: for example, a lighting fixture with
@@ -73,11 +74,12 @@ pub enum IdentityVerdict {
     /// A saved key matched no live unit even though a unit of the required kind occupies the same
     /// transport slot, as when a second camera is plugged into the USB port the saved camera used.
     ///
-    /// The saved device is neither confirmed present nor known to be gone, so a human must decide
+    /// The saved device is neither confirmed present nor confirmed absent, so a human must decide
     /// whether the occupying unit replaces it before any automatic action can use it.
     Displaced {
-        /// Durable key from saved configuration, retained instead of a process-local `DeviceId`
-        /// so the verdict remains meaningful after the process that issued a handle exits.
+        /// Durable key from saved configuration, retained instead of a process-local
+        /// [`DeviceId`](crate::DeviceId) so the verdict remains meaningful after the process that
+        /// issued a handle exits.
         saved: DeviceKey,
     },
     /// A human-authored binding matched its saved key while the unit in that binding reports a
@@ -87,31 +89,32 @@ pub enum IdentityVerdict {
     /// it to a dimmer instead.
     WrongUnit {
         /// Human-authored durable key that matched the saved binding and identifies the
-        /// conflicting assignment without relying on a process-local `DeviceId`.
+        /// conflicting assignment without relying on a process-local
+        /// [`DeviceId`](crate::DeviceId).
         authored: DeviceKey,
     },
     /// The unit cannot be identified because its identity is absent, duplicated in this scan, or
     /// unavailable through the platform API, as when two identical webcams report the same USB
     /// location value.
     ///
-    /// `UnverifiedReason` retains which observation occurred because each one leads to different
+    /// [`UnverifiedReason`] retains which observation occurred because each one leads to different
     /// recovery policy. `Unverified` prohibits automatic action.
     Unverified(UnverifiedReason),
 }
 
 impl IdentityVerdict {
-    /// Conclude one device's identity from its durable key and the keys this pass saw more than
-    /// once, for the case where no human owes a decision about it.
+    /// Conclude one device's identity from its durable key and the keys that appeared more than
+    /// once in this pass, for the case where no human decision is outstanding for it.
     ///
     /// The merge reaches this conclusion on every pass that finds nothing outstanding, and
     /// `crate::Devices::discharge_identity_decision` reaches it the moment a human answers. They
     /// share this one predicate because the alternative — the discharge clearing the debt and
-    /// leaving the merge to conclude the verdict on some later pass — is what kept an adopted unit
-    /// refusing authorization until the next scan arrived.
+    /// leaving the merge to conclude the verdict on a later pass — leaves an adopted unit
+    /// unauthorized until the next scan arrives.
     ///
-    /// A key more than one live unit reported in a single scan is `Unverified` whatever its source
-    /// claims: two identical webcams under one durable key cannot be told apart, and exact identity
-    /// requires one unit rather than a plausible choice between two.
+    /// A key that more than one live unit reported in a single scan is [`Self::Unverified`]
+    /// regardless of its [`DeviceIdSource`]: two identical webcams under one durable key cannot be
+    /// told apart, and exact identity requires one unit, not a choice between two.
     pub(crate) fn concluded_from_scan(
         key: &DeviceKey,
         duplicate_keys: &HashSet<DeviceKey>,
@@ -122,30 +125,31 @@ impl IdentityVerdict {
 
         match key.id {
             DeviceIdSource::Reported { .. } => Self::Proven,
-            DeviceIdSource::Synthesized { .. } => Self::RestoreOnly,
+            DeviceIdSource::Synthesized { .. } => Self::Presumed,
             DeviceIdSource::Authored { .. } => Self::Authored,
         }
     }
 
     /// Report whether this verdict identifies the physical unit and nothing more.
     ///
-    /// This is not the in-service predicate: `Devices::authorize_service` also requires presence
-    /// and a claim before `Proven` or `Authored` identity can authorize output.
-    /// `IdentityVerdict::RestoreOnly` is identified so saved configuration can return to the
-    /// matching unit while it remains ineligible to drive output.
+    /// This is not the in-service predicate: [`authorize_service`] also requires availability and
+    /// a usable claim before [`Self::Proven`], [`Self::Presumed`], or [`Self::Authored`] can
+    /// authorize output.
+    ///
+    /// [`authorize_service`]: crate::Devices::authorize_service
     #[must_use]
     pub(crate) const fn identified(&self) -> bool {
-        matches!(self, Self::Proven | Self::RestoreOnly | Self::Authored)
+        matches!(self, Self::Proven | Self::Presumed | Self::Authored)
     }
 }
 
 /// Whether a verdict only a human can resolve is outstanding for a device, independent of what the
 /// current pass concluded about it.
 ///
-/// `IdentityVerdict::Displaced` and `IdentityVerdict::WrongUnit` describe a join between an
+/// [`IdentityVerdict::Displaced`] and [`IdentityVerdict::WrongUnit`] describe a join between an
 /// arriving unit and the slot a saved one left, and that evidence exists only on the pass the unit
-/// arrived. A later pass that reports a scan observation instead — a key duplicated in one scan
-/// above all — would destroy the join if the outstanding verdict lived only in
+/// arrived. A later pass that reports a scan observation instead — most often a key duplicated in
+/// one scan — would overwrite that join if the outstanding verdict lived only in
 /// `crate::ReconciledDeviceState::verdict`, and the unit a human never accepted would be authorized
 /// as soon as the scan went back to reporting it once.
 #[derive(Clone, Default, PartialEq, Eq, Debug, Reflect)]
@@ -161,10 +165,10 @@ pub enum IdentityDecisionOwed {
 /// Evidence that prevents reconciliation from identifying a live unit, preserved so recovery
 /// policy can distinguish hardware limits from platform limits and duplicate reports.
 ///
-/// `UnverifiedReason::NotExposedByUnit` and `UnverifiedReason::PlatformCannotReport` name the same
-/// two limits as the `ReportedSerial` variants of those names. `ReportedSerial` records what a
-/// provider observed about one unit; these record that reconciliation could not identify the unit
-/// as a result.
+/// [`UnverifiedReason::NotExposedByUnit`] and [`UnverifiedReason::PlatformCannotReport`] name the
+/// same two limits as the [`ReportedSerial`] variants of those names. [`ReportedSerial`] records
+/// what a provider observed about one unit; these record that reconciliation could not identify the
+/// unit as a result.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Reflect)]
 pub enum UnverifiedReason {
     /// The unit itself exposes no serial, as with a serial-less display panel or webcam firmware
@@ -199,7 +203,7 @@ mod tests {
     fn identified_is_true_for_confirmed_identity_verdicts() {
         for identity_verdict in [
             IdentityVerdict::Proven,
-            IdentityVerdict::RestoreOnly,
+            IdentityVerdict::Presumed,
             IdentityVerdict::Authored,
         ] {
             assert!(identity_verdict.identified());
@@ -233,7 +237,7 @@ mod tests {
     #[test]
     fn identity_verdicts_compare_by_their_conclusions() {
         assert_eq!(IdentityVerdict::Proven, IdentityVerdict::Proven);
-        assert_ne!(IdentityVerdict::Proven, IdentityVerdict::RestoreOnly);
+        assert_ne!(IdentityVerdict::Proven, IdentityVerdict::Presumed);
     }
 
     #[test]
@@ -261,7 +265,7 @@ mod tests {
             Some(true)
         );
         assert_eq!(
-            IdentityVerdict::Proven.reflect_partial_eq(&IdentityVerdict::RestoreOnly),
+            IdentityVerdict::Proven.reflect_partial_eq(&IdentityVerdict::Presumed),
             Some(false)
         );
     }

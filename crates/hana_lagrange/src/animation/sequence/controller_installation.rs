@@ -45,7 +45,9 @@ pub(super) enum CameraControllerAvailability {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct CameraControllerInstallationIdentity(u128);
 
-/// Allocates installation identities only from semantic component insertions.
+/// Hands out installation identities. A fresh one is drawn only when an
+/// `OrbitCam` or `FreeCam` component is inserted or replaced, never when a
+/// controller is mutated in place.
 #[derive(Resource, Default)]
 pub(in crate::animation) struct CameraControllerInstallationIdentityAllocator(u128);
 

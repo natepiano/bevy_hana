@@ -212,7 +212,7 @@ pub struct PanelWorldConversion {
     pub world_width:         Option<f32>,
     /// Target world height in meters.
     pub world_height:        Option<f32>,
-    /// Whether applying this conversion should restore saved world-authored panel data.
+    /// Whether applying this conversion restores saved world-authored panel data.
     pub restore_saved_world: SavedWorldRestoreMode,
 }
 

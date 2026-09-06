@@ -147,12 +147,10 @@ impl CoordinateSpace {
 /// `DiegeticPanel.coordinate_space` directly rather than using this mirror as
 /// an authoring boundary.
 ///
-/// The cost is one duplicated discriminant kept in sync when a whole panel
-/// component is inserted or replaced (`sync_panel_space_on_insert`) and at the
-/// coordinate-space conversion apply points. `PanelSpace` never carries sizing or screen config;
-/// the field stays the single source for geometry. Removing the field entirely
-/// (true single source) would thread the space through the panel's geometry and
-/// conversion hot paths and is deliberately out of scope.
+/// The duplicated discriminant is written in two places: `sync_panel_space_on_insert`,
+/// when a whole panel component is inserted or replaced, and the coordinate-space
+/// conversion apply points. `PanelSpace` never carries sizing or screen config; the
+/// [`DiegeticPanel`] field stays the single source for geometry.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, Reflect)]
 #[reflect(Component, Default, PartialEq, Debug)]
 pub enum PanelSpace {

@@ -253,8 +253,8 @@ fn issue_command(
     }
 }
 
-/// Producers advance their own position from their own source state. The shared
-/// layer never infers a producer's clock.
+/// Producers advance their own position from their own source state. No shared
+/// system reads a producer's clock.
 fn produce_producer_movement(mut producers: Query<&mut SequenceMovement>, time: Res<Time>) {
     for mut movement in &mut producers {
         let advanced = time
@@ -267,7 +267,9 @@ fn produce_producer_movement(mut producers: Query<&mut SequenceMovement>, time: 
     }
 }
 
-/// A restorable producer publishes its own readiness after sampling its source.
+/// A restorable producer marks its [`SequenceSourceState`] current after
+/// sampling its source; driver arbitration reads that marker when restoring a
+/// displaced producer.
 fn mark_producers_current(mut producers: Query<&mut SequenceSourceState>) {
     for mut source_state in &mut producers {
         source_state.mark_current();

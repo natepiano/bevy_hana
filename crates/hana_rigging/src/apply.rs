@@ -1,147 +1,1296 @@
-//! Attempt lifecycle: starting, re-validating, polling, bounding, retrying, and escalating one
-//! role's endpoint apply.
-//!
-//! Every system here runs in `crate::RiggingSystems::Apply`, after reconciliation has published the
-//! frame's device set, so an attempt is always validated against the current pass rather than the
-//! one that authorized it.
+//! Ordered endpoint-attempt and established-session lifecycle.
 
+use std::collections::VecDeque;
+use std::time::Duration;
+
+use bevy::ecs::change_detection::DetectChangesMut;
 use bevy::log::warn;
 use bevy::platform::time::Instant;
+use bevy::prelude::Entity;
+use bevy::prelude::Resource;
 use bevy::prelude::World;
 use bevy::time::Real;
 use bevy::time::Time;
 
-use crate::Attempt;
-use crate::AttemptFinished;
-use crate::AttemptId;
+use crate::AppliedKind;
+use crate::AttemptEnding;
 use crate::AttemptInvalidation;
-use crate::AttemptLookup;
-use crate::AttemptOutcome;
-use crate::AttemptProgress;
+use crate::AttemptRef;
 use crate::Attempts;
-use crate::BindingEntities;
-use crate::BindingEntityLookup;
+use crate::BindingError;
 use crate::BindingGeneration;
 use crate::Bindings;
 use crate::Claim;
-use crate::DeviceId;
+use crate::DeviceAccessError;
+use crate::DeviceRef;
 use crate::DeviceResolution;
-use crate::DeviceRevisionLookup;
 use crate::DeviceStateLookup;
 use crate::Devices;
+use crate::DriverContractError;
+use crate::DriverContractFailureReport;
+use crate::DriverOutcomeStatus;
+use crate::EndedRegistrationLifetime;
 use crate::HardwareInventory;
-use crate::LastAttemptEnding;
+use crate::KeyAvailability;
 use crate::LastKnownGoodConfiguration;
+use crate::LiveRoleChange;
+use crate::LiveRoleChanged;
 use crate::OnAbort;
-use crate::OnSessionLoss;
 use crate::Presence;
-use crate::RetiredRoleAttemptEnded;
+use crate::RegistrationAttemptEnded;
+use crate::ReporterActivation;
 use crate::RiggingLimits;
 use crate::RoleKey;
-use crate::RoleState;
-use crate::RoleStateChanged;
-use crate::SessionLossDisposition;
-use crate::SessionLossProcessed;
-use crate::SessionLossRefusal;
-use crate::SessionLossReport;
-use crate::SessionLossReports;
+use crate::RoleStatusView;
+use crate::SessionReleaseCause;
+use crate::TargetResolution;
+use crate::TargetResolutionContext;
+use crate::TargetWait;
+use crate::UnconfirmedBasis;
 use crate::WaitingWork;
-use crate::attempt::AttemptDeadlineStatus;
+use crate::binding;
+use crate::binding::ActiveAttemptRecord;
+use crate::binding::ApplyConfigurationSource;
+use crate::binding::AuthorizedApplyAttempt;
 use crate::binding::BindingTransition;
 use crate::binding::BindingTransitionBatch;
+use crate::binding::ContinuousFlowJudgment;
+use crate::binding::DriverCleanup;
 use crate::binding::EndpointAvailability;
-use crate::binding::EstablishingAttemptLookup;
-use crate::binding::RoleView;
-use crate::binding::SessionLossApplication;
-use crate::binding::WaitingRole;
+use crate::binding::NonEmptyReporterIds;
+use crate::binding::ReporterWait;
+use crate::binding::WaitingCondition;
+use crate::contract::DriverReports;
+use crate::contract::ErasedApplied;
+use crate::contract::ErasedDriverCompletion;
+use crate::contract::ErasedSessionReport;
+use crate::contract::QueuedCompletion;
+use crate::contract::QueuedSessionReport;
+use crate::contract::ResolvedDeviceContext;
+use crate::devices::ApplyAuthorizationError;
+use crate::devices::DeviceEntityLookup;
+use crate::devices::DeviceRevision;
+use crate::devices::DeviceRevisionLookup;
+use crate::devices::PriorKeyAvailability;
 use crate::reconcile::FrameClockReading;
+use crate::registration::ApplyPermit;
 use crate::registration::Drivers;
+use crate::registration::RegisteredReporter;
+use crate::registration::ReporterContribution;
+use crate::registration::Reporters;
 
-/// Whether one in-flight attempt still holds the authorization it started under.
-///
-/// A named answer rather than an `Option<AttemptInvalidation>`: absence would have to be read as
-/// "every re-check passed, so the driver may be polled", which is the decision this phase exists to
-/// make, and a caller meeting `None` at the call site cannot tell it from "nothing was checked".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AttemptValidity {
-    /// Every re-check passed, so the driver may be polled again this frame.
     Holds,
-    /// One re-check failed, and this is the reason the attempt is abandoned.
     Invalidated(AttemptInvalidation),
 }
 
-/// End every attempt whose authorization no longer holds, before any driver poll this frame.
-///
-/// Ordered before `poll_attempts` so an attempt authorized against one unit can never land on
-/// another: the re-check happens while the driver is still untouched. An abort whose generation
-/// still matches the standing binding closes a retry gate through
-/// `crate::Bindings::record_attempt_ending`, which is what makes it terminal: the three apply
-/// systems are chained inside one set, so a role left ungated would be restarted later in the
-/// same frame against the conditions that just invalidated it. An ending stamped with a
-/// superseded generation records nothing, so the replacement's own dispatch later in this very
-/// chain starts cleanly rather than inheriting the ended attempt's gate.
-pub(crate) fn abort_invalidated_attempts(world: &mut World) {
-    let invalidated = invalidated_attempts(world);
-    if invalidated.is_empty() {
-        return;
+enum ApplyDispatchOutcome {
+    Started,
+    Deferred(WaitingCondition),
+    Rejected(ApplyDispatchRejection),
+}
+
+enum ApplyDispatchRejection {
+    Binding(crate::BindingError),
+    DriverContract(DriverContractError),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReporterWaitKind {
+    AwaitingFirstReport,
+    Unconfirmed,
+    Unreachable,
+    Absent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttemptEndingRegistrationLifetime {
+    Live(Entity),
+    Displaced,
+    Retired,
+}
+
+enum AttemptEndingPublicationDestination {
+    Live(Entity),
+    AwaitingRoleEntityRecovery,
+    RegistrationRetirementRequired,
+    Ended(EndedRegistrationLifetime),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttemptEndingPublicationReadiness {
+    ReadyAfterStatusPublication,
+    ReadyAfterAttemptLifecycle,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum AttemptEndingRoleEntityRecovery {
+    #[default]
+    NotAwaiting,
+    AwaitingNextPass,
+    PassCompleted,
+}
+
+/// One terminal attempt result retained until its ordering predecessor has been published.
+struct PendingAttemptEndingPublication {
+    role:                 RoleKey,
+    endpoint:             crate::DeviceEndpoint,
+    generation:           BindingGeneration,
+    attempt:              AttemptRef,
+    ending:               AttemptEnding,
+    lifetime:             AttemptEndingRegistrationLifetime,
+    readiness:            AttemptEndingPublicationReadiness,
+    role_entity_recovery: AttemptEndingRoleEntityRecovery,
+}
+
+impl PendingAttemptEndingPublication {
+    fn live(retained: &ActiveAttemptRecord, ending: AttemptEnding) -> Self {
+        Self {
+            role: retained.role.clone(),
+            endpoint: retained.attempt.endpoint().clone(),
+            generation: retained.attempt.generation(),
+            attempt: retained.attempt.reference(),
+            ending,
+            lifetime: AttemptEndingRegistrationLifetime::Live(retained.entity),
+            readiness: AttemptEndingPublicationReadiness::ReadyAfterStatusPublication,
+            role_entity_recovery: AttemptEndingRoleEntityRecovery::NotAwaiting,
+        }
     }
 
-    let now = FrameClockReading::from(world.resource::<Time<Real>>());
-    let mut endings = Vec::with_capacity(invalidated.len());
-    world.resource_scope::<Attempts, _>(|world, mut attempts| {
-        world.resource_scope::<Bindings, _>(|world, mut bindings| {
-            for (attempt, role, ended_generation, attempt_invalidation) in invalidated {
-                warn!("role `{role}`: in-flight apply attempt aborted: {attempt_invalidation:?}");
-                // Only the attempt `RoleState::Applying` names may reset that state: a stale
-                // attempt's abort arriving after a replacement must not knock the replacement's
-                // own dispatch out of `Applying`.
-                if bindings
-                    .binding(&role)
-                    .is_ok_and(|binding| binding.state == RoleState::Applying(attempt))
-                    && let Ok(RoleView::Applying(mut applying_role)) = bindings.role_view(&role)
-                {
-                    applying_role.abort();
-                }
-                let device_revision =
-                    role_device_revision(world.resource::<Devices>(), &bindings, &role);
-                bindings.record_attempt_ending(
-                    &role,
-                    ended_generation,
-                    AttemptOutcome::Aborted,
-                    device_revision,
-                    now,
-                );
-                apply_abort_policy(&mut bindings, &role, attempt_invalidation);
-                attempts.end(attempt);
-                endings.push((role, attempt, attempt_invalidation));
-            }
-        });
-    });
-
-    // Triggered after both scopes close, so an observer may declare `Res<Attempts>` or
-    // `Res<Bindings>`. A system parameter naming a resource the world does not currently hold is
-    // skipped rather than reported, so an observer written against a taken resource would silently
-    // never run.
-    for (role, attempt, attempt_invalidation) in endings {
-        announce_attempt_ending(
-            world,
-            &role,
+    const fn ended(
+        role: RoleKey,
+        endpoint: crate::DeviceEndpoint,
+        generation: BindingGeneration,
+        attempt: AttemptRef,
+        ending: AttemptEnding,
+        lifetime: AttemptEndingRegistrationLifetime,
+    ) -> Self {
+        Self {
+            role,
+            endpoint,
+            generation,
             attempt,
-            AttemptOutcome::Aborted,
-            Some(attempt_invalidation),
-        );
-        announce_role_state(world, &role);
+            ending,
+            lifetime,
+            readiness: AttemptEndingPublicationReadiness::ReadyAfterAttemptLifecycle,
+            role_entity_recovery: AttemptEndingRoleEntityRecovery::NotAwaiting,
+        }
+    }
+
+    fn finish_attempt_lifecycle(&mut self) {
+        if self.readiness == AttemptEndingPublicationReadiness::ReadyAfterAttemptLifecycle {
+            self.readiness = AttemptEndingPublicationReadiness::ReadyAfterStatusPublication;
+        }
+    }
+
+    fn finish_role_entity_recovery_pass(&mut self) {
+        if self.role_entity_recovery == AttemptEndingRoleEntityRecovery::AwaitingNextPass {
+            self.role_entity_recovery = AttemptEndingRoleEntityRecovery::PassCompleted;
+        }
+    }
+
+    fn await_next_role_entity_recovery_pass(&mut self) {
+        if self.role_entity_recovery == AttemptEndingRoleEntityRecovery::NotAwaiting {
+            self.role_entity_recovery = AttemptEndingRoleEntityRecovery::AwaitingNextPass;
+        }
     }
 }
 
-/// Carry out the role's `crate::OnAbort` choice for the attempt the kernel just abandoned.
+#[derive(Default, Resource)]
+pub(crate) struct PendingAttemptEndingPublications(Vec<PendingAttemptEndingPublication>);
+
+struct AttemptLifecycleResources<'a> {
+    bindings:           &'a mut Bindings,
+    drivers:            &'a mut Drivers,
+    devices:            &'a Devices,
+    hardware_inventory: &'a HardwareInventory,
+    reports:            &'a DriverReports,
+    now:                FrameClockReading,
+    apply_overrun:      Duration,
+    endings:            Vec<PendingAttemptEndingPublication>,
+}
+
+struct BindingTransitionDriverCleanup {
+    role:          RoleKey,
+    role_entity:   DriverCleanupRoleEntity,
+    endpoint:      crate::DeviceEndpoint,
+    cleanup:       DriverCleanup,
+    invalidation:  AttemptInvalidation,
+    release_cause: SessionReleaseCause,
+    lifetime:      AttemptEndingRegistrationLifetime,
+}
+
+/// Whether the role entity still exists when the kernel calls a driver's cleanup.
 ///
-/// The kernel performs no I/O, so `crate::OnAbort::Revert` cannot itself drive the endpoint back.
-/// What it does is record the debt: the role is owed a restoration of the value the last safe
-/// capture read back, so the next dispatch mints a last-known-good restore instead of the
-/// authored request, and the role's own driver performs it. With nothing established there is
-/// nothing to revert to, and the role keeps whatever the abandoned apply left — which is
-/// `crate::OnAbort::LeaveAsIs` by another route, and the only answer available.
+/// **Why the entity is not simply an [`Entity`].** A role entity despawned outside the kernel used
+/// to strand its driver: an established session was never released, so the hardware stayed open
+/// with no observer and no way back. Passing a bare `Entity` made that failure invisible, because
+/// the driver could not tell a live entity from a dangling id and the kernel could only warn. This
+/// type puts the fact in the signature: a driver handles [`Self::Removed`] exactly as
+/// [`Self::Live`] for its own records and hardware, and skips only the work that needs the entity.
+///
+/// [`Self::Live`] is checked at construction: it is built in exactly one place,
+/// `Self::checked`, which asks the world whether the id is still spawned. A driver may therefore
+/// take the promise literally and read or write the entity it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DriverCleanupRoleEntity {
+    /// The role entity is still spawned and may be read or written for this callback only.
+    Live(Entity),
+    /// The role entity is gone at the moment cleanup runs; only entity-free work can be done.
+    ///
+    /// The full precondition, because a plain despawn does not produce it: role-entity recovery
+    /// (`reconcile_role_entities`, which runs immediately before
+    /// `cleanup_binding_transition_driver_state`) re-spawns the entity of a binding that is still
+    /// registered, so a role entity despawned on its own comes back and reaches the driver as
+    /// `Live`. `Removed` arrives when the entity is gone at the moment the binding is replaced or
+    /// retired — nothing is left to re-spawn it — or when a loss, stall, or invalidation finds
+    /// that the id [`Bindings`] still records no longer exists (see `Self::checked`).
+    ///
+    /// To reproduce it in a test: retire the role, despawn its entity, run one update.
+    Removed,
+}
+
+impl DriverCleanupRoleEntity {
+    /// Classify a role entity id against the world that is about to hand it to a driver.
+    ///
+    /// [`Bindings::role_entity`] answers from a by-role map holding whatever id was registered, so
+    /// it returns `Ok` for an entity that has since been despawned: a role entity that loses its
+    /// `RoleKey` before it is despawned leaves no lost-entity record for recovery to act on, and
+    /// the dead id stays in [`Bindings`] for the life of the binding. Passing that id on as
+    /// [`Self::Live`] would be a lie the contract doc invites the driver to act on, and reading a
+    /// despawned entity panics. Every `Live` is built here, so a dead entity reaches the driver as
+    /// [`Self::Removed`] instead.
+    pub(crate) fn checked(world: &World, role_entity: Entity) -> Self {
+        if world.get_entity(role_entity).is_ok() {
+            Self::Live(role_entity)
+        } else {
+            Self::Removed
+        }
+    }
+}
+
+fn binding_transition_driver_cleanup(world: &World) -> Vec<BindingTransitionDriverCleanup> {
+    world
+        .resource::<BindingTransitionBatch>()
+        .transitions()
+        .iter()
+        .filter_map(|transition| {
+            let (role, role_entity, endpoint, cleanup, invalidation, release_cause, lifetime) =
+                match transition {
+                    BindingTransition::Registered { .. } => return None,
+                    BindingTransition::Replaced {
+                        role,
+                        displaced_entity,
+                        endpoint,
+                        cleanup,
+                        ..
+                    } => {
+                        let role_entity = world
+                            .resource::<Bindings>()
+                            .role_entity(role)
+                            .unwrap_or(*displaced_entity);
+                        (
+                            role.clone(),
+                            role_entity,
+                            endpoint.clone(),
+                            *cleanup,
+                            AttemptInvalidation::BindingReplaced,
+                            SessionReleaseCause::BindingReplaced,
+                            AttemptEndingRegistrationLifetime::Displaced,
+                        )
+                    },
+                    BindingTransition::Retired {
+                        role,
+                        endpoint,
+                        entity,
+                        cleanup,
+                        ..
+                    } => (
+                        role.clone(),
+                        *entity,
+                        endpoint.clone(),
+                        *cleanup,
+                        AttemptInvalidation::RoleRetired,
+                        SessionReleaseCause::RoleRetired,
+                        AttemptEndingRegistrationLifetime::Retired,
+                    ),
+                };
+            if cleanup == DriverCleanup::None {
+                return None;
+            }
+            let role_entity = DriverCleanupRoleEntity::checked(world, role_entity);
+            Some(BindingTransitionDriverCleanup {
+                role,
+                role_entity,
+                endpoint,
+                cleanup,
+                invalidation,
+                release_cause,
+                lifetime,
+            })
+        })
+        .collect()
+}
+
+/// Cancel or release client work before a replaced or retired role entity can be removed.
+pub(crate) fn cleanup_binding_transition_driver_state(world: &mut World) {
+    let cleanup = binding_transition_driver_cleanup(world);
+    if cleanup.is_empty() {
+        return;
+    }
+    world.resource_scope::<Drivers, _>(|world, mut drivers| {
+        for cleanup in cleanup {
+            let BindingTransitionDriverCleanup {
+                role,
+                role_entity,
+                endpoint,
+                cleanup,
+                invalidation,
+                release_cause,
+                lifetime,
+            } = cleanup;
+            match cleanup {
+                DriverCleanup::None => {},
+                DriverCleanup::Applying {
+                    driver,
+                    attempt,
+                    generation,
+                } => {
+                    // The driver is called whether or not the entity survived: an attempt whose
+                    // role entity vanished still has hardware started, and only the driver can
+                    // undo it.
+                    if let Err(error) = drivers.cancel_apply(
+                        world,
+                        driver,
+                        &role,
+                        role_entity,
+                        attempt,
+                        invalidation,
+                    ) {
+                        warn!("role `{role}`: driver cleanup failed: {error}");
+                    }
+                    world
+                        .resource_mut::<PendingAttemptEndingPublications>()
+                        .0
+                        .push(PendingAttemptEndingPublication::ended(
+                            role,
+                            endpoint,
+                            generation,
+                            attempt,
+                            AttemptEnding::Invalidated(invalidation),
+                            lifetime,
+                        ));
+                },
+                // A despawned role entity is the case this most has to reach: without the call
+                // the session stays open in the driver forever, with nothing left to observe it.
+                DriverCleanup::Established { driver, session } => {
+                    if let Err(error) = drivers.release_session(
+                        world,
+                        driver,
+                        &role,
+                        role_entity,
+                        session,
+                        release_cause,
+                    ) {
+                        warn!("role `{role}`: driver cleanup failed: {error}");
+                    }
+                },
+            }
+        }
+    });
+}
+
+/// Advance all driver-owned authorities in the contract's fixed lifecycle order.
+pub(crate) fn advance_attempt_lifecycle(world: &mut World) {
+    for publication in &mut world.resource_mut::<PendingAttemptEndingPublications>().0 {
+        publication.finish_attempt_lifecycle();
+        publication.finish_role_entity_recovery_pass();
+    }
+    rearm_reacquired_roles(world);
+
+    let reports = world.resource::<DriverReports>().clone();
+    let completions = reports.drain_completions();
+    let session_reports = reports.drain_session_reports();
+    let now = FrameClockReading::from(world.resource::<Time<Real>>());
+    let apply_overrun = world.resource::<RiggingLimits>().apply_overrun;
+    let has_startable_roles = !startable_roles(world).is_empty();
+    let has_active_attempts = !world.resource::<Bindings>().active_attempts().is_empty();
+    if completions.is_empty()
+        && session_reports.is_empty()
+        && !has_startable_roles
+        && !has_active_attempts
+    {
+        return;
+    }
+    let endings = world.resource_scope::<Bindings, _>(|world, mut bindings| {
+        world.resource_scope::<Drivers, _>(|world, mut drivers| {
+            world.resource_scope::<Devices, _>(|world, devices| {
+                world.resource_scope::<HardwareInventory, _>(|world, hardware_inventory| {
+                    AttemptLifecycleResources {
+                        bindings: &mut bindings,
+                        drivers: &mut drivers,
+                        devices: &devices,
+                        hardware_inventory: &hardware_inventory,
+                        reports: &reports,
+                        now,
+                        apply_overrun,
+                        endings: Vec::new(),
+                    }
+                    .advance(world, completions, session_reports)
+                })
+            })
+        })
+    });
+
+    world
+        .resource_mut::<PendingAttemptEndingPublications>()
+        .0
+        .extend(endings);
+}
+
+/// Credit continuous-flow testimony, publish newly crossed stalls, and release stalls retained
+/// from the prior update.
+///
+/// A monitored session testifies on nearly every frame once its device is producing data, and
+/// crediting that testimony rewrites nothing a consumer of the binding register can observe. The
+/// judgment reports whether it published anything, and only then is the register marked changed:
+/// borrowing it mutably on every datum frame would re-project every managed window's placement and
+/// break the settled-frame write counts at data rate.
+pub(crate) fn judge_continuous_flow(world: &mut World) {
+    let now = FrameClockReading::from(world.resource::<Time<Real>>());
+    if !world.resource::<Bindings>().continuous_flow_update_due(now) {
+        return;
+    }
+    let mut bindings = world.resource_mut::<Bindings>();
+    let ContinuousFlowJudgment::Published { release_required } = bindings
+        .bypass_change_detection()
+        .judge_continuous_flow(now)
+    else {
+        return;
+    };
+    bindings.set_changed();
+    if release_required.is_empty() {
+        return;
+    }
+
+    world.resource_scope::<Bindings, _>(|world, mut bindings| {
+        world.resource_scope::<Drivers, _>(|world, mut drivers| {
+            world.resource_scope::<Devices, _>(|world, devices| {
+                for retained in release_required {
+                    let Some(established) =
+                        bindings.established_session(&retained.role, retained.session)
+                    else {
+                        continue;
+                    };
+                    // A stall crossing fires its loss exactly once because the session always
+                    // leaves `Established` here. Nothing below may skip that: the flow judge is
+                    // selected by retained state rather than a consumed queue entry, so a role
+                    // parked in `Established(Stalled)` is re-selected, re-released, and re-warned
+                    // on every following update for the life of the binding.
+                    if let Ok(role_entity) = bindings.role_entity(&established.role) {
+                        let role_entity = DriverCleanupRoleEntity::checked(world, role_entity);
+                        let _ = drivers.release_session(
+                            world,
+                            established.driver,
+                            &established.role,
+                            role_entity,
+                            established.session,
+                            SessionReleaseCause::FlowStalled,
+                        );
+                    } else {
+                        warn!(
+                            "role `{}`: stalled session has no live role entity",
+                            established.role
+                        );
+                    }
+                    let device_revision =
+                        role_device_revision(&devices, &bindings, &established.role);
+                    let _ = bindings.apply_session_loss(&established.role, device_revision, now);
+                }
+            });
+        });
+    });
+}
+
+impl AttemptLifecycleResources<'_> {
+    fn advance(
+        mut self,
+        world: &mut World,
+        completions: VecDeque<QueuedCompletion>,
+        session_reports: VecDeque<QueuedSessionReport>,
+    ) -> Vec<PendingAttemptEndingPublication> {
+        // (1) Synchronous start errors are recorded while starting successors below.
+        // (2) Revalidate every non-time guard before accepting any completion.
+        self.revalidate_attempts(world);
+        // (3) Accept on-time completions for attempts whose guards still hold.
+        let refused = self.accept_completions(world, completions);
+        // (4) Only a strict crossing of the hard end exhausts an unfinished attempt.
+        self.expire_overdue_attempts(world);
+        // (5) Late, duplicate, unknown, and superseded results are refused here.
+        record_refused_completions(refused);
+        process_session_reports(
+            world,
+            self.bindings,
+            self.drivers,
+            self.devices,
+            session_reports,
+            self.now,
+        );
+        // (6) Resolution precedes issuance for every successor.
+        self.start_successors(world);
+        self.endings
+    }
+
+    fn revalidate_attempts(&mut self, world: &mut World) {
+        for retained in self.bindings.active_attempts() {
+            let AttemptValidity::Invalidated(cause) = attempt_validity(
+                &retained,
+                self.bindings,
+                self.devices,
+                self.hardware_inventory,
+            ) else {
+                continue;
+            };
+            cancel_attempt(world, self.bindings, self.drivers, &retained, cause);
+            finish_invalidated(
+                self.bindings,
+                self.devices,
+                &retained,
+                cause,
+                self.now,
+                &mut self.endings,
+            );
+        }
+    }
+
+    fn accept_completions(
+        &mut self,
+        world: &mut World,
+        completions: VecDeque<QueuedCompletion>,
+    ) -> Vec<QueuedCompletion> {
+        let mut refused = Vec::new();
+        for queued in completions {
+            let Some(retained) = self.bindings.active_attempt(&queued.role, queued.attempt) else {
+                refused.push(queued);
+                continue;
+            };
+            if queued.completed_at > retained.attempt.deadline() + self.apply_overrun {
+                refused.push(queued);
+                continue;
+            }
+            accept_completion(
+                world,
+                self.bindings,
+                self.drivers,
+                self.devices,
+                self.reports,
+                retained,
+                queued,
+                self.now,
+                &mut self.endings,
+            );
+        }
+        refused
+    }
+
+    fn expire_overdue_attempts(&mut self, world: &mut World) {
+        let FrameClockReading::Measurable(measured) = self.now else {
+            return;
+        };
+        let overdue = self
+            .bindings
+            .active_attempts()
+            .into_iter()
+            .filter(|retained| measured > retained.attempt.deadline() + self.apply_overrun)
+            .collect::<Vec<_>>();
+        for retained in overdue {
+            cancel_attempt(
+                world,
+                self.bindings,
+                self.drivers,
+                &retained,
+                AttemptInvalidation::OverrunExhausted,
+            );
+            finish_invalidated(
+                self.bindings,
+                self.devices,
+                &retained,
+                AttemptInvalidation::OverrunExhausted,
+                self.now,
+                &mut self.endings,
+            );
+        }
+    }
+
+    fn start_successors(&mut self, world: &mut World) {
+        let startable = startable_roles_from(world, self.bindings, self.devices, self.now);
+        for role in startable {
+            if let Some(ending) = start_one_apply(
+                world,
+                self.bindings,
+                self.drivers,
+                self.devices,
+                self.hardware_inventory,
+                self.reports,
+                &role,
+                self.now,
+            ) {
+                self.endings.push(ending);
+            }
+        }
+    }
+}
+
+fn record_refused_completions(refused: Vec<QueuedCompletion>) {
+    for queued in refused {
+        warn!(
+            "role `{}`: refused completion for inactive attempt {}",
+            queued.role,
+            queued.attempt.get()
+        );
+    }
+}
+
+fn attempt_validity(
+    retained: &ActiveAttemptRecord,
+    bindings: &Bindings,
+    devices: &Devices,
+    hardware_inventory: &HardwareInventory,
+) -> AttemptValidity {
+    let attempt = &retained.attempt;
+    match bindings.generation(&retained.role) {
+        None => return AttemptValidity::Invalidated(AttemptInvalidation::RoleRetired),
+        Some(generation) if generation != attempt.generation() => {
+            return AttemptValidity::Invalidated(AttemptInvalidation::BindingReplaced);
+        },
+        Some(_) => {},
+    }
+    if devices.resolve(&attempt.endpoint().device)
+        != DeviceResolution::Resolved(attempt.device_id())
+    {
+        return AttemptValidity::Invalidated(AttemptInvalidation::DeviceChanged);
+    }
+    let DeviceStateLookup::Retained(device_state) = devices.state(attempt.device_id()) else {
+        return AttemptValidity::Invalidated(AttemptInvalidation::DeviceNotPresent);
+    };
+    if !matches!(
+        devices.key_availability(&device_state.key),
+        PriorKeyAvailability::Published(crate::KeyAvailability::Present(_))
+    ) {
+        return AttemptValidity::Invalidated(AttemptInvalidation::DeviceNotPresent);
+    }
+    match device_state.claim {
+        Claim::Held | Claim::Free | Claim::NotApplicable => {},
+        Claim::Contended { .. } | Claim::Blocked { .. } => {
+            return AttemptValidity::Invalidated(AttemptInvalidation::ClaimLost);
+        },
+    }
+    if !device_state.verdict.identified() {
+        return AttemptValidity::Invalidated(AttemptInvalidation::IdentityNoLongerConfirmed);
+    }
+    if hardware_inventory
+        .ensure_operational(&attempt.endpoint().device)
+        .is_err()
+    {
+        return AttemptValidity::Invalidated(AttemptInvalidation::InventoryWithdrewTheDevice);
+    }
+    if devices.revision(attempt.device_id())
+        != DeviceRevisionLookup::Retained(attempt.device_revision())
+    {
+        return AttemptValidity::Invalidated(AttemptInvalidation::RevisionAdvanced);
+    }
+    AttemptValidity::Holds
+}
+
+fn cancel_attempt(
+    world: &mut World,
+    bindings: &Bindings,
+    drivers: &mut Drivers,
+    retained: &ActiveAttemptRecord,
+    cause: AttemptInvalidation,
+) {
+    let Ok(role_entity) = bindings.role_entity(&retained.role) else {
+        warn!(
+            "role `{}`: canceled attempt has no live role entity",
+            retained.role
+        );
+        return;
+    };
+    let role_entity = DriverCleanupRoleEntity::checked(world, role_entity);
+    let _ = drivers.cancel_apply(
+        world,
+        retained.driver,
+        &retained.role,
+        role_entity,
+        retained.attempt.reference(),
+        cause,
+    );
+}
+
+fn finish_invalidated(
+    bindings: &mut Bindings,
+    devices: &Devices,
+    retained: &ActiveAttemptRecord,
+    cause: AttemptInvalidation,
+    now: FrameClockReading,
+    endings: &mut Vec<PendingAttemptEndingPublication>,
+) {
+    apply_abort_policy(bindings, &retained.role, cause);
+    bindings.record_invalidated_attempt_ending(
+        &retained.role,
+        retained.attempt.generation(),
+        cause,
+        role_device_revision(devices, bindings, &retained.role),
+        now,
+    );
+    endings.push(PendingAttemptEndingPublication::live(
+        retained,
+        AttemptEnding::Invalidated(cause),
+    ));
+}
+
+fn accept_completion(
+    world: &mut World,
+    bindings: &mut Bindings,
+    drivers: &mut Drivers,
+    devices: &Devices,
+    reports: &DriverReports,
+    retained: ActiveAttemptRecord,
+    queued: QueuedCompletion,
+    now: FrameClockReading,
+    endings: &mut Vec<PendingAttemptEndingPublication>,
+) {
+    match queued.completion {
+        ErasedDriverCompletion::Succeeded(applied) => {
+            let applied_kind = match &applied {
+                ErasedApplied::AsDispatched => AppliedKind::AsDispatched,
+                ErasedApplied::DiffersFromDispatched(_) => AppliedKind::DiffersFromDispatched,
+            };
+            let session = bindings.issue_session();
+            let Ok(role_entity) = bindings.role_entity(&retained.role) else {
+                warn!(
+                    "role `{}`: successful attempt has no live role entity",
+                    retained.role
+                );
+                return;
+            };
+            match drivers.established(
+                world,
+                retained.driver,
+                &retained.role,
+                role_entity,
+                retained.attempt.reference(),
+                session,
+                reports,
+            ) {
+                Ok(datum_arrivals) => {
+                    if bindings.accept_success(
+                        &retained.role,
+                        retained.attempt.reference(),
+                        queued.completed_at,
+                        session,
+                        datum_arrivals,
+                        applied,
+                    ) {
+                        endings.push(PendingAttemptEndingPublication::live(
+                            &retained,
+                            AttemptEnding::Reported(DriverOutcomeStatus::Succeeded(applied_kind)),
+                        ));
+                    }
+                },
+                Err(error) => {
+                    cancel_attempt(
+                        world,
+                        bindings,
+                        drivers,
+                        &retained,
+                        AttemptInvalidation::DriverContractFailed,
+                    );
+                    record_contract_failure(bindings, devices, &retained, error, now, endings);
+                },
+            }
+        },
+        ErasedDriverCompletion::Failed(error) => {
+            let outcome = DriverOutcomeStatus::Failed(error);
+            bindings.record_attempt_ending(
+                &retained.role,
+                retained.attempt.generation(),
+                outcome.clone(),
+                role_device_revision(devices, bindings, &retained.role),
+                now,
+            );
+            endings.push(PendingAttemptEndingPublication::live(
+                &retained,
+                AttemptEnding::Reported(outcome),
+            ));
+        },
+        ErasedDriverCompletion::Aborted(reason) => {
+            let outcome = DriverOutcomeStatus::Aborted(reason);
+            bindings.record_attempt_ending(
+                &retained.role,
+                retained.attempt.generation(),
+                outcome.clone(),
+                role_device_revision(devices, bindings, &retained.role),
+                now,
+            );
+            endings.push(PendingAttemptEndingPublication::live(
+                &retained,
+                AttemptEnding::Reported(outcome),
+            ));
+        },
+    }
+}
+
+fn record_contract_failure(
+    bindings: &mut Bindings,
+    devices: &Devices,
+    retained: &ActiveAttemptRecord,
+    error: DriverContractError,
+    now: FrameClockReading,
+    endings: &mut Vec<PendingAttemptEndingPublication>,
+) {
+    let report = DriverContractFailureReport::from(error);
+    bindings.record_registration_application_ending(
+        &retained.role,
+        retained.attempt.generation(),
+        AttemptEnding::ContractFailed(report.clone()),
+    );
+    bindings.record_dispatch_refused(
+        &retained.role,
+        role_device_revision(devices, bindings, &retained.role),
+        now,
+        retained.attempt.deadline(),
+        WaitingCondition::DriverRepair {
+            error: report.clone(),
+        },
+    );
+    endings.push(PendingAttemptEndingPublication::live(
+        retained,
+        AttemptEnding::ContractFailed(report),
+    ));
+}
+
+fn process_session_reports(
+    world: &mut World,
+    bindings: &mut Bindings,
+    drivers: &mut Drivers,
+    devices: &Devices,
+    reports: impl IntoIterator<Item = QueuedSessionReport>,
+    now: FrameClockReading,
+) {
+    for queued in reports {
+        match queued.report {
+            ErasedSessionReport::ConfigurationChanged(configuration) => {
+                let _ = bindings.update_established_configuration(
+                    &queued.role,
+                    queued.session,
+                    configuration,
+                );
+            },
+            ErasedSessionReport::Loss(_error) => {
+                let Some(established) =
+                    bindings.established_sessions().into_iter().find(|session| {
+                        session.role == queued.role && session.session == queued.session
+                    })
+                else {
+                    continue;
+                };
+                let Ok(role_entity) = bindings.role_entity(&established.role) else {
+                    warn!(
+                        "role `{}`: released session has no live role entity",
+                        established.role
+                    );
+                    continue;
+                };
+                let role_entity = DriverCleanupRoleEntity::checked(world, role_entity);
+                let _ = drivers.release_session(
+                    world,
+                    established.driver,
+                    &established.role,
+                    role_entity,
+                    established.session,
+                    SessionReleaseCause::ReportedLoss,
+                );
+                let device_revision = role_device_revision(devices, bindings, &established.role);
+                let _ = bindings.apply_session_loss(&established.role, device_revision, now);
+            },
+        }
+    }
+}
+
+struct PreparedApply<'a> {
+    role:            &'a RoleKey,
+    endpoint:        crate::DeviceEndpoint,
+    driver:          crate::DriverId,
+    generation:      crate::BindingGeneration,
+    role_entity:     Entity,
+    source:          ApplyConfigurationSource,
+    device_id:       crate::DeviceId,
+    device_revision: DeviceRevision,
+    started_at:      Instant,
+    deadline:        Instant,
+    resolved_device: ResolvedDeviceContext,
+    permit:          ApplyPermit,
+}
+
+fn start_one_apply(
+    world: &mut World,
+    bindings: &mut Bindings,
+    drivers: &mut Drivers,
+    devices: &Devices,
+    hardware_inventory: &HardwareInventory,
+    reports: &DriverReports,
+    role: &RoleKey,
+    now: FrameClockReading,
+) -> Option<PendingAttemptEndingPublication> {
+    let FrameClockReading::Measurable(started_at) = now else {
+        return None;
+    };
+    let binding = bindings.binding(role).ok()?;
+    let endpoint = binding.endpoint.clone();
+    let driver = binding.driver;
+    let generation = bindings.generation(role)?;
+    let role_entity = bindings.role_entity(role).ok()?;
+    let apply_deadline = binding.apply_deadline;
+    let source = match bindings.waiting_work(role) {
+        WaitingWork::RestorationOwed => ApplyConfigurationSource::LastKnownGood,
+        WaitingWork::Nothing => ApplyConfigurationSource::Requested,
+        WaitingWork::ReapplyRequestOwed | WaitingWork::RegistrationOwed => return None,
+    };
+
+    let DeviceResolution::Resolved(device_id) = devices.resolve(&endpoint.device) else {
+        bindings.set_wait(
+            role,
+            started_at,
+            unresolved_device_wait(world, devices, &endpoint.device, started_at),
+        );
+        return None;
+    };
+    let DeviceRevisionLookup::Retained(device_revision) = devices.revision(device_id) else {
+        return None;
+    };
+    let DeviceEntityLookup::Projected(device_entity) = devices.entity(device_id) else {
+        bindings.set_wait(
+            role,
+            started_at,
+            WaitingCondition::KernelStateRepairRequired,
+        );
+        return None;
+    };
+    let permit = devices.authorize_service(device_id);
+    let permit = match permit {
+        Ok(permit) => permit,
+        Err(error) => {
+            let wait = authorization_wait(world, devices, device_id, &error, started_at);
+            bindings.set_wait(role, started_at, wait);
+            return None;
+        },
+    };
+    if let Err(error) = hardware_inventory.ensure_operational(&endpoint.device) {
+        record_prestart_rejection(
+            bindings,
+            role,
+            device_revision,
+            now,
+            started_at,
+            ApplyDispatchRejection::Binding(error),
+        );
+        return None;
+    }
+    let deadline = started_at
+        + apply_deadline
+            .resolve(world.resource::<RiggingLimits>())
+            .duration();
+    let resolved_device = ResolvedDeviceContext::new(
+        device_entity,
+        DeviceRef::from_device_id(device_id),
+        device_revision,
+    );
+    dispatch_prepared_apply(
+        world,
+        bindings,
+        drivers,
+        devices,
+        reports,
+        PreparedApply {
+            role,
+            endpoint,
+            driver,
+            generation,
+            role_entity,
+            source,
+            device_id,
+            device_revision,
+            started_at,
+            deadline,
+            resolved_device,
+            permit,
+        },
+        now,
+    )
+}
+
+fn dispatch_prepared_apply(
+    world: &mut World,
+    bindings: &mut Bindings,
+    drivers: &mut Drivers,
+    devices: &Devices,
+    reports: &DriverReports,
+    prepared: PreparedApply<'_>,
+    now: FrameClockReading,
+) -> Option<PendingAttemptEndingPublication> {
+    let configuration = match prepared
+        .source
+        .dispatch_configuration(bindings.binding(prepared.role).ok()?)
+    {
+        Ok(configuration) => configuration,
+        Err(error) => {
+            record_prestart_rejection(
+                bindings,
+                prepared.role,
+                prepared.device_revision,
+                now,
+                prepared.deadline,
+                ApplyDispatchRejection::Binding(error),
+            );
+            return None;
+        },
+    };
+    let target_context = TargetResolutionContext::new(
+        prepared.role,
+        prepared.role_entity,
+        &prepared.endpoint,
+        prepared.resolved_device,
+    );
+    let dispatch =
+        match drivers.resolve_target(world, prepared.driver, &target_context, configuration) {
+            Ok(TargetResolution::Reached(target)) => {
+                let attempt = world.resource_mut::<Attempts>().issue().ok()?;
+                let authorized = AuthorizedApplyAttempt::new(
+                    attempt,
+                    prepared.generation,
+                    prepared.endpoint.clone(),
+                    prepared.device_id,
+                    prepared.device_revision,
+                    prepared.started_at,
+                    prepared.deadline,
+                );
+                if let Err(rejection) =
+                    release_replaced_session(world, bindings, drivers, prepared.role)
+                {
+                    record_prestart_rejection(
+                        bindings,
+                        prepared.role,
+                        prepared.device_revision,
+                        now,
+                        prepared.deadline,
+                        rejection,
+                    );
+                    return None;
+                }
+                bindings.start_apply(prepared.role, authorized, prepared.source);
+                let configuration = bindings.active_configuration(prepared.role, attempt).ok()?;
+                let context = TargetResolutionContext::new(
+                    prepared.role,
+                    prepared.role_entity,
+                    &prepared.endpoint,
+                    prepared.resolved_device,
+                );
+                match drivers.start_apply(
+                    world,
+                    prepared.driver,
+                    context,
+                    prepared.deadline,
+                    prepared.permit,
+                    attempt,
+                    reports,
+                    configuration,
+                    target,
+                ) {
+                    Ok(()) => ApplyDispatchOutcome::Started,
+                    Err(error) => {
+                        let retained = bindings.active_attempt(prepared.role, attempt)?;
+                        cancel_attempt(
+                            world,
+                            bindings,
+                            drivers,
+                            &retained,
+                            AttemptInvalidation::DriverContractFailed,
+                        );
+                        reports.refuse_attempt(attempt);
+                        return Some(record_started_contract_failure(
+                            bindings, devices, retained, error, now,
+                        ));
+                    },
+                }
+            },
+            Ok(TargetResolution::Deferred(wait)) => ApplyDispatchOutcome::Deferred(
+                waiting_condition_for_target(world, &prepared.endpoint, wait, prepared.started_at),
+            ),
+            Err(error) => {
+                ApplyDispatchOutcome::Rejected(ApplyDispatchRejection::DriverContract(error))
+            },
+        };
+    record_dispatch_outcome(bindings, &prepared, dispatch, now)
+}
+
+fn record_dispatch_outcome(
+    bindings: &mut Bindings,
+    prepared: &PreparedApply<'_>,
+    dispatch: ApplyDispatchOutcome,
+    now: FrameClockReading,
+) -> Option<PendingAttemptEndingPublication> {
+    match dispatch {
+        ApplyDispatchOutcome::Started => None,
+        ApplyDispatchOutcome::Deferred(waiting) => {
+            bindings.set_wait(prepared.role, prepared.started_at, waiting);
+            None
+        },
+        ApplyDispatchOutcome::Rejected(rejection) => {
+            record_prestart_rejection(
+                bindings,
+                prepared.role,
+                prepared.device_revision,
+                now,
+                prepared.deadline,
+                rejection,
+            );
+            None
+        },
+    }
+}
+
+fn release_replaced_session(
+    world: &mut World,
+    bindings: &Bindings,
+    drivers: &mut Drivers,
+    role: &RoleKey,
+) -> Result<(), ApplyDispatchRejection> {
+    let Some(established) = bindings
+        .established_sessions()
+        .into_iter()
+        .find(|established| established.role == *role)
+    else {
+        return Ok(());
+    };
+    let role_entity = bindings
+        .role_entity(role)
+        .map_err(ApplyDispatchRejection::Binding)?;
+    let role_entity = DriverCleanupRoleEntity::checked(world, role_entity);
+    drivers
+        .release_session(
+            world,
+            established.driver,
+            role,
+            role_entity,
+            established.session,
+            SessionReleaseCause::ReplacementApply,
+        )
+        .map_err(ApplyDispatchRejection::DriverContract)
+}
+
+fn record_started_contract_failure(
+    bindings: &mut Bindings,
+    devices: &Devices,
+    retained: ActiveAttemptRecord,
+    error: DriverContractError,
+    now: FrameClockReading,
+) -> PendingAttemptEndingPublication {
+    let report = DriverContractFailureReport::from(error);
+    bindings.record_dispatch_refused(
+        &retained.role,
+        role_device_revision(devices, bindings, &retained.role),
+        now,
+        retained.attempt.deadline(),
+        WaitingCondition::DriverRepair {
+            error: report.clone(),
+        },
+    );
+    PendingAttemptEndingPublication::live(&retained, AttemptEnding::ContractFailed(report))
+}
+
+fn record_prestart_rejection(
+    bindings: &mut Bindings,
+    role: &RoleKey,
+    device_revision: DeviceRevision,
+    now: FrameClockReading,
+    wait_bound: Instant,
+    rejection: ApplyDispatchRejection,
+) {
+    match rejection {
+        ApplyDispatchRejection::Binding(error) => {
+            warn!("role `{role}`: binding refused apply: {error}");
+            bindings.record_dispatch_refused(
+                role,
+                DeviceRevisionLookup::Retained(device_revision),
+                now,
+                wait_bound,
+                WaitingCondition::ApplicationBindingRepairRequired,
+            );
+        },
+        ApplyDispatchRejection::DriverContract(error) => {
+            let report = DriverContractFailureReport::from(error);
+            bindings.record_dispatch_refused(
+                role,
+                DeviceRevisionLookup::Retained(device_revision),
+                now,
+                wait_bound,
+                WaitingCondition::DriverRepair { error: report },
+            );
+        },
+    }
+}
+
+fn waiting_condition_for_target(
+    world: &World,
+    endpoint: &crate::DeviceEndpoint,
+    wait: TargetWait,
+    now: Instant,
+) -> WaitingCondition {
+    match wait {
+        TargetWait::Reporter { reporter, error } => {
+            let kind = target_reporter_wait_kind(world, reporter, &error);
+            reporter_wait_for_ids(world, kind, &endpoint.device, &[reporter], now)
+        },
+        TargetWait::ApplicationRoleAttachmentRequired => {
+            WaitingCondition::ApplicationTargetAttachmentRequired
+        },
+        TargetWait::ApplicationCapabilityRegistrationRequired { failure } => {
+            WaitingCondition::ApplicationCapabilityRegistrationRequired { failure }
+        },
+    }
+}
+
+/// Names the reporter state behind a driver target that is not ready yet.
+///
+/// A missing projected capability is not proof that the physical device is absent. Before the
+/// driver's reporter completes its first set, it is an awaiting-first-report wait; after a set
+/// completes without the capability, it is unconfirmed evidence. Other access errors mean the
+/// reporter currently cannot reach a usable target.
+fn target_reporter_wait_kind(
+    world: &World,
+    reporter: crate::ReporterId,
+    error: &DeviceAccessError,
+) -> ReporterWaitKind {
+    if !matches!(error, DeviceAccessError::Absent { .. }) {
+        return ReporterWaitKind::Unreachable;
+    }
+    world
+        .resource::<Reporters>()
+        .registered_reporters()
+        .find(|registered| registered.reporter == reporter)
+        .map_or(
+            ReporterWaitKind::Unconfirmed,
+            |registered| match registered.contribution {
+                ReporterContribution::AwaitingFirstCompleteSet => {
+                    ReporterWaitKind::AwaitingFirstReport
+                },
+                ReporterContribution::Completed { .. } => ReporterWaitKind::Unconfirmed,
+            },
+        )
+}
+
 fn apply_abort_policy(
     bindings: &mut Bindings,
     role: &RoleKey,
@@ -162,446 +1311,216 @@ fn apply_abort_policy(
     }
 }
 
-/// List the attempts this frame must end, while only shared borrows are held.
-///
-/// Selecting first keeps a settled frame silent: `World::resource_scope` marks a resource changed
-/// on reinsertion whether or not the closure wrote anything, so a frame with no invalidated attempt
-/// must never enter one.
-fn invalidated_attempts(
-    world: &World,
-) -> Vec<(AttemptId, RoleKey, BindingGeneration, AttemptInvalidation)> {
-    let attempts = world.resource::<Attempts>();
-    let devices = world.resource::<Devices>();
-    let bindings = world.resource::<Bindings>();
-    let hardware_inventory = world.resource::<HardwareInventory>();
-    let rigging_limits = world.resource::<RiggingLimits>();
-    let now = FrameClockReading::from(world.resource::<Time<Real>>());
-
-    attempts
-        .in_flight_attempts()
-        .filter_map(|attempt| {
-            let AttemptValidity::Invalidated(attempt_invalidation) = attempt_validity(
-                attempt,
-                bindings,
-                devices,
-                hardware_inventory,
-                attempts.deadline_status(attempt.id, now, rigging_limits.apply_overrun),
-            ) else {
-                return None;
-            };
-            Some((
-                attempt.id,
-                attempt.role.clone(),
-                attempt.binding_generation,
-                attempt_invalidation,
-            ))
-        })
-        .collect()
-}
-
-/// Decide whether one in-flight attempt still holds the authorization it started under.
-fn attempt_validity(
-    attempt: &Attempt,
-    bindings: &Bindings,
-    devices: &Devices,
-    hardware_inventory: &HardwareInventory,
-    deadline_status: AttemptDeadlineStatus,
-) -> AttemptValidity {
-    // Compared against authoritative state, never against the frame-delayed transition batch: an
-    // attempt carries the generation of the binding that dispatched it, so a replacement is
-    // detected the moment it lands and the replacement's own dispatch can never select itself.
-    match bindings.generation(&attempt.role) {
-        None => return AttemptValidity::Invalidated(AttemptInvalidation::RoleRetired),
-        Some(generation) if generation != attempt.binding_generation => {
-            return AttemptValidity::Invalidated(AttemptInvalidation::BindingReplaced);
-        },
-        Some(_) => {},
-    }
-    if devices.resolve(&attempt.endpoint.device)
-        != DeviceResolution::Resolved(attempt.expected_device_id)
-    {
-        return AttemptValidity::Invalidated(AttemptInvalidation::DeviceChanged);
-    }
-    // Claim, verdict, and presence are read through `Devices`, never through the device entity's
-    // mirrored components: the entity can be despawned while an attempt is still finishing, which
-    // is exactly when these checks matter most. Presence variants are compared, never values,
-    // because `Presence::Unreachable` carries an elapsed time that grows on every scan.
-    match devices.state(attempt.expected_device_id) {
-        DeviceStateLookup::Retired => {
-            return AttemptValidity::Invalidated(AttemptInvalidation::DeviceNotPresent);
-        },
-        DeviceStateLookup::Retained(reconciled_device_state) => {
-            match reconciled_device_state.claim {
-                Claim::Held | Claim::Free | Claim::NotApplicable => {},
-                Claim::Contended { .. } | Claim::Blocked { .. } => {
-                    return AttemptValidity::Invalidated(AttemptInvalidation::ClaimLost);
+pub(crate) fn publish_pending_attempt_endings(world: &mut World) {
+    let ready = {
+        let mut pending = world.resource_mut::<PendingAttemptEndingPublications>();
+        let mut ready = Vec::new();
+        for publication in std::mem::take(&mut pending.0) {
+            match publication.readiness {
+                AttemptEndingPublicationReadiness::ReadyAfterStatusPublication => {
+                    ready.push(publication);
+                },
+                AttemptEndingPublicationReadiness::ReadyAfterAttemptLifecycle => {
+                    pending.0.push(publication);
                 },
             }
-            if !reconciled_device_state.verdict.identified() {
-                return AttemptValidity::Invalidated(
-                    AttemptInvalidation::IdentityNoLongerConfirmed,
+        }
+        ready
+    };
+    for mut publication in ready {
+        match publication.lifetime {
+            AttemptEndingRegistrationLifetime::Live(binding) => {
+                match attempt_ending_publication_destination(
+                    world,
+                    &publication.role,
+                    &publication.endpoint,
+                    publication.generation,
+                    binding,
+                    publication.role_entity_recovery,
+                ) {
+                    AttemptEndingPublicationDestination::Live(binding) => {
+                        let ending_view = binding::project_attempt_ending(&publication.ending);
+                        world.entity_mut(binding).insert(publication.ending);
+                        world.trigger(LiveRoleChanged {
+                            binding,
+                            role: publication.role,
+                            change: LiveRoleChange::AttemptEnded {
+                                attempt: publication.attempt,
+                                ending:  ending_view,
+                            },
+                        });
+                    },
+                    AttemptEndingPublicationDestination::Ended(lifetime) => {
+                        publish_ended_registration_attempt(world, publication, lifetime);
+                    },
+                    AttemptEndingPublicationDestination::AwaitingRoleEntityRecovery => {
+                        publication.await_next_role_entity_recovery_pass();
+                        world
+                            .resource_mut::<PendingAttemptEndingPublications>()
+                            .0
+                            .push(publication);
+                    },
+                    AttemptEndingPublicationDestination::RegistrationRetirementRequired => {
+                        retire_registration_for_pending_attempt_ending(world, publication);
+                    },
+                }
+            },
+            AttemptEndingRegistrationLifetime::Displaced => {
+                publish_ended_registration_attempt(
+                    world,
+                    publication,
+                    EndedRegistrationLifetime::Displaced,
                 );
-            }
-            if !reconciled_device_state
-                .presence
-                .is_same_variant(Presence::Present)
-            {
-                return AttemptValidity::Invalidated(AttemptInvalidation::DeviceNotPresent);
-            }
-        },
-    }
-    if hardware_inventory
-        .ensure_operational(&attempt.endpoint.device)
-        .is_err()
-    {
-        return AttemptValidity::Invalidated(AttemptInvalidation::InventoryWithdrewTheDevice);
-    }
-    // Last of the state checks, because its meaning is "moved in a way none of the others names".
-    // A device the kernel no longer retains has no revision at all, which the checks above have
-    // already ended the attempt for.
-    if devices.revision(attempt.expected_device_id)
-        != DeviceRevisionLookup::Retained(attempt.device_revision)
-    {
-        return AttemptValidity::Invalidated(AttemptInvalidation::RevisionAdvanced);
-    }
-    match deadline_status {
-        AttemptDeadlineStatus::OverrunExhausted { .. } => {
-            AttemptValidity::Invalidated(AttemptInvalidation::OverrunExhausted)
-        },
-        AttemptDeadlineStatus::NoSuchAttempt
-        | AttemptDeadlineStatus::WithinDeadline
-        | AttemptDeadlineStatus::OverdueWithinOverrun { .. } => AttemptValidity::Holds,
+            },
+            AttemptEndingRegistrationLifetime::Retired => {
+                publish_ended_registration_attempt(
+                    world,
+                    publication,
+                    EndedRegistrationLifetime::Retired,
+                );
+            },
+        }
     }
 }
 
-/// Report one terminal attempt outcome to whichever observer can still receive it.
-///
-/// A role that still projects a binding entity gets the entity-targeted `crate::AttemptFinished`.
-/// A role whose entity was despawned this frame gets the global `crate::RetiredRoleAttemptEnded`
-/// instead: an event addressed to a despawned entity reaches nobody, and a retirement is exactly
-/// the ending a diagnostic most needs to see.
-fn announce_attempt_ending(
+fn retire_registration_for_pending_attempt_ending(
     world: &mut World,
-    role: &RoleKey,
-    attempt: AttemptId,
-    outcome: AttemptOutcome,
-    invalidation: Option<AttemptInvalidation>,
+    publication: PendingAttemptEndingPublication,
 ) {
-    match world.resource::<BindingEntities>().entity(role) {
-        BindingEntityLookup::Registered(binding) => {
-            world.entity_mut(binding).insert(LastAttemptEnding {
-                outcome: outcome.clone(),
-                invalidation,
-            });
-            world.trigger(AttemptFinished {
-                binding,
-                role: role.clone(),
-                attempt,
-                outcome,
-            });
+    match world.resource_mut::<Bindings>().retire(&publication.role) {
+        Ok(_) => {
+            world
+                .resource_mut::<PendingAttemptEndingPublications>()
+                .0
+                .push(publication);
         },
-        BindingEntityLookup::Unregistered => {
-            world.trigger(RetiredRoleAttemptEnded {
-                role: role.clone(),
-                attempt,
-                outcome,
-            });
+        Err(error @ BindingError::PendingTransitionCapacityReached) => {
+            warn!(
+                "role `{}`: registration retirement after entity recovery failed: {error}",
+                publication.role
+            );
+            world
+                .resource_mut::<PendingAttemptEndingPublications>()
+                .0
+                .push(publication);
+        },
+        Err(error @ BindingError::TransitionSequenceExhausted) => {
+            warn!(
+                "role `{}`: registration retirement after entity recovery failed permanently: \
+                 {error}",
+                publication.role
+            );
+            publish_ended_registration_attempt(
+                world,
+                publication,
+                EndedRegistrationLifetime::RetirementBlocked,
+            );
+        },
+        Err(error) => {
+            // `Bindings::retire` confirms `Bindings::by_role` membership before its only fallible
+            // call, `Bindings::reserve_transition`, which returns only the two variants above. The
+            // shared `BindingError` return type requires this unreachable arm.
+            warn!(
+                "role `{}`: registration retirement after entity recovery failed unexpectedly: \
+                 {error}",
+                publication.role
+            );
+            publish_ended_registration_attempt(
+                world,
+                publication,
+                EndedRegistrationLifetime::RetirementBlocked,
+            );
         },
     }
 }
 
-/// Report one role's new lifecycle state to whichever binding entity can still receive it.
-///
-/// Called from `crate::RiggingSystems::Apply` rather than derived from the entity mirror, which
-/// refreshes a full system set earlier: the three apply systems can move one role
-/// `Applying -> Waiting -> Applying` inside a single frame, and a mirror-derived event would arrive
-/// next frame carrying only the final state, leaving a consumer unable to count attempts from
-/// events. A role whose binding entity was despawned this frame reports nothing: its ending is
-/// already covered by `crate::RetiredRoleAttemptEnded`.
-fn announce_role_state(world: &mut World, role: &RoleKey) {
-    let BindingEntityLookup::Registered(binding) = world.resource::<BindingEntities>().entity(role)
-    else {
-        return;
-    };
-    let Ok(state) = world
-        .resource::<Bindings>()
-        .binding(role)
-        .map(|binding| binding.state)
-    else {
-        return;
-    };
-    world.trigger(RoleStateChanged {
-        binding,
-        role: role.clone(),
-        state,
-    });
-}
-
-/// Process integration-reported established-session failures at their explicit lifecycle point.
-///
-/// Selection and mutation happen outside endpoint-driver dispatch. Every report is checked against
-/// the current binding, binding-transition batch, resolved process-local device handle, and device
-/// revision before its `OnSessionLoss` policy can move the role.
-pub(crate) fn process_session_loss_reports(world: &mut World) {
-    let reports: Vec<SessionLossReport> =
-        world.resource_mut::<SessionLossReports>().drain().collect();
-    if reports.is_empty() {
-        return;
-    }
-
-    for report in reports {
-        let disposition = if let Some(refusal) = session_loss_refusal(world, &report) {
-            SessionLossDisposition::Refused(refusal)
-        } else {
-            let now = FrameClockReading::from(world.resource::<Time<Real>>());
-            match world.resource_mut::<Bindings>().apply_session_loss(
-                &report.role,
-                report.expected_device_revision,
-                now,
-            ) {
-                SessionLossApplication::Applied(OnSessionLoss::Recreate) => {
-                    SessionLossDisposition::RecreateScheduled
-                },
-                SessionLossApplication::Applied(OnSessionLoss::ReportOnly) => {
-                    SessionLossDisposition::ReportedOnly
-                },
-                SessionLossApplication::BindingAbsent => {
-                    SessionLossDisposition::Refused(SessionLossRefusal::RoleAbsent)
-                },
-            }
-        };
-        let role = report.role.clone();
-        let accepted = matches!(
-            disposition,
-            SessionLossDisposition::RecreateScheduled | SessionLossDisposition::ReportedOnly
-        );
-        world.trigger(SessionLossProcessed {
-            report,
-            disposition,
-        });
-        if accepted {
-            announce_role_state(world, &role);
-        }
-    }
-}
-
-/// Name the first stale guard that prevents one session-loss report from moving its role.
-fn session_loss_refusal(world: &World, report: &SessionLossReport) -> Option<SessionLossRefusal> {
-    for transition in world
-        .resource::<BindingTransitionBatch>()
-        .transitions()
-        .iter()
-        .rev()
-    {
-        match transition {
-            BindingTransition::Retired { role, .. } if role == &report.role => {
-                return Some(SessionLossRefusal::RoleRetired);
-            },
-            BindingTransition::Replaced { role, .. } if role == &report.role => {
-                return Some(SessionLossRefusal::RoleReplaced);
-            },
-            BindingTransition::Registered { .. }
-            | BindingTransition::Replaced { .. }
-            | BindingTransition::Retired { .. } => {},
-        }
-    }
-
+fn attempt_ending_publication_destination(
+    world: &World,
+    role: &RoleKey,
+    endpoint: &crate::DeviceEndpoint,
+    generation: BindingGeneration,
+    binding: Entity,
+    role_entity_recovery: AttemptEndingRoleEntityRecovery,
+) -> AttemptEndingPublicationDestination {
     let bindings = world.resource::<Bindings>();
-    for transition in bindings.pending_transitions().rev() {
-        match transition {
-            BindingTransition::Retired { role, .. } if role == &report.role => {
-                return Some(SessionLossRefusal::RoleRetired);
+    if world.get_entity(binding).is_err() {
+        let Some(current_generation) = bindings.generation(role) else {
+            return AttemptEndingPublicationDestination::Ended(EndedRegistrationLifetime::Retired);
+        };
+        if current_generation != generation {
+            return AttemptEndingPublicationDestination::Ended(
+                EndedRegistrationLifetime::Displaced,
+            );
+        }
+        if let Ok(current_entity) = bindings.role_entity(role)
+            && world.get_entity(current_entity).is_ok()
+        {
+            return AttemptEndingPublicationDestination::Live(current_entity);
+        }
+        return match role_entity_recovery {
+            AttemptEndingRoleEntityRecovery::NotAwaiting
+            | AttemptEndingRoleEntityRecovery::AwaitingNextPass => {
+                AttemptEndingPublicationDestination::AwaitingRoleEntityRecovery
             },
-            BindingTransition::Replaced { role, .. } if role == &report.role => {
-                return Some(SessionLossRefusal::RoleReplaced);
+            AttemptEndingRoleEntityRecovery::PassCompleted => {
+                AttemptEndingPublicationDestination::RegistrationRetirementRequired
+            },
+        };
+    }
+    let ended_lifetime = bindings
+        .pending_transitions()
+        .find_map(|transition| match transition {
+            BindingTransition::Replaced {
+                role: transition_role,
+                displaced_entity,
+                endpoint: transition_endpoint,
+                ..
+            } if transition_role == role
+                && *displaced_entity == binding
+                && transition_endpoint == endpoint =>
+            {
+                Some(EndedRegistrationLifetime::Displaced)
+            },
+            BindingTransition::Retired {
+                role: transition_role,
+                endpoint: transition_endpoint,
+                entity,
+                ..
+            } if transition_role == role
+                && *entity == binding
+                && transition_endpoint == endpoint =>
+            {
+                Some(EndedRegistrationLifetime::Retired)
             },
             BindingTransition::Registered { .. }
             | BindingTransition::Replaced { .. }
-            | BindingTransition::Retired { .. } => {},
-        }
-    }
-    let Ok(binding) = bindings.binding(&report.role) else {
-        return Some(SessionLossRefusal::RoleAbsent);
-    };
-    if binding.state != RoleState::Ready {
-        return Some(SessionLossRefusal::SessionNotEstablished);
-    }
-    let devices = world.resource::<Devices>();
-    if devices.resolve(&binding.endpoint.device)
-        != DeviceResolution::Resolved(report.expected_device_id)
-    {
-        return Some(SessionLossRefusal::DeviceRebound);
-    }
-    if devices.revision(report.expected_device_id)
-        != DeviceRevisionLookup::Retained(report.expected_device_revision)
-    {
-        return Some(SessionLossRefusal::DeviceRevisionChanged);
-    }
-    match bindings.establishing_attempt(&report.role) {
-        EstablishingAttemptLookup::EstablishedBy(establishing_attempt)
-            if establishing_attempt == report.establishing_attempt =>
-        {
-            None
-        },
-        EstablishingAttemptLookup::EstablishedBy(_) => {
-            Some(SessionLossRefusal::EstablishingAttemptReplaced)
-        },
-        EstablishingAttemptLookup::NotEstablished => {
-            Some(SessionLossRefusal::SessionNotEstablished)
-        },
-    }
-}
-
-/// Poll every attempt that survived re-validation and finish the ones a driver reports terminal.
-pub(crate) fn poll_attempts(world: &mut World) {
-    let polled: Vec<AttemptId> = world
-        .resource::<Attempts>()
-        .in_flight_attempts()
-        .map(|attempt| attempt.id)
-        .collect();
-    if polled.is_empty() {
-        return;
-    }
-
-    let now = FrameClockReading::from(world.resource::<Time<Real>>());
-    let mut endings = Vec::new();
-    world.resource_scope::<Attempts, _>(|world, mut attempts| {
-        world.resource_scope::<Bindings, _>(|world, mut bindings| {
-            world.resource_scope::<Drivers, _>(|world, mut drivers| {
-                world.resource_scope::<HardwareInventory, _>(|world, hardware_inventory| {
-                    for attempt in polled {
-                        let AttemptLookup::InFlight(retained) = attempts.in_flight(attempt) else {
-                            continue;
-                        };
-                        let role = retained.role.clone();
-                        let endpoint = retained.endpoint.clone();
-                        let ended_generation = retained.binding_generation;
-                        let attempt_progress = {
-                            let Ok(RoleView::Applying(applying_role)) = bindings.role_view(&role)
-                            else {
-                                continue;
-                            };
-                            let Ok(poll_request) = applying_role.poll_request(&hardware_inventory)
-                            else {
-                                continue;
-                            };
-                            // The request carries the role and endpoint the binding currently
-                            // holds; the attempt carries the ones it
-                            // was authorized against. A driver is
-                            // only asked to continue when the two still name the same work.
-                            if poll_request.role != &role || poll_request.endpoint != &endpoint {
-                                continue;
-                            }
-                            match drivers.poll(world, poll_request) {
-                                Ok(attempt_progress) => attempt_progress,
-                                Err(_) => AttemptProgress::Finished(AttemptOutcome::Aborted),
-                            }
-                        };
-                        let AttemptProgress::Finished(attempt_outcome) = attempt_progress else {
-                            continue;
-                        };
-                        if let Ok(RoleView::Applying(mut applying_role)) = bindings.role_view(&role)
-                        {
-                            applying_role.finish(attempt_outcome.clone());
-                        }
-                        let device_revision =
-                            role_device_revision(world.resource::<Devices>(), &bindings, &role);
-                        bindings.record_attempt_ending(
-                            &role,
-                            ended_generation,
-                            attempt_outcome.clone(),
-                            device_revision,
-                            now,
-                        );
-                        attempts.end(attempt);
-                        endings.push((role, attempt, attempt_outcome));
-                    }
-                });
-            });
+            | BindingTransition::Retired { .. } => None,
         });
+    if let Some(ended_lifetime) = ended_lifetime {
+        return AttemptEndingPublicationDestination::Ended(ended_lifetime);
+    }
+    AttemptEndingPublicationDestination::Live(binding)
+}
+
+fn publish_ended_registration_attempt(
+    world: &mut World,
+    publication: PendingAttemptEndingPublication,
+    lifetime: EndedRegistrationLifetime,
+) {
+    world.trigger(RegistrationAttemptEnded {
+        role: publication.role,
+        endpoint: publication.endpoint,
+        attempt: publication.attempt,
+        ending: binding::project_attempt_ending(&publication.ending),
+        lifetime,
     });
-
-    // Triggered after every scope closes, for the same reason the abort path defers its endings: an
-    // observer declaring a resource the world does not currently hold is skipped, not reported.
-    for (role, attempt, attempt_outcome) in endings {
-        announce_attempt_ending(world, &role, attempt, attempt_outcome, None);
-        announce_role_state(world, &role);
-    }
 }
 
-/// Start one authorized apply for every waiting role whose retry pacing has opened.
-///
-/// Erased driver dispatch runs first and only a successful dispatch commits the binding to
-/// `crate::RoleState::Applying`, so a missing driver or a configuration-contract failure leaves the
-/// role `crate::RoleState::Waiting` with no in-flight attempt.
-pub(crate) fn start_authorized_applies(world: &mut World) {
-    rearm_reacquired_roles(world);
-
-    let startable = startable_roles(world);
-    if startable.is_empty() {
-        return;
-    }
-
-    // Recorded before dispatch because only a successful start moves the role, and the announcement
-    // has to distinguish that from the roles this pass tried and left where they were.
-    let states_before = role_states(world, &startable);
-
-    world.resource_scope::<Bindings, _>(|world, mut bindings| {
-        world.resource_scope::<Drivers, _>(|world, mut drivers| {
-            world.resource_scope::<Devices, _>(|world, devices| {
-                world.resource_scope::<HardwareInventory, _>(|world, hardware_inventory| {
-                    for role in startable {
-                        start_one_apply(
-                            world,
-                            &mut bindings,
-                            &mut drivers,
-                            &devices,
-                            &hardware_inventory,
-                            &role,
-                        );
-                    }
-                });
-            });
-        });
-    });
-
-    for (role, state_before) in states_before {
-        if role_state(world, &role) != Some(state_before) {
-            announce_role_state(world, &role);
-        }
-    }
-}
-
-/// Read the current recovery state of every named role that still has a binding.
-fn role_states(world: &World, roles: &[RoleKey]) -> Vec<(RoleKey, RoleState)> {
-    roles
-        .iter()
-        .filter_map(|role| role_state(world, role).map(|state| (role.clone(), state)))
-        .collect()
-}
-
-/// Read one role's current recovery state, or `None` when the role no longer has a binding.
-fn role_state(world: &World, role: &RoleKey) -> Option<RoleState> {
-    world
-        .resource::<Bindings>()
-        .binding(role)
-        .ok()
-        .map(|binding| binding.state)
-}
-
-/// Return every role the kernel stopped after repeated failures whose device has since returned.
-///
-/// The second way out of `crate::RoleState::StoppedAfterRepeatedFailures`, beside the explicit
-/// `crate::Bindings::restart_after_repeated_failures`: a role gets one more attempt once the unit
-/// it kept failing against has actually left and come back, and a success on that attempt clears
-/// the run. Watching for the departure first is what keeps a device that never leaves from being
-/// retried — that role stays stopped until the application restarts it.
 fn rearm_reacquired_roles(world: &mut World) {
     let stopped = stopped_role_endpoints(world);
     if stopped.is_empty() {
         return;
     }
-
     world.resource_scope::<Bindings, _>(|_world, mut bindings| {
         for (role, endpoint_availability) in stopped {
             bindings.observe_stopped_role_endpoint(&role, endpoint_availability);
@@ -609,53 +1528,41 @@ fn rearm_reacquired_roles(world: &mut World) {
     });
 }
 
-/// Read how every stopped role's endpoint resolves this frame, while only shared borrows are held.
 fn stopped_role_endpoints(world: &World) -> Vec<(RoleKey, EndpointAvailability)> {
     let bindings = world.resource::<Bindings>();
     let devices = world.resource::<Devices>();
-
     bindings
         .registered_roles()
         .filter_map(|role| {
             let binding = bindings.binding(role).ok()?;
-            if binding.state != RoleState::StoppedAfterRepeatedFailures {
-                return None;
-            }
-
-            Some((
-                role.clone(),
-                endpoint_availability(devices, &binding.endpoint.device),
-            ))
+            matches!(
+                bindings.projected_status(role),
+                Ok(RoleStatusView::Stopped(_))
+            )
+            .then(|| {
+                (
+                    role.clone(),
+                    endpoint_availability(devices, &binding.endpoint.device),
+                )
+            })
         })
         .collect()
 }
 
-/// Report whether one durable endpoint currently names a device the kernel could drive.
 fn endpoint_availability(devices: &Devices, device_key: &crate::DeviceKey) -> EndpointAvailability {
-    let DeviceResolution::Resolved(device_id) = devices.resolve(device_key) else {
+    let DeviceResolution::Resolved(_) = devices.resolve(device_key) else {
         return EndpointAvailability::Gone;
     };
-    match devices.state(device_id) {
-        DeviceStateLookup::Retired => EndpointAvailability::Gone,
-        DeviceStateLookup::Retained(reconciled_device_state) => {
-            if reconciled_device_state
-                .presence
-                .is_same_variant(Presence::Present)
-            {
-                EndpointAvailability::Available
-            } else {
-                EndpointAvailability::Gone
-            }
+    match devices.key_availability(device_key) {
+        PriorKeyAvailability::Published(KeyAvailability::Present(_)) => {
+            EndpointAvailability::Available
+        },
+        PriorKeyAvailability::NeverPublished | PriorKeyAvailability::Published(_) => {
+            EndpointAvailability::Gone
         },
     }
 }
 
-/// Read how many times one role's device has changed, in the form the retry gate stamps and reads.
-///
-/// A role whose endpoint resolves to nothing answers `DeviceRevisionLookup::Retired`, which is what
-/// lets a gate stamped while the device was gone reopen when the device returns: reacquisition
-/// issues a fresh handle whose counter restarts, so the two readings differ even though the numbers
-/// would not.
 fn role_device_revision(
     devices: &Devices,
     bindings: &Bindings,
@@ -670,1685 +1577,625 @@ fn role_device_revision(
     }
 }
 
-/// List the roles whose waiting state and retry pacing both permit a dispatch this frame.
 fn startable_roles(world: &World) -> Vec<RoleKey> {
     let bindings = world.resource::<Bindings>();
     let devices = world.resource::<Devices>();
     let now = FrameClockReading::from(world.resource::<Time<Real>>());
+    startable_roles_from(world, bindings, devices, now)
+}
 
+fn startable_roles_from(
+    world: &World,
+    bindings: &Bindings,
+    devices: &Devices,
+    now: FrameClockReading,
+) -> Vec<RoleKey> {
     bindings
         .registered_roles()
         .filter(|role| {
             bindings
                 .retry_pacing(role)
                 .permits_dispatch(role_device_revision(devices, bindings, role), now)
-                && bindings.waiting_work(role) != WaitingWork::ApplicationRequestOwed
-                && bindings.binding(role).is_ok_and(|binding| {
-                    binding.state == RoleState::Waiting
-                        && matches!(
-                            devices.resolve(&binding.endpoint.device),
-                            DeviceResolution::Resolved(_)
-                        )
-                })
+                && !bindings.waiting_work(role).holds_for_application()
+                && !bindings
+                    .pending_transitions()
+                    .any(|transition| match transition {
+                        BindingTransition::Registered {
+                            role: transitioned, ..
+                        }
+                        | BindingTransition::Replaced {
+                            role: transitioned, ..
+                        }
+                        | BindingTransition::Retired {
+                            role: transitioned, ..
+                        } => transitioned == *role,
+                    })
+                && matches!(
+                    bindings.projected_status(role),
+                    Ok(RoleStatusView::Waiting(_))
+                )
+                && endpoint_wait_requires_update(world, bindings, devices, role, now)
         })
         .cloned()
         .collect()
 }
 
-/// How far one waiting role got toward handing an apply to its driver.
-///
-/// Owned rather than borrowed, so the lifecycle view that mints the request is dropped before the
-/// caller records what happened: the refusal paths have to touch `crate::Bindings` again, and the
-/// request borrows it.
-enum ApplyDispatch {
-    /// The driver accepted the start after the authoritative attempt was retained.
-    Started,
-    /// The device is not authorized for this kind of apply right now. Not paced: the condition is
-    /// device state that reconciliation re-answers every frame, and no driver was asked anything.
-    NotAuthorized,
-    /// Nothing reached a driver: the lifecycle view refused to mint a request, or erased dispatch
-    /// failed on an unregistered driver or a configuration-contract mismatch.
-    Refused,
-}
-
-/// Authorize, mint, and dispatch one apply for a single waiting role.
-///
-/// The identifier is minted as late as the request contract allows — after the binding, the
-/// resolution, and the clock — and handed back on every path that does not commit, so a role whose
-/// driver is unregistered cannot spend the registry's non-reusable sequence one identifier per
-/// frame. A refusal that reached a driver also closes a retry gate, because the role stays
-/// `crate::RoleState::Waiting` and would otherwise be re-dispatched on the next frame, forever.
-fn start_one_apply(
-    world: &mut World,
-    bindings: &mut Bindings,
-    drivers: &mut Drivers,
+fn endpoint_wait_requires_update(
+    world: &World,
+    bindings: &Bindings,
     devices: &Devices,
-    hardware_inventory: &HardwareInventory,
     role: &RoleKey,
-) {
-    let Ok(binding) = bindings.binding(role) else {
-        return;
-    };
-    let DeviceResolution::Resolved(device_id) = devices.resolve(&binding.endpoint.device) else {
-        return;
-    };
-    // The two maps are written by one reconcile pass, so a handle that resolves always has a
-    // revision; the attempt is stamped with it rather than with a stand-in, because a stand-in
-    // would be indistinguishable from a device that never changed.
-    let DeviceRevisionLookup::Retained(device_revision) = devices.revision(device_id) else {
-        return;
-    };
-    let now = FrameClockReading::from(world.resource::<Time<Real>>());
+    now: FrameClockReading,
+) -> bool {
     let FrameClockReading::Measurable(measured) = now else {
-        return;
+        return false;
     };
-    // The role's own bound when it authored one, the process-wide bound otherwise: one process
-    // drives endpoints with genuinely different costs, and a single bound either abandons the slow
-    // one or lets the fast one hang.
-    let deadline = measured
-        + binding
-            .apply_deadline
-            .resolve(world.resource::<RiggingLimits>())
-            .duration();
-    let Ok(attempt) = world.resource_mut::<Attempts>().issue() else {
-        return;
+    let Ok(binding) = bindings.binding(role) else {
+        return false;
     };
+    if let DeviceResolution::Resolved(_) = devices.resolve(&binding.endpoint.device) {
+        return match devices.key_availability(&binding.endpoint.device) {
+            PriorKeyAvailability::Published(KeyAvailability::Present(_))
+            | PriorKeyAvailability::NeverPublished => true,
+            PriorKeyAvailability::Published(availability) => {
+                let condition =
+                    availability_wait(world, &binding.endpoint.device, availability, measured);
+                bindings.wait_requires_update(role, measured, &condition)
+            },
+        };
+    }
+    let condition = unresolved_device_wait(world, devices, &binding.endpoint.device, measured);
+    bindings.wait_requires_update(role, measured, &condition)
+}
 
-    match dispatch_one_apply(
-        world,
-        bindings,
-        drivers,
-        devices,
-        hardware_inventory,
-        role,
-        device_id,
-        device_revision,
-        deadline,
-        attempt,
-    ) {
-        ApplyDispatch::Started => {},
-        ApplyDispatch::NotAuthorized => world.resource_mut::<Attempts>().rollback_dispatch(attempt),
-        ApplyDispatch::Refused => {
-            world.resource_mut::<Attempts>().rollback_dispatch(attempt);
-            bindings.record_dispatch_refused(
-                role,
-                DeviceRevisionLookup::Retained(device_revision),
-                now,
-            );
+fn unresolved_device_wait(
+    world: &World,
+    devices: &Devices,
+    device_key: &crate::DeviceKey,
+    now: Instant,
+) -> WaitingCondition {
+    if let PriorKeyAvailability::Published(availability) = devices.key_availability(device_key) {
+        return availability_wait(world, device_key, availability, now);
+    }
+    let reporters = world.resource::<Reporters>();
+    let mut awaiting = Vec::new();
+    let mut completed = Vec::new();
+    let mut disabled = Vec::new();
+    for registered in reporters
+        .registered_reporters()
+        .filter(|reporter| reporter.coverage.establishes_absence_for(device_key))
+    {
+        if registered.activation == ReporterActivation::Disabled {
+            disabled.push(registered.reporter);
+            continue;
+        }
+        match &registered.contribution {
+            ReporterContribution::AwaitingFirstCompleteSet => awaiting.push(registered),
+            ReporterContribution::Completed { .. } => completed.push(registered),
+        }
+    }
+    if !awaiting.is_empty() {
+        return reporter_wait(
+            ReporterWaitKind::AwaitingFirstReport,
+            device_key,
+            now,
+            awaiting,
+            world.resource::<RiggingLimits>(),
+        );
+    }
+    if completed.is_empty()
+        && let Some((first, rest)) = disabled.split_first()
+    {
+        return WaitingCondition::ApplicationReporterEnable {
+            reporters: NonEmptyReporterIds::from_reporter_ids(*first, rest),
+        };
+    }
+    reporter_wait(
+        ReporterWaitKind::Absent,
+        device_key,
+        now,
+        completed,
+        world.resource::<RiggingLimits>(),
+    )
+}
+
+fn authorization_wait(
+    world: &World,
+    devices: &Devices,
+    device_id: crate::DeviceId,
+    error: &ApplyAuthorizationError,
+    now: Instant,
+) -> WaitingCondition {
+    let DeviceStateLookup::Retained(state) = devices.state(device_id) else {
+        return WaitingCondition::NewRegistration;
+    };
+    match error {
+        ApplyAuthorizationError::NotPresent { .. } => {
+            if let PriorKeyAvailability::Published(availability) =
+                devices.key_availability(&state.key)
+            {
+                return availability_wait(world, &state.key, availability, now);
+            }
+            let kind = match state.presence {
+                Presence::Unreachable { .. } => ReporterWaitKind::Unreachable,
+                Presence::Absent => ReporterWaitKind::Absent,
+                Presence::Present => return WaitingCondition::NewRegistration,
+            };
+            reporter_wait_for_ids(world, kind, &state.key, &state.contributors, now)
+        },
+        ApplyAuthorizationError::ClaimUnavailable { .. } => match &state.claim {
+            Claim::Contended { holder } => WaitingCondition::ClaimRelease {
+                holder: holder.clone(),
+            },
+            Claim::Blocked { gate } => {
+                WaitingCondition::ApplicationPermissionRequired { gate: gate.clone() }
+            },
+            Claim::Held | Claim::Free | Claim::NotApplicable => {
+                WaitingCondition::KernelStateRepairRequired
+            },
+        },
+        ApplyAuthorizationError::IdentityNotProven { .. } => reporter_wait_for_ids(
+            world,
+            ReporterWaitKind::Unconfirmed,
+            &state.key,
+            &state.contributors,
+            now,
+        ),
+        ApplyAuthorizationError::DeviceRetired { .. } => WaitingCondition::NewRegistration,
+        ApplyAuthorizationError::Offline { .. } => {
+            WaitingCondition::ApplicationDeviceEnableRequired {
+                key: state.key.clone(),
+            }
         },
     }
 }
 
-/// Ask one waiting role's lifecycle view for a request and hand it to erased driver dispatch.
-///
-/// The stored `crate::WaitingWork` picks the configuration and the resulting view then demands the
-/// matching permit; permission never selects the configuration.
-fn dispatch_one_apply(
-    world: &mut World,
-    bindings: &mut Bindings,
-    drivers: &mut Drivers,
-    devices: &Devices,
-    hardware_inventory: &HardwareInventory,
-    role: &RoleKey,
-    device_id: DeviceId,
-    device_revision: crate::DeviceRevision,
-    deadline: Instant,
-    attempt: AttemptId,
-) -> ApplyDispatch {
-    // Read before the lifecycle view takes the mutable borrow; stamped into the attempt so its
-    // ending can be matched to the binding that dispatched it.
-    let Some(binding_generation) = bindings.generation(role) else {
-        return ApplyDispatch::NotAuthorized;
-    };
-    let Ok(RoleView::Waiting(waiting_role)) = bindings.role_view(role) else {
-        return ApplyDispatch::NotAuthorized;
-    };
-    let (start_apply_request, permit) = match waiting_role {
-        // The role's recovery policy refused an automatic reapply after its device departed. No
-        // driver is asked anything, so this is not paced and counts as no failure: the state clears
-        // when application code acts.
-        WaitingRole::ApplicationRequest => return ApplyDispatch::NotAuthorized,
-        WaitingRole::Hardware(requesting_role) => {
-            // A `RestoreOnly` device has nothing to restore until a safe readback establishes one,
-            // so its first apply runs from authored intent under the weaker permit. `RestoreOnly`
-            // means the kernel only ever applies what the application asked for, never a
-            // configuration of its own choosing.
-            let Ok(permit) = devices
-                .authorize_service(device_id)
-                .or_else(|_| devices.authorize_restore(device_id))
-            else {
-                return ApplyDispatch::NotAuthorized;
-            };
-            match requesting_role.start_requested_apply(attempt, permit, hardware_inventory) {
-                Ok(start_apply_request) => (start_apply_request, permit),
-                Err(error) => {
-                    warn!("role `{role}`: requested apply refused: {error}");
-                    return ApplyDispatch::Refused;
-                },
-            }
-        },
-        WaitingRole::Restoration(restoring_role) => {
-            let Ok(permit) = devices.authorize_restore(device_id) else {
-                return ApplyDispatch::NotAuthorized;
-            };
-            match restoring_role.start_last_known_good_restore(attempt, permit, hardware_inventory)
-            {
-                Ok(start_apply_request) => (start_apply_request, permit),
-                Err(error) => {
-                    warn!("role `{role}`: last-known-good restore refused: {error}");
-                    return ApplyDispatch::Refused;
-                },
-            }
-        },
-    };
-    let endpoint = start_apply_request.binding.endpoint.clone();
-    world.resource_mut::<Attempts>().begin(Attempt {
-        id: attempt,
-        role: role.clone(),
-        endpoint,
-        permit,
-        binding_generation,
-        expected_device_id: device_id,
-        device_revision,
-        deadline,
-    });
-    if let Err(error) = drivers.start_apply(world, start_apply_request) {
-        warn!("role `{role}`: driver dispatch refused: {error}");
-        return ApplyDispatch::Refused;
-    }
+fn reporter_wait_for_ids(
+    world: &World,
+    kind: ReporterWaitKind,
+    device_key: &crate::DeviceKey,
+    reporter_ids: &[crate::ReporterId],
+    now: Instant,
+) -> WaitingCondition {
+    let reporters = world.resource::<Reporters>();
+    let registered = reporters
+        .registered_reporters()
+        .filter(|reporter| reporter_ids.contains(&reporter.reporter))
+        .collect();
+    reporter_wait(
+        kind,
+        device_key,
+        now,
+        registered,
+        world.resource::<RiggingLimits>(),
+    )
+}
 
-    ApplyDispatch::Started
+fn reporter_wait(
+    kind: ReporterWaitKind,
+    device_key: &crate::DeviceKey,
+    now: Instant,
+    registered_reporters: Vec<RegisteredReporter<'_>>,
+    rigging_limits: &RiggingLimits,
+) -> WaitingCondition {
+    let Some((first, rest)) = registered_reporters.split_first() else {
+        return WaitingCondition::ApplicationReporterRegistrationRequired {
+            key: device_key.clone(),
+        };
+    };
+    let reporter_wait = match kind {
+        ReporterWaitKind::AwaitingFirstReport => {
+            ReporterWait::awaiting_first_report(device_key.clone(), now, first, rest)
+        },
+        ReporterWaitKind::Unconfirmed => ReporterWait::unconfirmed(
+            device_key.clone(),
+            now,
+            first,
+            rest,
+            rigging_limits,
+            UnconfirmedBasis::NoFreshEvidence,
+        ),
+        ReporterWaitKind::Unreachable => {
+            ReporterWait::unreachable(device_key.clone(), now, first, rest, rigging_limits)
+        },
+        ReporterWaitKind::Absent => {
+            let established_by = std::iter::once(first)
+                .chain(rest)
+                .filter_map(|reporter| match reporter.contribution {
+                    ReporterContribution::Completed { batch, .. } => {
+                        Some(crate::RetirementEvidence::new(
+                            crate::ReporterRef::from_reporter_id(reporter.reporter),
+                            batch,
+                        ))
+                    },
+                    ReporterContribution::AwaitingFirstCompleteSet => None,
+                })
+                .min_by_key(|evidence| evidence.reporter.get());
+            let Some(established_by) = established_by else {
+                return WaitingCondition::ApplicationReporterRegistrationRequired {
+                    key: device_key.clone(),
+                };
+            };
+            ReporterWait::absent(device_key.clone(), established_by)
+        },
+    };
+    WaitingCondition::Reporter(reporter_wait)
+}
+
+pub(crate) fn availability_wait(
+    world: &World,
+    device_key: &crate::DeviceKey,
+    availability: &crate::KeyAvailability,
+    now: Instant,
+) -> WaitingCondition {
+    let reporters = world.resource::<Reporters>();
+    let rigging_limits = world.resource::<RiggingLimits>();
+    match availability {
+        KeyAvailability::Present(_) => WaitingCondition::NewRegistration,
+        KeyAvailability::DepartureGrace {
+            deadline, evidence, ..
+        } => WaitingCondition::Reporter(ReporterWait::departure_grace(
+            device_key.clone(),
+            world
+                .resource::<crate::RiggingRuntimeClock>()
+                .instant_at(*deadline),
+            *evidence,
+        )),
+        KeyAvailability::AwaitingFirstReport {
+            reporters: reporter_refs,
+            ..
+        } => reporter_wait_for_refs(
+            reporters,
+            reporter_refs.as_slice(),
+            device_key,
+            now,
+            rigging_limits,
+            ReporterWaitKind::AwaitingFirstReport,
+            UnconfirmedBasis::NoFreshEvidence,
+        ),
+        KeyAvailability::Unconfirmed { basis, .. } => {
+            let reporter_refs = match basis {
+                UnconfirmedBasis::NoFreshEvidence => reporters
+                    .registered_reporters()
+                    .filter(|reporter| reporter.coverage.establishes_absence_for(device_key))
+                    .map(|reporter| crate::ReporterRef::from_reporter_id(reporter.reporter))
+                    .collect::<Vec<_>>(),
+                UnconfirmedBasis::UncoveredAbsence { reporter, .. } => vec![*reporter],
+            };
+            reporter_wait_for_refs(
+                reporters,
+                &reporter_refs,
+                device_key,
+                now,
+                rigging_limits,
+                ReporterWaitKind::Unconfirmed,
+                basis.clone(),
+            )
+        },
+        KeyAvailability::Unreachable {
+            reporters: reporter_refs,
+            ..
+        } => reporter_wait_for_refs(
+            reporters,
+            reporter_refs.as_slice(),
+            device_key,
+            now,
+            rigging_limits,
+            ReporterWaitKind::Unreachable,
+            UnconfirmedBasis::NoFreshEvidence,
+        ),
+        KeyAvailability::Absent { established_by, .. } => {
+            WaitingCondition::Reporter(ReporterWait::absent(device_key.clone(), *established_by))
+        },
+    }
+}
+
+fn reporter_wait_for_refs(
+    reporters: &Reporters,
+    reporter_refs: &[crate::ReporterRef],
+    device_key: &crate::DeviceKey,
+    now: Instant,
+    rigging_limits: &RiggingLimits,
+    kind: ReporterWaitKind,
+    basis: crate::UnconfirmedBasis,
+) -> WaitingCondition {
+    let registered = reporters
+        .registered_reporters()
+        .filter(|reporter| {
+            reporter_refs.contains(&crate::ReporterRef::from_reporter_id(reporter.reporter))
+        })
+        .collect::<Vec<_>>();
+    let registered = if kind == ReporterWaitKind::AwaitingFirstReport {
+        let registered_ids = registered
+            .iter()
+            .map(|reporter| reporter.reporter)
+            .collect::<Vec<_>>();
+        let enabled = registered
+            .into_iter()
+            .filter(|reporter| reporter.activation == ReporterActivation::Enabled)
+            .collect::<Vec<_>>();
+        if enabled.is_empty()
+            && let Some((first, rest)) = registered_ids.split_first()
+        {
+            return WaitingCondition::ApplicationReporterEnable {
+                reporters: NonEmptyReporterIds::from_reporter_ids(*first, rest),
+            };
+        }
+        enabled
+    } else {
+        registered
+    };
+    let Some((first, rest)) = registered.split_first() else {
+        return WaitingCondition::ApplicationReporterRegistrationRequired {
+            key: device_key.clone(),
+        };
+    };
+    let reporter_wait = match kind {
+        ReporterWaitKind::AwaitingFirstReport => {
+            ReporterWait::awaiting_first_report(device_key.clone(), now, first, rest)
+        },
+        ReporterWaitKind::Unconfirmed => {
+            ReporterWait::unconfirmed(device_key.clone(), now, first, rest, rigging_limits, basis)
+        },
+        ReporterWaitKind::Unreachable => {
+            ReporterWait::unreachable(device_key.clone(), now, first, rest, rigging_limits)
+        },
+        ReporterWaitKind::Absent => return WaitingCondition::KernelStateRepairRequired,
+    };
+    WaitingCondition::Reporter(reporter_wait)
 }
 
 /// Empty the frame's accepted lifecycle changes once every reader has run.
-///
-/// Ordered after `crate::RiggingSystems::Apply` rather than living in the event stage: the real
-/// constraint is that nobody clears until every reader has run, and this phase's aborts read the
-/// batch a full set later than the events that report the same transitions.
 pub(crate) fn clear_binding_transitions(world: &mut World) {
-    let batch = world.resource::<BindingTransitionBatch>();
-    if batch.transitions().is_empty() {
+    if world
+        .resource::<BindingTransitionBatch>()
+        .transitions()
+        .is_empty()
+    {
         return;
     }
     world.resource_mut::<BindingTransitionBatch>().clear();
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::panic,
-    reason = "tests should panic on unexpected values"
-)]
 mod tests {
-    use std::collections::HashSet;
     use std::error::Error;
-    use std::sync::Arc;
-    use std::sync::Mutex;
+    use std::num::NonZeroUsize;
     use std::time::Duration;
 
-    use bevy::MinimalPlugins;
     use bevy::app::App;
     use bevy::app::Update;
-    use bevy::ecs::reflect::ReflectComponent;
-    use bevy::ecs::schedule::IntoScheduleConfigs;
-    use bevy::prelude::Component;
     use bevy::prelude::On;
-    use bevy::prelude::Reflect;
     use bevy::prelude::ResMut;
     use bevy::prelude::Resource;
-    use bevy::prelude::World;
-    use bevy::time::TimeUpdateStrategy;
 
+    use super::AttemptEndingPublicationReadiness;
+    use super::AttemptEndingRegistrationLifetime;
+    use super::AttemptEndingRoleEntityRecovery;
+    use super::PendingAttemptEndingPublication;
+    use super::PendingAttemptEndingPublications;
+    use super::publish_pending_attempt_endings;
     use crate::ApplyDeadline;
-    use crate::ApplyPermit;
-    use crate::AttachmentPath;
-    use crate::Attempt;
-    use crate::AttemptFinished;
-    use crate::AttemptId;
-    use crate::AttemptLookup;
-    use crate::AttemptOutcome;
-    use crate::AttemptProgress;
-    use crate::AvailableConfiguration;
-    use crate::Binding;
+    use crate::AttemptEnding;
+    use crate::AttemptEndingView;
+    use crate::AttemptInvalidation;
+    use crate::AttemptInvalidationView;
+    use crate::AttemptRef;
+    use crate::AuthoredId;
+    use crate::BindingAuthoring;
+    use crate::BindingPolicy;
     use crate::Bindings;
-    use crate::Capabilities;
-    use crate::CaptureOutcome;
-    use crate::Claim;
-    use crate::ClaimHolder;
-    use crate::ConfiguredDevice;
-    use crate::ConfiguredDeviceMode;
-    use crate::DeviceAccessError;
-    use crate::DeviceDescriptor;
     use crate::DeviceEndpoint;
     use crate::DeviceIdSource;
     use crate::DeviceKey;
     use crate::DeviceKind;
-    use crate::DeviceRecord;
-    use crate::DeviceReporter;
-    use crate::DeviceResolution;
-    use crate::DeviceRevisionLookup;
-    use crate::DeviceScan;
-    use crate::Devices;
-    use crate::DiscoveryCadence;
-    use crate::DiscoveryControl;
-    use crate::DiscoveryWork;
     use crate::DriverId;
-    use crate::EndpointDriver;
+    use crate::EndedRegistrationLifetime;
+    use crate::EndpointDriverRegistration;
     use crate::EndpointId;
-    use crate::HardwareInventory;
-    use crate::IdentityVerdict;
-    use crate::LastKnownGoodConfiguration;
-    use crate::MainThreadDiscoveryJob;
     use crate::OnAbort;
     use crate::OnSessionLoss;
-    use crate::PlatformDeviceHandle;
-    use crate::Presence;
-    use crate::ReconciledDeviceState;
     use crate::RecoveryPolicy;
-    use crate::ReportedAs;
-    use crate::ReportedId;
-    use crate::ReportedParent;
-    use crate::ReportedSerial;
-    use crate::ReporterCoverage;
-    use crate::ReporterId;
-    use crate::ReporterRegistration;
-    use crate::RequestedConfiguration;
-    use crate::RetiredRoleAttemptEnded;
+    use crate::RegistrationAttemptEnded;
     use crate::RetryOn;
-    use crate::RiggingAppExt;
-    use crate::RiggingLimits;
-    use crate::RiggingPlugin;
-    use crate::RiggingRevision;
     use crate::RoleKey;
-    use crate::RoleState;
-    use crate::SchemeName;
-    use crate::SessionLossDisposition;
-    use crate::SessionLossProcessed;
-    use crate::SessionLossRefusal;
-    use crate::SessionLossReport;
-    use crate::SessionLossReports;
-    use crate::UnverifiedReason;
-    use crate::WaitingWork;
-    use crate::binding::EstablishingAttemptLookup;
-    use crate::devices::RoleAttemptLookup;
-    use crate::plugin::RiggingSystems;
-    use crate::registration::Reporters;
+    use crate::binding;
+    use crate::binding::BindingTransitionBatch;
+    use crate::binding::LostRegisteredRoleEntities;
+    use crate::register_binding;
 
-    const SECOND_ROLE: &str = "secondary-window";
-    const SECOND_UNIT: &str = "UNIT-0002";
-    const TEST_ROLE: &str = "primary-window";
-    const TEST_SCHEME: &str = "test-scheme";
-    const TEST_UNIT: &str = "UNIT-0001";
-    /// Frames one test may spend waiting for a reported set to reach the binding.
-    const FRAME_CEILING: u32 = 32;
-    /// Frames one requested re-scan needs to be collected, reconciled, and acted on.
-    const RESCAN_FRAMES: u32 = 4;
-
-    /// Configuration the test role asks its driver for.
-    #[derive(Component, Reflect)]
-    #[reflect(Component)]
-    struct TestConfiguration(u32);
-
-    #[derive(Component, Reflect)]
-    #[reflect(Component)]
-    struct MismatchedConfiguration;
-
-    struct DriverStartObservation {
+    #[derive(Debug, PartialEq, Eq)]
+    struct ObservedEndedRegistrationAttempt {
+        role:     RoleKey,
         endpoint: DeviceEndpoint,
-        permit:   ApplyPermit,
-        retained: Attempt,
+        attempt:  AttemptRef,
+        ending:   AttemptEndingView,
+        lifetime: EndedRegistrationLifetime,
     }
 
-    /// What every test driver did, and what its next poll answers.
-    ///
-    /// Held in the world rather than in the driver value, because the driver itself lives inside
-    /// the kernel's registry and a test never sees it again after registration.
-    #[derive(Resource)]
-    struct DriverLog {
-        started:            Vec<AttemptId>,
-        start_observations: Vec<DriverStartObservation>,
-        polled:             Vec<AttemptId>,
-        progress:           AttemptProgress,
-    }
-
-    impl Default for DriverLog {
-        fn default() -> Self {
-            Self {
-                started:            Vec::new(),
-                start_observations: Vec::new(),
-                polled:             Vec::new(),
-                progress:           AttemptProgress::Pending,
-            }
-        }
-    }
-
-    struct TestDriver;
-
-    impl EndpointDriver for TestDriver {
-        type Configuration = TestConfiguration;
-
-        fn capture(
-            &mut self,
-            _: &mut World,
-            _: &DeviceEndpoint,
-        ) -> CaptureOutcome<Self::Configuration> {
-            CaptureOutcome::NotReadable
-        }
-
-        fn start_apply(
-            &mut self,
-            world: &mut World,
-            endpoint: &DeviceEndpoint,
-            _: &Self::Configuration,
-            attempt: AttemptId,
-            permit: ApplyPermit,
-        ) {
-            let retained = match world.resource::<crate::Attempts>().in_flight(attempt) {
-                AttemptLookup::InFlight(retained) => retained.clone(),
-                AttemptLookup::Finished => return,
-            };
-            let mut driver_log = world.resource_mut::<DriverLog>();
-            driver_log.started.push(attempt);
-            driver_log.start_observations.push(DriverStartObservation {
-                endpoint: endpoint.clone(),
-                permit,
-                retained,
-            });
-        }
-
-        fn poll(&mut self, world: &mut World, attempt: AttemptId) -> AttemptProgress {
-            let mut driver_log = world.resource_mut::<DriverLog>();
-            driver_log.polled.push(attempt);
-            driver_log.progress.clone()
-        }
-    }
-
-    /// Reports whatever set the shared list currently holds, on demand only.
-    ///
-    /// On demand rather than periodic so a scan lands at a frame the test names: a reporter that
-    /// submits a set every frame would leave when its evidence reaches a role up to the frame rate,
-    /// and a test asserting what one scan did could not say which scan it saw.
-    struct ListReporter(Arc<Mutex<Vec<DeviceKey>>>);
-
-    impl DeviceReporter for ListReporter {
-        fn discover(&mut self) -> DiscoveryWork {
-            let reported_keys = self
-                .0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            DiscoveryWork::Immediate(MainThreadDiscoveryJob::new(move |_: &mut World| {
-                DeviceScan::Complete(reported_keys.iter().cloned().map(present).collect())
-            }))
-        }
-    }
-
-    /// Every attempt ending an observer saw, split by whether a binding entity still existed.
     #[derive(Default, Resource)]
-    struct ObservedEndings {
-        on_binding_entity: Vec<(RoleKey, AttemptOutcome)>,
-        after_retirement:  Vec<(RoleKey, AttemptOutcome)>,
-    }
+    struct ObservedEndedRegistrationAttempts(Vec<ObservedEndedRegistrationAttempt>);
 
-    /// Ordered session-loss decisions observed through the public global event.
-    #[derive(Default, Resource)]
-    struct ObservedSessionLosses(Vec<SessionLossDisposition>);
-
-    #[derive(Clone, Copy)]
-    struct EstablishedSessionGuard {
-        device_id:            crate::DeviceId,
-        device_revision:      crate::DeviceRevision,
-        establishing_attempt: AttemptId,
-    }
-
-    fn observe_attempt_finished(
-        attempt_finished: On<AttemptFinished>,
-        mut observed_endings: ResMut<ObservedEndings>,
+    fn observe_ended_registration_attempt(
+        event: On<RegistrationAttemptEnded>,
+        mut observed: ResMut<ObservedEndedRegistrationAttempts>,
     ) {
-        observed_endings.on_binding_entity.push((
-            attempt_finished.role.clone(),
-            attempt_finished.outcome.clone(),
-        ));
-    }
-
-    fn observe_retired_role_attempt_ended(
-        retired_role_attempt_ended: On<RetiredRoleAttemptEnded>,
-        mut observed_endings: ResMut<ObservedEndings>,
-    ) {
-        observed_endings.after_retirement.push((
-            retired_role_attempt_ended.role.clone(),
-            retired_role_attempt_ended.outcome.clone(),
-        ));
-    }
-
-    fn observe_session_loss_processed(
-        session_loss_processed: On<SessionLossProcessed>,
-        mut observed_session_losses: ResMut<ObservedSessionLosses>,
-    ) {
-        observed_session_losses
-            .0
-            .push(session_loss_processed.disposition);
-    }
-
-    /// One app whose role is bound to a reported unit, driven until that unit resolves.
-    struct ApplyHarness {
-        app:           App,
-        role:          RoleKey,
-        reporter:      ReporterId,
-        reported_keys: Arc<Mutex<Vec<DeviceKey>>>,
-    }
-
-    impl ApplyHarness {
-        fn new(driver: DriverId) -> Result<Self, Box<dyn Error>> {
-            Self::with_cadence(driver, DiscoveryCadence::OnDemand)
-        }
-
-        /// Build a harness whose reporter declares `cadence`.
-        ///
-        /// The cadence is what decides whether the reporter's evidence can ever go stale: an
-        /// on-demand reporter promised nothing and so is never late, while a reporter that declared
-        /// an interval has a freshness lease the test can run past.
-        fn with_cadence(
-            driver: DriverId,
-            cadence: DiscoveryCadence,
-        ) -> Result<Self, Box<dyn Error>> {
-            let reported_keys = Arc::new(Mutex::new(vec![unit_key(TEST_UNIT)?]));
-            let mut app = App::new();
-            app.add_plugins(MinimalPlugins)
-                .add_plugins(RiggingPlugin)
-                .register_device_scheme(SchemeName::new(TEST_SCHEME)?)
-                .init_resource::<DriverLog>()
-                .init_resource::<ObservedEndings>()
-                .init_resource::<ObservedSessionLosses>()
-                .add_observer(observe_attempt_finished)
-                .add_observer(observe_retired_role_attempt_ended)
-                .add_observer(observe_session_loss_processed);
-            let registered = app.add_endpoint_driver(TestDriver);
-            assert_eq!(registered, DriverId(0));
-            let reporter = app.add_device_reporter(
-                ListReporter(Arc::clone(&reported_keys)),
-                ReporterRegistration::required(cadence, ReporterCoverage::MatchingEvidenceOnly),
-            );
-            let role = RoleKey::new(TEST_ROLE)?;
-            app.world_mut()
-                .resource_mut::<Bindings>()
-                .register(test_binding(role.clone(), unit_key(TEST_UNIT)?, driver))?;
-
-            Ok(Self {
-                app,
-                role,
-                reporter,
-                reported_keys,
-            })
-        }
-
-        /// Build a harness whose role already has one attempt in flight.
-        fn started(driver: DriverId) -> Result<Self, Box<dyn Error>> {
-            let mut harness = Self::new(driver)?;
-            harness.settle();
-
-            Ok(harness)
-        }
-
-        /// Build a started harness whose role reverts on abort and has a value to go back to.
-        ///
-        /// Both halves are needed to tell the abort reasons apart: `OnAbort::Revert` alone
-        /// records nothing while `LastKnownGoodConfiguration::NotEstablished` says there is nothing
-        /// to restore, so a test that omitted either would pass for the wrong reason.
-        fn started_reverting(driver: DriverId) -> Result<Self, Box<dyn Error>> {
-            let mut harness = Self::new(driver)?;
-            let mut reverting = test_binding(harness.role.clone(), unit_key(TEST_UNIT)?, driver);
-            reverting.on_abort = OnAbort::Revert;
-            reverting.last_known_good = LastKnownGoodConfiguration::known(TestConfiguration(9));
-            let _replaced = harness
-                .app
-                .world_mut()
-                .resource_mut::<Bindings>()
-                .replace(reverting)?;
-            harness.settle();
-
-            Ok(harness)
-        }
-
-        /// Bind a second role to a second unit, so a scan can change one device and leave the
-        /// other one reported exactly as it was.
-        fn bind_second_role(&mut self, driver: DriverId) -> Result<RoleKey, Box<dyn Error>> {
-            let second_role = RoleKey::new(SECOND_ROLE)?;
-            self.app
-                .world_mut()
-                .resource_mut::<Bindings>()
-                .register(test_binding(
-                    second_role.clone(),
-                    unit_key(SECOND_UNIT)?,
-                    driver,
-                ))?;
-
-            Ok(second_role)
-        }
-
-        /// The reconciled state the kernel currently holds for the harness's unit.
-        fn reconciled_device_state(&self) -> ReconciledDeviceState {
-            self.app
-                .world()
-                .resource::<Devices>()
-                .states()
-                .next()
-                .expect("the harness settles once its reported unit has been reconciled")
-                .clone()
-        }
-
-        /// Write one reconciled state straight into `Devices`, as a reconcile pass would.
-        ///
-        /// Written directly rather than reported, because the kernel computes the identity verdict
-        /// and the merged claim itself: a test that had to talk a reconcile pass into producing a
-        /// particular one would be exercising the verdict rules instead of the abort rules.
-        fn reconcile_device(&mut self, reconciled_device_state: ReconciledDeviceState) {
-            self.app
-                .world_mut()
-                .resource_mut::<Devices>()
-                .replace_reconciled(
-                    vec![reconciled_device_state],
-                    HashSet::new(),
-                    HashSet::new(),
-                );
-        }
-
-        /// Drive frames until the driver has started `count` attempts, or the ceiling arrives.
-        fn settle_until_started(&mut self, count: usize) {
-            for _ in 0..FRAME_CEILING {
-                if self.driver_log().started.len() >= count {
-                    return;
-                }
-                self.app.update();
-            }
-        }
-
-        fn waiting_work(&self) -> WaitingWork {
-            self.app
-                .world()
-                .resource::<Bindings>()
-                .waiting_work(&self.role)
-        }
-
-        /// Drive frames until the reported unit reaches the role's binding, or the ceiling arrives.
-        fn settle(&mut self) {
-            for _ in 0..FRAME_CEILING {
-                self.app.update();
-                if self.app.world().resource::<DriverLog>().started.is_empty() {
-                    continue;
-                }
-                return;
-            }
-        }
-
-        /// Drive frames until an attempt ending has been observed, or the ceiling arrives.
-        fn settle_until_ending(&mut self) {
-            for _ in 0..FRAME_CEILING {
-                if !self
-                    .app
-                    .world()
-                    .resource::<ObservedEndings>()
-                    .on_binding_entity
-                    .is_empty()
-                {
-                    return;
-                }
-                self.app.update();
-            }
-        }
-
-        fn attempt(&self) -> RoleAttemptLookup {
-            self.app
-                .world()
-                .resource::<crate::Attempts>()
-                .in_flight_for(&self.role, self.app.world().resource::<Bindings>())
-        }
-
-        fn role_state(&self) -> RoleState {
-            self.app
-                .world()
-                .resource::<Bindings>()
-                .binding(&self.role)
-                .map_or(RoleState::Retired, |binding| binding.state)
-        }
-
-        fn driver_log(&self) -> &DriverLog { self.app.world().resource::<DriverLog>() }
-
-        fn reauthor_session_policy(
-            &mut self,
-            retry: RetryOn,
-            on_loss: OnSessionLoss,
-        ) -> Result<(), Box<dyn Error>> {
-            let mut binding = test_binding(self.role.clone(), unit_key(TEST_UNIT)?, DriverId(0));
-            binding.retry = retry;
-            binding.on_loss = on_loss;
-            let _ = self
-                .app
-                .world_mut()
-                .resource_mut::<Bindings>()
-                .replace(binding)?;
-            Ok(())
-        }
-
-        fn establish(&mut self) {
-            self.set_progress(AttemptProgress::Finished(AttemptOutcome::Succeeded));
-            self.app.update();
-            assert_eq!(self.role_state(), RoleState::Ready);
-        }
-
-        fn current_attempt(&self) -> AttemptId {
-            let binding = self
-                .app
-                .world()
-                .resource::<Bindings>()
-                .binding(&self.role)
-                .expect("the harness retains its role");
-            let RoleState::Applying(attempt) = binding.state else {
-                panic!("the harness role has no in-flight attempt");
-            };
-            attempt
-        }
-
-        fn device_guard(&self, establishing_attempt: AttemptId) -> EstablishedSessionGuard {
-            let bindings = self.app.world().resource::<Bindings>();
-            let devices = self.app.world().resource::<Devices>();
-            let binding = bindings
-                .binding(&self.role)
-                .expect("the harness retains its role");
-            let DeviceResolution::Resolved(device_id) = devices.resolve(&binding.endpoint.device)
-            else {
-                panic!("the harness settles its reported device");
-            };
-            let DeviceRevisionLookup::Retained(device_revision) = devices.revision(device_id)
-            else {
-                panic!("a resolved harness device retains a revision");
-            };
-            EstablishedSessionGuard {
-                device_id,
-                device_revision,
-                establishing_attempt,
-            }
-        }
-
-        fn session_guard(&self) -> EstablishedSessionGuard {
-            let EstablishingAttemptLookup::EstablishedBy(establishing_attempt) = self
-                .app
-                .world()
-                .resource::<Bindings>()
-                .establishing_attempt(&self.role)
-            else {
-                panic!("the ready harness role retains its establishing attempt");
-            };
-            self.device_guard(establishing_attempt)
-        }
-
-        fn submit_session_loss(&mut self, guard: EstablishedSessionGuard) {
-            self.app
-                .world_mut()
-                .resource_mut::<SessionLossReports>()
-                .submit(SessionLossReport::new(
-                    self.role.clone(),
-                    guard.establishing_attempt,
-                    guard.device_id,
-                    guard.device_revision,
-                    DeviceAccessError::Transport {
-                        detail: "scripted established session ended".to_string(),
-                    },
-                ));
-        }
-
-        fn set_progress(&mut self, attempt_progress: AttemptProgress) {
-            self.app.world_mut().resource_mut::<DriverLog>().progress = attempt_progress;
-        }
-
-        /// Report a whole set and ask for one run, which is what lands a scan at a known frame.
-        fn report(&mut self, keys: Vec<DeviceKey>) {
-            *self
-                .reported_keys
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = keys;
-            self.app
-                .world_mut()
-                .resource_mut::<DiscoveryControl>()
-                .request(self.reporter)
-                .expect("the harness registered this reporter");
-        }
-    }
-
-    fn unit_key(value: &str) -> Result<DeviceKey, Box<dyn Error>> {
-        Ok(DeviceKey {
-            kind: DeviceKind::Display,
-            id:   DeviceIdSource::Reported {
-                scheme: SchemeName::new(TEST_SCHEME)?,
-                value:  ReportedId::new(value)?,
-            },
-        })
-    }
-
-    fn present(device_key: DeviceKey) -> DeviceRecord {
-        DeviceRecord {
-            reported_as:            ReportedAs::Keyed(device_key),
-            parent:                 ReportedParent::Root,
-            presence:               Presence::Present,
-            claim:                  Claim::NotApplicable,
-            capabilities:           Capabilities::new(),
-            serial:                 ReportedSerial::NotExposedByUnit,
-            platform_device_handle: PlatformDeviceHandle::PlatformReportedNothing,
-            attachment:             AttachmentPath::PlatformHasNoConcept,
-            descriptor:             DeviceDescriptor::PlatformReportedNothing,
-        }
-    }
-
-    fn test_binding(role: RoleKey, device: DeviceKey, driver: DriverId) -> Binding {
-        Binding {
-            role,
-            endpoint: DeviceEndpoint {
-                device,
-                id: EndpointId::Whole,
-            },
-            driver,
-            recovery: RecoveryPolicy::Forget,
-            retry: RetryOn::NewRevision,
-            on_abort: OnAbort::default(),
-            on_loss: OnSessionLoss::default(),
-            state: RoleState::default(),
-            requested: RequestedConfiguration::new(TestConfiguration(3)),
-            last_known_good: LastKnownGoodConfiguration::default(),
-            apply_deadline: ApplyDeadline::ProcessDefault,
-        }
-    }
-
-    #[test]
-    fn a_waiting_role_whose_device_resolves_starts_one_attempt_and_polls_it_the_next_frame()
-    -> Result<(), Box<dyn Error>> {
-        let mut harness = ApplyHarness::started(DriverId(0))?;
-
-        assert_eq!(harness.driver_log().started.len(), 1);
-        assert!(harness.driver_log().polled.is_empty());
-        assert!(matches!(harness.role_state(), RoleState::Applying(_)));
-        assert!(matches!(harness.attempt(), RoleAttemptLookup::InFlight(_)));
-
-        harness.app.update();
-
-        assert_eq!(harness.driver_log().polled.len(), 1);
-        assert_eq!(harness.driver_log().started.len(), 1);
-        assert!(matches!(harness.role_state(), RoleState::Applying(_)));
-
-        Ok(())
-    }
-
-    #[test]
-    fn a_driver_reads_its_authoritative_attempt_during_start_apply() -> Result<(), Box<dyn Error>> {
-        let harness = ApplyHarness::started(DriverId(0))?;
-        let observation = harness
-            .driver_log()
-            .start_observations
-            .first()
-            .ok_or("the driver did not observe its retained attempt")?;
-        let AttemptLookup::InFlight(retained) = harness
-            .app
-            .world()
-            .resource::<crate::Attempts>()
-            .in_flight(observation.retained.id)
-        else {
-            return Err("the driver-started attempt was not retained".into());
-        };
-
-        assert_eq!(observation.retained.id, retained.id);
-        assert_eq!(observation.retained.role, retained.role);
-        assert_eq!(observation.retained.endpoint, retained.endpoint);
-        assert_eq!(observation.endpoint, retained.endpoint);
-        assert_eq!(
-            observation.permit.allows_in_service_use(),
-            retained.permit.allows_in_service_use()
-        );
-        assert_eq!(
-            observation.retained.expected_device_id,
-            retained.expected_device_id
-        );
-        assert_eq!(
-            observation.retained.device_revision,
-            retained.device_revision
-        );
-        assert_eq!(observation.retained.deadline, retained.deadline);
-
-        Ok(())
-    }
-
-    #[test]
-    fn a_successful_attempt_leaves_the_role_ready_without_establishing_a_readback()
-    -> Result<(), Box<dyn Error>> {
-        let mut harness = ApplyHarness::started(DriverId(0))?;
-        harness.set_progress(AttemptProgress::Finished(AttemptOutcome::Succeeded));
-
-        harness.app.update();
-
-        assert_eq!(harness.role_state(), RoleState::Ready);
-        assert_eq!(harness.attempt(), RoleAttemptLookup::Idle);
-        assert_eq!(
-            harness
-                .app
-                .world()
-                .resource::<ObservedEndings>()
-                .on_binding_entity,
-            vec![(RoleKey::new(TEST_ROLE)?, AttemptOutcome::Succeeded)]
-        );
-        // A successful apply proves what the kernel asked for, never what the endpoint holds.
-        assert!(matches!(
-            harness
-                .app
-                .world()
-                .resource::<Bindings>()
-                .configuration_for(&harness.role)?,
-            AvailableConfiguration::Requested(_)
-        ));
-
-        Ok(())
-    }
-
-    /// Replacement waiting to be submitted from inside a frame.
-    #[derive(Resource)]
-    struct PendingReplacement(Option<Binding>);
-
-    /// Submit the held replacement from `crate::RiggingSystems::Prepare`, as a consumer system
-    /// would.
-    ///
-    /// Submitted mid-frame rather than between updates because the ordering under test needs the
-    /// replace to land after this frame's transition drain and before the apply chain: only then
-    /// does the `BindingTransition::Replaced` reach the batch one frame after the replacement's
-    /// own attempt was dispatched.
-    fn replace_from_prepare(
-        mut pending_replacement: ResMut<PendingReplacement>,
-        mut bindings: ResMut<Bindings>,
-    ) {
-        if let Some(binding) = pending_replacement.0.take() {
-            bindings
-                .replace(binding)
-                .expect("the role is registered, so the replacement is accepted");
-        }
-    }
-
-    #[test]
-    fn replacing_a_binding_does_not_abort_the_attempt_the_replacement_dispatched()
-    -> Result<(), Box<dyn Error>> {
-        let mut harness = ApplyHarness::started(DriverId(0))?;
-        assert_eq!(harness.driver_log().started.len(), 1);
-        let replacement = test_binding(harness.role.clone(), unit_key(TEST_UNIT)?, DriverId(0));
-        harness
-            .app
-            .insert_resource(PendingReplacement(Some(replacement)));
-        harness
-            .app
-            .add_systems(Update, replace_from_prepare.in_set(RiggingSystems::Prepare));
-
-        // The replace lands after this frame's drain; the apply chain then ends the superseded
-        // attempt as `AttemptInvalidation::BindingReplaced` and dispatches the replacement's own
-        // attempt in the same frame. The stale ending installs no retry gate, because the ended
-        // generation no longer matches the standing binding.
-        harness.app.update();
-        assert_eq!(harness.driver_log().started.len(), 2);
-
-        // The drained `Replaced` transition is published while the replacement's attempt is in
-        // flight. Its stamped generation matches the standing binding, so the abort pass leaves
-        // it running.
-        harness.app.update();
-        assert!(matches!(harness.attempt(), RoleAttemptLookup::InFlight(_)));
-
-        harness.set_progress(AttemptProgress::Finished(AttemptOutcome::Succeeded));
-        harness.app.update();
-
-        assert_eq!(harness.role_state(), RoleState::Ready);
-        assert_eq!(harness.attempt(), RoleAttemptLookup::Idle);
-        assert_eq!(harness.driver_log().started.len(), 2);
-
-        Ok(())
-    }
-
-    #[test]
-    fn accepted_session_loss_recreates_only_after_retry_pacing_opens() -> Result<(), Box<dyn Error>>
-    {
-        let mut harness = ApplyHarness::new(DriverId(0))?;
-        harness
-            .app
-            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(1)));
-        harness.reauthor_session_policy(
-            RetryOn::Interval(Duration::from_millis(10)),
-            OnSessionLoss::Recreate,
-        )?;
-        harness.settle();
-        harness.establish();
-        let guard = harness.session_guard();
-        let starts_before_loss = harness.driver_log().started.len();
-
-        harness.submit_session_loss(guard);
-        harness.app.update();
-
-        assert_eq!(harness.role_state(), RoleState::Waiting);
-        assert_eq!(harness.driver_log().started.len(), starts_before_loss);
-        assert_eq!(
-            harness.app.world().resource::<ObservedSessionLosses>().0,
-            vec![SessionLossDisposition::RecreateScheduled]
-        );
-
-        harness
-            .app
-            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
-                20,
-            )));
-        harness.app.update();
-        assert!(matches!(harness.role_state(), RoleState::Applying(_)));
-        assert_eq!(harness.driver_log().started.len(), starts_before_loss + 1);
-        Ok(())
-    }
-
-    #[test]
-    fn failed_session_rebuilds_still_escalate_after_three_attempts() -> Result<(), Box<dyn Error>> {
-        let mut harness = ApplyHarness::new(DriverId(0))?;
-        harness
-            .reauthor_session_policy(RetryOn::Interval(Duration::ZERO), OnSessionLoss::Recreate)?;
-        harness.settle();
-        harness.establish();
-        let guard = harness.session_guard();
-        harness.set_progress(AttemptProgress::Finished(AttemptOutcome::Failed(
-            DeviceAccessError::Transport {
-                detail: "scripted rebuild failure".to_string(),
-            },
-        )));
-
-        harness.submit_session_loss(guard);
-        for _ in 0..4 {
-            harness.app.update();
-            if harness.role_state() == RoleState::StoppedAfterRepeatedFailures {
-                break;
-            }
-        }
-
-        assert_eq!(
-            harness.role_state(),
-            RoleState::StoppedAfterRepeatedFailures
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn report_only_session_loss_is_observable_and_opens_no_replacement()
-    -> Result<(), Box<dyn Error>> {
-        let mut harness = ApplyHarness::new(DriverId(0))?;
-        harness.reauthor_session_policy(
-            RetryOn::Interval(Duration::ZERO),
-            OnSessionLoss::ReportOnly,
-        )?;
-        harness.settle();
-        harness.establish();
-        let guard = harness.session_guard();
-        let starts_before_loss = harness.driver_log().started.len();
-
-        harness.submit_session_loss(guard);
-        harness.app.update();
-        harness.app.update();
-
-        assert_eq!(harness.role_state(), RoleState::Waiting);
-        assert_eq!(harness.waiting_work(), WaitingWork::ApplicationRequestOwed);
-        assert_eq!(harness.driver_log().started.len(), starts_before_loss);
-        assert_eq!(
-            harness.app.world().resource::<ObservedSessionLosses>().0,
-            vec![SessionLossDisposition::ReportedOnly]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn replaced_and_retired_roles_refuse_stale_session_losses() -> Result<(), Box<dyn Error>> {
-        let mut replaced = ApplyHarness::started(DriverId(0))?;
-        replaced.establish();
-        let guard = replaced.session_guard();
-        replaced.submit_session_loss(guard);
-        let replacement = test_binding(replaced.role.clone(), unit_key(TEST_UNIT)?, DriverId(0));
-        let _ = replaced
-            .app
-            .world_mut()
-            .resource_mut::<Bindings>()
-            .replace(replacement)?;
-        super::process_session_loss_reports(replaced.app.world_mut());
-        assert_eq!(
-            replaced.app.world().resource::<ObservedSessionLosses>().0,
-            vec![SessionLossDisposition::Refused(
-                SessionLossRefusal::RoleReplaced
-            )]
-        );
-
-        let mut retired = ApplyHarness::started(DriverId(0))?;
-        retired.establish();
-        let guard = retired.session_guard();
-        retired.submit_session_loss(guard);
-        let _ = retired
-            .app
-            .world_mut()
-            .resource_mut::<Bindings>()
-            .retire(&retired.role)?;
-        super::process_session_loss_reports(retired.app.world_mut());
-        assert_eq!(
-            retired.app.world().resource::<ObservedSessionLosses>().0,
-            vec![SessionLossDisposition::Refused(
-                SessionLossRefusal::RoleRetired
-            )]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn delayed_replaced_session_token_is_refused_after_its_successor_is_ready()
-    -> Result<(), Box<dyn Error>> {
-        let mut harness = ApplyHarness::started(DriverId(0))?;
-        harness.establish();
-        let replaced_session = harness.session_guard();
-        let starts_before_replacement = harness.driver_log().started.len();
-
-        let replacement = test_binding(harness.role.clone(), unit_key(TEST_UNIT)?, DriverId(0));
-        let _ = harness
-            .app
-            .world_mut()
-            .resource_mut::<Bindings>()
-            .replace(replacement)?;
-        harness.settle_until_started(starts_before_replacement + 1);
-        harness.establish();
-        let successor_session = harness.session_guard();
-
-        assert_eq!(replaced_session.device_id, successor_session.device_id);
-        assert_eq!(
-            replaced_session.device_revision,
-            successor_session.device_revision
-        );
-        assert_ne!(
-            replaced_session.establishing_attempt,
-            successor_session.establishing_attempt
-        );
-        for _ in 0..4 {
-            harness.app.update();
-        }
-
-        harness.submit_session_loss(replaced_session);
-        harness.app.update();
-        assert_eq!(harness.role_state(), RoleState::Ready);
-        assert_eq!(
-            harness.app.world().resource::<ObservedSessionLosses>().0,
-            vec![SessionLossDisposition::Refused(
-                SessionLossRefusal::EstablishingAttemptReplaced
-            )]
-        );
-
-        harness.submit_session_loss(successor_session);
-        harness.app.update();
-        assert_eq!(harness.role_state(), RoleState::Waiting);
-        assert_eq!(
-            harness.app.world().resource::<ObservedSessionLosses>().0,
-            vec![
-                SessionLossDisposition::Refused(SessionLossRefusal::EstablishingAttemptReplaced),
-                SessionLossDisposition::RecreateScheduled,
-            ]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn absent_unestablished_rebound_and_revised_reports_are_refused() -> Result<(), Box<dyn Error>>
-    {
-        let mut unestablished = ApplyHarness::started(DriverId(0))?;
-        let guard = unestablished.device_guard(unestablished.current_attempt());
-        unestablished.submit_session_loss(guard);
-        unestablished.app.update();
-        assert_eq!(
-            unestablished
-                .app
-                .world()
-                .resource::<ObservedSessionLosses>()
-                .0,
-            vec![SessionLossDisposition::Refused(
-                SessionLossRefusal::SessionNotEstablished
-            )]
-        );
-
-        let mut absent = ApplyHarness::started(DriverId(0))?;
-        absent.establish();
-        let guard = absent.session_guard();
-        absent
-            .app
-            .world_mut()
-            .resource_mut::<SessionLossReports>()
-            .submit(SessionLossReport::new(
-                RoleKey::new("absent-session-role")?,
-                guard.establishing_attempt,
-                guard.device_id,
-                guard.device_revision,
-                DeviceAccessError::Transport {
-                    detail: "scripted absent role".to_string(),
-                },
-            ));
-        absent.app.update();
-        assert_eq!(
-            absent.app.world().resource::<ObservedSessionLosses>().0,
-            vec![SessionLossDisposition::Refused(
-                SessionLossRefusal::RoleAbsent
-            )]
-        );
-
-        let mut rebound = ApplyHarness::new(DriverId(0))?;
-        let second_role = rebound.bind_second_role(DriverId(0))?;
-        rebound.report(vec![unit_key(TEST_UNIT)?, unit_key(SECOND_UNIT)?]);
-        rebound.settle();
-        rebound.establish();
-        let second_device = {
-            let bindings = rebound.app.world().resource::<Bindings>();
-            let devices = rebound.app.world().resource::<Devices>();
-            let binding = bindings.binding(&second_role)?;
-            let DeviceResolution::Resolved(device_id) = devices.resolve(&binding.endpoint.device)
-            else {
-                return Err("second test device did not resolve".into());
-            };
-            let DeviceRevisionLookup::Retained(device_revision) = devices.revision(device_id)
-            else {
-                return Err("second test device has no revision".into());
-            };
-            (device_id, device_revision)
-        };
-        rebound.submit_session_loss(EstablishedSessionGuard {
-            device_id: second_device.0,
-            device_revision: second_device.1,
-            ..rebound.session_guard()
+        observed.0.push(ObservedEndedRegistrationAttempt {
+            role:     event.role.clone(),
+            endpoint: event.endpoint.clone(),
+            attempt:  event.attempt,
+            ending:   event.ending.clone(),
+            lifetime: event.lifetime,
         });
-        rebound.app.update();
-        assert_eq!(
-            rebound.app.world().resource::<ObservedSessionLosses>().0,
-            vec![SessionLossDisposition::Refused(
-                SessionLossRefusal::DeviceRebound
-            )]
-        );
-
-        let mut revised = ApplyHarness::started(DriverId(0))?;
-        revised.establish();
-        let old_guard = revised.session_guard();
-        let mut changed = revised.reconciled_device_state();
-        changed.claim = Claim::Held;
-        revised.reconcile_device(changed);
-        revised.submit_session_loss(old_guard);
-        revised.app.update();
-        assert_eq!(
-            revised.app.world().resource::<ObservedSessionLosses>().0,
-            vec![SessionLossDisposition::Refused(
-                SessionLossRefusal::DeviceRevisionChanged
-            )]
-        );
-        Ok(())
     }
 
     #[test]
-    fn a_role_naming_an_unregistered_driver_stays_waiting_with_no_attempt()
+    fn exhausted_retirement_sequence_publishes_the_recorded_ending_once()
     -> Result<(), Box<dyn Error>> {
-        let mut harness = ApplyHarness::started(DriverId(7))?;
-
-        harness.app.update();
-        harness.app.update();
-
-        assert_refused_dispatch_reclaimed(&mut harness);
-
-        Ok(())
-    }
-
-    #[test]
-    fn a_request_construction_refusal_leaves_no_attempt_or_spent_identifier()
-    -> Result<(), Box<dyn Error>> {
-        let mut harness = ApplyHarness::new(DriverId(0))?;
-        let role = harness.role.clone();
-        harness
-            .app
-            .world_mut()
+        let role = RoleKey::new("unretirable-registration")?;
+        let endpoint = DeviceEndpoint {
+            device: DeviceKey {
+                kind: DeviceKind::Display,
+                id:   DeviceIdSource::Authored {
+                    value: AuthoredId::new("unretirable-device")?,
+                },
+            },
+            id:     EndpointId::Whole,
+        };
+        let attempt = AttemptRef::new(31);
+        let mut app = App::new();
+        app.init_resource::<Bindings>()
+            .init_resource::<LostRegisteredRoleEntities>()
+            .init_resource::<PendingAttemptEndingPublications>()
+            .init_resource::<ObservedEndedRegistrationAttempts>()
+            .add_observer(observe_ended_registration_attempt);
+        let binding = register_binding(
+            app.world_mut(),
+            BindingAuthoring::new(
+                role.clone(),
+                endpoint.clone(),
+                EndpointDriverRegistration::<()>::new(DriverId(0)),
+                (),
+                BindingPolicy::new(
+                    RecoveryPolicy::default(),
+                    RetryOn::Interval(Duration::ZERO),
+                    OnAbort::default(),
+                    OnSessionLoss::default(),
+                    ApplyDeadline::ProcessDefault,
+                ),
+            ),
+        )?;
+        let generation = app
+            .world()
+            .resource::<Bindings>()
+            .generation(&role)
+            .ok_or("the registered role has no generation")?;
+        assert!(app.world_mut().despawn(binding));
+        app.world_mut()
             .resource_mut::<Bindings>()
-            .set_waiting_work(&role, WaitingWork::RestorationOwed);
+            .mark_transition_sequence_exhausted();
+        app.world_mut()
+            .resource_mut::<PendingAttemptEndingPublications>()
+            .0
+            .push(PendingAttemptEndingPublication {
+                role: role.clone(),
+                endpoint: endpoint.clone(),
+                generation,
+                attempt,
+                ending: AttemptEnding::Invalidated(AttemptInvalidation::DeviceNotPresent),
+                lifetime: AttemptEndingRegistrationLifetime::Live(binding),
+                readiness: AttemptEndingPublicationReadiness::ReadyAfterStatusPublication,
+                role_entity_recovery: AttemptEndingRoleEntityRecovery::PassCompleted,
+            });
 
-        harness.settle();
+        publish_pending_attempt_endings(app.world_mut());
+        publish_pending_attempt_endings(app.world_mut());
 
-        assert_refused_dispatch_reclaimed(&mut harness);
-
+        assert!(app.world().resource::<Bindings>().binding(&role).is_ok());
+        assert_eq!(
+            app.world()
+                .resource::<ObservedEndedRegistrationAttempts>()
+                .0,
+            vec![ObservedEndedRegistrationAttempt {
+                role,
+                endpoint,
+                attempt,
+                ending: AttemptEndingView::Invalidated(AttemptInvalidationView::DeviceNotPresent,),
+                lifetime: EndedRegistrationLifetime::RetirementBlocked,
+            }]
+        );
         Ok(())
     }
 
     #[test]
-    fn an_erased_configuration_refusal_leaves_no_attempt_or_spent_identifier()
-    -> Result<(), Box<dyn Error>> {
-        let mut harness = ApplyHarness::new(DriverId(0))?;
-        let mut binding = test_binding(harness.role.clone(), unit_key(TEST_UNIT)?, DriverId(0));
-        binding.requested = RequestedConfiguration::new(MismatchedConfiguration);
-        let _replaced = harness
-            .app
-            .world_mut()
+    fn full_retirement_transition_queue_requeues_then_publishes_once() -> Result<(), Box<dyn Error>>
+    {
+        let role = RoleKey::new("capacity-blocked-retirement")?;
+        let endpoint = DeviceEndpoint {
+            device: DeviceKey {
+                kind: DeviceKind::Display,
+                id:   DeviceIdSource::Authored {
+                    value: AuthoredId::new("capacity-blocked-device")?,
+                },
+            },
+            id:     EndpointId::Whole,
+        };
+        let attempt = AttemptRef::new(32);
+        let mut app = App::new();
+        app.init_resource::<Bindings>()
+            .init_resource::<BindingTransitionBatch>()
+            .init_resource::<LostRegisteredRoleEntities>()
+            .init_resource::<PendingAttemptEndingPublications>()
+            .init_resource::<ObservedEndedRegistrationAttempts>()
+            .add_systems(Update, binding::drain_binding_transitions)
+            .add_observer(observe_ended_registration_attempt);
+        let binding = register_binding(
+            app.world_mut(),
+            BindingAuthoring::new(
+                role.clone(),
+                endpoint.clone(),
+                EndpointDriverRegistration::<()>::new(DriverId(0)),
+                (),
+                BindingPolicy::new(
+                    RecoveryPolicy::default(),
+                    RetryOn::Interval(Duration::ZERO),
+                    OnAbort::default(),
+                    OnSessionLoss::default(),
+                    ApplyDeadline::ProcessDefault,
+                ),
+            ),
+        )?;
+        let generation = app
+            .world()
+            .resource::<Bindings>()
+            .generation(&role)
+            .ok_or("the registered role has no generation")?;
+        app.world_mut()
             .resource_mut::<Bindings>()
-            .replace(binding)?;
+            .set_pending_transition_capacity(NonZeroUsize::MIN)?;
+        assert!(app.world_mut().despawn(binding));
+        app.world_mut()
+            .resource_mut::<PendingAttemptEndingPublications>()
+            .0
+            .push(PendingAttemptEndingPublication {
+                role: role.clone(),
+                endpoint: endpoint.clone(),
+                generation,
+                attempt,
+                ending: AttemptEnding::Invalidated(AttemptInvalidation::DeviceNotPresent),
+                lifetime: AttemptEndingRegistrationLifetime::Live(binding),
+                readiness: AttemptEndingPublicationReadiness::ReadyAfterStatusPublication,
+                role_entity_recovery: AttemptEndingRoleEntityRecovery::PassCompleted,
+            });
 
-        harness.settle();
+        publish_pending_attempt_endings(app.world_mut());
 
-        assert_refused_dispatch_reclaimed(&mut harness);
-
-        Ok(())
-    }
-
-    fn assert_refused_dispatch_reclaimed(harness: &mut ApplyHarness) {
-        assert!(harness.driver_log().started.is_empty());
-        assert_eq!(harness.role_state(), RoleState::Waiting);
-        assert_eq!(harness.attempt(), RoleAttemptLookup::Idle);
-        assert!(harness.app.world().resource::<crate::Attempts>().is_empty());
-        assert_eq!(
-            harness
-                .app
-                .world_mut()
-                .resource_mut::<crate::Attempts>()
-                .issue()
-                .expect("a refused dispatch leaves its identifier on offer"),
-            AttemptId::new(1)
-        );
-    }
-
-    #[test]
-    fn a_change_to_the_devices_own_state_abandons_the_attempt_and_still_owes_a_restoration()
-    -> Result<(), Box<dyn Error>> {
-        let mut harness = ApplyHarness::started_reverting(DriverId(0))?;
-        let mut moved = harness.reconciled_device_state();
-        moved.attachment = AttachmentPath::Reported(ReportedId::new("bay-2")?);
-        // Written between frames rather than reported, so the newer revision is visible on the
-        // attempt's very first poll frame and the check is not racing a scan.
-        harness.reconcile_device(moved);
-
-        harness.app.update();
-
-        assert!(harness.driver_log().polled.is_empty());
-        assert_eq!(
-            harness
-                .app
-                .world()
-                .resource::<ObservedEndings>()
-                .on_binding_entity,
-            vec![(RoleKey::new(TEST_ROLE)?, AttemptOutcome::Aborted)]
-        );
-        assert_eq!(harness.waiting_work(), WaitingWork::RestorationOwed);
-
-        Ok(())
-    }
-
-    #[test]
-    fn a_rescan_reporting_the_same_state_leaves_the_in_flight_attempt_alone()
-    -> Result<(), Box<dyn Error>> {
-        let mut harness = ApplyHarness::started(DriverId(0))?;
-        let before = harness.app.world().resource::<RiggingRevision>().get();
-
-        harness.report(vec![unit_key(TEST_UNIT)?]);
-        for _ in 0..RESCAN_FRAMES {
-            harness.app.update();
-        }
-
-        // The scan did land: the global counter moved, and it is precisely that counter which no
-        // longer reaches the apply path.
-        assert!(harness.app.world().resource::<RiggingRevision>().get() > before);
         assert!(
-            harness
-                .app
-                .world()
-                .resource::<ObservedEndings>()
-                .on_binding_entity
+            app.world()
+                .resource::<ObservedEndedRegistrationAttempts>()
+                .0
                 .is_empty()
         );
-        assert!(matches!(harness.attempt(), RoleAttemptLookup::InFlight(_)));
+        assert!(app.world().resource::<Bindings>().binding(&role).is_ok());
 
-        Ok(())
-    }
+        app.update();
+        publish_pending_attempt_endings(app.world_mut());
+        publish_pending_attempt_endings(app.world_mut());
+        publish_pending_attempt_endings(app.world_mut());
 
-    #[test]
-    fn a_scan_that_changes_one_device_leaves_another_devices_attempt_in_flight()
-    -> Result<(), Box<dyn Error>> {
-        let mut harness = ApplyHarness::new(DriverId(0))?;
-        let second_role = harness.bind_second_role(DriverId(0))?;
-        harness.report(vec![unit_key(TEST_UNIT)?, unit_key(SECOND_UNIT)?]);
-        harness.settle_until_started(2);
-        assert_eq!(harness.driver_log().started.len(), 2);
-
-        // Only the second role's unit leaves the reported set. The first role's device is reported
-        // exactly as before, so nothing about it moved.
-        harness.report(vec![unit_key(TEST_UNIT)?]);
-        harness.settle_until_ending();
-
+        assert!(app.world().resource::<Bindings>().binding(&role).is_err());
         assert_eq!(
-            harness
-                .app
-                .world()
-                .resource::<ObservedEndings>()
-                .on_binding_entity,
-            vec![(second_role, AttemptOutcome::Aborted)]
+            app.world()
+                .resource::<ObservedEndedRegistrationAttempts>()
+                .0,
+            vec![ObservedEndedRegistrationAttempt {
+                role,
+                endpoint,
+                attempt,
+                ending: AttemptEndingView::Invalidated(AttemptInvalidationView::DeviceNotPresent,),
+                lifetime: EndedRegistrationLifetime::Retired,
+            }]
         );
-        assert!(matches!(harness.attempt(), RoleAttemptLookup::InFlight(_)));
-
-        Ok(())
-    }
-
-    #[test]
-    fn a_lost_claim_abandons_the_attempt_without_owing_a_restoration() -> Result<(), Box<dyn Error>>
-    {
-        let mut harness = ApplyHarness::started_reverting(DriverId(0))?;
-        let mut contended = harness.reconciled_device_state();
-        contended.claim = Claim::Contended {
-            holder: ClaimHolder::Unidentified,
-        };
-        harness.reconcile_device(contended);
-
-        harness.app.update();
-
-        assert!(harness.driver_log().polled.is_empty());
-        assert_eq!(
-            harness
-                .app
-                .world()
-                .resource::<ObservedEndings>()
-                .on_binding_entity,
-            vec![(RoleKey::new(TEST_ROLE)?, AttemptOutcome::Aborted)]
-        );
-        // A role that reverts on abort and has a value to go back to still owes nothing: another
-        // process holds the endpoint, so writing to it is exactly what must not happen.
-        assert_eq!(harness.waiting_work(), WaitingWork::Nothing);
-
-        Ok(())
-    }
-
-    #[test]
-    fn a_withdrawn_identity_abandons_the_attempt_without_owing_a_restoration()
-    -> Result<(), Box<dyn Error>> {
-        let mut harness = ApplyHarness::started_reverting(DriverId(0))?;
-        let mut unverified = harness.reconciled_device_state();
-        unverified.verdict = IdentityVerdict::Unverified(UnverifiedReason::NotUniqueInScan);
-        harness.reconcile_device(unverified);
-
-        harness.app.update();
-
-        assert!(harness.driver_log().polled.is_empty());
-        assert_eq!(
-            harness
-                .app
-                .world()
-                .resource::<ObservedEndings>()
-                .on_binding_entity,
-            vec![(RoleKey::new(TEST_ROLE)?, AttemptOutcome::Aborted)]
-        );
-        // The unit at the far end is no longer known to be the authored one, so a restoration would
-        // write the role's configuration to whatever is actually there.
-        assert_eq!(harness.waiting_work(), WaitingWork::Nothing);
-
-        Ok(())
-    }
-
-    #[test]
-    fn a_departed_device_abandons_the_attempt_and_the_driver_is_never_polled()
-    -> Result<(), Box<dyn Error>> {
-        let mut harness = ApplyHarness::started(DriverId(0))?;
-        harness.report(Vec::new());
-
-        harness.settle_until_ending();
-
-        assert_eq!(
-            harness
-                .app
-                .world()
-                .resource::<ObservedEndings>()
-                .on_binding_entity,
-            vec![(RoleKey::new(TEST_ROLE)?, AttemptOutcome::Aborted)]
-        );
-        // The endpoint resolves to nothing now, so no replacement attempt is authorized.
-        assert_eq!(harness.driver_log().started.len(), 1);
-        assert_eq!(harness.attempt(), RoleAttemptLookup::Idle);
-
-        Ok(())
-    }
-
-    #[test]
-    fn an_offline_inventory_entry_abandons_the_attempt_and_starts_no_other()
-    -> Result<(), Box<dyn Error>> {
-        let mut harness = ApplyHarness::started(DriverId(0))?;
-        harness
-            .app
-            .world_mut()
-            .resource_mut::<HardwareInventory>()
-            .configure(ConfiguredDevice {
-                key:  unit_key(TEST_UNIT)?,
-                mode: ConfiguredDeviceMode::Offline,
-            });
-
-        harness.app.update();
-        harness.app.update();
-
-        assert!(harness.driver_log().polled.is_empty());
-        assert_eq!(harness.driver_log().started.len(), 1);
-        assert_eq!(harness.attempt(), RoleAttemptLookup::Idle);
-        assert_eq!(
-            harness
-                .app
-                .world()
-                .resource::<ObservedEndings>()
-                .on_binding_entity,
-            vec![(RoleKey::new(TEST_ROLE)?, AttemptOutcome::Aborted)]
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn an_attempt_past_its_bounded_overrun_is_abandoned() -> Result<(), Box<dyn Error>> {
-        let mut harness = ApplyHarness::new(DriverId(0))?;
-        // Set before the attempt is authorized: the deadline is stamped onto the attempt when it
-        // starts, so a limit changed afterwards would not shorten one already in flight.
-        {
-            let mut rigging_limits = harness.app.world_mut().resource_mut::<RiggingLimits>();
-            rigging_limits.apply_deadline = Duration::ZERO;
-            rigging_limits.apply_overrun = Duration::ZERO;
-        }
-        harness.settle();
-
-        harness.app.update();
-
-        assert!(harness.driver_log().polled.is_empty());
-        assert_eq!(
-            harness
-                .app
-                .world()
-                .resource::<ObservedEndings>()
-                .on_binding_entity,
-            vec![(RoleKey::new(TEST_ROLE)?, AttemptOutcome::Aborted)]
-        );
-        // The abort is terminal for the frame that made it. The three apply systems are chained
-        // inside one set, so an ungated role would be restarted by the dispatch two systems later,
-        // against the conditions that just abandoned it — and under `RetryOn::NewRevision` it stays
-        // stopped until a scan lands, which the on-demand reporter never does unasked.
-        assert_eq!(harness.driver_log().started.len(), 1);
-        assert_eq!(harness.role_state(), RoleState::Waiting);
-        assert_eq!(harness.attempt(), RoleAttemptLookup::Idle);
-
-        harness.app.update();
-        harness.app.update();
-
-        assert_eq!(harness.driver_log().started.len(), 1);
-        assert_eq!(
-            harness
-                .app
-                .world()
-                .resource::<ObservedEndings>()
-                .on_binding_entity
-                .len(),
-            1
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn a_device_that_only_goes_stale_abandons_its_attempt_without_a_scan_landing()
-    -> Result<(), Box<dyn Error>> {
-        // A declared cadence is what gives the reporter a freshness lease at all: an on-demand
-        // reporter promised nothing, so its silence proves nothing and its devices never age out.
-        // The backstop is long enough that the reporter is never due again during the test, so the
-        // only thing that changes is how old its evidence is.
-        let mut harness = ApplyHarness::with_cadence(
-            DriverId(0),
-            DiscoveryCadence::EventDriven {
-                backstop: Duration::from_hours(1),
-            },
-        )?;
-        harness.settle();
-        assert_eq!(harness.driver_log().started.len(), 1);
-        let authorized_revision = *harness.app.world().resource::<RiggingRevision>();
-
-        // The device is still reported and still names the same unit. Only the evidence ages.
-        harness
-            .app
-            .world_mut()
-            .resource_mut::<Reporters>()
-            .backdate_completion(harness.reporter, Duration::from_hours(2));
-
-        harness.settle_until_ending();
-
-        assert_eq!(
-            harness
-                .app
-                .world()
-                .resource::<ObservedEndings>()
-                .on_binding_entity,
-            vec![(RoleKey::new(TEST_ROLE)?, AttemptOutcome::Aborted)]
-        );
-        assert!(harness.driver_log().polled.is_empty());
-        // The whole point of the freshness read: no reporter submitted anything, so the ending
-        // came from the lease rewriting presence rather than from any scan the kernel ingested.
-        assert_eq!(
-            *harness.app.world().resource::<RiggingRevision>(),
-            authorized_revision
-        );
-        // The key never left the set, so the endpoint still resolves — it is the presence the
-        // lease rewrote, and the presence alone that ended the attempt.
-        assert!(matches!(
-            harness
-                .app
-                .world()
-                .resource::<crate::Devices>()
-                .resolve(&unit_key(TEST_UNIT)?),
-            crate::DeviceResolution::Resolved(_)
-        ));
-
-        Ok(())
-    }
-
-    #[test]
-    fn a_revision_abort_records_a_revert_only_when_the_role_asked_and_has_a_value_to_go_back_to()
-    -> Result<(), Box<dyn Error>> {
-        let role = RoleKey::new(TEST_ROLE)?;
-        let mut bindings = Bindings::default();
-        let mut reverting = test_binding(role.clone(), unit_key(TEST_UNIT)?, DriverId(0));
-        reverting.on_abort = OnAbort::Revert;
-        bindings.register(reverting)?;
-
-        // Nothing a safe readback established, so there is no captured configuration to go back to
-        // and the role keeps whatever the abandoned apply left.
-        super::apply_abort_policy(
-            &mut bindings,
-            &role,
-            super::AttemptInvalidation::RevisionAdvanced,
-        );
-        assert_eq!(bindings.waiting_work(&role), crate::WaitingWork::Nothing);
-
-        let mut established = test_binding(role.clone(), unit_key(TEST_UNIT)?, DriverId(0));
-        established.on_abort = OnAbort::Revert;
-        established.last_known_good = LastKnownGoodConfiguration::known(TestConfiguration(9));
-        bindings.replace(established)?;
-
-        // A claim lost and a service veto never revert; only a revision change consults the policy.
-        super::apply_abort_policy(
-            &mut bindings,
-            &role,
-            super::AttemptInvalidation::DeviceNotPresent,
-        );
-        assert_eq!(bindings.waiting_work(&role), crate::WaitingWork::Nothing);
-
-        super::apply_abort_policy(
-            &mut bindings,
-            &role,
-            super::AttemptInvalidation::RevisionAdvanced,
-        );
-
-        // The kernel drives no hardware, so reverting is recorded as the restoration the next
-        // dispatch mints and the role's own driver performs.
-        assert_eq!(
-            bindings.waiting_work(&role),
-            crate::WaitingWork::RestorationOwed
-        );
-
-        let leave_as_is_role = RoleKey::new("secondary-window")?;
-        let mut leave_as_is = test_binding(
-            leave_as_is_role.clone(),
-            unit_key("UNIT-0002")?,
-            DriverId(0),
-        );
-        leave_as_is.last_known_good = LastKnownGoodConfiguration::known(TestConfiguration(9));
-        bindings.register(leave_as_is)?;
-
-        super::apply_abort_policy(
-            &mut bindings,
-            &leave_as_is_role,
-            super::AttemptInvalidation::RevisionAdvanced,
-        );
-
-        assert_eq!(
-            bindings.waiting_work(&leave_as_is_role),
-            crate::WaitingWork::Nothing
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn a_retired_role_reports_its_abandoned_attempt_globally() -> Result<(), Box<dyn Error>> {
-        let mut harness = ApplyHarness::started(DriverId(0))?;
-        harness
-            .app
-            .world_mut()
-            .resource_mut::<Bindings>()
-            .retire(&harness.role)?;
-
-        harness.app.update();
-
-        assert!(harness.driver_log().polled.is_empty());
-        let observed_endings = harness.app.world().resource::<ObservedEndings>();
-        assert!(observed_endings.on_binding_entity.is_empty());
-        assert_eq!(
-            observed_endings.after_retirement,
-            vec![(RoleKey::new(TEST_ROLE)?, AttemptOutcome::Aborted)]
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn two_transitions_naming_one_role_end_its_attempt_once() -> Result<(), Box<dyn Error>> {
-        let mut harness = ApplyHarness::started(DriverId(0))?;
-        let role = harness.role.clone();
-        {
-            let mut bindings = harness.app.world_mut().resource_mut::<Bindings>();
-            let _replaced = bindings.replace(test_binding(
-                role.clone(),
-                unit_key(TEST_UNIT)?,
-                DriverId(0),
-            ))?;
-            let _retired = bindings.retire(&role)?;
-        }
-
-        harness.app.update();
-
-        let observed_endings = harness.app.world().resource::<ObservedEndings>();
-        assert_eq!(
-            observed_endings.on_binding_entity.len() + observed_endings.after_retirement.len(),
-            1
-        );
-
         Ok(())
     }
 }

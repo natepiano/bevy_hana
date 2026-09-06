@@ -27,7 +27,8 @@ impl SetFitTarget {
 
 /// Marks the entity that the camera is currently fitted to.
 ///
-/// Persists after fit completes to enable persistent debug overlay.
+/// Stays on the camera after the fit completes, so the debug overlay keeps
+/// drawing the same target.
 #[derive(Component, Reflect, Debug)]
 #[reflect(Component)]
 pub struct CurrentFitTarget(
@@ -35,7 +36,7 @@ pub struct CurrentFitTarget(
     pub Entity,
 );
 
-/// Observer for `SetFitTarget` event - sets the target entity for fit debug overlay.
+/// Inserts [`CurrentFitTarget`] on the camera a [`SetFitTarget`] event names.
 pub(super) fn on_set_fit_target(set_target: On<SetFitTarget>, mut commands: Commands) {
     commands
         .entity(set_target.camera)

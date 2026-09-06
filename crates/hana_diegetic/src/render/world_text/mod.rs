@@ -4,12 +4,11 @@
 //! run, including the single run of a one-element [`DiegeticText`](crate::DiegeticText)
 //! label. `TextContent` is also the marker panel-text systems filter on
 //! (`With<TextContent>`) to act on run entities; a panel root carries no
-//! `TextContent`. The standalone world-text render path that once lived here was
-//! removed when fluent text became one-element panels — all text now routes
-//! through the panel-text pipeline.
+//! `TextContent`. All text renders through the panel-text pipeline; there is no
+//! separate world-text render path.
 //!
-//! The readiness signal ([`WorldTextReady`] + the `AwaitingReady` gate) is shared
-//! infrastructure the panel-text path drives, kept here.
+//! The readiness signal — [`WorldTextReady`] and the `AwaitingReady` marker —
+//! also lives here, and the panel-text pipeline drives it.
 
 #[cfg(feature = "typography_overlay")]
 mod overlay_metrics;
@@ -25,7 +24,7 @@ pub(crate) use readiness::AwaitingReady;
 pub use readiness::WorldTextReady;
 pub(crate) use readiness::emit_world_text_ready;
 
-use crate::layout::LineMetricsSnapshot;
+use crate::layout::ShapedLineMetrics;
 use crate::layout::TextStyle;
 
 /// Computed layout data for a [`TextContent`] entity, read by the typography
@@ -55,7 +54,7 @@ pub struct ComputedWorldText {
     /// metric lines and name rather than reading the panel root's `TextStyle`.
     pub font_id:      u16,
     /// First-line metrics from the same shaping pass, in layout points.
-    pub line_metrics: LineMetricsSnapshot,
+    pub line_metrics: ShapedLineMetrics,
     /// Per-visible-glyph metrics aligned with the rendered text.
     pub glyphs:       Vec<ComputedGlyphMetrics>,
 }
@@ -99,10 +98,10 @@ impl TextContent {
     #[must_use]
     pub fn new(text: impl Into<String>) -> Self { Self { text: text.into() } }
 
-    /// Text contents.
+    /// Returns the run's string.
     #[must_use]
     pub fn text(&self) -> &str { &self.text }
 
-    /// Mutates the text contents.
+    /// Replaces the run's string.
     pub fn set_text(&mut self, text: impl Into<String>) { self.text = text.into(); }
 }

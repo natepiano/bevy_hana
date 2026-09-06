@@ -162,8 +162,8 @@ impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetHullDepthBindGroup<I>
 ///
 /// In the GPU preprocessing path, `batch_and_prepare` processes every entity in
 /// the bins unconditionally. In the CPU path it calls `get_binned_batch_data`
-/// which skips entities whose mesh instance is missing. We must mirror that
-/// skip logic exactly so our indices stay aligned.
+/// which skips entities whose mesh instance is missing. This function mirrors
+/// that skip exactly so the indices stay aligned.
 pub(crate) fn prepare_outline_buffer(
     render_mesh_instances: Res<RenderMeshInstances>,
     extracted_outlines: Res<ExtractedOutlineUniforms>,

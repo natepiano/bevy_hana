@@ -12,7 +12,8 @@ pub(super) enum CameraFitTargetEffect {
     Set(Entity),
 }
 
-/// Projection intent derived from the authored retained destination.
+/// The projection change the authored retained destination calls for, before
+/// it is checked against the live camera.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum CameraProjectionEffectCandidate {
     Preserve,
@@ -60,14 +61,15 @@ impl PendingCameraAdmissionEffects {
     }
 }
 
-/// A projection mutation already checked against the live camera tuple.
+/// A projection change already checked against the live camera's components.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum PreparedCameraProjectionEffect {
     Preserve,
     SetOrthographicScale(f32),
 }
 
-/// Why one request's semantic fit/projection transaction could not be admitted.
+/// Why one request's fit-target and projection effects could not be derived or
+/// applied.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(super) enum CameraAdmissionEffectError {
     #[error("a fit request did not name the target it fits")]

@@ -66,8 +66,9 @@ impl Plugin for TextPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(SlugPlugin);
 
-        // Preserve the font-parse-failure gate: if the embedded font fails
-        // to parse, skip text setup entirely (the plugin stack is disabled).
+        // If the embedded font fails to parse, skip the rest of text setup:
+        // no `FontRegistry`, no `DiegeticTextMeasurer`, no `Font` asset or
+        // loader, and none of the font systems get registered.
         let Some(font_registry) = FontRegistry::new() else {
             warn!("hana_diegetic: embedded font failed to parse — text plugin disabled");
             return;
@@ -115,11 +116,11 @@ fn consume_loaded_fonts(
                 continue;
             }
             if let Some(font_id) = font_registry.register_font(font.name(), font.data()) {
-                // The parley measurer maps `font_id` → family name through a
-                // snapshot taken when it was built. A font registered after
-                // startup is absent from that snapshot, so its measure falls
-                // back to the default family and mis-sizes the panel. Rebuild
-                // the measurer with the now-current family list so the new font
+                // The parley measurer maps `font_id` → family name through the
+                // family list it was built from. A font registered after
+                // startup is absent from that list, so its measure falls back
+                // to the default family and mis-sizes the panel. Rebuild the
+                // measurer with the now-current family list so the new font
                 // measures as itself.
                 commands.insert_resource(DiegeticTextMeasurer {
                     measure_fn: create_parley_measurer(
@@ -186,9 +187,9 @@ mod tests {
         app.add_plugins(AssetPlugin::default());
         app.init_asset::<Font>();
 
-        // Seed the registry and a measurer built from its startup family
-        // snapshot — at this point only the embedded monospace font exists, so
-        // the snapshot has a single entry.
+        // Seed the registry and a measurer built from its startup family list
+        // — at this point only the embedded monospace font exists, so that
+        // list has a single entry.
         let registry = FontRegistry::new().unwrap();
         let measurer = DiegeticTextMeasurer {
             measure_fn: create_parley_measurer(registry.font_context(), registry.family_names()),
@@ -207,8 +208,8 @@ mod tests {
 
         // Load the CJK font the example switches to. `Assets::add` queues an
         // `Added` event the asset system drains into the message buffer
-        // `consume_loaded_fonts` reads; it registers the font (font 1) and — the
-        // fix — rebuilds the measurer with the now-current family list.
+        // `consume_loaded_fonts` reads; it registers the font (font 1) and
+        // rebuilds the measurer with the now-current family list.
         let font = Font::from_bytes("Noto Sans CJK SC", NOTO_CJK_DATA).unwrap();
         // Hold the strong handle so the asset is not dropped before
         // `consume_loaded_fonts` reads the `Added` event.

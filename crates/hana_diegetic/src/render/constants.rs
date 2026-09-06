@@ -16,7 +16,7 @@ pub(super) const LAYER_DEPTH_BIAS: f32 = 1.0;
 ///
 /// Added to `position.z` in the fragment shader before `oit_draw`
 /// stores the fragment. Pipeline `depth_bias` does NOT affect
-/// `in.position.z`, so we apply this offset manually.
+/// `in.position.z`, so the shader adds this offset itself.
 /// Reverse-Z: positive = closer to camera = composited in front.
 ///
 /// Calibration: `hana_lagrange` syncs the perspective near plane to

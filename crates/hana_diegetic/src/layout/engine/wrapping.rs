@@ -162,11 +162,11 @@ fn wrap_text_newlines(
 /// indicating whether any computed sizes actually changed (used to skip
 /// redundant re-propagation).
 ///
-/// Two key optimizations avoid work in the common case (short text that fits):
+/// Two optimizations avoid work in the common case (short text that fits):
 ///
 /// 1. **Cached natural width** — uses the `natural_text_width` stored during
 ///    `initialize_leaf_sizes` instead of re-calling the measure function. If the cached width fits
-///    within the element's post-sizing width, the text won't reflow, so we skip wrapping entirely.
+///    within the element's post-sizing width, the text does not reflow and wrapping is skipped.
 ///
 /// 2. **Parent-aware traversal** — the pass walks from the root and carries the current parent's
 ///    content width, avoiding a separate parent lookup table.

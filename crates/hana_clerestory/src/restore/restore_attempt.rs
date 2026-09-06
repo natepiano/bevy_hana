@@ -13,18 +13,14 @@ use bevy::prelude::UVec2;
 use bevy::prelude::Window;
 use bevy::prelude::With;
 use bevy::prelude::Without;
+use bevy::prelude::World;
 use bevy::window::OnMonitor;
-use hana_rigging::prelude::Attempt;
-use hana_rigging::prelude::AttemptId;
-use hana_rigging::prelude::AttemptLookup;
-use hana_rigging::prelude::AttemptOutcome;
-use hana_rigging::prelude::Attempts;
+use hana_rigging::prelude::AttemptRef;
 use hana_rigging::prelude::DeviceAccessError;
-use hana_rigging::prelude::Devices;
-use hana_rigging::prelude::HardwareInventory;
 use hana_rigging::prelude::RoleKey;
 
 use super::target_position;
+use super::target_position::PreparedPositionMeaning;
 use super::target_position::RestoreDiagnostics;
 use super::target_position::TargetPosition;
 use super::winit_info;
@@ -32,13 +28,13 @@ use super::winit_info;
 use super::winit_info::InjectedWinitWindows;
 use super::winit_info::X11FrameCompensated;
 use crate::Platform;
-use crate::driver::WindowDriverAttemptResults;
+use crate::driver::RestoreRecord;
+use crate::driver::WindowPlacementTarget;
+use crate::driver::WindowRoleDriverState;
 use crate::monitors;
 use crate::monitors::CurrentMonitor;
 #[cfg(test)]
 use crate::monitors::MonitorDescriptor;
-use crate::monitors::MonitorDeviceAssociation;
-use crate::monitors::MonitorDeviceLookup;
 use crate::monitors::Monitors;
 use crate::persistence::EstablishedWindowPlacement;
 #[cfg(test)]
@@ -48,48 +44,70 @@ use crate::persistence::PersistedWindowState;
 use crate::platform::ReturnCapability;
 use crate::recovery::WindowFallbackRecoveryState;
 
-/// Target preparation tied to a kernel role and, for driver work, its issued attempt.
+/// Driver-owned preparation for one window placement attempt.
 ///
-/// This component schedules window-specific preparation only. It contains no status, deadline,
-/// generation, device identity, or registry; the kernel's `Attempt` remains authoritative for all
-/// of those facts.
-#[derive(Component, Clone, Debug, PartialEq, Eq)]
+/// This value lives in the driver's ledger record, not on either the role entity or the window. It
+/// is the driver's own record of what the attempt was told to place and where — the facts the
+/// restore pipeline rebuilds its target from every frame until the window settles.
+///
+/// It holds no [`AttemptCompletion`](hana_rigging::prelude::AttemptCompletion): the one-use
+/// authority to end the attempt belongs to the ledger, which retains it from `begin_attempt` and
+/// spends it in `succeed_attempt`, `fail_attempt`, or `abort_attempt`. Splitting the two leaves
+/// this value pure data — it can be read, rebuilt, or dropped without any risk of ending the
+/// attempt, and the attempt can only ever be ended once, by the ledger, however many times the
+/// pipeline runs.
 pub(crate) struct RestorePreparation {
+    role:       RoleKey,
+    target:     WindowPlacementTarget,
+    dispatched: EstablishedWindowPlacement,
+}
+
+/// Copyable window-entity reference to one driver-owned restore preparation.
+#[derive(Component, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WindowRestoreAttempt {
     role:   RoleKey,
     source: RestorePreparationSource,
-}
-
-/// Placement supplied by `WindowEndpointDriver::start_apply` for one kernel attempt.
-///
-/// The component is short-lived driver work. The authoritative configuration remains in the
-/// kernel binding, and this copy lets the main-thread target builder prepare the requested window
-/// without consulting a persistence adapter or rebuilding any attempt facts.
-#[derive(Component, Clone)]
-pub(crate) struct WindowApplyConfiguration(EstablishedWindowPlacement);
-
-impl WindowApplyConfiguration {
-    #[must_use]
-    pub(crate) const fn placement(&self) -> &EstablishedWindowPlacement { &self.0 }
-}
-
-impl From<EstablishedWindowPlacement> for WindowApplyConfiguration {
-    fn from(placement: EstablishedWindowPlacement) -> Self { Self(placement) }
 }
 
 /// Authority that requested one window-specific target preparation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Reflect)]
 pub(crate) enum RestorePreparationSource {
     /// The kernel issued this attempt and remains the authority for its lifecycle.
-    KernelAttempt(AttemptId),
+    KernelAttempt(AttemptRef),
 }
 
 impl RestorePreparation {
-    /// Prepare window-specific work for the exact attempt issued by the kernel.
-    #[must_use]
-    pub(crate) fn for_attempt(attempt: &Attempt) -> Self {
+    pub(crate) const fn new(
+        role: RoleKey,
+        target: WindowPlacementTarget,
+        dispatched: EstablishedWindowPlacement,
+    ) -> Self {
         Self {
-            role:   attempt.role.clone(),
-            source: RestorePreparationSource::KernelAttempt(attempt.id),
+            role,
+            target,
+            dispatched,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn role(&self) -> &RoleKey { &self.role }
+
+    #[must_use]
+    pub(crate) const fn window(&self) -> Entity { self.target.window }
+
+    #[must_use]
+    pub(crate) const fn target(&self) -> &WindowPlacementTarget { &self.target }
+
+    #[must_use]
+    pub(crate) const fn dispatched(&self) -> &EstablishedWindowPlacement { &self.dispatched }
+}
+
+impl WindowRestoreAttempt {
+    #[must_use]
+    pub(crate) const fn for_role(role: RoleKey, attempt: AttemptRef) -> Self {
+        Self {
+            role,
+            source: RestorePreparationSource::KernelAttempt(attempt),
         }
     }
 
@@ -99,57 +117,32 @@ impl RestorePreparation {
     #[must_use]
     pub(crate) const fn source(&self) -> RestorePreparationSource { self.source }
 
+    #[must_use]
+    pub(crate) const fn attempt(&self) -> AttemptRef {
+        match self.source {
+            RestorePreparationSource::KernelAttempt(attempt) => attempt,
+        }
+    }
+
     #[cfg(test)]
-    pub(crate) fn for_test(role: RoleKey) -> Self {
-        Self {
-            role,
-            source: RestorePreparationSource::KernelAttempt(AttemptId::default()),
-        }
-    }
+    pub(crate) fn for_test(role: RoleKey) -> Self { Self::for_role(role, AttemptRef::default()) }
 }
 
-/// Remove driver-local work whose kernel attempt no longer exists.
-pub(crate) fn clear_finished_restore_preparations(
-    mut commands: Commands,
-    preparations: Query<(Entity, &RestorePreparation)>,
-    attempts: Res<Attempts>,
-) {
-    for (entity, preparation) in &preparations {
-        let RestorePreparationSource::KernelAttempt(attempt_id) = preparation.source();
-        if matches!(attempts.in_flight(attempt_id), AttemptLookup::Finished) {
-            commands
-                .entity(entity)
-                .remove::<RestorePreparation>()
-                .remove::<WindowApplyConfiguration>();
-        }
-    }
-}
-
-/// Build one driver-requested target using the exact endpoint the kernel still retains.
+/// Build one driver-requested target from the monitor facts resolved before attempt issuance.
 pub(crate) fn prepare_driver_restore_targets(
     mut commands: Commands,
     preparations: Query<
-        (
-            Entity,
-            &RestorePreparation,
-            &WindowApplyConfiguration,
-            &OnMonitor,
-            &CurrentMonitor,
-        ),
+        (Entity, &WindowRestoreAttempt, &OnMonitor, &CurrentMonitor),
         (With<Window>, Without<TargetPosition>),
     >,
-    attempts: Res<Attempts>,
-    association: Res<MonitorDeviceAssociation>,
-    devices: Res<Devices>,
-    inventory: Res<HardwareInventory>,
     monitors: Res<Monitors>,
     platform: Res<Platform>,
-    mut results: ResMut<WindowDriverAttemptResults>,
+    mut driver_state: ResMut<WindowRoleDriverState>,
     mut fallback: ResMut<WindowFallbackRecoveryState>,
     _: NonSendMarker,
     #[cfg(test)] injected_windows: Option<Res<InjectedWinitWindows>>,
 ) {
-    for (entity, preparation, configuration, on_monitor, current_monitor) in &preparations {
+    for (entity, restore_attempt, on_monitor, current_monitor) in &preparations {
         if monitors::exact_monitor_association(on_monitor, current_monitor, &monitors).is_none() {
             continue;
         }
@@ -160,65 +153,47 @@ pub(crate) fn prepare_driver_restore_targets(
         ) else {
             continue;
         };
-        let RestorePreparationSource::KernelAttempt(attempt_id) = preparation.source();
-        let attempt = match attempts.in_flight(attempt_id) {
-            AttemptLookup::InFlight(attempt) => attempt,
-            AttemptLookup::Finished => {
-                commands
-                    .entity(entity)
-                    .remove::<RestorePreparation>()
-                    .remove::<WindowApplyConfiguration>();
+        let attempt = restore_attempt.attempt();
+        // An attempt whose success is already queued for the kernel and an attempt this driver
+        // never issued are different facts with one consequence here: no preparation is
+        // outstanding for this window, so the marker asking for a target is stale and comes off.
+        let (role, target_monitor, configuration) = match driver_state.restore_record(attempt) {
+            RestoreRecord::UnderPreparation(preparation) => (
+                preparation.role().clone(),
+                preparation.target().monitor,
+                preparation.dispatched().clone(),
+            ),
+            RestoreRecord::CompletionQueued | RestoreRecord::AttemptUnknown => {
+                commands.entity(entity).remove::<WindowRestoreAttempt>();
                 continue;
             },
         };
-        let descriptor = match association.lookup(&devices, &inventory, &attempt.endpoint.device) {
-            MonitorDeviceLookup::Live {
-                monitor_entity: _,
-                descriptor,
-            } => descriptor,
-            MonitorDeviceLookup::KnownWithoutLiveMonitor => {
-                fallback.mark_missing(attempt.role.clone());
-                results.record(
-                    attempt_id,
-                    AttemptOutcome::Failed(DeviceAccessError::Absent {
-                        detail: format!(
-                            "authorized display for role {} has no live monitor geometry",
-                            attempt.role
-                        ),
-                    }),
-                );
-                commands
-                    .entity(entity)
-                    .remove::<RestorePreparation>()
-                    .remove::<WindowApplyConfiguration>();
-                continue;
-            },
-            MonitorDeviceLookup::UnknownDevice => {
-                results.record(
-                    attempt_id,
-                    AttemptOutcome::Failed(DeviceAccessError::Transport {
-                        detail: format!(
-                            "authorized display for role {} is no longer known to Clerestory",
-                            attempt.role
-                        ),
-                    }),
-                );
-                commands
-                    .entity(entity)
-                    .remove::<RestorePreparation>()
-                    .remove::<WindowApplyConfiguration>();
-                continue;
-            },
+        let current_target_descriptor = monitors
+            .iter()
+            .find(|monitor| monitor.entity == target_monitor)
+            .map(|monitor| *monitor.descriptor);
+        let Some(descriptor) = current_target_descriptor else {
+            fallback.mark_missing(role.clone());
+            // The record comes back so nothing it left behind is dropped in silence; the marker
+            // it put on this window comes off on the next line, which is the whole of that.
+            let _ = driver_state.fail_attempt(
+                attempt,
+                DeviceAccessError::Absent {
+                    detail: format!("authorized display for role {role} is no longer live"),
+                },
+            );
+            commands.entity(entity).remove::<WindowRestoreAttempt>();
+            continue;
         };
         let target_position = target_position::compute_established_target_position(
-            configuration.placement(),
+            &configuration,
             &descriptor,
             native_window_info.physical_decoration(),
             current_monitor.scale,
             *platform,
         );
         let position_meaning = target_position::prepared_established_position_meaning(
-            configuration.placement(),
+            &configuration,
             &descriptor,
             *platform,
         );
@@ -226,29 +201,50 @@ pub(crate) fn prepare_driver_restore_targets(
             starting_monitor_index: current_monitor.index,
             starting_scale:         current_monitor.scale,
             target_scale:           target_position.target_scale,
-            monitor_scale_strategy: target_position.monitor_scale_strategy,
+            monitor_scale_strategy: target_position.monitor_scale_strategy.clone(),
         };
-        let needs_immediate_x11_compensation = !target_position.saved_window_mode.is_fullscreen()
-            || !platform.needs_frame_compensation();
+        // A windowed X11 restore waits for `compensate_target_position` to subtract the title
+        // bar height. Every other restore carries no frame to subtract, so
+        // `place_window_at_saved_geometry` may run immediately.
+        let awaits_frame_compensation =
+            platform.awaits_frame_compensation(&target_position.saved_window_mode);
         if current_monitor.descriptor != descriptor
             && matches!(
                 platform.fallback_return_capability(
-                    configuration.placement().position,
-                    &configuration.placement().saved_window_mode,
+                    configuration.position,
+                    &configuration.saved_window_mode,
                 ),
                 ReturnCapability::Supported
             )
         {
-            fallback.mark_on_fallback(attempt.role.clone());
+            fallback.mark_on_fallback(role);
         }
         commands
             .entity(entity)
             .insert((target_position, diagnostics, position_meaning));
 
-        if needs_immediate_x11_compensation {
+        if !awaits_frame_compensation {
             commands.entity(entity).insert(X11FrameCompensated);
         }
     }
+}
+
+pub(crate) fn remove_window_restore_work(world: &mut World, window: Entity, attempt: AttemptRef) {
+    let matches_attempt = world
+        .get::<WindowRestoreAttempt>(window)
+        .is_some_and(|restore_attempt| restore_attempt.attempt() == attempt);
+    if !matches_attempt {
+        return;
+    }
+    let Ok(mut window_entity) = world.get_entity_mut(window) else {
+        return;
+    };
+    window_entity.remove::<(
+        WindowRestoreAttempt,
+        TargetPosition,
+        PreparedPositionMeaning,
+        X11FrameCompensated,
+    )>();
 }
 
 #[cfg(test)]
@@ -288,13 +284,14 @@ mod tests {
     use bevy::prelude::UVec2;
 
     use super::*;
-    use crate::persistence::PersistedPanelIdentityV4;
+    use crate::monitors::MonitorDescriptor;
+    use crate::persistence::PersistedDisplayIdentityV4;
     use crate::persistence::PersistedWindowTargetV5;
     use crate::persistence::SavedWindowMode;
     use crate::persistence::UnrebasedDesktopPosition;
 
     fn descriptor(index: usize, position: IVec2, size: UVec2) -> MonitorDescriptor {
-        MonitorDescriptor::for_current_enumeration(index, 1.0, position, size)
+        crate::monitors::MonitorDescriptor::for_current_enumeration(index, 1.0, position, size)
     }
 
     fn legacy_state(position: IVec2) -> Option<PersistedWindowState> {
@@ -305,7 +302,7 @@ mod tests {
             logical_width:     800,
             logical_height:    600,
             target:            PersistedWindowTargetV5::AwaitingLegacyEvidence(
-                PersistedPanelIdentityV4::Anonymous,
+                PersistedDisplayIdentityV4::Anonymous,
             ),
             saved_window_mode: SavedWindowMode::Windowed,
             app_name:          "test".into(),
@@ -346,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn unmatched_saved_panel_and_coordinate_never_fall_back_to_a_live_monitor() {
+    fn unmatched_saved_display_and_coordinate_never_fall_back_to_a_live_monitor() {
         let only = descriptor(0, IVec2::ZERO, UVec2::new(1_000, 1_000));
         let monitors = Monitors::from_test_monitors([(Entity::from_bits(1), only)]);
         let Some(persisted) = legacy_state(IVec2::new(4_000, 4_000)) else {

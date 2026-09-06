@@ -277,7 +277,7 @@ use system_sets::LagrangeSystemSetsPlugin;
 pub use time_source::TimeSource;
 
 /// Bevy plugin for the lagrange cameras. Registers shared camera
-/// infrastructure and both camera kinds, `OrbitCam` and `FreeCam`.
+/// infrastructure and both camera kinds, [`OrbitCam`] and [`FreeCam`].
 /// # Example
 /// ```no_run
 /// # use bevy::prelude::*;

@@ -25,7 +25,8 @@ semantic_newtype::semantic_newtype!(
     /// let midpoint = (start_position + end_position) / 2.0;
     /// assert_eq!(midpoint.into_inner(), Vec3::new(2.0, 0.0, 0.0));
     /// ```
-    Position, Vec3
+    Position,
+    Vec3
 );
 
 #[cfg(test)]

@@ -7,9 +7,9 @@
 //!
 //! Measures the public `DiegeticPanel` update path: build or reuse a
 //! `LayoutTree`, mutate a panel when the scenario calls for it, and run
-//! `app.update()` so `compute_panel_layouts` has a chance to execute. This
-//! includes retained-mode API-boundary work and Bevy scheduling; it is not a
-//! raw `LayoutEngine` benchmark.
+//! `app.update()` so `compute_panel_layouts` runs. This includes retained-mode
+//! API-boundary work and Bevy scheduling; it is not a raw `LayoutEngine`
+//! benchmark.
 //!
 //! Scenarios per row count:
 //! - **`cold`**: first layout for a fresh panel.

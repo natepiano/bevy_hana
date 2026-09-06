@@ -251,8 +251,8 @@ impl DiskWorker {
 /// How [`KeymapPaths::user_keymap`] sits relative to the watched configuration directory.
 ///
 /// Each variant carries every path form [`Self::reports`] accepts as an event for that keymap
-/// file, and [`SymlinkParentWatch`] reads [`Self::ThroughSymlink`] to decide whether a second
-/// watch is placed.
+/// file, and `watch_symlink_target_parent` places a second watch only for
+/// [`Self::ThroughSymlink`], reporting the outcome as a [`SymlinkParentWatch`].
 #[derive(Clone)]
 enum UserKeymapWatch {
     /// The configuration directory did not canonicalize, so only the configured path is known.
@@ -265,7 +265,7 @@ enum UserKeymapWatch {
     /// The keymap file is a symlink to a file in another directory.
     ///
     /// An editor saves by writing a temporary file and renaming it over the target, which replaces
-    /// the file the watch was placed on. A watch on `target_parent` sees that rename, so edits
+    /// the file the watch was placed on. A watch on `target_parent` reports that rename, so edits
     /// keep arriving after the first save.
     ThroughSymlink {
         configured:     PathBuf,
@@ -297,7 +297,7 @@ impl UserKeymapWatch {
 enum SymlinkParentWatch {
     /// The keymap file is not a symlink out of the configuration directory.
     NotNeeded,
-    /// The directory holding the symlink target is watched, so a rename-over save is seen.
+    /// The directory holding the symlink target is watched, so a rename-over save is reported.
     Established,
     /// The directory holding the symlink target is not watched, and why.
     Unwatched {
@@ -309,7 +309,9 @@ enum SymlinkParentWatch {
 /// Also watches the directory a symlinked keymap file resolves into.
 ///
 /// Skipped when the platform's recommended watcher is a polling one: a network or virtual mount
-/// would then be walked on every interval, so the failure is recorded instead of paid for.
+/// would then be walked on every interval, so the directory is left
+/// [`SymlinkParentWatch::Unwatched`] with the reason recorded and the poll audit carries a
+/// rename-over save instead.
 fn watch_symlink_target_parent(
     watcher: &mut RecommendedWatcher,
     user_keymap_watch: &UserKeymapWatch,
@@ -410,9 +412,16 @@ fn resolve_user_keymap_watch(paths: &KeymapPaths) -> UserKeymapWatch {
 mod tests {
     use std::fs;
     use std::path::Path;
+    use std::sync::OnceLock;
+    use std::sync::mpsc;
+    use std::sync::mpsc::RecvTimeoutError;
     use std::thread;
     use std::time::Duration;
     use std::time::Instant;
+
+    use notify::Event;
+    use notify::RecursiveMode;
+    use notify::Watcher;
 
     use super::WatchMode;
     use crate::disk::KeymapPathAvailability;
@@ -432,6 +441,8 @@ mod tests {
     const POLL_AUDIT_INTERVAL: Duration = Duration::from_millis(20);
     const RETRY_INTERVAL: Duration = Duration::from_millis(30);
     const MISSING_SYMLINK_TARGET: &str = "missing-keymap-target/user-keymap.jsonc";
+    const NOTIFICATION_PROBE_DEADLINE: Duration = Duration::from_secs(2);
+    const NOTIFICATION_PROBE_INTERVAL: Duration = Duration::from_millis(50);
     const TEST_APP_NAME: &str = "hana-rubric-watch-test";
     const TEST_TIMEOUT: Duration = Duration::from_secs(3);
     const WAIT_INTERVAL: Duration = Duration::from_millis(5);
@@ -633,8 +644,113 @@ mod tests {
         Ok(())
     }
 
+    /// Whether this machine's filesystem-notification service actually delivers events.
+    ///
+    /// [`WatchMode::Native`] is the production path and the only mode that depends on that
+    /// service. Some execution environments deny it without denying the filesystem, so every
+    /// native watch silently never fires while ordinary reads and writes keep working. The
+    /// difference is measured rather than assumed: a platform or environment-variable check would
+    /// give up this coverage on the machine that needs it most.
+    enum NativeNotificationDelivery {
+        /// A watcher armed on a directory reported a file written inside it.
+        Delivering,
+        /// Nothing was reported, so a native watch cannot be observed here.
+        Silent { reason: String },
+    }
+
+    fn native_notification_delivery() -> &'static NativeNotificationDelivery {
+        static DELIVERY: OnceLock<NativeNotificationDelivery> = OnceLock::new();
+
+        DELIVERY.get_or_init(probe_native_notification_delivery)
+    }
+
+    fn probe_native_notification_delivery() -> NativeNotificationDelivery {
+        let directory = match TestDirectory::new("notification-probe") {
+            Ok(directory) => directory,
+            Err(error) => {
+                return NativeNotificationDelivery::Silent {
+                    reason: format!("a directory to watch could not be created: {error}"),
+                };
+            },
+        };
+        let (sender, receiver) = mpsc::channel();
+        let mut watcher = match notify::recommended_watcher(move |event: notify::Result<Event>| {
+            let _ = sender.send(event);
+        }) {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                return NativeNotificationDelivery::Silent {
+                    reason: format!("the notification service refused a watcher: {error}"),
+                };
+            },
+        };
+        if let Err(error) = watcher.watch(directory.path(), RecursiveMode::NonRecursive) {
+            return NativeNotificationDelivery::Silent {
+                reason: format!("the notification service refused to watch a directory: {error}"),
+            };
+        }
+
+        // The write repeats because arming a watch is not instantaneous on every backend: a single
+        // write can land before the service is listening and be reported by nobody.
+        let probe_file = directory.path().join("probe.jsonc");
+        let deadline = Instant::now() + NOTIFICATION_PROBE_DEADLINE;
+        let mut writes = 0_u32;
+        while Instant::now() < deadline {
+            writes += 1;
+            if let Err(error) = fs::write(&probe_file, writes.to_string()) {
+                return NativeNotificationDelivery::Silent {
+                    reason: format!("the watched file could not be written: {error}"),
+                };
+            }
+            match receiver.recv_timeout(NOTIFICATION_PROBE_INTERVAL) {
+                Ok(Ok(_)) => return NativeNotificationDelivery::Delivering,
+                Ok(Err(error)) => {
+                    return NativeNotificationDelivery::Silent {
+                        reason: format!("the notification service reported an error: {error}"),
+                    };
+                },
+                Err(RecvTimeoutError::Timeout) => {},
+                Err(RecvTimeoutError::Disconnected) => {
+                    return NativeNotificationDelivery::Silent {
+                        reason: String::from("the notification service closed its event channel"),
+                    };
+                },
+            }
+        }
+
+        NativeNotificationDelivery::Silent {
+            reason: format!(
+                "the notification service accepted a watch and then reported nothing for a file written {writes} times inside the directory it was watching",
+            ),
+        }
+    }
+
+    /// Reports whether `test` can observe a native watch on this machine, naming the environment
+    /// when it cannot so the skip is never read as a disk-worker defect.
+    ///
+    /// The reason is printed rather than swallowed, and `.config/nextest.toml` shows these two
+    /// tests' output even when they pass, because a silent pass would be indistinguishable from
+    /// real coverage.
+    fn native_watch_is_observable(test: &str) -> bool {
+        match native_notification_delivery() {
+            NativeNotificationDelivery::Delivering => true,
+            NativeNotificationDelivery::Silent { reason } => {
+                eprintln!(
+                    "SKIPPED {test}: this environment denies the filesystem-notification service, \
+                     so a native watch cannot be observed. The disk worker was never exercised and \
+                     is not implicated: {reason}",
+                );
+                false
+            },
+        }
+    }
+
     #[test]
     fn a_native_watch_carries_an_edit_without_a_poll_audit() -> Result<(), String> {
+        if !native_watch_is_observable("a_native_watch_carries_an_edit_without_a_poll_audit") {
+            return Ok(());
+        }
+
         let environment_lock = ENVIRONMENT_LOCK
             .lock()
             .expect("environment lock is available");
@@ -642,7 +758,7 @@ mod tests {
             TestDirectory::new("native-watch").expect("temporary directory exists");
         let xdg_config_home = XdgConfigHome::set(temporary_directory.path());
         let paths = isolated_paths(&temporary_directory)?;
-        // The temporary directory is deliberately left in its symlinked form. A configuration
+        // The temporary directory is left in its symlinked form, not canonicalized. A configuration
         // directory reached through a symlink is the ordinary case on macOS and under a dotfile
         // manager, and it is precisely the case a path-equality watch check fails.
         let worker_timings = WorkerTimings {
@@ -692,6 +808,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_native_watch_carries_edits_to_a_symlinked_keymap_file() -> Result<(), String> {
+        if !native_watch_is_observable("a_native_watch_carries_edits_to_a_symlinked_keymap_file") {
+            return Ok(());
+        }
+
         let environment_lock = ENVIRONMENT_LOCK
             .lock()
             .expect("environment lock is available");

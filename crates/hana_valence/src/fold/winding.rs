@@ -7,11 +7,11 @@ use super::ProviderCapability;
 
 /// Physical clearance that keeps each wrapped layer off the layer beneath it.
 ///
-/// A winding clearance is a provider capability: the provider knows how thick
-/// its members are, and a wrapping recipe needs that thickness to place every
-/// layer. The mapping from member to displacement stays private so a recipe
-/// cannot receive partial coverage, an unrelated member, or a mixed winding
-/// sense.
+/// A winding clearance is a provider capability: member thickness is the
+/// provider's own data, and a wrapping recipe needs that thickness to place
+/// every layer. The mapping from member to displacement stays private so a
+/// recipe cannot receive partial coverage, an unrelated member, or a mixed
+/// winding sense.
 ///
 /// Each stored [`Displacement`] is the canonical positive winding direction for
 /// its member, measured in the same source-local frame as

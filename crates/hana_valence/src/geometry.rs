@@ -28,8 +28,9 @@ pub enum AnchorSite {
 ///
 /// Frames are complete: use [`Position::default`] and
 /// [`Orientation::default`] for an origin/identity frame rather than omitting
-/// either half. Constructing a frame rejects a non-finite position exactly once;
-/// [`Orientation`] already guarantees a finite normalized quaternion.
+/// either half. [`AnchorFrame::try_new`] rejects a non-finite position, so the
+/// check runs at construction and not on every read; [`Orientation`] already
+/// guarantees a finite normalized quaternion.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Reflect)]
 #[reflect(opaque)]
 pub struct AnchorFrame {
@@ -84,14 +85,15 @@ impl Edge {
 
     /// Returns the native Bevy direction from `start` to `end`.
     ///
-    /// `Dir3` is intentionally exposed only at this calculation boundary;
-    /// stored geometry remains semantic [`Position`] and [`Orientation`] data.
+    /// `Dir3` appears at this calculation boundary only; stored geometry keeps
+    /// [`Position`] and [`Orientation`] values.
     ///
     /// # Errors
     ///
-    /// Returns [`GeometryError::MissingAnchorSite`] if this standalone edge is
-    /// not part of `geometry`, or [`GeometryError::DegenerateEdge`] when its
-    /// endpoints are identical or too close to define a direction.
+    /// Returns [`GeometryError::MissingAnchorSite`] when `geometry` holds no
+    /// frame for one of this edge's endpoint sites, or
+    /// [`GeometryError::DegenerateEdge`] when its endpoints are identical or
+    /// too close to define a direction.
     pub fn axis(&self, geometry: &ResolvedAnchorGeometry) -> Result<Dir3, GeometryError> {
         if self.start == self.end {
             return Err(GeometryError::DegenerateEdge { edge: *self });
@@ -125,9 +127,10 @@ pub struct ResolvedAnchorGeometry {
 impl ResolvedAnchorGeometry {
     /// Validates and stores one provider's frames and ordered edges.
     ///
-    /// The supplied frame iterator may yield sites in any order. The resulting
-    /// lookup order is intentionally unspecified, while [`Self::edges`] keeps
-    /// the exact authored edge order and each edge keeps its endpoint order.
+    /// The supplied frame iterator may yield sites in any order. Frames land in
+    /// a hash map, so their later iteration order is unspecified;
+    /// [`Self::edges`] keeps the exact authored edge order and each edge keeps
+    /// its endpoint order.
     ///
     /// # Errors
     ///
