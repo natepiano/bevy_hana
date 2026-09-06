@@ -1852,6 +1852,12 @@ pub(crate) mod tests {
         let window_state = tempdir()
             .map_err(|error| format!("failed to create the window state directory: {error}"))?;
         let mut app = App::new();
+        // Pin the platform before the plugin builds, so this fixture asserts the same restore
+        // branches on every host. `Platform::detect` reads the environment: on a headless Linux
+        // runner it reports `X11`, whose windowed restore waits forever for the
+        // `_NET_FRAME_EXTENTS` reply that gates `X11FrameCompensated`, and the returned display
+        // never places the window. The plugin harness in `lib.rs` pins the same way.
+        app.insert_resource(Platform::MacOs);
         app.add_plugins((
             MinimalPlugins,
             WindowPlugin {

@@ -136,6 +136,7 @@ use tempfile::TempDir;
 use tempfile::tempdir;
 
 use crate::DisplayTestAdapter;
+use crate::Platform;
 use crate::WindowManagerPlugin;
 use crate::driver;
 use crate::driver::WindowDriverId;
@@ -436,6 +437,14 @@ impl ConformanceSubject for WindowPlacementSubject {
         app: &mut App,
         reporter: ReporterId,
     ) -> EndpointDriverRegistration<Self::Configuration> {
+        // Pin the platform before the plugin builds, so the walk asserts the same driver branches
+        // on every host. `Platform::detect` reads the environment: on a headless Linux runner it
+        // reports `X11`, whose windowed restore waits forever for the `_NET_FRAME_EXTENTS` reply
+        // that gates `X11FrameCompensated`, and the walk then refuses at `SessionEstablished`
+        // having proven nothing about this driver. The plugin harness in `lib.rs` pins the same
+        // way.
+        app.insert_resource(Platform::MacOs);
+
         // The adapter goes in before the window manager, because `MonitorPlugin::build` reads
         // `DisplayTestAdapter::installation` out of the world to decide between the production
         // display source and the scripted one.
