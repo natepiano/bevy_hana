@@ -127,12 +127,12 @@ mod tests {
 
     use super::*;
     use crate::input::InputGain;
+    use crate::input::OrbitCamLineScroll;
     use crate::input::OrbitCamMouseDrag;
 
     #[test]
     fn line_scroll_rejects_invalid_gains_and_preserves_disabled_bindings()
     -> Result<(), BindingsError> {
-        use crate::input::OrbitCamLineScroll;
         for gain in [f32::NAN, f32::INFINITY, -1.0] {
             assert!(
                 OrbitCamBindings::builder()

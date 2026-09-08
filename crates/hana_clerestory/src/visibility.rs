@@ -1088,7 +1088,7 @@ pub(crate) mod tests {
             .init_resource::<PersistedWindowPlacements>()
             .init_resource::<WindowFallbackRecoveryState>()
             .init_resource::<StrandedWindowMovementBaselines>()
-            .insert_resource(Platform::detect())
+            .insert_resource(Platform::FIXTURE)
             .add_observer(crate::mark_primary_window_as_managed)
             .add_systems(
                 Update,
@@ -2077,7 +2077,7 @@ pub(crate) mod tests {
             .init_resource::<StrandedWindowMovementBaselines>()
             .init_resource::<ManagedWindowRegistry>()
             .init_resource::<EndedAttemptEvents>()
-            .insert_resource(Platform::detect())
+            .insert_resource(Platform::FIXTURE)
             .add_observer(count_ended_attempt)
             .add_observer(managed::on_managed_window_added)
             .add_observer(crate::mark_primary_window_as_managed)
@@ -2584,6 +2584,9 @@ pub(crate) mod tests {
         let window_state = tempdir()
             .map_err(|error| format!("failed to create the window state directory: {error}"))?;
         let mut app = App::new();
+        // Pinned before the plugin builds; `configured_platform` reads it instead of the
+        // host session.
+        app.insert_resource(Platform::FIXTURE);
         app.add_plugins((
             MinimalPlugins,
             WindowPlugin {

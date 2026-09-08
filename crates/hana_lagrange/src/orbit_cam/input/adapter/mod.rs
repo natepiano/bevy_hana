@@ -236,6 +236,7 @@ mod tests {
     use crate::input::OrbitCamInputContext;
     use crate::input::OrbitCamInputGain;
     use crate::input::OrbitCamInputMode;
+    use crate::input::OrbitCamLineScroll;
     use crate::input::OrbitCamMouseDrag;
     use crate::input::OrbitCamMouseWheelZoom;
     use crate::input::OrbitCamPinchZoom;
@@ -250,6 +251,7 @@ mod tests {
     use crate::input::TouchTracker;
     use crate::input::TwoFingerGestures;
     use crate::input::WHEEL_INPUT_GAIN;
+    use crate::input::ZoomInversion;
     use crate::orbit_cam::OrbitCam;
     use crate::orbit_cam::OrbitCamInput;
     use crate::orbit_cam::OrbitDelta;
@@ -863,8 +865,6 @@ mod tests {
 
     #[test]
     fn line_scroll_zoom_inverts_and_mode_changes_remove_old_bindings() -> TestResult {
-        use crate::input::OrbitCamLineScroll;
-        use crate::input::ZoomInversion;
         let mut app = test_app();
         let bindings = OrbitCamBindings::builder()
             .zoom(OrbitCamLineScroll::default().with_input_gain(WHEEL_INPUT_GAIN))
@@ -898,7 +898,6 @@ mod tests {
 
     #[test]
     fn custom_line_binding_overrides_wheel_only_when_modifiers_match() -> TestResult {
-        use crate::input::OrbitCamLineScroll;
         let mut app = test_app();
         let bindings = OrbitCamBindings::builder()
             .orbit(OrbitCamLineScroll::default().with_mod_keys(ModKeys::SHIFT))

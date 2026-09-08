@@ -104,6 +104,20 @@ impl Platform {
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     pub fn detect() -> Self { compile_error!("Unsupported platform") }
 
+    /// The platform the crate's in-process fixtures run under.
+    ///
+    /// The fixtures assert on window placement, which needs a platform that
+    /// reports window position. X11 is that platform, without the clamping
+    /// macOS adds. Reading the developer's session through `detect()` made
+    /// the same fixtures see `WindowPosition::Automatic` under a Wayland
+    /// desktop, where no position is available.
+    ///
+    /// `ProductionPluginHarness` pins `MacOs` instead: its windowed restore
+    /// under `workaround-winit-4445` would wait on the `_NET_FRAME_EXTENTS`
+    /// reply that X11 frame compensation needs.
+    #[cfg(test)]
+    pub(crate) const FIXTURE: Self = Self::X11;
+
     /// Whether this is the Linux X11 platform.
     #[must_use]
     pub const fn is_x11(self) -> bool { matches!(self, Self::X11) }

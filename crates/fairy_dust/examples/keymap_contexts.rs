@@ -617,7 +617,6 @@ mod tests {
     use super::command_palette_keymap;
     use super::command_palette_recovery_command_id;
     use super::command_palette_recovery_keystroke;
-    use super::contextual_keymap_plugin;
     use super::install_example_contexts;
     use super::keymap_plugin;
 
@@ -721,7 +720,20 @@ mod tests {
         );
     }
 
-    fn assembled_headless_app() -> App { assembled_headless_app_with(contextual_keymap_plugin()) }
+    // The routing tests assemble their app in-process, and they name no application on
+    // purpose. Naming one points the plugin at the real user configuration directory and
+    // starts a disk worker there, which rewrites the shipped files and delivers its first
+    // read at a moment no test can predict. That delivery commits a fresh keymap generation,
+    // and routing resets and inhibits whatever key is held at that instant, so a press the
+    // test just dispatched is swallowed and the scene never changes. Nothing these tests
+    // assert comes from disk: the bindings under test are the embedded defaults.
+    fn assembled_headless_app() -> App { assembled_headless_app_with(headless_keymap_plugin()) }
+
+    fn headless_keymap_plugin() -> KeymapPlugin {
+        keymap_plugin()
+            .with_state_dimension::<ExampleApplicationState>("application")
+            .with_state_dimension::<ExampleInteractionState>("interaction")
+    }
 
     fn invalid_default_headless_app() -> App {
         let mut app = assembled_headless_app_with(invalid_contextual_keymap_plugin());
@@ -952,7 +964,10 @@ mod tests {
                 .with_protected_keystroke(second_keystroke),
         );
 
-        let mut app = assembled_headless_app();
+        // This one names the application on both halves, because agreeing about the
+        // application name is what it checks. It dispatches no keys, so the disk worker the
+        // name starts cannot disturb it.
+        let mut app = assembled_headless_app_with(super::contextual_keymap_plugin());
         app.add_plugins(keymap_plugin().with_app_name(super::APPLICATION_NAME));
         app.finish();
         app.update();

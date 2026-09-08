@@ -1402,7 +1402,7 @@ mod tests {
                 .init_resource::<PersistedWindowPlacements>()
                 .init_resource::<RetiredRoles>()
                 .init_resource::<StrandedWindowMovementBaselines>()
-                .insert_resource(Platform::detect())
+                .insert_resource(Platform::FIXTURE)
                 .init_resource::<RecoveryMarkerWarnings>()
                 .init_resource::<RecoveryMarkerWarningPathExecutions>()
                 .add_observer(on_managed_window_added)
@@ -1710,7 +1710,7 @@ mod tests {
             let driver = app.add_endpoint_driver(ProjectionBindingDriver);
             app.insert_resource(WindowDriverId(driver))
                 .init_resource::<ManagedWindowRegistry>()
-                .insert_resource(Platform::detect())
+                .insert_resource(Platform::FIXTURE)
                 .init_resource::<StrandedWindowMovementBaselines>()
                 .add_systems(
                     Update,

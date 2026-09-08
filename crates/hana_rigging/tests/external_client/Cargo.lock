@@ -2839,14 +2839,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hana_rigging_external_client"
-version = "0.0.0"
-dependencies = [
- "bevy",
- "hana_rigging",
-]
-
-[[package]]
 name = "harfrust"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4379,6 +4371,14 @@ name = "renderdoc-sys"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
+
+[[package]]
+name = "rigging_test_client"
+version = "0.0.0"
+dependencies = [
+ "bevy",
+ "hana_rigging",
+]
 
 [[package]]
 name = "ron"

@@ -1,6 +1,6 @@
 [package]
 edition = "2024"
-name    = "hana_rigging_external_client"
+name    = "rigging_test_client"
 publish = false
 version = "0.0.0"
 
