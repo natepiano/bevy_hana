@@ -177,6 +177,49 @@ impl Capabilities {
 
     /// Add one reflected capability component and return this declaration for builder-style setup.
     #[must_use]
+    /// A capability is a reflected component that can be compared, so
+    /// reconciliation can tell one report's capabilities from the next:
+    ///
+    /// ```
+    /// use bevy::ecs::reflect::ReflectComponent;
+    /// use bevy::prelude::Component;
+    /// use bevy::prelude::Reflect;
+    /// use hana_rigging::Capabilities;
+    ///
+    /// #[derive(Component, PartialEq, Reflect)]
+    /// #[reflect(Component, PartialEq)]
+    /// struct Resolution(u32, u32);
+    ///
+    /// fn describe() -> Capabilities { Capabilities::new().with(Resolution(3840, 2160)) }
+    /// ```
+    ///
+    /// A reflected value that is not a component has no place on a device
+    /// entity, and one that cannot be compared would make every report look
+    /// like a change. The capability above is what keeps the cases below
+    /// meaningful — a rename would break it loudly rather than leaving these
+    /// failing for an unrelated reason.
+    ///
+    /// ```compile_fail,E0277
+    /// use bevy::prelude::Reflect;
+    /// use hana_rigging::Capabilities;
+    ///
+    /// #[derive(PartialEq, Reflect)]
+    /// struct ReflectedAttribute;
+    ///
+    /// let _ = Capabilities::new().with(ReflectedAttribute);
+    /// ```
+    ///
+    /// ```compile_fail,E0277
+    /// use bevy::ecs::reflect::ReflectComponent;
+    /// use bevy::prelude::{Component, Reflect};
+    /// use hana_rigging::Capabilities;
+    ///
+    /// #[derive(Component, Reflect)]
+    /// #[reflect(Component)]
+    /// struct ReflectedComponent;
+    ///
+    /// let _ = Capabilities::new().with(ReflectedComponent);
+    /// ```
     pub fn with<C>(mut self, capability: C) -> Self
     where
         C: Component + Reflect + PartialEq,

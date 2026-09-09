@@ -3844,6 +3844,11 @@ fn discovery_progress_waits_for_its_delay_then_agrees_across_both_views()
     );
 
     advance_until_running(&mut app, reporter)?;
+    // The kernel marks a reporter running on the main thread as it spawns the job, so the run
+    // arrives here with the `Indeterminate` placeholder still retained and the scripted progress
+    // no further along than the I/O pool has taken it. Waiting for the job to reach its gate is
+    // what makes the progress asserted below the progress the reporter actually sent.
+    gate.wait_until_held()?;
 
     {
         let observed = app.world().resource::<ObservedEvents>();

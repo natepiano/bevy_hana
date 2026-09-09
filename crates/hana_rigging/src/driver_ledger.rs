@@ -766,6 +766,74 @@ enum QueuedCompletion<Attempt> {
 ///
 /// Both maps are keyed by process-local, operator-authored values, so
 /// [`bevy::platform::collections::HashMap`]'s `FixedHasher` gives up nothing.
+/// The ledger holds the authorities; a lookup borrows what it holds rather than
+/// handing one out, and every outcome that names hardware the driver must still
+/// end is `#[must_use]`:
+///
+/// ```
+/// #![deny(unused_must_use)]
+/// use bevy::prelude::Component;
+/// use bevy::prelude::Reflect;
+/// use hana_rigging::AttemptLookup;
+/// use hana_rigging::DriverLedger;
+/// use hana_rigging::RoleKey;
+/// use hana_rigging::SessionLookup;
+///
+/// #[derive(Component, Reflect)]
+/// struct Configuration;
+///
+/// fn look_up(ledger: &DriverLedger<Configuration>, role: &RoleKey) {
+///     let _: SessionLookup = ledger.session_of(role);
+///     let _: AttemptLookup = ledger.attempt_of(role);
+/// }
+///
+/// fn discard(ledger: &mut DriverLedger<Configuration>, role: &RoleKey) {
+///     let discarded = ledger.discard_retained(role);
+///     drop(discarded);
+/// }
+/// ```
+///
+/// The lookups above are what keep the cases below meaningful — a rename would
+/// break them loudly rather than leaving these failing for an unrelated reason.
+///
+/// ```compile_fail,E0308
+/// use bevy::prelude::{Component, Reflect};
+/// use hana_rigging::{AttemptCompletion, DriverLedger, RoleKey, SessionLease};
+///
+/// #[derive(Component, Reflect)]
+/// struct Configuration;
+///
+/// fn take_owned_authorities(ledger: &DriverLedger<Configuration>, role: &RoleKey) {
+///     let _: SessionLease<Configuration> = ledger.session_of(role);
+///     let _: AttemptCompletion<Configuration> = ledger.attempt_of(role);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// #![deny(unused_must_use)]
+/// use bevy::prelude::{Component, Reflect};
+/// use hana_rigging::{
+///     AttemptRef, DriverAbortReason, DriverLedger, EstablishedContext, Establishing, RoleKey,
+/// };
+///
+/// #[derive(Component, Reflect)]
+/// struct Configuration;
+///
+/// fn establish_and_forget(
+///     ledger: &mut DriverLedger<Configuration>,
+///     context: EstablishedContext<'_, Configuration>,
+/// ) {
+///     ledger.establish_lease(context, Establishing::Live, |()| ());
+/// }
+///
+/// fn abort_and_forget(ledger: &mut DriverLedger<Configuration>, attempt: AttemptRef) {
+///     ledger.abort_attempt(attempt, DriverAbortReason::OperationEnded);
+/// }
+///
+/// fn discard_and_forget(ledger: &mut DriverLedger<Configuration>, role: &RoleKey) {
+///     ledger.discard_retained(role);
+/// }
+/// ```
 pub struct DriverLedger<Configuration, Records: DriverRecords = NoRecords> {
     roles:    HashMap<RoleKey, RoleRecord<Configuration, Records::Attempt, Records::Session>>,
     /// Maps an in-flight attempt to the role whose slot holds it, so the three finish verbs —

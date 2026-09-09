@@ -22,6 +22,37 @@ use super::scheme::SchemeName;
 /// the device registry never issued and route an apply to another unit. Opacity also withholds the
 /// field, so reflection-driven tooling reads the issued value through [`DeviceId::get`] rather than
 /// through the type registry.
+/// Every identity value in this crate is reached through a constructor that
+/// either validates the value or records who issued it:
+///
+/// ```
+/// use hana_rigging::DeviceId;
+/// use hana_rigging::Digest;
+/// use hana_rigging::ReportedId;
+/// use hana_rigging::SchemeName;
+///
+/// fn identity_values(issued: DeviceId) -> Result<(), Box<dyn std::error::Error>> {
+///     let _: u64 = issued.get();
+///     let _ = SchemeName::new("edid-serial")?;
+///     let _ = ReportedId::new("DELL-U2723QE-9J4K2H3")?;
+///     let _ = Digest::new(14_695_981_039_346_656_037);
+///     Ok(())
+/// }
+/// ```
+///
+/// The wrapped field is private in every case, so the constructor cannot be
+/// stepped around. The calls above are what keep this case meaningful — a
+/// rename would break them loudly rather than leaving this one failing for an
+/// unrelated reason:
+///
+/// ```compile_fail,E0423
+/// use hana_rigging::{DeviceId, Digest, ReportedId, SchemeName};
+///
+/// let _ = DeviceId(1);
+/// let _ = SchemeName("edid-serial".to_owned());
+/// let _ = ReportedId("DELL-U2723QE-9J4K2H3".to_owned());
+/// let _ = Digest(14_695_981_039_346_656_037);
+/// ```
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Component, Reflect)]
 #[reflect(opaque)]
 #[reflect(Component, PartialEq)]
@@ -104,7 +135,40 @@ pub enum DeviceIdSource {
 /// Physical role used to keep identifier spaces for unrelated hardware separate.
 ///
 /// Adding a new device class is a workspace-wide change: every application match must classify
-/// the new class before the workspace compiles.
+/// the new class before the workspace compiles. The enum is deliberately
+/// exhaustive, so a match names every class:
+///
+/// ```
+/// use hana_rigging::prelude::DeviceKind;
+///
+/// fn classify(device_kind: DeviceKind) -> &'static str {
+///     match device_kind {
+///         DeviceKind::Display => "display",
+///         DeviceKind::Camera => "camera",
+///         DeviceKind::AudioInterface => "audio interface",
+///         DeviceKind::DmxUniverse => "DMX universe",
+///         DeviceKind::ControlSurface => "control surface",
+///     }
+/// }
+/// ```
+///
+/// A match that leaves one out does not compile — which is the whole point of
+/// the workspace-wide change. The total match above is what keeps this case
+/// meaningful: a rename would break it loudly rather than leaving this one
+/// failing for an unrelated reason.
+///
+/// ```compile_fail,E0004
+/// use hana_rigging::prelude::DeviceKind;
+///
+/// fn classify(device_kind: DeviceKind) -> &'static str {
+///     match device_kind {
+///         DeviceKind::Display => "display",
+///         DeviceKind::Camera => "camera",
+///         DeviceKind::AudioInterface => "audio interface",
+///         DeviceKind::DmxUniverse => "DMX universe",
+///     }
+/// }
+/// ```
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, Reflect)]
 #[reflect(Serialize, Deserialize)]
 pub enum DeviceKind {

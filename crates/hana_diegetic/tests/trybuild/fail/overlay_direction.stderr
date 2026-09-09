@@ -1,7 +1,0 @@
-error[E0599]: no method named `direction` found for struct `El<Overlay>` in the current scope
- --> tests/trybuild/fail/overlay_direction.rs:5:27
-  |
-5 |     let _ = El::overlay().direction(Direction::TopToBottom);
-  |                           ^^^^^^^^^ method not found in `El<Overlay>`
-  |
-  = note: the method was found for `El<L, WidgetElement<Slider>>`

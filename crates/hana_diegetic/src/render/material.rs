@@ -79,6 +79,10 @@ pub(crate) fn material_asset_for_frame<'a>(
     reason = "tests should panic on unexpected values"
 )]
 mod tests {
+    use std::thread;
+    use std::time::Duration;
+    use std::time::Instant;
+
     use bevy::asset::AssetPlugin;
     use bevy::prelude::App;
     use bevy::prelude::AssetApp;
@@ -86,6 +90,16 @@ mod tests {
     use bevy::prelude::MinimalPlugins;
 
     use super::*;
+
+    /// Wall-clock budget for the asset server to resolve a missing path. The
+    /// resolution runs on the IO pool, so the number of frames it takes is a
+    /// property of the machine: a CI runner sharing its cores with three sibling
+    /// jobs can need the whole budget where an idle machine needs none of it.
+    const MISSING_PATH_LOAD_DEADLINE: Duration = Duration::from_secs(30);
+    /// Gap between load-state reads while waiting out that budget. Short enough
+    /// to add no measurable time on an idle machine, long enough that the wait
+    /// yields its core rather than holding it.
+    const MISSING_PATH_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
     fn material_app() -> App {
         let mut app = App::new();
@@ -162,17 +176,17 @@ mod tests {
         let missing_handle: Handle<StandardMaterial> =
             asset_server.load("materials/does_not_exist.standard_material");
 
-        for _ in 0..32 {
+        // A fixed frame count is a race the runner loses; bound the wait by wall
+        // clock, which is what is actually being waited on.
+        let deadline = Instant::now() + MISSING_PATH_LOAD_DEADLINE;
+        while matches!(asset_server.load_state(&missing_handle), LoadState::Loading) {
+            assert!(
+                Instant::now() < deadline,
+                "missing path handle should leave Loading before fallback is asserted"
+            );
             app.update();
-            if !matches!(asset_server.load_state(&missing_handle), LoadState::Loading) {
-                break;
-            }
+            thread::sleep(MISSING_PATH_POLL_INTERVAL);
         }
-
-        assert!(
-            !matches!(asset_server.load_state(&missing_handle), LoadState::Loading),
-            "missing path handle should leave Loading before fallback is asserted"
-        );
         let materials = app.world().resource::<Assets<StandardMaterial>>();
         let material =
             material_asset_for_frame(materials, &asset_server, &missing_handle, &default_handle)

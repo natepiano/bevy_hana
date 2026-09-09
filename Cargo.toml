@@ -153,7 +153,6 @@ jsonschema        = { version = "0.50.1", default-features = false }
 serde_json        = "1.0.151"
 static_assertions = "1.1.0"
 tempfile          = "3.27.0"
-trybuild          = "1"
 
 [workspace.lints.clippy]
 # Our strict lints

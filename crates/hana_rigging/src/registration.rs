@@ -95,6 +95,29 @@ pub struct DriverId(pub(crate) u32);
 /// The private field and constructor prevent a driver from manufacturing permission for a device
 /// whose identity did not authorize it. `#[reflect(opaque)]` extends that boundary to reflection:
 /// a dynamic reflected tuple cannot construct this token.
+///
+/// The type is public and nameable, because an authorized apply receives one:
+///
+/// ```
+/// fn authorized(_: hana_rigging::ApplyPermit) {}
+/// ```
+///
+/// It cannot be built, and it cannot be taken apart by pattern either — a
+/// destructuring match would be a second way to reach the same private field.
+/// The signature above is what keeps these cases meaningful: a rename would
+/// break it loudly rather than leaving these failing for an unrelated reason.
+///
+/// ```compile_fail,E0423
+/// let _ = hana_rigging::ApplyPermit(());
+/// ```
+///
+/// ```compile_fail,E0532
+/// use hana_rigging::ApplyPermit;
+///
+/// fn cannot_match(permit: ApplyPermit) {
+///     let ApplyPermit(_) = permit;
+/// }
+/// ```
 #[derive(Clone, Copy, Debug, Reflect)]
 #[reflect(opaque)]
 pub struct ApplyPermit(());
@@ -2102,7 +2125,15 @@ mod tests {
     use crate::reporter_health::ReporterLogDecision;
     use crate::reporter_health::ReporterLogState;
 
-    const BACKGROUND_RESULT_POLL_CEILING: usize = 256;
+    /// How long a test waits for one reporter's background result before calling it stuck.
+    ///
+    /// The work runs on another thread, so the bound is elapsed time rather than a poll count:
+    /// a loaded machine can burn through any fixed number of polls before it schedules that
+    /// thread even once, which reports a result that is merely late as one that never arrived.
+    const BACKGROUND_RESULT_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// How long to wait between polls once the first one finds the result unfinished.
+    const BACKGROUND_RESULT_POLL_INTERVAL: Duration = Duration::from_micros(100);
 
     #[test]
     fn reporter_registration_and_plugin_order_share_the_runtime_clock_anchor() {
@@ -2740,7 +2771,8 @@ mod tests {
     }
 
     fn reporter_result_becomes_ready(app: &mut App, reporter: ReporterId) -> bool {
-        for _ in 0..BACKGROUND_RESULT_POLL_CEILING {
+        let deadline = Instant::now() + BACKGROUND_RESULT_DEADLINE;
+        loop {
             let result_is_ready =
                 app.world_mut()
                     .resource_scope::<Reporters, _>(|_, mut reporters| {
@@ -2759,9 +2791,11 @@ mod tests {
             if result_is_ready {
                 return true;
             }
-            std::thread::yield_now();
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(BACKGROUND_RESULT_POLL_INTERVAL);
         }
-        false
     }
 
     fn published_report_projections(app: &App) -> &[&'static str] {
@@ -3063,9 +3097,13 @@ mod tests {
     }
 
     fn finish_background_discovery_task(reporter_entry: &mut ReporterEntry, now: Instant) {
-        const MAX_POLLS: usize = 10_000;
+        // The pooled task has to be scheduled before it can report completion, so the
+        // wait is bounded by wall clock rather than by a poll count. A fixed number of
+        // yields elapses in milliseconds on an idle machine and can run out before the
+        // pool thread is scheduled at all on a host whose cores are already committed.
+        let deadline = Instant::now() + BACKGROUND_RESULT_DEADLINE;
 
-        for _ in 0..MAX_POLLS {
+        loop {
             reporter_entry.collect_finished_run(now);
             if matches!(
                 reporter_entry.completion_time(),
@@ -3073,13 +3111,12 @@ mod tests {
             ) {
                 return;
             }
-            std::thread::yield_now();
+            assert!(
+                Instant::now() < deadline,
+                "background discovery task must reach completion within the wait budget"
+            );
+            std::thread::sleep(BACKGROUND_RESULT_POLL_INTERVAL);
         }
-
-        assert!(matches!(
-            reporter_entry.completion_time(),
-            ReporterCompletionTime::CompletedAt(_)
-        ));
     }
 
     fn expire_reporter_deadline(app: &mut App, reporter: ReporterId) {

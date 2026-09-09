@@ -68,6 +68,41 @@ impl MaximumDatumGap {
 }
 
 /// Timing bounds for a session whose data must continue arriving.
+///
+/// The two intervals answer different questions — how long to wait for the
+/// first datum, and how long a gap between later ones may last — so each has
+/// its own type and they cannot be handed over in the wrong order:
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use hana_rigging::ContinuousFlowExpectation;
+/// use hana_rigging::FirstDatumTimeout;
+/// use hana_rigging::MaximumDatumGap;
+///
+/// fn expectation() -> Result<ContinuousFlowExpectation, Box<dyn std::error::Error>> {
+///     let first = FirstDatumTimeout::new(Duration::from_secs(1))?;
+///     let gap = MaximumDatumGap::new(Duration::from_secs(1))?;
+///     Ok(ContinuousFlowExpectation::new(first, gap))
+/// }
+/// ```
+///
+/// The construction above is what keeps this case meaningful — a rename would
+/// break it loudly rather than leaving this one failing for an unrelated
+/// reason:
+///
+/// ```compile_fail,E0308
+/// use std::time::Duration;
+///
+/// use hana_rigging::{ContinuousFlowExpectation, FirstDatumTimeout, MaximumDatumGap};
+///
+/// fn swapped(
+///     first: FirstDatumTimeout,
+///     gap: MaximumDatumGap,
+/// ) -> ContinuousFlowExpectation {
+///     ContinuousFlowExpectation::new(gap, first)
+/// }
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Reflect)]
 #[reflect(opaque)]
 pub struct ContinuousFlowExpectation {

@@ -474,7 +474,34 @@ impl PartialEq for Tooltip {
 impl Tooltip {
     /// Creates a deferred `Fit` by `Fit` tooltip with `root` as its visible root.
     ///
-    /// ```compile_fail
+    /// A tooltip describes a widget; it does not contain one. Its root, its
+    /// containers, and its leaves are ordinary layout:
+    ///
+    /// ```
+    /// use bevy::asset::Handle;
+    /// use bevy::color::Color;
+    /// use bevy::image::Image;
+    /// use hana_diegetic::El;
+    /// use hana_diegetic::TextStyle;
+    /// use hana_diegetic::Tooltip;
+    ///
+    /// fn described() -> Tooltip {
+    ///     let mut tooltip = Tooltip::new(El::column());
+    ///     tooltip.with(El::new(), |tooltip| {
+    ///         tooltip.text("plain");
+    ///         tooltip.text(("styled", TextStyle::default()));
+    ///     });
+    ///     tooltip.image(El::new(), Handle::<Image>::default(), Color::WHITE);
+    ///     tooltip
+    /// }
+    /// ```
+    ///
+    /// The tooltip above is what keeps this case and the ones on
+    /// [`Self::with`], [`Self::text`], and [`Self::image`] meaningful — a
+    /// rename would break that one loudly rather than leaving these succeeding
+    /// for an unrelated reason:
+    ///
+    /// ```compile_fail,E0308
     /// use hana_diegetic::{Button, El, Tooltip};
     ///
     /// let widget = El::new().button("nested");
@@ -502,7 +529,10 @@ impl Tooltip {
 
     /// Adds a visual container and authors its descendants through this tooltip.
     ///
-    /// ```compile_fail
+    /// A container is ordinary layout. See [`Self::new`] for the passing case
+    /// that keeps this one meaningful.
+    ///
+    /// ```compile_fail,E0308
     /// use hana_diegetic::{Button, El, Tooltip};
     ///
     /// let mut tooltip = Tooltip::new(El::new());
@@ -525,6 +555,19 @@ impl Tooltip {
     }
 
     /// Adds a text leaf under the current tooltip container.
+    ///
+    /// The run's layout element is ordinary layout, like every other part of a
+    /// tooltip; a run laid out on a widget cannot become one. See
+    /// [`Self::new`] for the passing case that keeps this one meaningful.
+    ///
+    /// ```compile_fail,E0277
+    /// use hana_diegetic::{Button, El, Text, TextStyle, Tooltip};
+    ///
+    /// let widget_text =
+    ///     Text::new("nested", TextStyle::default()).layout(El::new().button("nested"));
+    /// let mut tooltip = Tooltip::new(El::new());
+    /// tooltip.text(widget_text);
+    /// ```
     pub fn text(&mut self, text: impl Into<Text<LayoutOnly>>) -> &mut Self {
         let parent = self.current_parent();
         Arc::make_mut(&mut self.blueprint).tooltip_add_text(
@@ -537,7 +580,10 @@ impl Tooltip {
 
     /// Adds an image leaf under the current tooltip container.
     ///
-    /// ```compile_fail
+    /// An image leaf is ordinary layout. See [`Self::new`] for the passing case
+    /// that keeps this one meaningful.
+    ///
+    /// ```compile_fail,E0308
     /// use bevy::asset::Handle;
     /// use bevy::color::Color;
     /// use bevy::image::Image;
@@ -1247,6 +1293,33 @@ fn tooltip_readiness_inputs_changed(mut inputs: TooltipReadinessInputChanges<'_,
 }
 
 /// A typed identity for a general tooltip target.
+///
+/// The coordinate space travels in the type, so an API that places in screen
+/// space accepts only screen-space targets:
+///
+/// ```
+/// use hana_diegetic::Screen;
+/// use hana_diegetic::TooltipTarget;
+/// use hana_diegetic::TooltipTargetEntity;
+///
+/// fn requires_screen_target<Target: TooltipTarget<Space = Screen>>(_target: Target) {}
+///
+/// fn accept_screen_target(target: TooltipTargetEntity<Screen>) { requires_screen_target(target); }
+/// ```
+///
+/// A world-space target is refused there. The acceptance above is what keeps
+/// this case meaningful — a rename would break that one loudly rather than
+/// leaving this one succeeding for an unrelated reason:
+///
+/// ```compile_fail,E0271
+/// use hana_diegetic::{Screen, TooltipTarget, TooltipTargetEntity, World};
+///
+/// fn requires_screen_target<Target: TooltipTarget<Space = Screen>>(_target: Target) {}
+///
+/// fn reject_world_target(target: TooltipTargetEntity<World>) {
+///     requires_screen_target(target);
+/// }
+/// ```
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TooltipTargetEntity<Space> {
     entity: Entity,
@@ -1322,6 +1395,59 @@ impl<Space: TooltipTargetSpace> TooltipTarget for WidgetEntity<Space> {
 /// Extension methods for checked standalone tooltip authoring.
 pub trait TooltipCommandsExt {
     /// Reserves and returns a tooltip controller entity.
+    ///
+    /// A target is a checked handle that carries its coordinate space —
+    /// Hana's typed panel and widget handles, a general
+    /// [`TooltipTargetEntity`], or an application's own [`TooltipTarget`]:
+    ///
+    /// ```
+    /// use bevy::ecs::system::Commands;
+    /// use bevy::prelude::Entity;
+    /// use hana_diegetic::El;
+    /// use hana_diegetic::PanelEntity;
+    /// use hana_diegetic::Tooltip;
+    /// use hana_diegetic::TooltipCommandsExt;
+    /// use hana_diegetic::TooltipTarget;
+    /// use hana_diegetic::TooltipTargetEntity;
+    /// use hana_diegetic::WidgetEntity;
+    /// use hana_diegetic::World;
+    ///
+    /// struct ApplicationWorldTarget(Entity);
+    ///
+    /// impl TooltipTarget for ApplicationWorldTarget {
+    ///     type Space = World;
+    ///
+    ///     fn tooltip_target_entity(&self) -> Entity { self.0 }
+    /// }
+    ///
+    /// fn typed_targets(
+    ///     commands: &mut Commands,
+    ///     panel: PanelEntity<World>,
+    ///     widget: WidgetEntity<World>,
+    ///     general: TooltipTargetEntity<World>,
+    ///     application: ApplicationWorldTarget,
+    /// ) {
+    ///     commands.spawn_tooltip(panel, Tooltip::new(El::new()));
+    ///     commands.spawn_tooltip(widget, Tooltip::new(El::new()));
+    ///     commands.spawn_tooltip(general, Tooltip::new(El::new()));
+    ///     commands.spawn_tooltip(application, Tooltip::new(El::new()));
+    /// }
+    /// ```
+    ///
+    /// A bare [`Entity`] says nothing about what it is or where it is placed,
+    /// so it is not one. The typed targets above are what keep this case
+    /// meaningful — a rename would break those loudly rather than leaving this
+    /// one succeeding for an unrelated reason:
+    ///
+    /// ```compile_fail,E0277
+    /// use bevy::ecs::system::Commands;
+    /// use bevy::prelude::Entity;
+    /// use hana_diegetic::{El, Tooltip, TooltipCommandsExt};
+    ///
+    /// fn raw_entity_target(commands: &mut Commands, target: Entity) {
+    ///     commands.spawn_tooltip(target, Tooltip::new(El::new()));
+    /// }
+    /// ```
     fn spawn_tooltip<Target>(&mut self, target: Target, tooltip: Tooltip) -> Entity
     where
         Target: TooltipTarget;

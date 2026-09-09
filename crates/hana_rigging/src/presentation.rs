@@ -32,6 +32,21 @@ use crate::WaitingStatusView;
     clippy::derive_partial_eq_without_eq,
     reason = "the published component contract requires PartialEq without promising Eq"
 )]
+/// The type is public and nameable, because an application reads one:
+///
+/// ```
+/// fn presented<Cause>(_: &hana_rigging::RolePresentation<Cause>) {}
+/// ```
+///
+/// Its wrapped view is private, so the kernel is the only writer. The signature
+/// above is what keeps this case meaningful — a rename would break it loudly
+/// rather than leaving this one failing for an unrelated reason:
+///
+/// ```compile_fail,E0423
+/// use hana_rigging::{KernelRolePresentation, RolePresentation, RolePresentationView};
+///
+/// let _: KernelRolePresentation = RolePresentation(RolePresentationView::Presenting);
+/// ```
 #[derive(Component, Clone, PartialEq, Reflect, Serialize)]
 #[reflect(opaque)]
 #[reflect(Component, PartialEq, Serialize)]

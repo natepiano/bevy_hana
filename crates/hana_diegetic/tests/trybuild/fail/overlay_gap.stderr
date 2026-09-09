@@ -1,9 +1,0 @@
-error[E0599]: no method named `gap` found for struct `El<Overlay>` in the current scope
- --> tests/trybuild/fail/overlay_gap.rs:5:27
-  |
-5 |     let _ = El::overlay().gap(In(0.08));
-  |                           ^^^ method not found in `El<Overlay>`
-  |
-  = note: the method was found for
-          - `El<Column, Role>`
-          - `El<Row, Role>`

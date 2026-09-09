@@ -111,6 +111,52 @@ impl<Configuration> Copy for EndpointDriverRegistration<Configuration> {}
 /// An implementation panic is fatal, and the kernel does not catch it. Continuing after a
 /// partially prepared discovery run would leave the reporter's device set and progress partly
 /// built, with nothing recording which parts completed.
+/// A reporter states what work it wants done; the kernel decides where that
+/// work runs. [`Self::discover`] therefore takes no `World`:
+///
+/// ```
+/// use hana_rigging::prelude::DeviceReporter;
+/// use hana_rigging::prelude::DeviceScan;
+/// use hana_rigging::prelude::DiscoveryJob;
+/// use hana_rigging::prelude::DiscoveryWork;
+///
+/// struct BackgroundReporter;
+///
+/// impl DeviceReporter for BackgroundReporter {
+///     fn discover(&mut self) -> DiscoveryWork {
+///         DiscoveryWork::Background(DiscoveryJob::new(|_| DeviceScan::Complete(Vec::new())))
+///     }
+/// }
+/// ```
+///
+/// A world-taking `discover` would let a reporter reach live state from
+/// whichever thread its scan ran on. The implementation above is what keeps the
+/// cases below meaningful — a rename would break it loudly rather than leaving
+/// these failing for an unrelated reason.
+///
+/// ```compile_fail,E0050
+/// use bevy::prelude::World;
+/// use hana_rigging::{DeviceReporter, DiscoveryWork};
+///
+/// struct Reporter;
+///
+/// impl DeviceReporter for Reporter {
+///     fn discover(&mut self, _: &mut World) -> DiscoveryWork { todo!() }
+/// }
+/// ```
+///
+/// The earlier `scan` entry point that did is gone, not deprecated:
+///
+/// ```compile_fail,E0407
+/// use bevy::prelude::World;
+/// use hana_rigging::{DeviceReporter, DeviceScan};
+///
+/// struct Reporter;
+///
+/// impl DeviceReporter for Reporter {
+///     fn scan(&mut self, _: &mut World) -> DeviceScan { DeviceScan::Complete(Vec::new()) }
+/// }
+/// ```
 pub trait DeviceReporter: Send + Sync + 'static {
     /// Prepare one complete discovery run when the kernel schedules this reporter.
     ///
@@ -158,6 +204,45 @@ pub struct DiscoveryJob(
 impl DiscoveryJob {
     /// Store one sendable discovery closure for a later `IoTaskPool` submission.
     #[must_use]
+    /// The closure runs on an I/O worker, so it is sendable, it receives a
+    /// progress sender rather than the world, and it returns an owned scan:
+    ///
+    /// ```
+    /// use hana_rigging::DeviceScan;
+    /// use hana_rigging::DiscoveryJob;
+    ///
+    /// fn job() -> DiscoveryJob { DiscoveryJob::new(|_| DeviceScan::Complete(Vec::new())) }
+    /// ```
+    ///
+    /// The job above is what keeps the cases below meaningful — a rename would
+    /// break it loudly rather than leaving these failing for an unrelated
+    /// reason.
+    ///
+    /// ```compile_fail,E0277
+    /// use std::rc::Rc;
+    ///
+    /// use hana_rigging::{DeviceScan, DiscoveryJob};
+    ///
+    /// let non_send_state = Rc::new(());
+    /// let _ = DiscoveryJob::new(move |_| {
+    ///     let _ = Rc::strong_count(&non_send_state);
+    ///     DeviceScan::Complete(Vec::new())
+    /// });
+    /// ```
+    ///
+    /// ```compile_fail,E0631
+    /// use bevy::prelude::World;
+    /// use hana_rigging::{DeviceScan, DiscoveryJob};
+    ///
+    /// let _ = DiscoveryJob::new(|_: &mut World| DeviceScan::Complete(Vec::new()));
+    /// ```
+    ///
+    /// ```compile_fail,E0308
+    /// use hana_rigging::{DeviceScan, DiscoveryJob};
+    ///
+    /// let device_scan = DeviceScan::Complete(Vec::new());
+    /// let _ = DiscoveryJob::new(move |_| &device_scan);
+    /// ```
     pub fn new(run: impl FnOnce(DiscoveryProgressSender) -> DeviceScan + Send + 'static) -> Self {
         Self(Mutex::new(Box::new(run)))
     }
@@ -1055,6 +1140,101 @@ pub enum SessionReleaseCause {
 /// The authority belongs in driver storage keyed by [`AttemptRef`], never on the role entity. A
 /// role-scoped [`SessionLease`] is instead keyed by [`RoleKey`]. Role recovery may replace the
 /// entity while either authority remains valid.
+///
+/// One attempt reports one result, and the result carries the configuration
+/// the driver was registered for:
+///
+/// ```
+/// use bevy::prelude::Component;
+/// use bevy::prelude::Reflect;
+/// use hana_rigging::Applied;
+/// use hana_rigging::AttemptCompletion;
+/// use hana_rigging::DriverCompletion;
+///
+/// #[derive(Component, Reflect)]
+/// struct Configuration;
+///
+/// fn finish_once(completion: AttemptCompletion<Configuration>) {
+///     completion.finish(DriverCompletion::Succeeded(Applied::AsDispatched));
+/// }
+/// ```
+///
+/// [`Self::finish`] takes the authority by value, so a second report has
+/// nothing left to report with. The single report above is what keeps the
+/// cases below meaningful — a rename would break it loudly rather than leaving
+/// these failing for an unrelated reason.
+///
+/// ```compile_fail,E0382
+/// use bevy::prelude::{Component, Reflect};
+/// use hana_rigging::{Applied, AttemptCompletion, DriverCompletion};
+///
+/// #[derive(Component, Reflect)]
+/// struct Configuration;
+///
+/// fn finish_twice(completion: AttemptCompletion<Configuration>) {
+///     completion.finish(DriverCompletion::Succeeded(Applied::AsDispatched));
+///     completion.finish(DriverCompletion::Succeeded(Applied::AsDispatched));
+/// }
+/// ```
+///
+/// A result describing some other configuration type is not this attempt's:
+///
+/// ```compile_fail,E0308
+/// use bevy::prelude::{Component, Reflect};
+/// use hana_rigging::{Applied, AttemptCompletion, DriverCompletion};
+///
+/// #[derive(Component, Reflect)]
+/// struct ExpectedConfiguration;
+///
+/// #[derive(Component, Reflect)]
+/// struct WrongConfiguration;
+///
+/// fn finish_with_wrong_configuration(completion: AttemptCompletion<ExpectedConfiguration>) {
+///     completion.finish(DriverCompletion::Succeeded(Applied::DiffersFromDispatched(
+///         WrongConfiguration,
+///     )));
+/// }
+/// ```
+///
+/// The kernel issues the authority, so a driver cannot assemble one:
+///
+/// ```compile_fail
+/// use bevy::prelude::{Component, Reflect};
+/// use hana_rigging::AttemptCompletion;
+///
+/// #[derive(Component, Reflect)]
+/// struct Configuration;
+///
+/// let _ = AttemptCompletion::<Configuration> {};
+/// ```
+///
+/// … nor duplicate one it holds:
+///
+/// ```compile_fail,E0308
+/// use bevy::prelude::{Component, Reflect};
+/// use hana_rigging::AttemptCompletion;
+///
+/// #[derive(Component, Reflect)]
+/// struct Configuration;
+///
+/// fn clone_authority(completion: &AttemptCompletion<Configuration>) {
+///     let _: AttemptCompletion<Configuration> = completion.clone();
+/// }
+/// ```
+///
+/// … nor write one down to be revived later:
+///
+/// ```compile_fail,E0277
+/// use bevy::prelude::{Component, Reflect};
+/// use hana_rigging::AttemptCompletion;
+///
+/// #[derive(Component, Reflect)]
+/// struct Configuration;
+///
+/// fn serialize_authority(completion: &AttemptCompletion<Configuration>) {
+///     let _ = serde_json::to_string(completion);
+/// }
+/// ```
 pub struct AttemptCompletion<Configuration> {
     role:          RoleKey,
     attempt:       AttemptRef,
@@ -1117,6 +1297,93 @@ where
 ///
 /// The lease belongs in driver storage keyed by [`RoleKey`], never on the role entity. The entity
 /// supplied to [`EndpointDriver::established`] is valid only for that callback.
+///
+/// A lease reports what its session did:
+///
+/// ```
+/// use bevy::prelude::Component;
+/// use bevy::prelude::Reflect;
+/// use hana_rigging::DeviceAccessError;
+/// use hana_rigging::SessionLease;
+/// use hana_rigging::SessionRef;
+///
+/// #[derive(Component, Reflect)]
+/// struct Configuration;
+///
+/// fn correlate(lease: &SessionLease<Configuration>) -> SessionRef { lease.session_ref() }
+///
+/// fn reconfigure(lease: &mut SessionLease<Configuration>) {
+///     lease.configuration_changed(Configuration);
+/// }
+///
+/// fn end(lease: SessionLease<Configuration>, error: DeviceAccessError) {
+///     lease.report_loss(error);
+/// }
+/// ```
+///
+/// The kernel issues it, so a driver cannot assemble one. The reports above are
+/// what keep the cases below meaningful — a rename would break them loudly
+/// rather than leaving these failing for an unrelated reason.
+///
+/// ```compile_fail
+/// use bevy::prelude::{Component, Reflect};
+/// use hana_rigging::SessionLease;
+///
+/// #[derive(Component, Reflect)]
+/// struct Configuration;
+///
+/// let _ = SessionLease::<Configuration> {};
+/// ```
+///
+/// … nor duplicate one it holds:
+///
+/// ```compile_fail,E0308
+/// use bevy::prelude::{Component, Reflect};
+/// use hana_rigging::SessionLease;
+///
+/// #[derive(Component, Reflect)]
+/// struct Configuration;
+///
+/// fn clone_authority(lease: &SessionLease<Configuration>) {
+///     let _: SessionLease<Configuration> = lease.clone();
+/// }
+/// ```
+///
+/// … nor write one down to be revived later:
+///
+/// ```compile_fail,E0277
+/// use bevy::prelude::{Component, Reflect};
+/// use hana_rigging::SessionLease;
+///
+/// #[derive(Component, Reflect)]
+/// struct Configuration;
+///
+/// fn serialize_authority(lease: &SessionLease<Configuration>) {
+///     let _ = serde_json::to_string(lease);
+/// }
+/// ```
+///
+/// A driver states what its transport carried; it never credits an arrival. The
+/// lease exposes no method that would, and the evidence a lease holds cannot be
+/// spelled from outside the kernel either:
+///
+/// ```compile_fail
+/// use hana_rigging::SessionLease;
+///
+/// fn assert_an_arrival<Configuration>(lease: &mut SessionLease<Configuration>) {
+///     lease.record_datum_arrival();
+/// }
+/// ```
+///
+/// ```compile_fail,E0603
+/// use std::time::Instant;
+///
+/// use hana_rigging::SessionDatumArrivalEvidence;
+///
+/// fn spell_an_arrival(observed_at: Instant) -> SessionDatumArrivalEvidence {
+///     SessionDatumArrivalEvidence::ObservedAt(observed_at)
+/// }
+/// ```
 pub struct SessionLease<Configuration> {
     role:           RoleKey,
     session:        SessionRef,

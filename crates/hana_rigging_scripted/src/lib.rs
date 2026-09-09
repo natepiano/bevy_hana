@@ -25,7 +25,9 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
+use std::sync::MutexGuard;
 use std::time::Duration;
+use std::time::Instant;
 
 use bevy::app::App;
 use bevy::prelude::Component;
@@ -89,12 +91,14 @@ use hana_rigging::TargetResolution;
 use hana_rigging::TargetResolutionContext;
 use thiserror::Error;
 
-/// How many frames [`advance_reporter`] runs before it reports one requested scan as stalled.
+/// How long [`advance_reporter`] drives frames before it reports one requested scan as stalled.
 ///
 /// A scheduled reporter needs one update to prepare and run its job and one more for the kernel to
-/// accept the completed set. A run that has not landed within this many frames returns
-/// [`ScriptedAdvanceError::Stalled`] instead of consuming more frames.
-const SCAN_FRAME_CEILING: u32 = 16;
+/// accept the completed set, but the job itself runs off the main thread. A frame count cannot
+/// bound that wait: frames are cheap enough to exhaust before a loaded machine has scheduled the
+/// worker even once, which reports a run that is merely late as one that stalled. The bound is
+/// elapsed time instead, and the harness keeps driving frames until it passes.
+const SCAN_DEADLINE: Duration = Duration::from_secs(10);
 
 /// A capability declaration rebuilt on demand for each replay of one scripted device.
 pub(crate) type CapabilityBuilder = Arc<dyn Fn() -> Capabilities + Send + Sync>;
@@ -119,9 +123,12 @@ pub enum ScriptedAdvanceError {
     /// The reporter has no retained status, so its completion count cannot be watched.
     #[error("the scripted reporter has no retained discovery status: {0}")]
     NoStatus(String),
-    /// The requested run did not complete within `SCAN_FRAME_CEILING` frames.
-    #[error("a scripted discovery run did not complete within {SCAN_FRAME_CEILING} frames")]
+    /// The requested run did not complete within `SCAN_DEADLINE`.
+    #[error("a scripted discovery run did not complete within {SCAN_DEADLINE:?}")]
     Stalled,
+    /// No held scan reached the gate within `SCAN_DEADLINE`.
+    #[error("a held scan did not reach its gate within {SCAN_DEADLINE:?}")]
+    NeverHeld,
 }
 
 /// Failure selecting an authority retained by a [`ScriptedDriver`].
@@ -694,52 +701,95 @@ impl DeviceReporter for ScriptedReporter {
     }
 }
 
-/// Releases one held scan of a [`ScriptedReporter::gated`] reporter.
+/// Releases one held scan of a [`ScriptedReporter::gated`] reporter, and reports its arrival.
 ///
 /// Releases are counted rather than signalled, so a test may release before or after the job
 /// reaches the gate and neither ordering can lose the release or deadlock the I/O pool thread.
+/// Arrivals are counted for the same reason, so [`ScriptedRunGate::wait_until_held`] cannot miss a
+/// job that reached the gate before the caller asked.
 #[derive(Clone)]
 pub struct ScriptedRunGate(Arc<ScriptedRunGateState>);
 
 struct ScriptedRunGateState {
-    releases: Mutex<usize>,
-    released: Condvar,
+    counts:  Mutex<ScriptedRunGateCounts>,
+    changed: Condvar,
+}
+
+/// Held scans that have reached the gate, and releases no held scan has claimed yet.
+#[derive(Default)]
+struct ScriptedRunGateCounts {
+    arrivals: usize,
+    releases: usize,
 }
 
 impl ScriptedRunGate {
     fn new() -> Self {
         Self(Arc::new(ScriptedRunGateState {
-            releases: Mutex::new(0),
-            released: Condvar::new(),
+            counts:  Mutex::new(ScriptedRunGateCounts::default()),
+            changed: Condvar::new(),
         }))
     }
 
     /// Let one held scan finish and return its whole set to the kernel.
     pub fn release(&self) {
-        let mut releases = self
-            .0
-            .releases
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *releases += 1;
-        drop(releases);
-        self.0.released.notify_one();
+        let mut counts = self.counts();
+        counts.releases += 1;
+        drop(counts);
+        self.0.changed.notify_all();
+    }
+
+    /// Block until one held scan has reached the gate, so what it reported is on its way.
+    ///
+    /// A gated job sends its progress and only then holds, and the kernel marks the reporter
+    /// running on the main thread as it spawns that job — before the I/O pool has run it even
+    /// once. So [`advance_until_running`] returns while the retained progress is still the
+    /// `Indeterminate` placeholder, and a test that reads what the run reported has to wait for
+    /// the job itself rather than for the kernel's view of it. One frame after this returns, the
+    /// scheduler has drained the sent progress.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScriptedAdvanceError::NeverHeld`] when no scan reaches the gate within
+    /// `SCAN_DEADLINE`.
+    pub fn wait_until_held(&self) -> Result<(), ScriptedAdvanceError> {
+        let deadline = Instant::now() + SCAN_DEADLINE;
+        let mut counts = self.counts();
+        while counts.arrivals == 0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ScriptedAdvanceError::NeverHeld);
+            }
+            counts = self
+                .0
+                .changed
+                .wait_timeout(counts, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        counts.arrivals -= 1;
+        drop(counts);
+        Ok(())
     }
 
     fn wait(&self) {
-        let mut releases = self
-            .0
-            .releases
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while *releases == 0 {
-            releases = self
+        let mut counts = self.counts();
+        counts.arrivals += 1;
+        self.0.changed.notify_all();
+        while counts.releases == 0 {
+            counts = self
                 .0
-                .released
-                .wait(releases)
+                .changed
+                .wait(counts)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
-        *releases -= 1;
+        counts.releases -= 1;
+    }
+
+    fn counts(&self) -> MutexGuard<'_, ScriptedRunGateCounts> {
+        self.0
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -753,7 +803,7 @@ impl ScriptedRunGate {
 /// # Errors
 ///
 /// Returns [`ScriptedAdvanceError`] when the kernel refuses the request, when the reporter has no
-/// retained status, or when the run has not been accepted within `SCAN_FRAME_CEILING` frames.
+/// retained status, or when the run has not been accepted within `SCAN_DEADLINE`.
 pub fn advance_reporter(app: &mut App, reporter: ReporterId) -> Result<(), ScriptedAdvanceError> {
     let completed_before = completed_batches(app, reporter)?;
     app.world_mut()
@@ -761,7 +811,8 @@ pub fn advance_reporter(app: &mut App, reporter: ReporterId) -> Result<(), Scrip
         .request(reporter)
         .map_err(|error| ScriptedAdvanceError::RequestRefused(error.to_string()))?;
 
-    for _ in 0..SCAN_FRAME_CEILING {
+    let deadline = Instant::now() + SCAN_DEADLINE;
+    while Instant::now() < deadline {
         app.update();
         if completed_batches(app, reporter)? > completed_before {
             return Ok(());
@@ -781,7 +832,7 @@ pub fn advance_reporter(app: &mut App, reporter: ReporterId) -> Result<(), Scrip
 /// # Errors
 ///
 /// Returns [`ScriptedAdvanceError`] when the kernel refuses the request, when the reporter has no
-/// retained status, or when the run has not started within `SCAN_FRAME_CEILING` frames.
+/// retained status, or when the run has not started within `SCAN_DEADLINE`.
 pub fn advance_until_running(
     app: &mut App,
     reporter: ReporterId,
@@ -791,7 +842,8 @@ pub fn advance_until_running(
         .request(reporter)
         .map_err(|error| ScriptedAdvanceError::RequestRefused(error.to_string()))?;
 
-    for _ in 0..SCAN_FRAME_CEILING {
+    let deadline = Instant::now() + SCAN_DEADLINE;
+    while Instant::now() < deadline {
         app.update();
         if is_running(app, reporter)? {
             return Ok(());
@@ -809,13 +861,14 @@ pub fn advance_until_running(
 /// # Errors
 ///
 /// Returns [`ScriptedAdvanceError`] when the reporter has no retained status, or when the run has
-/// not been accepted within `SCAN_FRAME_CEILING` frames.
+/// not been accepted within `SCAN_DEADLINE`.
 pub fn advance_until_accepted(
     app: &mut App,
     reporter: ReporterId,
 ) -> Result<(), ScriptedAdvanceError> {
     let completed_before = completed_batches(app, reporter)?;
-    for _ in 0..SCAN_FRAME_CEILING {
+    let deadline = Instant::now() + SCAN_DEADLINE;
+    while Instant::now() < deadline {
         app.update();
         if completed_batches(app, reporter)? > completed_before {
             return Ok(());

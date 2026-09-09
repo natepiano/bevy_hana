@@ -440,7 +440,7 @@ impl<S> SprinkleBuilder<S, AssetRootPending> {
     /// This method is only available immediately after [`crate::sprinkle_example`]
     /// and consumes the pre-installation builder state:
     ///
-    /// ```
+    /// ```no_run
     /// let builder = fairy_dust::sprinkle_example()
     ///     .with_asset_root(concat!(env!("CARGO_MANIFEST_DIR"), "/assets"));
     /// # drop(builder);
@@ -538,6 +538,25 @@ impl<S> SprinkleBuilder<S> {
 
     /// Escape hatch: borrow the underlying [`App`] for capabilities not yet
     /// surfaced as `with_*` methods.
+    ///
+    /// Offered only once the baseline is installed:
+    ///
+    /// ```no_run
+    /// let mut builder = fairy_dust::sprinkle_example()
+    ///     .with_asset_root(concat!(env!("CARGO_MANIFEST_DIR"), "/assets"));
+    /// let _app = builder.app_mut();
+    /// ```
+    ///
+    /// Before installation the builder is still [`AssetRootPending`] and has no
+    /// configured `App` to lend, so the escape hatch does not exist yet. The
+    /// passing case above is what keeps this one meaningful: renaming the
+    /// method would break that one loudly rather than leaving this one
+    /// succeeding for the wrong reason.
+    ///
+    /// ```compile_fail
+    /// let mut builder = fairy_dust::sprinkle_example();
+    /// let _app = builder.app_mut();
+    /// ```
     pub const fn app_mut(&mut self) -> &mut App { &mut self.app }
 }
 

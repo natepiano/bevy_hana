@@ -196,6 +196,56 @@ pub struct BindingAuthoring<Configuration> {
 impl<Configuration> BindingAuthoring<Configuration> {
     /// Build one typed registration request from validated authored values.
     #[must_use]
+    /// The registered driver and the requested configuration are the same
+    /// `Configuration`, so a request cannot ask one driver to apply another
+    /// driver's settings:
+    ///
+    /// ```
+    /// use bevy::prelude::Reflect;
+    /// use hana_rigging::BindingAuthoring;
+    /// use hana_rigging::BindingPolicy;
+    /// use hana_rigging::DeviceEndpoint;
+    /// use hana_rigging::EndpointDriverRegistration;
+    /// use hana_rigging::RoleKey;
+    ///
+    /// #[derive(Reflect)]
+    /// struct WindowPlacement;
+    ///
+    /// fn author(
+    ///     role: RoleKey,
+    ///     endpoint: DeviceEndpoint,
+    ///     driver: EndpointDriverRegistration<WindowPlacement>,
+    ///     policy: BindingPolicy,
+    /// ) -> BindingAuthoring<WindowPlacement> {
+    ///     BindingAuthoring::new(role, endpoint, driver, WindowPlacement, policy)
+    /// }
+    /// ```
+    ///
+    /// The request above is what keeps this case meaningful — a rename would
+    /// break it loudly rather than leaving this one failing for an unrelated
+    /// reason:
+    ///
+    /// ```compile_fail,E0308
+    /// use bevy::prelude::Reflect;
+    /// use hana_rigging::{
+    ///     BindingAuthoring, BindingPolicy, DeviceEndpoint, EndpointDriverRegistration, RoleKey,
+    /// };
+    ///
+    /// #[derive(Reflect)]
+    /// struct WindowPlacement;
+    ///
+    /// #[derive(Reflect)]
+    /// struct CameraSettings;
+    ///
+    /// fn author_camera_settings_with_window_driver(
+    ///     role: RoleKey,
+    ///     endpoint: DeviceEndpoint,
+    ///     driver: EndpointDriverRegistration<WindowPlacement>,
+    ///     policy: BindingPolicy,
+    /// ) {
+    ///     let _ = BindingAuthoring::new(role, endpoint, driver, CameraSettings, policy);
+    /// }
+    /// ```
     pub const fn new(
         role: RoleKey,
         endpoint: DeviceEndpoint,

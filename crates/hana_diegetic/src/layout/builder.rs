@@ -824,6 +824,27 @@ fn text_leaf_element(mut common: CommonEl, content: ElementContent) -> Element {
     }
 }
 
+/// Only a layout-only element has a default. A widget element carries
+/// panel-local identity, so it exists only where that identity was supplied:
+///
+/// ```
+/// use hana_diegetic::Button;
+/// use hana_diegetic::El;
+/// use hana_diegetic::Row;
+/// use hana_diegetic::WidgetElement;
+///
+/// fn identified() -> El<Row, WidgetElement<Button>> { El::new().button("button") }
+/// ```
+///
+/// The construction above is what keeps this case meaningful — a rename would
+/// break that one loudly rather than leaving this one succeeding for an
+/// unrelated reason:
+///
+/// ```compile_fail,E0599
+/// use hana_diegetic::{Button, El, Row, WidgetElement};
+///
+/// let _ = El::<Row, WidgetElement<Button>>::default();
+/// ```
 impl<L> Default for El<L, LayoutOnly>
 where
     L: Default,
@@ -888,6 +909,64 @@ impl<Role: ElementRole> El<Column, Role> {
 
 impl El<Overlay, LayoutOnly> {
     /// Creates an overlay element declaration.
+    ///
+    /// An overlay stacks its children in one place, so it carries no
+    /// between-children spacing, separator, or ordering. Those belong to
+    /// [`El::row`] and [`El::column`]:
+    ///
+    /// ```
+    /// use bevy::color::Color;
+    /// use hana_diegetic::ChildDivider;
+    /// use hana_diegetic::Column;
+    /// use hana_diegetic::El;
+    /// use hana_diegetic::Overlay;
+    /// use hana_diegetic::Row;
+    ///
+    /// fn spaced_row() -> El<Row> {
+    ///     El::row()
+    ///         .gap(1.0)
+    ///         .child_divider(ChildDivider::new(1.0, Color::WHITE))
+    /// }
+    ///
+    /// fn spaced_column() -> El<Column> {
+    ///     El::column()
+    ///         .gap(1.0)
+    ///         .child_divider(ChildDivider::new(1.0, Color::WHITE))
+    /// }
+    ///
+    /// fn stacked() -> El<Overlay> { El::overlay() }
+    /// ```
+    ///
+    /// The rows and columns above are what keep the cases below meaningful — a
+    /// rename would break those loudly rather than leaving these succeeding for
+    /// an unrelated reason.
+    ///
+    /// ```compile_fail,E0599
+    /// use hana_diegetic::{El, In};
+    ///
+    /// let _ = El::overlay().gap(In(0.08));
+    /// ```
+    ///
+    /// ```compile_fail,E0599
+    /// use bevy::color::Color;
+    /// use hana_diegetic::{ChildDivider, El, In};
+    ///
+    /// let _ = El::overlay().child_divider(ChildDivider::new(In(0.01), Color::WHITE));
+    /// ```
+    ///
+    /// ```compile_fail,E0599
+    /// use hana_diegetic::{Direction, El};
+    ///
+    /// let _ = El::overlay().direction(Direction::TopToBottom);
+    /// ```
+    ///
+    /// The spacing method is named `gap` on every layout, never `child_gap`:
+    ///
+    /// ```compile_fail,E0599
+    /// use hana_diegetic::{El, In};
+    ///
+    /// let _ = El::overlay().child_gap(In(0.08));
+    /// ```
     pub fn overlay() -> Self { Self::default() }
 }
 
@@ -1077,6 +1156,78 @@ impl<L> El<L, LayoutOnly> {
     /// in ordinary focus traversal automatically. Semantic activation opens
     /// its editor; while editing, the active IME session reserves Tab and
     /// Shift+Tab instead of moving widget focus.
+    ///
+    /// The element is already a widget once this returns, and an editable field
+    /// has no press state — pointer holds belong to its editor, not to the
+    /// field. Hover, focus, and disabled are the states it does offer:
+    ///
+    /// ```
+    /// use bevy::color::Color;
+    /// use hana_diegetic::Appearance;
+    /// use hana_diegetic::EditableField;
+    /// use hana_diegetic::El;
+    /// use hana_diegetic::ImeAppOwnedFieldSpec;
+    /// use hana_diegetic::ImeEditableFieldSpec;
+    /// use hana_diegetic::Row;
+    /// use hana_diegetic::WidgetElement;
+    ///
+    /// fn field() -> El<Row, WidgetElement<EditableField>> {
+    ///     let spec = ImeEditableFieldSpec::AppOwned(ImeAppOwnedFieldSpec::new("gain"));
+    ///     El::new()
+    ///         .editable_field("editable", spec)
+    ///         .hovered(Appearance::new().background(Color::BLACK))
+    ///         .focused(Appearance::new().background(Color::BLACK))
+    ///         .disabled(Appearance::new().background(Color::BLACK))
+    /// }
+    /// ```
+    ///
+    /// The chain above is what keeps the cases below meaningful — a rename
+    /// would break that one loudly rather than leaving these succeeding for an
+    /// unrelated reason.
+    ///
+    /// A widget cannot then be declared a second kind of widget:
+    ///
+    /// ```compile_fail,E0599
+    /// use hana_diegetic::{El, ImeAppOwnedFieldSpec, ImeEditableFieldSpec};
+    ///
+    /// let spec = ImeEditableFieldSpec::AppOwned(ImeAppOwnedFieldSpec::new("test"));
+    /// let _ = El::new()
+    ///     .editable_field("editable", spec)
+    ///     .button("button");
+    /// ```
+    ///
+    /// The field's own root has no press state:
+    ///
+    /// ```compile_fail,E0599
+    /// use bevy::color::Color;
+    /// use hana_diegetic::{Appearance, El, ImeAppOwnedFieldSpec, ImeEditableFieldSpec};
+    ///
+    /// let spec = ImeEditableFieldSpec::AppOwned(ImeAppOwnedFieldSpec::new("test"));
+    /// let _ = El::new()
+    ///     .editable_field("editable", spec)
+    ///     .pressed(Appearance::new().background(Color::BLACK));
+    /// ```
+    ///
+    /// … and neither do its parts, because the field is not `Pressable`:
+    ///
+    /// ```compile_fail,E0277
+    /// use bevy::color::Color;
+    /// use hana_diegetic::{
+    ///     Appearance, El, ImeAppOwnedFieldSpec, ImeEditableFieldSpec, LayoutBuilder,
+    ///     LayoutContentBuilder,
+    /// };
+    ///
+    /// let spec = ImeEditableFieldSpec::AppOwned(ImeAppOwnedFieldSpec::new("test"));
+    /// let mut builder = LayoutBuilder::new(100.0, 50.0);
+    /// builder.with(El::new().editable_field("editable", spec), |builder| {
+    ///     builder.with(
+    ///         builder
+    ///             .child(El::new().background(Color::WHITE))
+    ///             .pressed(Appearance::new().background(Color::BLACK)),
+    ///         |_| {},
+    ///     );
+    /// });
+    /// ```
     pub fn editable_field(
         mut self,
         field_id: impl Into<PanelElementId>,
@@ -1159,6 +1310,82 @@ impl<L> El<L, WidgetChild> {
     /// Sets the appearance while the enclosing widget is disabled.
     ///
     /// A later call replaces any bundle an earlier call authored for this state.
+    ///
+    /// A part reaches this state verb only through the enclosing widget's own
+    /// builder, which is what supplies the widget scope:
+    ///
+    /// ```
+    /// use bevy::color::Color;
+    /// use hana_diegetic::Appearance;
+    /// use hana_diegetic::El;
+    /// use hana_diegetic::Row;
+    /// use hana_diegetic::WidgetBuilder;
+    /// use hana_diegetic::WidgetOwner;
+    /// use hana_diegetic::WidgetPart;
+    ///
+    /// fn disabled_part<W: WidgetOwner>(builder: &WidgetBuilder<'_, W>) -> El<Row, WidgetPart> {
+    ///     builder
+    ///         .child(El::new().background(Color::WHITE))
+    ///         .disabled(Appearance::new().background(Color::BLACK))
+    /// }
+    /// ```
+    ///
+    /// An element authored outside any widget has no such scope, and neither
+    /// does a tooltip's own root. The part above is what keeps the cases below
+    /// meaningful — a rename would break that one loudly rather than leaving
+    /// these succeeding for an unrelated reason.
+    ///
+    /// ```compile_fail,E0599
+    /// use bevy::color::Color;
+    /// use hana_diegetic::{Appearance, El, LayoutBuilder, LayoutContentBuilder};
+    ///
+    /// let mut builder = LayoutBuilder::new(100.0, 50.0);
+    /// builder.with(
+    ///     El::new()
+    ///         .background(Color::WHITE)
+    ///         .disabled(Appearance::new().background(Color::BLACK)),
+    ///     |_| {},
+    /// );
+    /// ```
+    ///
+    /// ```compile_fail,E0599
+    /// use bevy::color::Color;
+    /// use hana_diegetic::{Appearance, El, Tooltip};
+    ///
+    /// let _ = Tooltip::new(
+    ///     El::new()
+    ///         .background(Color::WHITE)
+    ///         .disabled(Appearance::new().background(Color::BLACK)),
+    /// );
+    /// ```
+    ///
+    /// The scope cannot be forged by naming the trait implementation directly
+    /// either — the child builder it hands back is the widget's, not the
+    /// caller's:
+    ///
+    /// ```compile_fail,E0308
+    /// use bevy::color::Color;
+    /// use hana_diegetic::{
+    ///     AcceptsElement, Appearance, Button, El, LayoutBuilder, LayoutContentBuilder,
+    ///     WidgetElement,
+    /// };
+    ///
+    /// let mut panel = LayoutBuilder::new(100.0, 50.0);
+    ///
+    /// <LayoutBuilder as AcceptsElement<WidgetElement<Button>>>::with_child_builder(
+    ///     &mut panel,
+    ///     |widget| {
+    ///         widget.with(
+    ///             widget
+    ///                 .child(El::new().background(Color::WHITE))
+    ///                 .disabled(Appearance::new().background(Color::BLACK)),
+    ///             |_| {},
+    ///         );
+    ///     },
+    /// );
+    ///
+    /// let _ = panel.build();
+    /// ```
     pub fn disabled(mut self, appearance: impl IntoAppearance) -> El<L, WidgetPart> {
         self.appearance_mut().disabled =
             Cascade::Override(WidgetDisabledAppearance::new(appearance));
@@ -1178,6 +1405,32 @@ impl<L, W> El<L, WidgetElement<W>> {
     /// Attaches a tooltip declaration to this widget element.
     ///
     /// A later call replaces the earlier declaration.
+    ///
+    /// A tooltip needs a widget to hang from — it is offered on a button, a
+    /// slider, or an editable field, and on nothing else:
+    ///
+    /// ```
+    /// use hana_diegetic::Button;
+    /// use hana_diegetic::El;
+    /// use hana_diegetic::Row;
+    /// use hana_diegetic::Tooltip;
+    /// use hana_diegetic::WidgetElement;
+    ///
+    /// fn described() -> El<Row, WidgetElement<Button>> {
+    ///     El::new().button("button").tooltip(Tooltip::new(El::new()))
+    /// }
+    /// ```
+    ///
+    /// An ordinary layout element has no such method. The button above is what
+    /// keeps this case meaningful — a rename would break that one loudly rather
+    /// than leaving this one succeeding for an unrelated reason:
+    ///
+    /// ```compile_fail,E0599
+    /// use hana_diegetic::{El, Tooltip};
+    ///
+    /// let tooltip = Tooltip::new(El::new());
+    /// let _ = El::new().tooltip(tooltip);
+    /// ```
     pub fn tooltip(mut self, tooltip: Tooltip) -> Self {
         self.common.tooltip = Some(tooltip);
         self
@@ -1188,6 +1441,92 @@ impl<L, W> El<L, WidgetElement<W>> {
     /// See [`Appearance`] for each property's retained record and ordinary
     /// declaration requirement.
     /// A later call replaces any bundle an earlier call authored for this state.
+    ///
+    /// The state verbs are offered on a widget element and author one bundle
+    /// each:
+    ///
+    /// ```
+    /// use bevy::asset::Handle;
+    /// use bevy::color::Color;
+    /// use bevy::pbr::StandardMaterial;
+    /// use hana_diegetic::Appearance;
+    /// use hana_diegetic::Border;
+    /// use hana_diegetic::El;
+    /// use hana_diegetic::Px;
+    /// use hana_diegetic::Slider;
+    ///
+    /// fn appearance() -> Appearance {
+    ///     Appearance::new()
+    ///         .background(Color::BLACK)
+    ///         .border_color(Color::WHITE)
+    ///         .border_width(Px(2.0))
+    ///         .material(Handle::<StandardMaterial>::default())
+    /// }
+    ///
+    /// fn button() {
+    ///     let _ = El::new()
+    ///         .background(Color::WHITE)
+    ///         .border(Border::all(Px(0.0), Color::WHITE))
+    ///         .button("action")
+    ///         .hovered(appearance())
+    ///         .focused(appearance())
+    ///         .pressed(appearance())
+    ///         .disabled(appearance());
+    /// }
+    ///
+    /// fn slider() {
+    ///     let _ = El::new()
+    ///         .widget("level", Slider::new(0.0..=1.0))
+    ///         .hovered(appearance())
+    ///         .focused(appearance())
+    ///         .pressed(appearance())
+    ///         .disabled(appearance());
+    /// }
+    /// ```
+    ///
+    /// An ordinary layout element has no interaction states to dress, so none
+    /// of the verbs reach it. The chains above are what keep the cases below
+    /// meaningful — a rename would break those loudly rather than leaving these
+    /// succeeding for an unrelated reason.
+    ///
+    /// ```compile_fail,E0599
+    /// use bevy::color::Color;
+    /// use hana_diegetic::{Appearance, El};
+    ///
+    /// let _ = El::new()
+    ///     .background(Color::WHITE)
+    ///     .hovered(Appearance::new().background(Color::BLACK));
+    /// ```
+    ///
+    /// ```compile_fail,E0599
+    /// use bevy::color::Color;
+    /// use hana_diegetic::{Appearance, El};
+    ///
+    /// let _ = El::new()
+    ///     .background(Color::WHITE)
+    ///     .focused(Appearance::new().background(Color::BLACK));
+    /// ```
+    ///
+    /// ```compile_fail,E0599
+    /// use bevy::color::Color;
+    /// use hana_diegetic::{Appearance, El};
+    ///
+    /// let _ = El::new()
+    ///     .background(Color::WHITE)
+    ///     .pressed(Appearance::new().background(Color::BLACK));
+    /// ```
+    ///
+    /// A bare `Color` does not say which property it sets, so it is refused in
+    /// favour of a wrapper that names one:
+    ///
+    /// ```compile_fail,E0277
+    /// use bevy::prelude::Color;
+    /// use hana_diegetic::El;
+    ///
+    /// const RED: Color = Color::srgb(1.0, 0.0, 0.0);
+    ///
+    /// let _button = El::new().button("button").hovered(RED);
+    /// ```
     pub fn hovered(mut self, appearance: impl IntoAppearance) -> Self {
         self.appearance_mut().hovered = Cascade::Override(WidgetHoveredAppearance::new(appearance));
         self
@@ -1245,6 +1584,58 @@ impl<L> El<L, WidgetElement<EditableField>> {
     /// A later call replaces an earlier caret colors declaration. The generated
     /// caret keeps its editor-controlled dimensions, and the colors apply to
     /// its fill.
+    ///
+    /// The part is generated, so the declaration carries colors and nothing
+    /// else — which property each color paints is already decided by the part:
+    ///
+    /// ```
+    /// use bevy::color::Color;
+    /// use hana_diegetic::EditorStateColors;
+    /// use hana_diegetic::El;
+    /// use hana_diegetic::ImeAppOwnedFieldSpec;
+    /// use hana_diegetic::ImeEditableFieldSpec;
+    ///
+    /// fn caret() {
+    ///     let spec = ImeEditableFieldSpec::AppOwned(ImeAppOwnedFieldSpec::new("gain"));
+    ///     let _ = El::new().editable_field("editable", spec).editor_caret(
+    ///         EditorStateColors::new()
+    ///             .focused(Color::WHITE)
+    ///             .hovered(Color::BLACK)
+    ///             .disabled(Color::NONE),
+    ///     );
+    /// }
+    /// ```
+    ///
+    /// The declaration above is what keeps the cases below meaningful — a
+    /// rename would break that one loudly rather than leaving these succeeding
+    /// for an unrelated reason.
+    ///
+    /// There is no per-property setter to reach for:
+    ///
+    /// ```compile_fail,E0599
+    /// use bevy::color::Color;
+    /// use hana_diegetic::{EditorStateColors, El, ImeAppOwnedFieldSpec, ImeEditableFieldSpec};
+    ///
+    /// let spec = ImeEditableFieldSpec::AppOwned(ImeAppOwnedFieldSpec::new("test"));
+    /// let _ = El::new().editable_field("editable", spec).editor_caret(
+    ///     EditorStateColors::new()
+    ///         .focused(Color::BLACK)
+    ///         .text_color(Color::WHITE),
+    /// );
+    /// ```
+    ///
+    /// … and a pressed color leaves the accepted type behind, because
+    /// [`EditorStateColors::pressed`] returns [`PressedEditorStateColors`]:
+    ///
+    /// ```compile_fail,E0308
+    /// use bevy::color::Color;
+    /// use hana_diegetic::{EditorStateColors, El, ImeAppOwnedFieldSpec, ImeEditableFieldSpec};
+    ///
+    /// let spec = ImeEditableFieldSpec::AppOwned(ImeAppOwnedFieldSpec::new("test"));
+    /// let _ = El::new()
+    ///     .editable_field("editable", spec)
+    ///     .editor_caret(EditorStateColors::new().focused(Color::WHITE).pressed(Color::BLACK));
+    /// ```
     pub fn editor_caret(mut self, colors: EditorStateColors) -> Self {
         self.common.editor_caret =
             Some(Box::new(colors.into_editor_part(EditorPartColorRole::Fill)));
@@ -1701,6 +2092,63 @@ pub trait AcceptsElement<Role: ElementRole>: private::BuilderSealed {
 /// author ordinary layout content without losing the enclosing widget owner.
 pub trait LayoutContentBuilder: private::BuilderSealed + AcceptsElement<LayoutOnly> {
     /// Adds a child container under the current parent, then fills it in.
+    ///
+    /// A widget's own builder accepts ordinary layout and widget parts:
+    ///
+    /// ```
+    /// use bevy::color::Color;
+    /// use hana_diegetic::Appearance;
+    /// use hana_diegetic::El;
+    /// use hana_diegetic::LayoutBuilder;
+    /// use hana_diegetic::LayoutContentBuilder;
+    /// use hana_diegetic::Slider;
+    /// use hana_diegetic::Text;
+    /// use hana_diegetic::TextStyle;
+    ///
+    /// fn slider_content(builder: &mut LayoutBuilder) {
+    ///     builder.with(
+    ///         El::new().widget("slider", Slider::new(0.0..=1.0)),
+    ///         |builder| {
+    ///             builder.with(builder.child(El::column()), |builder| {
+    ///                 builder.text(Text::new("label", TextStyle::default()));
+    ///             });
+    ///         },
+    ///     );
+    /// }
+    /// ```
+    ///
+    /// It does not accept another widget: interaction states would have two
+    /// owners. The nesting above is what keeps the cases below meaningful — a
+    /// rename would break that one loudly rather than leaving these succeeding
+    /// for an unrelated reason.
+    ///
+    /// ```compile_fail,E0277
+    /// use hana_diegetic::{El, LayoutBuilder, LayoutContentBuilder};
+    ///
+    /// let mut builder = LayoutBuilder::new(100.0, 50.0);
+    /// builder.with(El::new().button("outer"), |builder| {
+    ///     builder.with(El::new().button("inner"), |_| {});
+    /// });
+    /// ```
+    ///
+    /// Naming the accepting bound generically does not open the door either:
+    ///
+    /// ```compile_fail,E0308
+    /// use hana_diegetic::{
+    ///     AcceptsElement, Button, El, LayoutBuilder, LayoutContentBuilder, WidgetElement,
+    /// };
+    ///
+    /// fn add_nested_widget(
+    ///     builder: &mut (impl LayoutContentBuilder + AcceptsElement<WidgetElement<Button>>),
+    /// ) {
+    ///     builder.with(El::new().button("outer"), |builder| {
+    ///         builder.with(El::new().button("inner"), |_| {});
+    ///     });
+    /// }
+    ///
+    /// let mut builder = LayoutBuilder::new(100.0, 50.0);
+    /// add_nested_widget(&mut builder);
+    /// ```
     fn with<L, Role>(
         &mut self,
         el: El<L, Role>,

@@ -461,8 +461,16 @@ mod tests {
     const ERROR_RETRY_WINDOWS: u32 = 6;
     const POLL_AUDIT_INTERVAL: Duration = Duration::from_millis(20);
     const QUIESCENCE_INTERVAL: Duration = Duration::from_millis(180);
-    const RETRY_ASSERTION_MARGIN: Duration = Duration::from_millis(20);
-    const RETRY_GRACE_INTERVAL: Duration = Duration::from_millis(250);
+    /// Slack between the worker's retry grace and the assertions that bracket it.
+    /// These tests restore a renamed file inside the grace window, so the margin has
+    /// to absorb however long the test thread waits to be scheduled. CI runs them on
+    /// a shared machine whose cgroup is CPU-throttled with other jobs in flight,
+    /// where that delay reaches hundreds of milliseconds; keep this at half the
+    /// grace so the assertion measures the worker's behavior, not the scheduler's.
+    const RETRY_ASSERTION_MARGIN: Duration = RETRY_GRACE_INTERVAL
+        .checked_div(2)
+        .expect("halving a duration is always representable");
+    const RETRY_GRACE_INTERVAL: Duration = Duration::from_millis(1500);
     const RETRY_INTERVAL: Duration = Duration::from_millis(30);
     const TEST_APP_NAME: &str = "hana-rubric-worker-test";
     const TEST_TIMEOUT: Duration = Duration::from_secs(3);

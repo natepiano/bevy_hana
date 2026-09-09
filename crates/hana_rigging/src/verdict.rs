@@ -48,6 +48,42 @@ pub enum ReportedSerial {
 /// about one live unit. Computing the verdict during reconciliation prevents a raw provider claim
 /// from contradicting the key. This enum is non-exhaustive because future reconciliation evidence
 /// can require another conclusion; applications must retain a wildcard arm when matching it.
+///
+/// ```
+/// use hana_rigging::IdentityVerdict;
+///
+/// fn classify(identity_verdict: IdentityVerdict) -> &'static str {
+///     match identity_verdict {
+///         IdentityVerdict::Proven => "proven",
+///         IdentityVerdict::Presumed => "presumed",
+///         IdentityVerdict::Authored => "authored",
+///         IdentityVerdict::Displaced { .. } => "displaced",
+///         IdentityVerdict::WrongUnit { .. } => "wrong unit",
+///         IdentityVerdict::Unverified(_) => "unverified",
+///         _ => "unrecognized",
+///     }
+/// }
+/// ```
+///
+/// Without that arm the match does not compile, so a new conclusion cannot
+/// reach an application that never decided what to do with one. The match above
+/// is what keeps this case meaningful — a rename would break it loudly rather
+/// than leaving this one failing for an unrelated reason:
+///
+/// ```compile_fail,E0004
+/// use hana_rigging::IdentityVerdict;
+///
+/// fn classify(identity_verdict: IdentityVerdict) -> &'static str {
+///     match identity_verdict {
+///         IdentityVerdict::Proven => "proven",
+///         IdentityVerdict::Presumed => "presumed",
+///         IdentityVerdict::Authored => "authored",
+///         IdentityVerdict::Displaced { .. } => "displaced",
+///         IdentityVerdict::WrongUnit { .. } => "wrong unit",
+///         IdentityVerdict::Unverified(_) => "unverified",
+///     }
+/// }
+/// ```
 #[non_exhaustive]
 #[derive(Clone, PartialEq, Eq, Debug, Component, Reflect)]
 #[reflect(Component, PartialEq)]

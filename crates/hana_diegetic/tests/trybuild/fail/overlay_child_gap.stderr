@@ -1,5 +1,0 @@
-error[E0599]: no method named `child_gap` found for struct `El<L, Role>` in the current scope
- --> tests/trybuild/fail/overlay_child_gap.rs:5:27
-  |
-5 |     let _ = El::overlay().child_gap(In(0.08));
-  |                           ^^^^^^^^^ method not found in `El<Overlay>`

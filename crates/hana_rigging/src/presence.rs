@@ -19,6 +19,29 @@ use crate::ReportedSerial;
 /// [`Presence`] is an entity component because reporters update it as hardware appears, departs,
 /// or becomes unreachable. [`Self::Unreachable`] is not [`Self::Absent`]: treating a silent remote
 /// node as removed can retire output still attached to a live device.
+///
+/// [`Self::Unreachable`] is a struct variant carrying when contact was lost, so
+/// silence always arrives with its own timestamp:
+///
+/// ```
+/// use hana_rigging::Presence;
+///
+/// fn describe(presence: Presence) -> &'static str {
+///     match presence {
+///         Presence::Present => "present",
+///         Presence::Absent => "absent",
+///         Presence::Unreachable { .. } => "unreachable",
+///     }
+/// }
+/// ```
+///
+/// Naming it without that value is not a `Presence`. The match above is what
+/// keeps this case meaningful — a rename would break it loudly rather than
+/// leaving this one failing for an unrelated reason:
+///
+/// ```compile_fail,E0533
+/// let _ = hana_rigging::Presence::Unreachable;
+/// ```
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Component, Reflect)]
 #[reflect(Component, PartialEq)]
 pub enum Presence {
@@ -58,6 +81,30 @@ impl Presence {
 /// The two variants replace `Option<DeviceKey>` because a reporter that can name a unit durably
 /// participates in key reconciliation, while a reporter with only operating-system match evidence
 /// must not fabricate a durable identity.
+///
+/// ```
+/// use hana_rigging::DeviceKey;
+/// use hana_rigging::ReportedAs;
+///
+/// fn keyed(reported_as: &ReportedAs) -> Option<&DeviceKey> {
+///     match reported_as {
+///         ReportedAs::Keyed(key) => Some(key),
+///         ReportedAs::MatchEvidenceOnly => None,
+///     }
+/// }
+/// ```
+///
+/// The evidence-only variant carries nothing, so there is no key to unwrap out
+/// of it. The match above is what keeps this case meaningful — a rename would
+/// break it loudly rather than leaving this one failing for an unrelated
+/// reason:
+///
+/// ```compile_fail
+/// use hana_rigging::ReportedAs;
+///
+/// let reported_as = ReportedAs::MatchEvidenceOnly;
+/// let ReportedAs::MatchEvidenceOnly(_) = reported_as;
+/// ```
 #[derive(Clone, PartialEq, Eq, Debug, Reflect)]
 pub enum ReportedAs {
     /// The reporter derived a durable key from evidence that can identify this unit across runs.
@@ -96,6 +143,32 @@ pub enum ReportedParent {
 /// or [`DeviceId`](crate::DeviceId). Reconciliation creates those conclusions after comparing this
 /// report with saved keys; allowing a reporter to supply either would let it assert identity for a
 /// unit that supplied no evidence.
+///
+/// A record carries observations:
+///
+/// ```
+/// use hana_rigging::DeviceRecord;
+/// use hana_rigging::Presence;
+/// use hana_rigging::ReportedAs;
+///
+/// fn observations(record: &DeviceRecord) -> (&ReportedAs, Presence) {
+///     (&record.reported_as, record.presence)
+/// }
+/// ```
+///
+/// It carries no conclusion. The reads above are what keep this case
+/// meaningful — a rename would break them loudly rather than leaving this one
+/// failing for an unrelated reason:
+///
+/// ```compile_fail,E0609
+/// use hana_rigging::DeviceRecord;
+///
+/// fn conclusions(record: &DeviceRecord) {
+///     let _ = &record.identity;
+///     let _ = &record.device_id;
+///     let _ = &record.key;
+/// }
+/// ```
 pub struct DeviceRecord {
     /// Durable naming status for this report, including the evidence-only case with no device key.
     pub reported_as:            ReportedAs,
@@ -228,6 +301,22 @@ fn capabilities_are_equal(left: &Capabilities, right: &Capabilities) -> bool {
 /// Not calling a reporter is the unchanged case: cadence and activation state record why it was
 /// not due. A completed scan always contains the reporter's whole current set, so a missing record
 /// is meaningful evidence of departure.
+///
+/// ```
+/// use hana_rigging::DeviceScan;
+///
+/// fn scanned() -> DeviceScan { DeviceScan::Complete(Vec::new()) }
+/// ```
+///
+/// There is no way to answer "nothing changed": cadence and activation state
+/// already record why a reporter was not called, and a scan that ran always
+/// reports its whole set. The completion above is what keeps this case
+/// meaningful — a rename would break it loudly rather than leaving this one
+/// failing for an unrelated reason:
+///
+/// ```compile_fail,E0599
+/// let _ = hana_rigging::DeviceScan::Unchanged;
+/// ```
 pub enum DeviceScan {
     /// The reporter scanned and supplied every currently visible device record.
     ///

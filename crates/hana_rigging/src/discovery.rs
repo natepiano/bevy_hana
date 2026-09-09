@@ -407,6 +407,33 @@ impl DiscoveryBatchId {
 /// `max_concurrent_jobs` reserves one I/O worker for unrelated file and network operations when
 /// `IoTaskPool` has at least two threads. A one-thread pool runs one discovery job because
 /// reserving its only worker would disable discovery entirely.
+///
+/// Both capacities are `NonZeroUsize`, so a limit of none cannot be authored:
+///
+/// ```
+/// use std::num::NonZeroUsize;
+///
+/// use hana_rigging::DiscoveryLimits;
+///
+/// fn limits() -> DiscoveryLimits {
+///     let mut limits = DiscoveryLimits::default();
+///     limits.set_max_concurrent_jobs(NonZeroUsize::MIN);
+///     limits.set_max_completions_per_frame(NonZeroUsize::MIN);
+///     limits
+/// }
+/// ```
+///
+/// The authoring above is what keeps this case meaningful — a rename would
+/// break it loudly rather than leaving this one failing for an unrelated
+/// reason:
+///
+/// ```compile_fail,E0308
+/// use hana_rigging::DiscoveryLimits;
+///
+/// let mut discovery_limits = DiscoveryLimits::default();
+/// discovery_limits.set_max_concurrent_jobs(0);
+/// discovery_limits.set_max_completions_per_frame(0);
+/// ```
 #[derive(Clone, Resource, Reflect)]
 #[reflect(Resource)]
 pub struct DiscoveryLimits {
