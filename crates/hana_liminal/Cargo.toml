@@ -40,12 +40,20 @@ rand = { workspace = true }
 getrandom = { workspace = true }
 
 [dev-dependencies]
-bevy = { version = "0.19.0", features = [
+# Deliberately not `default`: that pulls bevy's `audio` feature, and cargo
+# unifies features across the workspace build, so one dev-dependency asking for
+# it puts `AudioPlugin` into `DefaultPlugins` for every test binary. Audio
+# startup opens ALSA -> PipeWire -> D-Bus and asks the realtime portal for
+# priority with no timeout, which strands headless test processes forever.
+bevy = { workspace = true, features = [
+  "2d",
+  "3d",
   "bevy_animation",
   "bevy_anti_alias",
   "bevy_gltf",
   "bevy_post_process",
   "scene",
+  "ui",
 ] }
 bevy_brp_extras = { workspace = true }
 fairy_dust = { workspace = true }

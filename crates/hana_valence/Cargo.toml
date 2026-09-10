@@ -34,7 +34,12 @@ thiserror      = { workspace = true }
 tracing        = { workspace = true }
 
 [dev-dependencies]
-bevy                = { workspace = true, features = ["default"] }
+# Deliberately not `default`: that pulls bevy's `audio` feature, and cargo
+# unifies features across the workspace build, so one dev-dependency asking for
+# it puts `AudioPlugin` into `DefaultPlugins` for every test binary. Audio
+# startup opens ALSA -> PipeWire -> D-Bus and asks the realtime portal for
+# priority with no timeout, which strands headless test processes forever.
+bevy                = { workspace = true, features = ["2d", "3d", "ui"] }
 bevy_enhanced_input = { workspace = true }
 fairy_dust          = { workspace = true }
 hana_diegetic       = { workspace = true }

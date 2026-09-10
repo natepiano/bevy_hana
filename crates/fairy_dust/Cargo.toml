@@ -43,7 +43,7 @@ bevy = { workspace = true, features = [
 bevy_brp_extras = { workspace = true }
 bevy_enhanced_input = { workspace = true }
 hana_clerestory = { workspace = true }
-hana_diegetic = { path = "../hana_diegetic" }
+hana_diegetic = { workspace = true }
 hana_lagrange = { workspace = true }
 hana_rubric = { workspace = true }
 hana_valence = { workspace = true }
