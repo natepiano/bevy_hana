@@ -170,6 +170,7 @@ use hana_rigging_scripted::ScriptedScan;
 use hana_rigging_scripted::advance_reporter;
 use hana_rigging_scripted::advance_until_accepted;
 use hana_rigging_scripted::advance_until_running;
+use hana_rigging_scripted::install_scripted_io_task_pool;
 use hana_rigging_scripted::reported_key;
 use hana_rigging_scripted::scan;
 
@@ -905,6 +906,7 @@ fn required_scripted_app(scans: Vec<ScriptedScan>) -> Result<(App, ReporterId), 
 
 /// The kernel, the scripted scheme, and every observer this suite reads events through.
 fn observing_app() -> Result<App, Box<dyn Error>> {
+    install_scripted_io_task_pool();
     let mut app = App::new();
     app.add_plugins(MinimalPlugins)
         .add_plugins(RiggingPlugin)

@@ -117,6 +117,7 @@ use crate::ScriptedRunGate;
 use crate::ScriptedScan;
 use crate::advance_until_accepted;
 use crate::advance_until_running;
+use crate::install_scripted_io_task_pool;
 
 /// Role every conformance walk authors, retires, and re-authors.
 ///
@@ -806,6 +807,7 @@ where
         let scans = script(declared(&scan, &device, &declaration));
         let scripted_scans = scans.len();
 
+        install_scripted_io_task_pool();
         let mut app = App::new();
         app.insert_resource(walk_limits())
             .add_plugins(MinimalPlugins)

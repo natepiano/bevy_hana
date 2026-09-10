@@ -34,6 +34,8 @@ use bevy::prelude::Component;
 use bevy::prelude::FromReflect;
 use bevy::prelude::Reflect;
 use bevy::prelude::World;
+use bevy::tasks::IoTaskPool;
+use bevy::tasks::TaskPoolBuilder;
 pub use conformance::CapabilityDeclaration;
 pub use conformance::ConformanceFailure;
 pub use conformance::ConformanceRefusal;
@@ -100,6 +102,31 @@ use thiserror::Error;
 /// elapsed time instead, and the harness keeps driving frames until it passes.
 const SCAN_DEADLINE: Duration = Duration::from_secs(10);
 
+/// Number of I/O workers a scripted test app gives Bevy's global pool.
+///
+/// The kernel admits `min(max_concurrent_jobs, io_threads - 1)` concurrent discovery jobs, so four
+/// workers admit two: enough for a test that holds two gated reporters open at once.
+const SCRIPTED_IO_TASK_POOL_THREADS: usize = 4;
+
+/// Size the global I/O pool that scripted background discovery runs on.
+///
+/// A gated scan parks its I/O worker until a test releases it, and discovery admission capacity is
+/// derived from that pool's width. Bevy sizes the pool from the machine's core count, so a
+/// four-core runner leaves one worker and therefore one admission slot, and a test that holds two
+/// gated reporters open at once deadlocks there while the same test passes on a wider machine.
+/// Fixing the width here keeps a scripted test's outcome a property of the code rather than of the
+/// machine that ran it.
+///
+/// Call this before building the `App`: Bevy's `TaskPoolPlugin` initializes the same global pool,
+/// and whichever call runs first decides the width for the whole process.
+pub fn install_scripted_io_task_pool() {
+    IoTaskPool::get_or_init(|| {
+        TaskPoolBuilder::new()
+            .num_threads(SCRIPTED_IO_TASK_POOL_THREADS)
+            .build()
+    });
+}
+
 /// A capability declaration rebuilt on demand for each replay of one scripted device.
 pub(crate) type CapabilityBuilder = Arc<dyn Fn() -> Capabilities + Send + Sync>;
 
@@ -124,8 +151,16 @@ pub enum ScriptedAdvanceError {
     #[error("the scripted reporter has no retained discovery status: {0}")]
     NoStatus(String),
     /// The requested run did not complete within `SCAN_DEADLINE`.
-    #[error("a scripted discovery run did not complete within {SCAN_DEADLINE:?}")]
-    Stalled,
+    #[error(
+        "a scripted discovery run did not complete within {SCAN_DEADLINE:?}: the reporter is \
+         {activity:?} with {io_threads} I/O worker(s) backing discovery"
+    )]
+    Stalled {
+        /// What the kernel last reported the reporter doing.
+        activity:   ReporterActivityView,
+        /// Width of the global I/O pool the run waited to be admitted into.
+        io_threads: usize,
+    },
     /// No held scan reached the gate within `SCAN_DEADLINE`.
     #[error("a held scan did not reach its gate within {SCAN_DEADLINE:?}")]
     NeverHeld,
@@ -819,7 +854,7 @@ pub fn advance_reporter(app: &mut App, reporter: ReporterId) -> Result<(), Scrip
         }
     }
 
-    Err(ScriptedAdvanceError::Stalled)
+    Err(stalled(app, reporter))
 }
 
 /// Ask one gated reporter for a run and advance frames until the kernel reports it running.
@@ -850,7 +885,7 @@ pub fn advance_until_running(
         }
     }
 
-    Err(ScriptedAdvanceError::Stalled)
+    Err(stalled(app, reporter))
 }
 
 /// Advance frames until the kernel has accepted the run already in flight.
@@ -875,7 +910,21 @@ pub fn advance_until_accepted(
         }
     }
 
-    Err(ScriptedAdvanceError::Stalled)
+    Err(stalled(app, reporter))
+}
+
+/// Describe a run that never finished, from the reporter's activity and the pool that admits it.
+///
+/// Both are what separate a reporter the kernel never admitted from one whose job is still in
+/// flight, and a one-worker pool is the shape that turns a second gated reporter into a deadlock.
+fn stalled(app: &App, reporter: ReporterId) -> ScriptedAdvanceError {
+    match reporter_health(app, reporter) {
+        Ok(reporter_health) => ScriptedAdvanceError::Stalled {
+            activity:   reporter_health.activity().clone(),
+            io_threads: IoTaskPool::get().thread_num(),
+        },
+        Err(error) => error,
+    }
 }
 
 /// Read whether one reporter's retained activity is a run the kernel currently holds.
