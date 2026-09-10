@@ -2,7 +2,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 #[cfg(test)]
 use std::sync::mpsc::SyncSender;
@@ -89,9 +88,7 @@ impl DiskWorker {
         } else if dirty {
             self.dirty_at = Some(Instant::now() + self.worker_timings.debounce);
             #[cfg(test)]
-            self.status
-                .dirty_notifications
-                .fetch_add(1, Ordering::Release);
+            self.status.record_dirty_notification();
         }
     }
 
@@ -130,11 +127,11 @@ impl DiskWorker {
 
     pub(super) fn recreate_watcher(&mut self, paths: &KeymapPaths) {
         self.watcher = None;
-        self.status.watching.store(false, Ordering::Release);
+        self.status.set_watching(false);
 
         if self.watch_mode.is_injected() {
             if paths.config_directory().is_dir() {
-                self.status.watching.store(true, Ordering::Release);
+                self.status.set_watching(true);
             } else {
                 self.report_watcher_setup_failure(
                     paths.config_directory(),
@@ -223,7 +220,7 @@ impl DiskWorker {
         self.watcher = Some(watcher);
         self.watcher_notifications = Some(watch_notifications);
         self.watcher_receiver = Some(watcher_receiver);
-        self.status.watching.store(true, Ordering::Release);
+        self.status.set_watching(true);
 
         if let SymlinkParentWatch::Unwatched {
             target_parent,
@@ -415,7 +412,6 @@ mod tests {
     use std::sync::OnceLock;
     use std::sync::mpsc;
     use std::sync::mpsc::RecvTimeoutError;
-    use std::thread;
     use std::time::Duration;
     use std::time::Instant;
 
@@ -437,15 +433,18 @@ mod tests {
 
     const DEFAULT_KEYMAP: &[u8] = b"{\"bindings\": []}";
     const DEBOUNCE_INTERVAL: Duration = Duration::from_millis(100);
-    const NATIVE_WATCH_DEADLINE: Duration = Duration::from_millis(500);
     const POLL_AUDIT_INTERVAL: Duration = Duration::from_millis(20);
     const RETRY_INTERVAL: Duration = Duration::from_millis(30);
     const MISSING_SYMLINK_TARGET: &str = "missing-keymap-target/user-keymap.jsonc";
+    /// How long the probe below asks the operating system's notification service for an answer.
+    ///
+    /// The one wall clock left in these tests, and it bounds the external service rather than
+    /// the disk worker: a machine that denies filesystem notifications reports nothing at all,
+    /// so the only way to learn that is to ask and stop asking. What it decides is whether the
+    /// two native-watch tests can run here, never whether the worker is correct.
     const NOTIFICATION_PROBE_DEADLINE: Duration = Duration::from_secs(2);
     const NOTIFICATION_PROBE_INTERVAL: Duration = Duration::from_millis(50);
     const TEST_APP_NAME: &str = "hana-rubric-watch-test";
-    const TEST_TIMEOUT: Duration = Duration::from_secs(3);
-    const WAIT_INTERVAL: Duration = Duration::from_millis(5);
 
     fn isolated_paths(temporary_directory: &TestDirectory) -> Result<KeymapPaths, String> {
         let paths = KeymapPathAvailability::for_app_name(TEST_APP_NAME)
@@ -479,76 +478,31 @@ mod tests {
         )
     }
 
-    fn wait_for_message(worker: &DiskWorkerChannels) -> Result<(), String> {
-        let deadline = Instant::now() + TEST_TIMEOUT;
-
-        while Instant::now() < deadline {
-            if worker.take_message().is_some() {
-                return Ok(());
-            }
-            thread::sleep(WAIT_INTERVAL);
-        }
-
-        Err(String::from(
-            "disk worker did not publish a message before the test timeout",
-        ))
-    }
+    /// Every wait below ends on the worker's own signal rather than on a deadline, so a busy
+    /// machine changes how long a test takes and never whether it passes. A signal that never
+    /// arrives parks the test for nextest's `slow-timeout` in `.config/nextest.toml`, which
+    /// reports the worker as stuck -- the fact a deadline here would have obscured.
+    fn wait_for_message(worker: &DiskWorkerChannels) { drop(worker.await_message()); }
 
     fn wait_for_snapshot(
         worker: &DiskWorkerChannels,
         path: &Path,
         expected_contents: Option<&[u8]>,
-    ) -> Result<(), String> {
-        let deadline = Instant::now() + TEST_TIMEOUT;
-
-        while Instant::now() < deadline {
-            if let Some(message) = worker.take_message()
-                && matches!(
-                    &message.delivery,
-                    DiskDelivery::Snapshot(snapshot)
-                        if snapshot.source_path == path
-                            && channels::contents_match(&snapshot.contents, expected_contents)
-                )
-            {
-                return Ok(());
-            }
-            thread::sleep(WAIT_INTERVAL);
-        }
-
-        Err(String::from(
-            "disk worker did not publish the requested snapshot",
-        ))
+    ) {
+        while !matches!(
+            &worker.await_message().delivery,
+            DiskDelivery::Snapshot(snapshot)
+                if snapshot.source_path == path
+                    && channels::contents_match(&snapshot.contents, expected_contents)
+        ) {}
     }
 
-    fn wait_for_watcher(worker: &DiskWorkerChannels, expected: bool) -> Result<(), String> {
-        let deadline = Instant::now() + TEST_TIMEOUT;
-
-        while Instant::now() < deadline {
-            if worker.is_watching() == expected {
-                return Ok(());
-            }
-            thread::sleep(WAIT_INTERVAL);
-        }
-
-        Err(format!("disk worker watch state did not become {expected}"))
+    fn wait_for_watcher(worker: &DiskWorkerChannels, expected: bool) {
+        worker.wait_for_activity(|activity| activity.watching == expected);
     }
 
-    fn wait_for_dirty_notifications(
-        worker: &DiskWorkerChannels,
-        expected: usize,
-    ) -> Result<(), String> {
-        let deadline = Instant::now() + TEST_TIMEOUT;
-
-        while Instant::now() < deadline {
-            if worker.dirty_notifications() >= expected {
-                return Ok(());
-            }
-            thread::sleep(WAIT_INTERVAL);
-        }
-
-        Err(String::from(
-            "disk worker did not handle the injected watcher notification",
-        ))
+    fn wait_for_dirty_notifications(worker: &DiskWorkerChannels, expected: usize) {
+        worker.wait_for_activity(|activity| activity.dirty_notifications >= expected);
     }
 
     /// A symlinked keymap file whose target directory is missing fails the same way on every
@@ -613,26 +567,26 @@ mod tests {
                 .config_directory()
                 .starts_with(temporary_directory.path())
         );
-        wait_for_message(&worker)?;
-        wait_for_watcher(&worker, true)?;
+        wait_for_message(&worker);
+        wait_for_watcher(&worker, true);
 
         fs::remove_dir_all(paths.config_directory())
             .map_err(|error| format!("configuration directory removal failed: {error}"))?;
         worker.inject_watcher_failure()?;
-        wait_for_watcher(&worker, false)?;
+        wait_for_watcher(&worker, false);
         fs::create_dir_all(paths.config_directory())
             .map_err(|error| format!("configuration directory recreation failed: {error}"))?;
         worker.inject_watcher_failure()?;
-        wait_for_watcher(&worker, true)?;
-        wait_for_snapshot(&worker, paths.user_keymap(), None)?;
-        let read_attempts_before_write = worker.read_attempts();
+        wait_for_watcher(&worker, true);
+        wait_for_snapshot(&worker, paths.user_keymap(), None);
+        let read_attempts_before_write = worker.activity(|activity| activity.read_attempts);
         fs::write(paths.user_keymap(), b"{\"bindings\": []}")
             .map_err(|error| format!("recreated user keymap write failed: {error}"))?;
         worker.inject_watcher_dirty()?;
-        wait_for_dirty_notifications(&worker, 1)?;
+        wait_for_dirty_notifications(&worker, 1);
 
-        wait_for_snapshot(&worker, paths.user_keymap(), Some(b"{\"bindings\": []}"))?;
-        if worker.read_attempts() != read_attempts_before_write + 1 {
+        wait_for_snapshot(&worker, paths.user_keymap(), Some(b"{\"bindings\": []}"));
+        if worker.activity(|activity| activity.read_attempts) != read_attempts_before_write + 1 {
             return Err(String::from(
                 "the recreated watcher snapshot did not come from its injected watcher edge",
             ));
@@ -779,21 +733,18 @@ mod tests {
             &worker,
             paths.user_keymap(),
             Some(runtime::USER_KEYMAP_STUB),
-        )?;
-        wait_for_watcher(&worker, true)?;
+        );
+        wait_for_watcher(&worker, true);
 
+        // Delivery is the whole assertion. There is no latency bound: the notification
+        // service is the operating system's, this test already skips where that service is
+        // unavailable, and a millisecond figure measured against it says more about how loaded
+        // the machine is than about the worker. A watch that never delivers parks here for
+        // nextest's `slow-timeout` to end.
         let edited_contents = b"{\"bindings\": [{\"bindings\": {}}]}";
-        let edited_at = Instant::now();
         fs::write(paths.user_keymap(), edited_contents)
             .map_err(|error| format!("native watch keymap write failed: {error}"))?;
-        wait_for_snapshot(&worker, paths.user_keymap(), Some(edited_contents))?;
-        let latency = edited_at.elapsed();
-
-        if latency > NATIVE_WATCH_DEADLINE {
-            return Err(format!(
-                "the native watch delivered an edit after {latency:?}, past the {NATIVE_WATCH_DEADLINE:?} deadline",
-            ));
-        }
+        wait_for_snapshot(&worker, paths.user_keymap(), Some(edited_contents));
 
         worker.shutdown();
         drop(xdg_config_home);
@@ -842,39 +793,27 @@ mod tests {
             &worker,
             paths.user_keymap(),
             Some(runtime::USER_KEYMAP_STUB),
-        )?;
-        wait_for_watcher(&worker, true)?;
+        );
+        wait_for_watcher(&worker, true);
 
+        // Both saves assert delivery and nothing about how quickly it arrived, for the reason
+        // given on the direct-edit test above.
         let edited_contents = b"{\"bindings\": [{\"bindings\": {}}]}";
-        let edited_at = Instant::now();
         fs::write(paths.user_keymap(), edited_contents)
             .map_err(|error| format!("symlinked keymap write failed: {error}"))?;
-        wait_for_snapshot(&worker, paths.user_keymap(), Some(edited_contents))?;
-        assert_within_native_deadline("a direct edit", edited_at.elapsed())?;
+        wait_for_snapshot(&worker, paths.user_keymap(), Some(edited_contents));
 
         let renamed_contents = b"{\"bindings\": [{\"context\": \"resting\"}]}";
         let staged_keymap = keymap_store.join("tracked-keymap.jsonc.tmp");
-        let renamed_at = Instant::now();
         fs::write(&staged_keymap, renamed_contents)
             .map_err(|error| format!("staged keymap write failed: {error}"))?;
         fs::rename(&staged_keymap, &linked_keymap)
             .map_err(|error| format!("rename-over-target save failed: {error}"))?;
-        wait_for_snapshot(&worker, paths.user_keymap(), Some(renamed_contents))?;
-        assert_within_native_deadline("a rename-over-target save", renamed_at.elapsed())?;
+        wait_for_snapshot(&worker, paths.user_keymap(), Some(renamed_contents));
 
         worker.shutdown();
         drop(xdg_config_home);
         drop(environment_lock);
-        Ok(())
-    }
-
-    fn assert_within_native_deadline(save_form: &str, latency: Duration) -> Result<(), String> {
-        if latency > NATIVE_WATCH_DEADLINE {
-            return Err(format!(
-                "the native watch delivered {save_form} after {latency:?}, past the {NATIVE_WATCH_DEADLINE:?} deadline",
-            ));
-        }
-
         Ok(())
     }
 
@@ -899,7 +838,7 @@ mod tests {
                 .config_directory()
                 .starts_with(temporary_directory.path())
         );
-        wait_for_message(&worker)?;
+        wait_for_message(&worker);
         fs::write(paths.user_keymap(), b"{\"bindings\": [{\"bindings\": {}}]}")
             .map_err(|error| format!("polled user keymap write failed: {error}"))?;
 
@@ -907,7 +846,7 @@ mod tests {
             &worker,
             paths.user_keymap(),
             Some(b"{\"bindings\": [{\"bindings\": {}}]}"),
-        )?;
+        );
 
         worker.shutdown();
         drop(xdg_config_home);

@@ -352,8 +352,39 @@ impl Reporters {
     fn poll_running(&mut self, now: Instant) {
         for reporter_entry in &mut self.entries {
             reporter_entry.drain_progress();
-            reporter_entry.collect_finished_run(now);
+            reporter_entry.collect_finished_run(now, RunCollection::PollOnce);
         }
+    }
+
+    /// Drive every running discovery job to completion, then collect its result.
+    ///
+    /// This is the completion signal a test should wait on. [`Self::poll_running`]
+    /// can only report whether the I/O pool has finished a scan yet, so a test built
+    /// on it has to re-ask until the answer changes and give up at some bound --
+    /// which makes "the scan did not finish" and "this machine is busy" the same
+    /// failure. Awaiting the task instead removes the bound: the call returns exactly
+    /// when the scan's own work returns.
+    ///
+    /// A scan that never returns hangs the test rather than failing it. That is
+    /// deliberate: nextest's `slow-timeout` in `.config/nextest.toml` is the one
+    /// wall clock in the workspace, and a genuine hang belongs to it.
+    ///
+    /// A scan held open by a test gate must be released from another thread, or this
+    /// call waits for a release that cannot arrive.
+    ///
+    /// Only the named reporter is awaited. Awaiting every reporter would make one
+    /// test's gated scan block a wait that has nothing to do with it.
+    #[cfg(feature = "test-support")]
+    fn await_running_job(&mut self, reporter: ReporterId, now: Instant) {
+        let Some(reporter_entry) = self
+            .entries
+            .iter_mut()
+            .find(|reporter_entry| reporter_entry.reporter_id == reporter)
+        else {
+            return;
+        };
+        reporter_entry.drain_progress();
+        reporter_entry.collect_finished_run(now, RunCollection::AwaitCompletion);
     }
 
     fn accept_completed(
@@ -951,6 +982,36 @@ enum RetainedDeviceSet {
 enum NextDue {
     NotScheduled,
     At(Instant),
+}
+
+/// How far `collect_finished_run` drives a background scan before it returns.
+///
+/// A background scan runs on the I/O pool, so there are two different questions to
+/// ask about it, and only one of them belongs in a frame.
+#[derive(Clone, Copy)]
+enum RunCollection {
+    /// Sample the task: report a result only if the pool has already produced one.
+    ///
+    /// The production path. A frame must never block on a scan that can take seconds.
+    PollOnce,
+    /// Await the task: return once the scan has produced its result, however long
+    /// the pool takes to get there.
+    ///
+    /// The test path. It makes completion something a test establishes rather than
+    /// something it samples, so a slower machine changes how long a test takes and
+    /// never whether it passes.
+    #[cfg(feature = "test-support")]
+    AwaitCompletion,
+}
+
+impl RunCollection {
+    fn resolve(self, task: &mut Task<DeviceScan>) -> Option<DeviceScan> {
+        match self {
+            Self::PollOnce => block_on(poll_once(task)),
+            #[cfg(feature = "test-support")]
+            Self::AwaitCompletion => Some(block_on(task)),
+        }
+    }
 }
 
 enum ReporterRunState {
@@ -1657,9 +1718,9 @@ impl ReporterEntry {
         }
     }
 
-    fn collect_finished_run(&mut self, now: Instant) {
+    fn collect_finished_run(&mut self, now: Instant, collection: RunCollection) {
         let is_complete = match &mut self.state {
-            ReporterRunState::Running { task, .. } => block_on(poll_once(task)),
+            ReporterRunState::Running { task, .. } => collection.resolve(task),
             ReporterRunState::Disabled
             | ReporterRunState::Idle { .. }
             | ReporterRunState::Queued { .. }
@@ -1884,6 +1945,28 @@ impl Drivers {
     }
 }
 
+/// Drive one reporter's running discovery scan to completion, then collect its result.
+///
+/// A background scan runs on the I/O pool, so a test that samples for its result has
+/// to re-ask until the answer changes and give up at some bound -- which makes "the
+/// scan did not finish" and "this machine is busy" the same failure. This awaits the
+/// scan's own work instead, so a slower machine changes how long the call takes and
+/// never whether it succeeds.
+///
+/// Returns with nothing done when the reporter has no run in flight.
+///
+/// A scan that never returns hangs the test rather than failing it. That is
+/// deliberate: nextest's `slow-timeout` in `.config/nextest.toml` is the one wall
+/// clock in the workspace, and a genuine hang belongs to it. A scan held open by a
+/// test gate must therefore be released from another thread.
+#[cfg(feature = "test-support")]
+pub fn await_running_discovery_job(app: &mut App, reporter: ReporterId) {
+    app.world_mut()
+        .resource_scope::<Reporters, _>(|_, mut reporters| {
+            reporters.await_running_job(reporter, Instant::now());
+        });
+}
+
 /// Adds Hana Rigging reporters, endpoint drivers, and identity schemes to a Bevy `App`.
 ///
 /// Bevy's `App` cannot receive inherent methods from this crate, so integration crates import
@@ -2058,6 +2141,7 @@ mod tests {
     use super::RerunRequest;
     use super::RetainedDeviceSet;
     use super::RiggingAppExt;
+    use super::RunCollection;
     use crate::Applied;
     use crate::ApplyContext;
     use crate::AttachmentPath;
@@ -2124,16 +2208,6 @@ mod tests {
     use crate::reporter_health::ReporterFailureRun;
     use crate::reporter_health::ReporterLogDecision;
     use crate::reporter_health::ReporterLogState;
-
-    /// How long a test waits for one reporter's background result before calling it stuck.
-    ///
-    /// The work runs on another thread, so the bound is elapsed time rather than a poll count:
-    /// a loaded machine can burn through any fixed number of polls before it schedules that
-    /// thread even once, which reports a result that is merely late as one that never arrived.
-    const BACKGROUND_RESULT_DEADLINE: Duration = Duration::from_secs(10);
-
-    /// How long to wait between polls once the first one finds the result unfinished.
-    const BACKGROUND_RESULT_POLL_INTERVAL: Duration = Duration::from_micros(100);
 
     #[test]
     fn reporter_registration_and_plugin_order_share_the_runtime_clock_anchor() {
@@ -2713,12 +2787,16 @@ mod tests {
         started: &Receiver<&'static str>,
         expected_count: usize,
     ) -> Vec<&'static str> {
-        const JOB_START_TIMEOUT: Duration = Duration::from_secs(5);
-
+        // No timeout. Each job starts on a thread the runtime owns, so a bound would decide from
+        // how busy the machine is that a job still on its way had never started. The sending half
+        // drops with the runtime, so a job that dies before reaching its gate fails the `recv`
+        // immediately; one that never starts parks for nextest's `slow-timeout` to end, which
+        // reports it as stuck. Absence is asserted separately, by
+        // `assert_no_additional_job_started`, which reads the channel without waiting at all.
         let mut reporter_names = (0..expected_count)
             .map(|_| {
                 started
-                    .recv_timeout(JOB_START_TIMEOUT)
+                    .recv()
                     .expect("admitted discovery job must reach its deterministic gate")
             })
             .collect::<Vec<_>>();
@@ -2744,58 +2822,54 @@ mod tests {
         })
     }
 
-    fn update_until_completed_batches(app: &mut App, reporter: ReporterId, completed_batches: u64) {
-        const MAX_UPDATES: usize = 100;
-
-        for _ in 0..MAX_UPDATES {
-            app.update();
-            let reporter_discovery_status = app
-                .world()
-                .resource::<DiscoveryStatus>()
-                .reporter_status(reporter)
-                .expect("registered reporter must retain status");
-            if reporter_discovery_status.completed_batches >= completed_batches {
-                return;
-            }
-            std::thread::yield_now();
-        }
-
-        assert_eq!(
-            app.world()
-                .resource::<DiscoveryStatus>()
-                .reporter_status(reporter)
-                .expect("registered reporter must retain status")
-                .completed_batches,
-            completed_batches
-        );
+    fn completed_batches(app: &App, reporter: ReporterId) -> u64 {
+        app.world()
+            .resource::<DiscoveryStatus>()
+            .reporter_status(reporter)
+            .expect("registered reporter must retain status")
+            .completed_batches
     }
 
-    fn reporter_result_becomes_ready(app: &mut App, reporter: ReporterId) -> bool {
-        let deadline = Instant::now() + BACKGROUND_RESULT_DEADLINE;
-        loop {
-            let result_is_ready =
-                app.world_mut()
-                    .resource_scope::<Reporters, _>(|_, mut reporters| {
-                        reporters.poll_running(Instant::now());
-                        reporters
-                            .entries
-                            .iter()
-                            .find(|reporter_entry| reporter_entry.reporter_id == reporter)
-                            .is_some_and(|reporter_entry| {
-                                matches!(
-                                    reporter_entry.completion_time(),
-                                    ReporterCompletionTime::CompletedAt(_)
-                                )
-                            })
-                    });
-            if result_is_ready {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            std::thread::sleep(BACKGROUND_RESULT_POLL_INTERVAL);
+    /// Advance frames until the reporter has completed `completed_batches` batches.
+    ///
+    /// Each turn runs one frame and then drives whatever that frame started to
+    /// completion, so the loop advances by finished work rather than by elapsed time
+    /// or by a number of turns. A reporter that never completes another batch hangs
+    /// here, and nextest's `slow-timeout` is what ends it.
+    /// Advance until the reporter has accepted `batches` whole sets.
+    ///
+    /// The await precedes the frame: the frame that accepts a finished scan is also the frame
+    /// that starts whatever run was requested behind it, so awaiting after it would wait on a
+    /// run this call was never asked about.
+    fn update_until_completed_batches(app: &mut App, reporter: ReporterId, batches: u64) {
+        while completed_batches(app, reporter) < batches {
+            app.world_mut()
+                .resource_scope::<Reporters, _>(|_, mut reporters| {
+                    reporters.await_running_job(reporter, Instant::now());
+                });
+            app.update();
         }
+    }
+
+    /// Await the reporter's running scan and report whether it produced a result.
+    ///
+    /// `false` now means the reporter had no run to await or its run did not complete
+    /// one, never that a machine was too slow to finish one in time.
+    fn reporter_result_becomes_ready(app: &mut App, reporter: ReporterId) -> bool {
+        app.world_mut()
+            .resource_scope::<Reporters, _>(|_, mut reporters| {
+                reporters.await_running_job(reporter, Instant::now());
+                reporters
+                    .entries
+                    .iter()
+                    .find(|reporter_entry| reporter_entry.reporter_id == reporter)
+                    .is_some_and(|reporter_entry| {
+                        matches!(
+                            reporter_entry.completion_time(),
+                            ReporterCompletionTime::CompletedAt(_)
+                        )
+                    })
+            })
     }
 
     fn published_report_projections(app: &App) -> &[&'static str] {
@@ -2931,7 +3005,8 @@ mod tests {
             .resource_scope::<Reporters, _>(|world, mut reporters| {
                 let now = Instant::now();
                 reporters.entries[reporter_index].drain_progress();
-                reporters.entries[reporter_index].collect_finished_run(now);
+                reporters.entries[reporter_index]
+                    .collect_finished_run(now, RunCollection::PollOnce);
                 let discovery_limits = world.resource::<DiscoveryLimits>().clone();
                 let (mut journal, capacity) = discarded_journal(&reporters, &discovery_limits);
                 world.resource_scope::<DiscoveryControl, _>(|world, discovery_control| {
@@ -3097,26 +3172,14 @@ mod tests {
     }
 
     fn finish_background_discovery_task(reporter_entry: &mut ReporterEntry, now: Instant) {
-        // The pooled task has to be scheduled before it can report completion, so the
-        // wait is bounded by wall clock rather than by a poll count. A fixed number of
-        // yields elapses in milliseconds on an idle machine and can run out before the
-        // pool thread is scheduled at all on a host whose cores are already committed.
-        let deadline = Instant::now() + BACKGROUND_RESULT_DEADLINE;
-
-        loop {
-            reporter_entry.collect_finished_run(now);
-            if matches!(
+        reporter_entry.collect_finished_run(now, RunCollection::AwaitCompletion);
+        assert!(
+            matches!(
                 reporter_entry.completion_time(),
                 ReporterCompletionTime::CompletedAt(_)
-            ) {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "background discovery task must reach completion within the wait budget"
-            );
-            std::thread::sleep(BACKGROUND_RESULT_POLL_INTERVAL);
-        }
+            ),
+            "an awaited background discovery task must have produced its result"
+        );
     }
 
     fn expire_reporter_deadline(app: &mut App, reporter: ReporterId) {
@@ -4529,8 +4592,6 @@ mod tests {
 
     #[test]
     fn background_discovery_runs_on_io_pool_and_updates_its_retained_outcome() {
-        const MAX_UPDATES: usize = 50;
-
         initialize_io_task_pool();
         let discoveries = Arc::new(AtomicUsize::new(0));
         let mut app = App::new();
@@ -4546,20 +4607,7 @@ mod tests {
             ),
         );
 
-        for _ in 0..MAX_UPDATES {
-            app.update();
-            if matches!(
-                app.world()
-                    .resource::<DiscoveryStatus>()
-                    .reporter_status(reporter_id)
-                    .expect("registered reporter must retain status")
-                    .last_outcome,
-                LastDiscoveryOutcome::Succeeded { .. }
-            ) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        update_until_completed_batches(&mut app, reporter_id, 1);
 
         assert_eq!(discoveries.load(Ordering::Relaxed), 1);
         assert!(matches!(

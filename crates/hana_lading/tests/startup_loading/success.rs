@@ -104,7 +104,7 @@ fn success_two_sets() {
         },
     );
 
-    update_until(&mut app, "success_two_sets terminal", |world| {
+    update_until(&mut app, |world| {
         world
             .resource::<SuccessLog>()
             .entries

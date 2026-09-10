@@ -81,7 +81,6 @@ pub(crate) fn material_asset_for_frame<'a>(
 mod tests {
     use std::thread;
     use std::time::Duration;
-    use std::time::Instant;
 
     use bevy::asset::AssetPlugin;
     use bevy::prelude::App;
@@ -91,14 +90,9 @@ mod tests {
 
     use super::*;
 
-    /// Wall-clock budget for the asset server to resolve a missing path. The
-    /// resolution runs on the IO pool, so the number of frames it takes is a
-    /// property of the machine: a CI runner sharing its cores with three sibling
-    /// jobs can need the whole budget where an idle machine needs none of it.
-    const MISSING_PATH_LOAD_DEADLINE: Duration = Duration::from_secs(30);
-    /// Gap between load-state reads while waiting out that budget. Short enough
-    /// to add no measurable time on an idle machine, long enough that the wait
-    /// yields its core rather than holding it.
+    /// Gap between load-state reads while waiting for the load to settle. Short
+    /// enough to add no measurable time on an idle machine, long enough that the
+    /// wait yields its core rather than holding it.
     const MISSING_PATH_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
     fn material_app() -> App {
@@ -176,14 +170,13 @@ mod tests {
         let missing_handle: Handle<StandardMaterial> =
             asset_server.load("materials/does_not_exist.standard_material");
 
-        // A fixed frame count is a race the runner loses; bound the wait by wall
-        // clock, which is what is actually being waited on.
-        let deadline = Instant::now() + MISSING_PATH_LOAD_DEADLINE;
+        // No bound. The resolution runs on the IO pool, so any budget is sized for
+        // a machine and the machine is not knowable: a runner sharing its cores
+        // with three sibling jobs needs what an idle one does not, and a bound
+        // that expires only decides that work still on its way had never
+        // arrived. A load that can never settle parks here for nextest's
+        // `slow-timeout` to end, which reports it as stuck.
         while matches!(asset_server.load_state(&missing_handle), LoadState::Loading) {
-            assert!(
-                Instant::now() < deadline,
-                "missing path handle should leave Loading before fallback is asserted"
-            );
             app.update();
             thread::sleep(MISSING_PATH_POLL_INTERVAL);
         }

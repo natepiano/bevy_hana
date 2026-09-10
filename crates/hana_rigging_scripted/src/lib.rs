@@ -27,7 +27,6 @@ use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::time::Duration;
-use std::time::Instant;
 
 use bevy::app::App;
 use bevy::prelude::Component;
@@ -91,16 +90,8 @@ use hana_rigging::SessionRef;
 use hana_rigging::SessionReleaseCause;
 use hana_rigging::TargetResolution;
 use hana_rigging::TargetResolutionContext;
+use hana_rigging::await_running_discovery_job;
 use thiserror::Error;
-
-/// How long [`advance_reporter`] drives frames before it reports one requested scan as stalled.
-///
-/// A scheduled reporter needs one update to prepare and run its job and one more for the kernel to
-/// accept the completed set, but the job itself runs off the main thread. A frame count cannot
-/// bound that wait: frames are cheap enough to exhaust before a loaded machine has scheduled the
-/// worker even once, which reports a run that is merely late as one that stalled. The bound is
-/// elapsed time instead, and the harness keeps driving frames until it passes.
-const SCAN_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Number of I/O workers a scripted test app gives Bevy's global pool.
 ///
@@ -150,20 +141,6 @@ pub enum ScriptedAdvanceError {
     /// The reporter has no retained status, so its completion count cannot be watched.
     #[error("the scripted reporter has no retained discovery status: {0}")]
     NoStatus(String),
-    /// The requested run did not complete within `SCAN_DEADLINE`.
-    #[error(
-        "a scripted discovery run did not complete within {SCAN_DEADLINE:?}: the reporter is \
-         {activity:?} with {io_threads} I/O worker(s) backing discovery"
-    )]
-    Stalled {
-        /// What the kernel last reported the reporter doing.
-        activity:   ReporterActivityView,
-        /// Width of the global I/O pool the run waited to be admitted into.
-        io_threads: usize,
-    },
-    /// No held scan reached the gate within `SCAN_DEADLINE`.
-    #[error("a held scan did not reach its gate within {SCAN_DEADLINE:?}")]
-    NeverHeld,
 }
 
 /// Failure selecting an authority retained by a [`ScriptedDriver`].
@@ -782,28 +759,20 @@ impl ScriptedRunGate {
     /// the job itself rather than for the kernel's view of it. One frame after this returns, the
     /// scheduler has drained the sent progress.
     ///
-    /// # Errors
-    ///
-    /// Returns [`ScriptedAdvanceError::NeverHeld`] when no scan reaches the gate within
-    /// `SCAN_DEADLINE`.
-    pub fn wait_until_held(&self) -> Result<(), ScriptedAdvanceError> {
-        let deadline = Instant::now() + SCAN_DEADLINE;
+    /// A scan that never reaches its gate parks here rather than returning an error. The
+    /// condvar below is the arrival's own signal, so waking from it means the scan arrived
+    /// and never means a machine was slow; a scan that cannot arrive is a deadlock, and
+    /// nextest's `slow-timeout` is what ends it.
+    pub fn wait_until_held(&self) {
         let mut counts = self.counts();
         while counts.arrivals == 0 {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(ScriptedAdvanceError::NeverHeld);
-            }
             counts = self
                 .0
                 .changed
-                .wait_timeout(counts, remaining)
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .0;
+                .wait(counts)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
         counts.arrivals -= 1;
-        drop(counts);
-        Ok(())
     }
 
     fn wait(&self) {
@@ -835,10 +804,15 @@ impl ScriptedRunGate {
 /// prepared job and at least one more to accept the completed set, and that is a scheduling detail
 /// this harness deliberately does not pin.
 ///
+/// The await comes before the frame, and reversing the two deadlocks the call. The frame that
+/// accepts a finished scan is also the frame that starts the next requested one, so awaiting after
+/// it would wait on a run this call was never asked about -- for a gated reporter, one no test has
+/// released.
+///
 /// # Errors
 ///
-/// Returns [`ScriptedAdvanceError`] when the kernel refuses the request, when the reporter has no
-/// retained status, or when the run has not been accepted within `SCAN_DEADLINE`.
+/// Returns [`ScriptedAdvanceError`] when the kernel refuses the request or when the reporter has
+/// no retained status.
 pub fn advance_reporter(app: &mut App, reporter: ReporterId) -> Result<(), ScriptedAdvanceError> {
     let completed_before = completed_batches(app, reporter)?;
     app.world_mut()
@@ -846,15 +820,12 @@ pub fn advance_reporter(app: &mut App, reporter: ReporterId) -> Result<(), Scrip
         .request(reporter)
         .map_err(|error| ScriptedAdvanceError::RequestRefused(error.to_string()))?;
 
-    let deadline = Instant::now() + SCAN_DEADLINE;
-    while Instant::now() < deadline {
+    while completed_batches(app, reporter)? <= completed_before {
+        await_running_discovery_job(app, reporter);
         app.update();
-        if completed_batches(app, reporter)? > completed_before {
-            return Ok(());
-        }
     }
 
-    Err(stalled(app, reporter))
+    Ok(())
 }
 
 /// Ask one gated reporter for a run and advance frames until the kernel reports it running.
@@ -866,8 +837,13 @@ pub fn advance_reporter(app: &mut App, reporter: ReporterId) -> Result<(), Scrip
 ///
 /// # Errors
 ///
-/// Returns [`ScriptedAdvanceError`] when the kernel refuses the request, when the reporter has no
-/// retained status, or when the run has not started within `SCAN_DEADLINE`.
+/// Returns [`ScriptedAdvanceError`] when the kernel refuses the request or when the reporter has
+/// no retained status.
+///
+/// Unlike its siblings this never awaits the scan, because leaving the scan in flight is the
+/// whole point of the call. The kernel marks a reporter running inside the frame that admits it,
+/// so frames alone carry this forward; a reporter that is never admitted -- every slot held by
+/// another gated scan, say -- parks here for nextest's `slow-timeout` to end.
 pub fn advance_until_running(
     app: &mut App,
     reporter: ReporterId,
@@ -877,15 +853,11 @@ pub fn advance_until_running(
         .request(reporter)
         .map_err(|error| ScriptedAdvanceError::RequestRefused(error.to_string()))?;
 
-    let deadline = Instant::now() + SCAN_DEADLINE;
-    while Instant::now() < deadline {
+    while !is_running(app, reporter)? {
         app.update();
-        if is_running(app, reporter)? {
-            return Ok(());
-        }
     }
 
-    Err(stalled(app, reporter))
+    Ok(())
 }
 
 /// Advance frames until the kernel has accepted the run already in flight.
@@ -893,38 +865,24 @@ pub fn advance_until_running(
 /// The counterpart to [`advance_until_running`]: the request has already been made, so this waits
 /// on the completion count alone.
 ///
+/// The await comes before the frame, for the reason given on [`advance_reporter`]: the frame that
+/// accepts the run in flight also starts whatever was requested behind it.
+///
 /// # Errors
 ///
-/// Returns [`ScriptedAdvanceError`] when the reporter has no retained status, or when the run has
-/// not been accepted within `SCAN_DEADLINE`.
+/// Returns [`ScriptedAdvanceError`] when the reporter has no retained status.
 pub fn advance_until_accepted(
     app: &mut App,
     reporter: ReporterId,
 ) -> Result<(), ScriptedAdvanceError> {
     let completed_before = completed_batches(app, reporter)?;
-    let deadline = Instant::now() + SCAN_DEADLINE;
-    while Instant::now() < deadline {
+
+    while completed_batches(app, reporter)? <= completed_before {
+        await_running_discovery_job(app, reporter);
         app.update();
-        if completed_batches(app, reporter)? > completed_before {
-            return Ok(());
-        }
     }
 
-    Err(stalled(app, reporter))
-}
-
-/// Describe a run that never finished, from the reporter's activity and the pool that admits it.
-///
-/// Both are what separate a reporter the kernel never admitted from one whose job is still in
-/// flight, and a one-worker pool is the shape that turns a second gated reporter into a deadlock.
-fn stalled(app: &App, reporter: ReporterId) -> ScriptedAdvanceError {
-    match reporter_health(app, reporter) {
-        Ok(reporter_health) => ScriptedAdvanceError::Stalled {
-            activity:   reporter_health.activity().clone(),
-            io_threads: IoTaskPool::get().thread_num(),
-        },
-        Err(error) => error,
-    }
+    Ok(())
 }
 
 /// Read whether one reporter's retained activity is a run the kernel currently holds.

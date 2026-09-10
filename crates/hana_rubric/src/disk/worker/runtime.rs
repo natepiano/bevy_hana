@@ -7,7 +7,6 @@ use std::io::ErrorKind;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::RecvTimeoutError;
@@ -227,7 +226,7 @@ impl DiskWorker {
             }
         }
 
-        self.status.watching.store(false, Ordering::Release);
+        self.status.set_watching(false);
     }
 
     /// Parks the worker between [`Self::recreate_watcher`] arming the watch and
@@ -314,15 +313,13 @@ impl DiskWorker {
 
     pub(super) fn read_user_keymap(&mut self, paths: &KeymapPaths, now: Instant) {
         #[cfg(test)]
-        self.status.read_attempts.fetch_add(1, Ordering::Release);
+        self.status.record_read_attempt();
 
         match fs::read(paths.user_keymap()) {
             Ok(contents) => self.observe_contents(paths, Arc::from(contents)),
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 #[cfg(test)]
-                self.status
-                    .not_found_observations
-                    .fetch_add(1, Ordering::Release);
+                self.status.record_not_found_observation();
                 self.observe_absence(paths, now);
             },
             Err(error) => {
@@ -473,7 +470,6 @@ mod tests {
     const RETRY_GRACE_INTERVAL: Duration = Duration::from_millis(1500);
     const RETRY_INTERVAL: Duration = Duration::from_millis(30);
     const TEST_APP_NAME: &str = "hana-rubric-worker-test";
-    const TEST_TIMEOUT: Duration = Duration::from_secs(3);
     const WAIT_INTERVAL: Duration = Duration::from_millis(5);
 
     fn worker_timings() -> WorkerTimings {
@@ -568,34 +564,16 @@ mod tests {
         )
     }
 
-    fn wait_for_message(worker: &DiskWorkerChannels) -> Result<DiskWorkerMessage, String> {
-        let deadline = Instant::now() + TEST_TIMEOUT;
+    /// Block until the worker publishes its next delivery.
+    ///
+    /// The worker's own publication ends this wait, so a slower machine changes how long the
+    /// test takes and never whether it passes. A worker that publishes nothing parks here for
+    /// nextest's `slow-timeout` to end, which is the right report: nothing arrived, rather than
+    /// nothing arrived quickly enough.
+    fn wait_for_message(worker: &DiskWorkerChannels) -> DiskWorkerMessage { worker.await_message() }
 
-        while Instant::now() < deadline {
-            if let Some(message) = worker.take_message() {
-                return Ok(message);
-            }
-
-            thread::sleep(WAIT_INTERVAL);
-        }
-
-        Err(String::from(
-            "disk worker did not publish a message before the test timeout",
-        ))
-    }
-
-    fn wait_for_watcher(worker: &DiskWorkerChannels, expected: bool) -> Result<(), String> {
-        let deadline = Instant::now() + TEST_TIMEOUT;
-
-        while Instant::now() < deadline {
-            if worker.is_watching() == expected {
-                return Ok(());
-            }
-
-            thread::sleep(WAIT_INTERVAL);
-        }
-
-        Err(format!("disk worker watch state did not become {expected}"))
+    fn wait_for_watcher(worker: &DiskWorkerChannels, expected: bool) {
+        worker.wait_for_activity(|activity| activity.watching == expected);
     }
 
     fn assert_snapshot(
@@ -624,100 +602,59 @@ mod tests {
         Ok(())
     }
 
-    fn expect_no_message_for(
-        worker: &DiskWorkerChannels,
-        duration: Duration,
-    ) -> Result<(), String> {
-        let deadline = Instant::now() + duration;
-
-        while Instant::now() < deadline {
-            if worker.take_message().is_some() {
-                return Err(String::from(
-                    "disk worker published unexpectedly during the quiet interval",
-                ));
-            }
-            thread::sleep(WAIT_INTERVAL);
+    /// The two negative assertions below are the only places a duration decides an outcome
+    /// here, and they are safe where a deadline is not: absence over an interval cannot be
+    /// established any other way, and a machine too busy to publish inside the window makes
+    /// these quieter rather than louder. What they report is a delivery that happened, never
+    /// one that was late.
+    fn expect_no_message_for(worker: &DiskWorkerChannels, quiet: Duration) -> Result<(), String> {
+        if worker.take_message_within(quiet).is_some() {
+            return Err(String::from(
+                "disk worker published unexpectedly during the quiet interval",
+            ));
         }
 
         Ok(())
     }
 
-    fn expect_no_absence_snapshot(
+    fn expect_no_confirmed_deletion_for(
         worker: &DiskWorkerChannels,
-        duration: Duration,
+        quiet: Duration,
     ) -> Result<(), String> {
-        let deadline = Instant::now() + duration;
+        let until = Instant::now() + quiet;
 
-        while Instant::now() < deadline {
-            if let Some(message) = worker.take_message()
-                && matches!(
-                    &message.delivery,
-                    DiskDelivery::Snapshot(snapshot)
-                        if matches!(snapshot.contents, UserKeymapContents::Absent)
-                )
-            {
+        while let Some(remaining) = until
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+        {
+            let Some(message) = worker.take_message_within(remaining) else {
+                return Ok(());
+            };
+
+            if matches!(
+                &message.delivery,
+                DiskDelivery::Snapshot(snapshot)
+                    if matches!(snapshot.contents, UserKeymapContents::Absent)
+            ) {
                 return Err(String::from(
                     "disk worker published confirmed deletion before the retry grace expired",
                 ));
             }
-            thread::sleep(WAIT_INTERVAL);
         }
 
         Ok(())
     }
 
-    fn wait_for_dirty_notifications(
-        worker: &DiskWorkerChannels,
-        expected: usize,
-    ) -> Result<(), String> {
-        let deadline = Instant::now() + TEST_TIMEOUT;
-
-        while Instant::now() < deadline {
-            if worker.dirty_notifications() >= expected {
-                return Ok(());
-            }
-            thread::sleep(WAIT_INTERVAL);
-        }
-
-        Err(format!(
-            "disk worker observed {} dirty notifications instead of at least {expected}",
-            worker.dirty_notifications()
-        ))
+    fn wait_for_dirty_notifications(worker: &DiskWorkerChannels, expected: usize) {
+        worker.wait_for_activity(|activity| activity.dirty_notifications >= expected);
     }
 
-    fn wait_for_not_found_observations(
-        worker: &DiskWorkerChannels,
-        expected: usize,
-    ) -> Result<(), String> {
-        let deadline = Instant::now() + TEST_TIMEOUT;
-
-        while Instant::now() < deadline {
-            if worker.not_found_observations() >= expected {
-                return Ok(());
-            }
-            thread::sleep(WAIT_INTERVAL);
-        }
-
-        Err(format!(
-            "disk worker observed {} missing keymaps instead of at least {expected}",
-            worker.not_found_observations()
-        ))
+    fn wait_for_not_found_observations(worker: &DiskWorkerChannels, expected: usize) {
+        worker.wait_for_activity(|activity| activity.not_found_observations >= expected);
     }
 
-    fn wait_for_read_attempts(worker: &DiskWorkerChannels, expected: usize) -> Result<(), String> {
-        let deadline = Instant::now() + TEST_TIMEOUT;
-
-        while Instant::now() < deadline {
-            if worker.read_attempts() >= expected {
-                return Ok(());
-            }
-            thread::sleep(WAIT_INTERVAL);
-        }
-
-        Err(format!(
-            "disk worker read {} times instead of at least {expected}",
-            worker.read_attempts()
-        ))
+    fn wait_for_read_attempts(worker: &DiskWorkerChannels, expected: usize) {
+        worker.wait_for_activity(|activity| activity.read_attempts >= expected);
     }
 
     #[test]
@@ -737,39 +674,39 @@ mod tests {
                 .config_directory()
                 .starts_with(temporary_directory.path())
         );
-        wait_for_watcher(&worker, true)?;
+        wait_for_watcher(&worker, true);
         assert_snapshot(
-            &wait_for_message(&worker)?,
+            &wait_for_message(&worker),
             paths.user_keymap(),
             Some(USER_KEYMAP_STUB),
         )?;
-        let initial_read_attempts = worker.read_attempts();
+        let initial_read_attempts = worker.activity(|activity| activity.read_attempts);
 
         let saved_contents = b"{\"bindings\": [{\"bindings\": {}}]}";
         fs::write(paths.user_keymap(), saved_contents)
             .map_err(|error| format!("saved keymap write failed: {error}"))?;
         worker.inject_watcher_dirty()?;
-        wait_for_dirty_notifications(&worker, 1)?;
-        if worker.read_attempts() != initial_read_attempts {
+        wait_for_dirty_notifications(&worker, 1);
+        if worker.activity(|activity| activity.read_attempts) != initial_read_attempts {
             return Err(String::from(
                 "the first watcher edge read before the final debounced edge",
             ));
         }
 
         worker.inject_watcher_dirty()?;
-        wait_for_dirty_notifications(&worker, 2)?;
-        if worker.read_attempts() != initial_read_attempts {
+        wait_for_dirty_notifications(&worker, 2);
+        if worker.activity(|activity| activity.read_attempts) != initial_read_attempts {
             return Err(String::from(
                 "the final watcher edge read before its debounce interval expired",
             ));
         }
 
         assert_snapshot(
-            &wait_for_message(&worker)?,
+            &wait_for_message(&worker),
             paths.user_keymap(),
             Some(saved_contents),
         )?;
-        if worker.read_attempts() != initial_read_attempts + 1 {
+        if worker.activity(|activity| activity.read_attempts) != initial_read_attempts + 1 {
             return Err(String::from(
                 "the debounced watcher edges performed more than one read",
             ));
@@ -801,7 +738,7 @@ mod tests {
         );
         // The watch is armed before the first read, so this resolves while the worker is still
         // parked ahead of that read. Reading first would leave it unarmed until after the read.
-        wait_for_watcher(&worker, true)?;
+        wait_for_watcher(&worker, true);
 
         let edited_contents = b"{\"bindings\": [{\"bindings\": {}}]}";
         fs::write(paths.user_keymap(), edited_contents)
@@ -811,7 +748,7 @@ mod tests {
         // Polling is off and no watcher edge is injected, so only the first read can carry this
         // edit to the application thread.
         assert_snapshot(
-            &wait_for_message(&worker)?,
+            &wait_for_message(&worker),
             paths.user_keymap(),
             Some(edited_contents),
         )?;
@@ -840,7 +777,7 @@ mod tests {
                 .starts_with(temporary_directory.path())
         );
         assert_snapshot(
-            &wait_for_message(&worker)?,
+            &wait_for_message(&worker),
             paths.user_keymap(),
             Some(USER_KEYMAP_STUB),
         )?;
@@ -848,19 +785,23 @@ mod tests {
         fs::remove_file(paths.user_keymap())
             .map_err(|error| format!("user keymap removal failed: {error}"))?;
         worker.inject_watcher_dirty()?;
-        wait_for_dirty_notifications(&worker, 1)?;
+        wait_for_dirty_notifications(&worker, 1);
         worker.inject_watcher_failure()?;
-        wait_for_not_found_observations(&worker, 1)?;
-        expect_no_absence_snapshot(&worker, WAIT_INTERVAL)?;
+        wait_for_not_found_observations(&worker, 1);
+        let read_attempts_before_retry = worker.activity(|activity| activity.read_attempts);
+        expect_no_confirmed_deletion_for(&worker, WAIT_INTERVAL)?;
 
-        thread::sleep(worker_timings.retry + WAIT_INTERVAL);
-        expect_no_absence_snapshot(&worker, WAIT_INTERVAL)?;
+        // The retry the worker makes next must not confirm the absence either. Wait for that
+        // read to happen rather than sleeping for as long as the retry interval: the read is
+        // the event this assertion is about, and the worker reports making it.
+        wait_for_read_attempts(&worker, read_attempts_before_retry + 1);
+        expect_no_confirmed_deletion_for(&worker, WAIT_INTERVAL)?;
 
         let restored_contents = b"{\"bindings\": [{\"bindings\": {}}]}";
         fs::write(paths.user_keymap(), restored_contents)
             .map_err(|error| format!("restored keymap write failed: {error}"))?;
         assert_snapshot(
-            &wait_for_message(&worker)?,
+            &wait_for_message(&worker),
             paths.user_keymap(),
             Some(restored_contents),
         )?;
@@ -890,7 +831,7 @@ mod tests {
                 .starts_with(temporary_directory.path())
         );
         assert_snapshot(
-            &wait_for_message(&worker)?,
+            &wait_for_message(&worker),
             paths.user_keymap(),
             Some(USER_KEYMAP_STUB),
         )?;
@@ -899,15 +840,15 @@ mod tests {
         fs::rename(paths.user_keymap(), &temporary_keymap)
             .map_err(|error| format!("temporary keymap removal failed: {error}"))?;
         worker.inject_watcher_failure()?;
-        wait_for_not_found_observations(&worker, 1)?;
-        expect_no_absence_snapshot(
+        wait_for_not_found_observations(&worker, 1);
+        expect_no_confirmed_deletion_for(
             &worker,
             worker_timings.retry.saturating_sub(RETRY_ASSERTION_MARGIN),
         )?;
         fs::rename(&temporary_keymap, paths.user_keymap())
             .map_err(|error| format!("temporary keymap restoration failed: {error}"))?;
 
-        expect_no_absence_snapshot(&worker, worker_timings.retry + RETRY_ASSERTION_MARGIN)?;
+        expect_no_confirmed_deletion_for(&worker, worker_timings.retry + RETRY_ASSERTION_MARGIN)?;
 
         worker.shutdown();
         drop(xdg_config_home);
@@ -933,7 +874,7 @@ mod tests {
                 .starts_with(temporary_directory.path())
         );
         assert_snapshot(
-            &wait_for_message(&worker)?,
+            &wait_for_message(&worker),
             paths.user_keymap(),
             Some(USER_KEYMAP_STUB),
         )?;
@@ -941,13 +882,13 @@ mod tests {
         fs::remove_file(paths.user_keymap())
             .map_err(|error| format!("user keymap removal failed: {error}"))?;
         worker.inject_watcher_failure()?;
-        wait_for_not_found_observations(&worker, 1)?;
-        expect_no_absence_snapshot(
+        wait_for_not_found_observations(&worker, 1);
+        expect_no_confirmed_deletion_for(
             &worker,
             worker_timings.retry.saturating_sub(RETRY_ASSERTION_MARGIN),
         )?;
 
-        assert_snapshot(&wait_for_message(&worker)?, paths.user_keymap(), None)?;
+        assert_snapshot(&wait_for_message(&worker), paths.user_keymap(), None)?;
         expect_no_message_for(&worker, QUIESCENCE_INTERVAL)?;
 
         worker.shutdown();
@@ -974,7 +915,7 @@ mod tests {
                 .starts_with(temporary_directory.path())
         );
         assert_snapshot(
-            &wait_for_message(&worker)?,
+            &wait_for_message(&worker),
             paths.user_keymap(),
             Some(USER_KEYMAP_STUB),
         )?;
@@ -983,19 +924,33 @@ mod tests {
         fs::create_dir(paths.user_keymap())
             .map_err(|error| format!("user keymap directory creation failed: {error}"))?;
 
-        let read_attempts_before_error = worker.read_attempts();
+        // What is bounded here is the retry rate, not the retry count: the worker may back off
+        // after fewer retries than the window allows, so waiting for a fixed number of reads
+        // would wait for reads it never has to make. So the window is still a sleep -- but the
+        // allowance is computed from the interval that actually elapsed rather than the one
+        // asked for. A machine that oversleeps then gets a proportionally larger allowance,
+        // which is what keeps a late scheduler from reading as a worker that spun.
+        let read_attempts_before_error = worker.activity(|activity| activity.read_attempts);
         worker.inject_watcher_failure()?;
-        wait_for_read_attempts(&worker, read_attempts_before_error + 1)?;
+        wait_for_read_attempts(&worker, read_attempts_before_error + 1);
+
+        let error_window_started = Instant::now();
         thread::sleep(worker_timings.retry.saturating_mul(ERROR_RETRY_WINDOWS));
+        let error_window = error_window_started.elapsed();
 
         let error_window_read_attempts = worker
-            .read_attempts()
+            .activity(|activity| activity.read_attempts)
             .saturating_sub(read_attempts_before_error);
         let maximum_error_window_read_attempts =
-            usize::try_from(ERROR_RETRY_WINDOWS).map_err(|error| error.to_string())? + 1;
+            usize::try_from(error_window.as_nanos() / worker_timings.retry.as_nanos())
+                .map_err(|error| error.to_string())?
+                + 1;
         if error_window_read_attempts > maximum_error_window_read_attempts {
             return Err(format!(
-                "disk worker read {error_window_read_attempts} times during the error window; expected at most {maximum_error_window_read_attempts}",
+                "disk worker read {error_window_read_attempts} times during a {error_window:?} \
+                 error window; its {:?} retry interval allows at most \
+                 {maximum_error_window_read_attempts}",
+                worker_timings.retry,
             ));
         }
 
@@ -1020,7 +975,7 @@ mod tests {
                 .config_directory()
                 .starts_with(temporary_directory.path())
         );
-        let _ = wait_for_message(&first_worker)?;
+        let _ = wait_for_message(&first_worker);
         if fs::read(paths.user_keymap())
             .map_err(|error| format!("first-launch stub read failed: {error}"))?
             != USER_KEYMAP_STUB
@@ -1037,7 +992,7 @@ mod tests {
         let mut second_worker = start_worker(WatchMode::Native);
 
         assert_snapshot(
-            &wait_for_message(&second_worker)?,
+            &wait_for_message(&second_worker),
             paths.user_keymap(),
             Some(custom_contents),
         )?;
@@ -1056,7 +1011,7 @@ mod tests {
             .map_err(|error| format!("empty keymap write failed: {error}"))?;
         let mut third_worker = start_worker(WatchMode::Native);
         assert_snapshot(
-            &wait_for_message(&third_worker)?,
+            &wait_for_message(&third_worker),
             paths.user_keymap(),
             Some(&[]),
         )?;

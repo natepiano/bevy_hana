@@ -85,25 +85,19 @@ fn first_failure_follows_declaration_order() {
         (fail_order.first.id(), fail_order.second.id())
     };
     register_image_loader(&mut app);
-    drain_asset_events_until(
-        &mut app,
-        "both missing roots record failed states",
-        move |world| {
-            let asset_server = world.resource::<AssetServer>();
-            matches!(
-                asset_server.get_load_state(first_id),
-                Some(LoadState::Failed(_))
-            ) && matches!(
-                asset_server.get_load_state(second_id),
-                Some(LoadState::Failed(_))
-            )
-        },
-    );
-    update_until(
-        &mut app,
-        "first_failure_follows_declaration_order terminal",
-        |world| world.resource::<OrderLog>().resolved_failures.is_some(),
-    );
+    drain_asset_events_until(&mut app, move |world| {
+        let asset_server = world.resource::<AssetServer>();
+        matches!(
+            asset_server.get_load_state(first_id),
+            Some(LoadState::Failed(_))
+        ) && matches!(
+            asset_server.get_load_state(second_id),
+            Some(LoadState::Failed(_))
+        )
+    });
+    update_until(&mut app, |world| {
+        world.resource::<OrderLog>().resolved_failures.is_some()
+    });
 
     let log = app.world().resource::<OrderLog>();
     assert_eq!(log.generic_paths, [MISSING_FIRST_PATH]);

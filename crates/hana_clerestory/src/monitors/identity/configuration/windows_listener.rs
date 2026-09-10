@@ -362,7 +362,11 @@ mod tests {
     use super::*;
     use crate::monitors::identity::configuration::MonitorConfigurationState;
 
-    const COMPLETION_TIMEOUT: Duration = Duration::from_secs(2);
+    // The waits below take no timeout. Each one waits on a thread this test spawned, so a bound
+    // would decide from how busy the machine is that work still on its way had never happened.
+    // The sending half drops with its thread, so a worker that dies without reporting fails the
+    // `recv` immediately rather than after a wait; one that never reports parks for nextest's
+    // `slow-timeout` to end, which reports it as stuck.
 
     #[test]
     fn registration_uses_monitor_filter_and_cleans_up_failure() {
@@ -383,8 +387,8 @@ mod tests {
                 .expect("registration result receiver should remain connected");
         });
         let result = receiver
-            .recv_timeout(COMPLETION_TIMEOUT)
-            .expect("registration failure should complete before the timeout");
+            .recv()
+            .expect("registration failure should complete");
         registration
             .join()
             .expect("registration test thread should not panic");
@@ -576,17 +580,9 @@ mod tests {
             }
         }
 
-        fn wait_until_waiting(&self) {
-            self.wait
-                .recv_timeout(COMPLETION_TIMEOUT)
-                .expect("listener should enter its wait before the timeout");
-        }
+        fn wait_until_waiting(&self) { self.wait.recv().expect("listener should enter its wait"); }
 
-        fn wait_until_complete(&self) {
-            self.completion
-                .recv_timeout(COMPLETION_TIMEOUT)
-                .expect("listener should clean up before the timeout");
-        }
+        fn wait_until_complete(&self) { self.completion.recv().expect("listener should clean up"); }
 
         fn shutdown(
             &mut self,
@@ -604,9 +600,7 @@ mod tests {
                     .send(result)
                     .expect("shutdown result receiver should remain connected");
             });
-            let result = receiver
-                .recv_timeout(COMPLETION_TIMEOUT)
-                .expect("listener shutdown should complete before the timeout");
+            let result = receiver.recv().expect("listener shutdown should complete");
             shutdown
                 .join()
                 .expect("shutdown test thread should not panic");

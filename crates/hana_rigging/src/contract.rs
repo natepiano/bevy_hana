@@ -2341,9 +2341,6 @@ mod tests {
     #[test]
     fn a_completion_carries_the_frame_instant_in_effect_when_it_was_queued()
     -> Result<(), RoleKeyError> {
-        /// Longest the test waits for the finishing thread to reach the frame-instant lock before
-        /// concluding it never holds one.
-        const CONTENTION_WINDOW: Duration = Duration::from_secs(5);
         /// Pause between probes, so probing does not starve the finishing thread of the lock it is
         /// trying to take.
         const PROBE_INTERVAL: Duration = Duration::from_millis(1);
@@ -2368,15 +2365,22 @@ mod tests {
         });
 
         // A `finish` parked on the mailbox still holds the frame instant. Released after the read
-        // instead, the frame-instant lock would stay free for this whole window.
-        let waiting_since = Instant::now();
+        // instead, the frame-instant lock would stay free for as long as this loop probes.
+        //
+        // There is no deadline. How soon the spawned thread reaches the lock is the machine's
+        // business, so a deadline decides from how busy the machine is that a thread still on its
+        // way had never held it. What is definitive is that thread returning: this test holds the
+        // mailbox, so a correct `finish` cannot get past it, and a finished thread is one that let
+        // the frame instant go without ever queueing. A `finish` that released the frame instant
+        // and then parked on the mailbox trips no such signal and parks here for nextest's
+        // `slow-timeout` to end, which reports it as stuck.
         loop {
             let frame_instant_held = reports.frame_instant.try_lock().is_err();
             if frame_instant_held {
                 break;
             }
             assert!(
-                waiting_since.elapsed() < CONTENTION_WINDOW,
+                !finishing.is_finished(),
                 "finish left the frame instant free while its completion was still unqueued, so \
                  the kernel could leave the frame that completion is stamped with"
             );

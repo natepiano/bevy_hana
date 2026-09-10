@@ -76,7 +76,7 @@ fn two_failures_one_frame() {
         log.failures_before_resolution = Some(log.failed_frames.len());
     });
 
-    update_until(&mut app, "two_failures_one_frame terminal", |world| {
+    update_until(&mut app, |world| {
         world
             .resource::<PairLog>()
             .failures_before_resolution

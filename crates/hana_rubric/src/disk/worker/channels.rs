@@ -2,16 +2,15 @@ use std::io::Error;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Condvar;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-#[cfg(test)]
-use std::sync::atomic::Ordering;
+use std::sync::MutexGuard;
 use std::sync::mpsc::Sender;
 #[cfg(test)]
 use std::sync::mpsc::SyncSender;
 use std::thread::JoinHandle;
+#[cfg(test)]
+use std::time::Duration;
 
 #[cfg(test)]
 use super::watch::TestWatcher;
@@ -72,22 +71,30 @@ impl DiskWorkerChannels {
     /// Takes the newest worker message, dropping no newer state.
     pub(super) fn take_message(&self) -> Option<DiskWorkerMessage> { self.slot.take() }
 
+    /// Block until the worker publishes a delivery, then take it.
     #[cfg(test)]
-    pub(super) fn is_watching(&self) -> bool { self.status.watching.load(Ordering::Acquire) }
+    pub(super) fn await_message(&self) -> DiskWorkerMessage { self.slot.take_blocking() }
 
+    /// Take a delivery published within `quiet`, reporting `None` when the worker stayed silent.
     #[cfg(test)]
-    pub(super) fn dirty_notifications(&self) -> usize {
-        self.status.dirty_notifications.load(Ordering::Acquire)
+    pub(super) fn take_message_within(&self, quiet: Duration) -> Option<DiskWorkerMessage> {
+        self.slot.take_within(quiet)
     }
 
+    /// Block until the worker's own activity satisfies `reached`.
+    ///
+    /// This is how a test waits for the worker to arm a watch, notice a change, or attempt a
+    /// read: the worker announces each of those, so the wait ends when it did the thing rather
+    /// than when a chosen interval expired.
     #[cfg(test)]
-    pub(super) fn not_found_observations(&self) -> usize {
-        self.status.not_found_observations.load(Ordering::Acquire)
+    pub(super) fn wait_for_activity(&self, reached: impl FnMut(&WorkerActivity) -> bool) {
+        self.status.wait_until(reached);
     }
 
+    /// Read the worker's activity as it stands, for an assertion about an exact count.
     #[cfg(test)]
-    pub(super) fn read_attempts(&self) -> usize {
-        self.status.read_attempts.load(Ordering::Acquire)
+    pub(super) fn activity<T>(&self, of: impl FnOnce(&WorkerActivity) -> T) -> T {
+        self.status.read(of)
     }
 
     #[cfg(test)]
@@ -153,21 +160,31 @@ impl Drop for DiskWorkerChannels {
 
 #[derive(Clone)]
 pub(super) struct CoalescingSlot {
-    message: Arc<Mutex<Option<DiskWorkerMessage>>>,
+    slot: Arc<CoalescingSlotState>,
+}
+
+/// The single retained delivery, and the signal that one has arrived.
+///
+/// The condvar is what a test waits on. Sampling the slot on a timer instead would let a
+/// machine that is merely busy read as a worker that published nothing, which is a
+/// different fact entirely.
+struct CoalescingSlotState {
+    message:   Mutex<Option<DiskWorkerMessage>>,
+    published: Condvar,
 }
 
 impl CoalescingSlot {
     pub(super) fn new() -> Self {
         Self {
-            message: Arc::new(Mutex::new(None)),
+            slot: Arc::new(CoalescingSlotState {
+                message:   Mutex::new(None),
+                published: Condvar::new(),
+            }),
         }
     }
 
     pub(super) fn publish(&self, mut message: DiskWorkerMessage) {
-        let mut message_slot = self
-            .message
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut message_slot = self.message_slot();
 
         if let Some(previous) = message_slot.take() {
             if matches!(message.delivery, DiskDelivery::DiagnosticsOnly) {
@@ -188,34 +205,154 @@ impl CoalescingSlot {
         }
 
         *message_slot = Some(message);
+        drop(message_slot);
+        self.slot.published.notify_all();
     }
 
     pub(super) fn take(&self) -> Option<DiskWorkerMessage> {
-        let mut message = self
-            .message
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()?;
+        Some(Self::retained(self.message_slot().take()?))
+    }
 
+    /// Block until the worker has published a delivery, then take it.
+    ///
+    /// This is the arrival's own signal, so returning from it means the worker published and
+    /// never means the machine was quick enough. A worker that publishes nothing parks the
+    /// caller here; nextest's `slow-timeout` in `.config/nextest.toml` is what ends that.
+    #[cfg(test)]
+    pub(super) fn take_blocking(&self) -> DiskWorkerMessage {
+        let mut message_slot = self.message_slot();
+
+        loop {
+            if let Some(message) = message_slot.take() {
+                return Self::retained(message);
+            }
+
+            message_slot = self
+                .slot
+                .published
+                .wait(message_slot)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    /// Block until the worker publishes, or report that `quiet` passed without one.
+    ///
+    /// The only negative assertion in the worker's tests, and the one place a duration decides
+    /// an outcome: absence over an interval cannot be established any other way. It is safe
+    /// where a deadline is not, because a slow machine makes this wait quieter rather than
+    /// louder -- the failure it reports is a delivery that happened, never one that was late.
+    #[cfg(test)]
+    pub(super) fn take_within(&self, quiet: Duration) -> Option<DiskWorkerMessage> {
+        let (mut message_slot, _) = self
+            .slot
+            .published
+            .wait_timeout_while(self.message_slot(), quiet, |message_slot| {
+                message_slot.is_none()
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        Some(Self::retained(message_slot.take()?))
+    }
+
+    /// Append the count of diagnostics the slot dropped while coalescing, when it dropped any.
+    fn retained(mut message: DiskWorkerMessage) -> DiskWorkerMessage {
         if message.discarded_diagnostics > 0 {
             message.diagnostics.push(discarded_diagnostics_diagnostic(
                 message.discarded_diagnostics,
             ));
         }
 
-        Some(message)
+        message
+    }
+
+    fn message_slot(&self) -> MutexGuard<'_, Option<DiskWorkerMessage>> {
+        self.slot
+            .message
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
+/// What the worker thread has done so far, and the signal that it has done more.
+///
+/// A test waits on the condvar below rather than sampling these fields on a timer. Sampling
+/// decides a failure from how busy the machine is; waking from the condvar means the worker
+/// itself moved. The lock is taken only when the worker arms or drops a watch and once per
+/// read attempt, so it never sits on a hot path.
 #[derive(Default)]
 pub(super) struct WorkerStatus {
-    pub(super) watching:               AtomicBool,
+    activity: Mutex<WorkerActivity>,
+    changed:  Condvar,
+}
+
+/// The worker activity a [`WorkerStatus`] retains.
+#[derive(Default)]
+pub(super) struct WorkerActivity {
+    /// Whether a watcher is currently armed on the keymap directory.
+    pub(super) watching:               bool,
     #[cfg(test)]
-    pub(super) dirty_notifications:    AtomicUsize,
+    pub(super) dirty_notifications:    usize,
     #[cfg(test)]
-    pub(super) not_found_observations: AtomicUsize,
+    pub(super) not_found_observations: usize,
     #[cfg(test)]
-    pub(super) read_attempts:          AtomicUsize,
+    pub(super) read_attempts:          usize,
+}
+
+impl WorkerStatus {
+    pub(super) fn set_watching(&self, watching: bool) {
+        self.record(|activity| activity.watching = watching);
+    }
+
+    #[cfg(test)]
+    pub(super) fn record_dirty_notification(&self) {
+        self.record(|activity| activity.dirty_notifications += 1);
+    }
+
+    #[cfg(test)]
+    pub(super) fn record_not_found_observation(&self) {
+        self.record(|activity| activity.not_found_observations += 1);
+    }
+
+    #[cfg(test)]
+    pub(super) fn record_read_attempt(&self) {
+        self.record(|activity| activity.read_attempts += 1);
+    }
+
+    /// Block until the worker's activity satisfies `reached`.
+    ///
+    /// The wait has no deadline, for the reason [`CoalescingSlot::take_blocking`] gives: an
+    /// activity that never arrives is a stuck worker, and nextest's `slow-timeout` owns that.
+    #[cfg(test)]
+    pub(super) fn wait_until(&self, mut reached: impl FnMut(&WorkerActivity) -> bool) {
+        let mut activity = self.lock_activity();
+
+        while !reached(&activity) {
+            activity = self
+                .changed
+                .wait(activity)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+
+        drop(activity);
+    }
+
+    #[cfg(test)]
+    pub(super) fn read<T>(&self, of: impl FnOnce(&WorkerActivity) -> T) -> T {
+        of(&self.lock_activity())
+    }
+
+    fn record(&self, change: impl FnOnce(&mut WorkerActivity)) {
+        let mut activity = self.lock_activity();
+        change(&mut activity);
+        drop(activity);
+        self.changed.notify_all();
+    }
+
+    fn lock_activity(&self) -> MutexGuard<'_, WorkerActivity> {
+        self.activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 pub(super) enum WorkerControl {

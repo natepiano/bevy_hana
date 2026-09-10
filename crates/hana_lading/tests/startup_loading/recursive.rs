@@ -206,20 +206,14 @@ fn recursive_dependencies_gate_and_fail() {
         );
 
     let entered_gate = gate.clone();
-    update_until(&mut app, "recursive child load begins", move |_| {
-        entered_gate.entered()
-    });
+    update_until(&mut app, move |_| entered_gate.entered());
     let root_id = app.world().resource::<RecursiveAssets>().root.id();
-    update_until(
-        &mut app,
-        "recursive root completes its own load",
-        move |world| {
-            matches!(
-                world.resource::<AssetServer>().get_load_state(root_id),
-                Some(LoadState::Loaded)
-            )
-        },
-    );
+    update_until(&mut app, move |world| {
+        matches!(
+            world.resource::<AssetServer>().get_load_state(root_id),
+            Some(LoadState::Loaded)
+        )
+    });
     for _ in 0..SETTLE_UPDATES {
         app.update();
     }
@@ -235,11 +229,9 @@ fn recursive_dependencies_gate_and_fail() {
     }
 
     gate.release();
-    update_until(
-        &mut app,
-        "recursive_dependencies_gate_and_fail terminal",
-        |world| world.resource::<RecursiveLog>().resolved_failures.is_some(),
-    );
+    update_until(&mut app, |world| {
+        world.resource::<RecursiveLog>().resolved_failures.is_some()
+    });
 
     let log = app.world().resource::<RecursiveLog>();
     assert_eq!(log.loaded, 0);

@@ -271,6 +271,8 @@ pub use registration::DriverId;
 #[cfg(feature = "test-support")]
 pub use registration::Drivers;
 pub use registration::RiggingAppExt;
+#[cfg(feature = "test-support")]
+pub use registration::await_running_discovery_job;
 pub use reporter_health::BatchRef;
 pub use reporter_health::CapabilityProjectionFailures;
 pub use reporter_health::CapabilityProjectionStatus;

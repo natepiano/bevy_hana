@@ -9,7 +9,6 @@ use bevy::app::AppExit;
 use bevy::app::PluginGroup;
 use bevy::app::ScheduleRunnerPlugin;
 use bevy::app::Startup;
-use bevy::app::Update;
 use bevy::asset::AssetLoadError;
 use bevy::asset::AssetServer;
 use bevy::asset::Handle;
@@ -22,8 +21,6 @@ use bevy::prelude::On;
 use bevy::prelude::Res;
 use bevy::prelude::ResMut;
 use bevy::prelude::Resource;
-use bevy::time::Real;
-use bevy::time::Time;
 use hana_lading::AllSetsLoaded;
 use hana_lading::AllSetsResolved;
 use hana_lading::AssetSetLoadFailed;
@@ -40,8 +37,7 @@ use crate::support::register_image_loader;
 use crate::support::test_asset_plugin;
 use crate::support::update_until;
 
-// deadlines and pacing
-const EXIT_FALLBACK_DEADLINE: Duration = Duration::from_secs(30);
+// pacing
 const EXIT_LOOP_WAIT: Duration = Duration::from_millis(1);
 
 // fixture paths relative to the test asset source root
@@ -111,7 +107,7 @@ fn failure_missing_file() {
             log.resolved_failures = Some(event.failures());
         });
 
-    update_until(&mut app, "failure_missing_file terminal", |world| {
+    update_until(&mut app, |world| {
         world.resource::<MissingLog>().resolved_failures.is_some()
     });
     for _ in 0..SETTLE_UPDATES {
@@ -133,12 +129,6 @@ fn failure_missing_file() {
     assert_eq!(log.resolved_failures, Some(1));
 }
 
-fn exit_after_fallback_deadline(time: Res<Time<Real>>, mut exit: MessageWriter<AppExit>) {
-    if time.elapsed() > EXIT_FALLBACK_DEADLINE {
-        exit.write(AppExit::Success);
-    }
-}
-
 #[test]
 fn exit_on_failure_pattern() {
     assert_fixture_absent(MISSING_ABSENT_PATH);
@@ -154,8 +144,10 @@ fn exit_on_failure_pattern() {
             |_: On<AssetSetLoadFailed>, mut exit: MessageWriter<AppExit>| {
                 exit.write(AppExit::error());
             },
-        )
-        .add_systems(Update, exit_after_fallback_deadline);
+        );
 
+    // No fallback exit. The run ends when the asset set reports its failure; a failure that never
+    // arrives parks here for nextest's `slow-timeout` to end. A wall-clock escape would decide
+    // from how busy the machine is that a resolution still on its way had never come.
     assert_eq!(app.run(), AppExit::error());
 }

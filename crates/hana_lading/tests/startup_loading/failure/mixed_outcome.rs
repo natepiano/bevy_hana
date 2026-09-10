@@ -52,7 +52,7 @@ fn mixed_outcome() {
         log.resolved_events.push(event.failures());
     });
 
-    update_until(&mut app, "mixed_outcome terminal", |world| {
+    update_until(&mut app, |world| {
         !world.resource::<MixedLog>().resolved_events.is_empty()
     });
     for _ in 0..SETTLE_UPDATES {
