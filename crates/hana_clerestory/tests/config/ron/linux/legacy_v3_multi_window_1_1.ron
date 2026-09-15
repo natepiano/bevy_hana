@@ -1,13 +1,14 @@
 (
-    version: 6,
+    version: 3,
     entries: [
         (
             key: Primary,
             state: (
-                position: MonitorOffset((100, 100)),
-                logical_width: 600,
-                logical_height: 400,
-                target: Classified(${MONITOR_0_DEVICE_KEY}),
+                // Monitor 1 (HDMI)
+                position: MonitorOffset((200, 200)),
+                logical_width: 800,
+                logical_height: 600,
+                monitor_index: 1,
                 mode: Windowed,
                 app_name: "restore_window",
             )
@@ -15,10 +16,11 @@
         (
             key: Managed("window-1"),
             state: (
-                position: MonitorOffset((200, 100)),
+                // Secondary window also on Monitor 1
+                position: MonitorOffset((400, 400)),
                 logical_width: 1200,
                 logical_height: 800,
-                target: Classified(${MONITOR_1_DEVICE_KEY}),
+                monitor_index: 1,
                 mode: Windowed,
                 app_name: "restore_window",
             )

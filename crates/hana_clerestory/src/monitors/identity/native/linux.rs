@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::str;
 
@@ -31,7 +32,7 @@ use crate::monitors::identity::edid::EdidIdentityEvidence;
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(in crate::monitors) enum QualifiedEvidence {
     InternalConnector(InternalConnector),
-    X11Edid(EdidIdentityEvidence),
+    LinuxEdid(EdidIdentityEvidence),
     #[cfg(test)]
     WindowsEdid(EdidIdentityEvidence),
     #[cfg(any(test, feature = "test"))]
@@ -43,7 +44,7 @@ impl QualifiedEvidence {
     pub(in crate::monitors::identity) fn stable_bytes(&self) -> &[u8] {
         match self {
             Self::InternalConnector(connector) => connector.as_bytes(),
-            Self::X11Edid(edid) => edid.stable_bytes(),
+            Self::LinuxEdid(edid) => edid.stable_bytes(),
             #[cfg(test)]
             Self::WindowsEdid(edid) => edid.stable_bytes(),
             #[cfg(any(test, feature = "test"))]
@@ -80,11 +81,38 @@ pub(in crate::monitors) fn monitor_evidence(
 ) -> MonitorEvidenceObservation {
     match platform {
         Platform::X11 => x11_monitor_evidence(handle),
-        Platform::MacOs | Platform::Windows | Platform::Wayland => MonitorEvidenceObservation {
+        Platform::Wayland => MonitorEvidenceObservation {
+            identity:   wayland_display_evidence(
+                handle.name().as_deref(),
+                Path::new(DRM_CLASS_DIRECTORY),
+            ),
+            attachment: attachment_path_when_unreported(platform),
+        },
+        Platform::MacOs | Platform::Windows => MonitorEvidenceObservation {
             identity:   Err(MonitorIdentificationError::StablePhysicalIdentityUnavailable),
             attachment: attachment_path_when_unreported(platform),
         },
     }
+}
+
+/// Return identity evidence for a Wayland output from the DRM connector that shares its name.
+///
+/// No Wayland protocol carries the EDID to a client. Plasma, GNOME, and wlroots compositors name
+/// each `wl_output` after its DRM connector (`DP-3`, `HDMI-A-2`), so `output_name` only locates the
+/// connector's kernel `edid` file under `drm_class_directory`; the display's identity is read from
+/// that EDID. An output with no name, or a name that matches no single connector, supplies none.
+fn wayland_display_evidence(
+    output_name: Option<&str>,
+    drm_class_directory: &Path,
+) -> Result<QualifiedEvidence, MonitorIdentificationError> {
+    let unresolved_error = MonitorIdentificationError::StablePhysicalIdentityUnavailable;
+    output_name.map_or(Err(unresolved_error), |output_name| {
+        drm_display_evidence(
+            output_name.as_bytes(),
+            drm_class_directory,
+            unresolved_error,
+        )
+    })
 }
 
 fn x11_monitor_evidence(handle: &MonitorHandle) -> MonitorEvidenceObservation {
@@ -131,8 +159,14 @@ fn x11_monitor_evidence(handle: &MonitorHandle) -> MonitorEvidenceObservation {
         },
     };
     let display_evidence = qualify_edid(x11_output_edid(&connection, output))
-        .map(QualifiedEvidence::X11Edid)
-        .or_else(|property_error| drm_display_evidence(&connector_name, property_error));
+        .map(QualifiedEvidence::LinuxEdid)
+        .or_else(|property_error| {
+            drm_display_evidence(
+                &connector_name,
+                Path::new(DRM_CLASS_DIRECTORY),
+                property_error,
+            )
+        });
     MonitorEvidenceObservation {
         identity:   display_evidence,
         attachment: connector_attachment(&connector_name),
@@ -173,32 +207,38 @@ fn x11_output_edid(
     Ok(edid.data)
 }
 
-/// Return identity evidence from the kernel connector file when the X11 property is unavailable.
+/// Return identity evidence from the kernel connector file, or `unresolved_error` when that file
+/// supplies none.
+///
+/// X11 reaches this when its output's EDID property is unavailable; Wayland has no other source.
 fn drm_display_evidence(
     connector_name: &[u8],
-    property_error: MonitorIdentificationError,
+    drm_class_directory: &Path,
+    unresolved_error: MonitorIdentificationError,
 ) -> Result<QualifiedEvidence, MonitorIdentificationError> {
     let Ok(connector_name) = str::from_utf8(connector_name) else {
-        return Err(property_error);
+        return Err(unresolved_error);
     };
-    let Some(connector_directory) = drm_connector_directory(connector_name) else {
-        return Err(property_error);
+    let Some(connector_directory) = drm_connector_directory(connector_name, drm_class_directory)
+    else {
+        return Err(unresolved_error);
     };
     let Ok(edid) = fs::read(connector_directory.join(DRM_CONNECTOR_EDID_FILE)) else {
-        return Err(property_error);
+        return Err(unresolved_error);
     };
     if !edid.is_empty() {
-        return EdidEvidence::qualify(edid).map(QualifiedEvidence::X11Edid);
+        return EdidEvidence::qualify(edid).map(QualifiedEvidence::LinuxEdid);
     }
-    InternalConnector::identify(connector_name).map_or(Err(property_error), |connector| {
+    InternalConnector::identify(connector_name).map_or(Err(unresolved_error), |connector| {
         Ok(QualifiedEvidence::InternalConnector(connector))
     })
 }
 
-/// The [`DRM_CLASS_DIRECTORY`] entry whose connector segment equals `connector_name`.
-fn drm_connector_directory(connector_name: &str) -> Option<PathBuf> {
+/// The `drm_class_directory` entry whose connector segment equals `connector_name`, or `None` when
+/// no entry or more than one entry matches.
+fn drm_connector_directory(connector_name: &str, drm_class_directory: &Path) -> Option<PathBuf> {
     let mut matched_directory = None;
-    for entry in fs::read_dir(DRM_CLASS_DIRECTORY).ok()? {
+    for entry in fs::read_dir(drm_class_directory).ok()? {
         let Ok(entry) = entry else {
             continue;
         };
@@ -231,6 +271,8 @@ fn qualify_edid(
     reason = "tests should panic on unexpected values"
 )]
 mod tests {
+    use tempfile::tempdir;
+
     use super::*;
 
     #[test]
@@ -285,10 +327,60 @@ mod tests {
     fn qualified_edid_variants_retain_the_extracted_serial_tier() {
         let identity = qualify_edid(Ok(serial_edid())).expect("fixture EDID should qualify");
         let windows = QualifiedEvidence::WindowsEdid(identity.clone());
-        let x11 = QualifiedEvidence::X11Edid(identity);
+        let linux = QualifiedEvidence::LinuxEdid(identity);
 
         assert_eq!(windows.stable_bytes(), b"42");
-        assert_eq!(x11.stable_bytes(), b"42");
+        assert_eq!(linux.stable_bytes(), b"42");
+    }
+
+    #[test]
+    fn wayland_output_name_reads_the_edid_of_its_drm_connector() {
+        let drm_class_directory = tempdir().expect("temporary DRM class directory");
+        write_connector_edid(drm_class_directory.path(), "card1-DP-3", &serial_edid());
+        write_connector_edid(drm_class_directory.path(), "card1-HDMI-A-2", &[]);
+
+        let identity = qualify_edid(Ok(serial_edid())).expect("fixture EDID should qualify");
+
+        assert_eq!(
+            wayland_display_evidence(Some("DP-3"), drm_class_directory.path()),
+            Ok(QualifiedEvidence::LinuxEdid(identity))
+        );
+    }
+
+    #[test]
+    fn wayland_built_in_panel_without_an_edid_is_named_by_its_connector() {
+        let drm_class_directory = tempdir().expect("temporary DRM class directory");
+        write_connector_edid(drm_class_directory.path(), "card0-eDP-1", &[]);
+
+        let connector = InternalConnector::identify("eDP-1").expect("eDP-1 is internal");
+
+        assert_eq!(
+            wayland_display_evidence(Some("eDP-1"), drm_class_directory.path()),
+            Ok(QualifiedEvidence::InternalConnector(connector))
+        );
+    }
+
+    #[test]
+    fn wayland_output_without_exactly_one_matching_connector_supplies_no_identity() {
+        let drm_class_directory = tempdir().expect("temporary DRM class directory");
+        write_connector_edid(drm_class_directory.path(), "card0-DP-1", &serial_edid());
+        write_connector_edid(drm_class_directory.path(), "card1-DP-1", &serial_edid());
+        write_connector_edid(drm_class_directory.path(), "card1-HDMI-A-1", &[]);
+
+        for output_name in [None, Some("DP-2"), Some("DP-1"), Some("HDMI-A-1")] {
+            assert_eq!(
+                wayland_display_evidence(output_name, drm_class_directory.path()),
+                Err(MonitorIdentificationError::StablePhysicalIdentityUnavailable),
+                "output {output_name:?}"
+            );
+        }
+    }
+
+    fn write_connector_edid(drm_class_directory: &Path, connector_directory: &str, edid: &[u8]) {
+        let connector_directory = drm_class_directory.join(connector_directory);
+        fs::create_dir(&connector_directory).expect("connector directory");
+        fs::write(connector_directory.join(DRM_CONNECTOR_EDID_FILE), edid)
+            .expect("connector edid file");
     }
 
     #[test]

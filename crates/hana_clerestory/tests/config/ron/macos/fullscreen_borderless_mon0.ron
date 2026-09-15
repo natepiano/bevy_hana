@@ -1,5 +1,5 @@
 (
-    version: 3,
+    version: 6,
     entries: [
         (
             key: Primary,
@@ -7,7 +7,7 @@
                 position: MonitorOffset((0, 0)),
                 logical_width: 1728,
                 logical_height: 1117,
-                monitor_index: 0,
+                target: Classified(${MONITOR_0_DEVICE_KEY}),
                 mode: BorderlessFullscreen,
                 app_name: "restore_window",
             )

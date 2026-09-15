@@ -1,5 +1,5 @@
 (
-    version: 3,
+    version: 6,
     entries: [
         (
             key: Primary,
@@ -7,7 +7,7 @@
                 position: MonitorOffset((100, 100)),
                 logical_width: 600,
                 logical_height: 400,
-                monitor_index: 0,
+                target: Classified(${MONITOR_0_DEVICE_KEY}),
                 mode: Windowed,
                 app_name: "restore_window",
             )
@@ -18,7 +18,7 @@
                 position: MonitorOffset((400, 300)),
                 logical_width: 600,
                 logical_height: 400,
-                monitor_index: 0,
+                target: Classified(${MONITOR_0_DEVICE_KEY}),
                 mode: Windowed,
                 app_name: "restore_window",
             )

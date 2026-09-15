@@ -1,5 +1,5 @@
 (
-    version: 3,
+    version: 6,
     entries: [
         (
             key: Primary,
@@ -9,9 +9,9 @@
                 position: MonitorOffset((0, 0)),
                 logical_width: ${MONITOR_1_VIDEO_MODE_LOGICAL_WIDTH},
                 logical_height: ${MONITOR_1_VIDEO_MODE_LOGICAL_HEIGHT},
-                monitor_index: 1,
+                target: Classified(${MONITOR_1_DEVICE_KEY}),
                 mode: Fullscreen(
-                    video_mode: Some((
+                    video_mode: Specific((
                         physical_size: (${MONITOR_1_VIDEO_MODE_WIDTH}, ${MONITOR_1_VIDEO_MODE_HEIGHT}),
                         bit_depth: ${MONITOR_1_VIDEO_MODE_DEPTH},
                         refresh_rate_millihertz: ${MONITOR_1_VIDEO_MODE_REFRESH},

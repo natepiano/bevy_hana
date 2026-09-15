@@ -16,6 +16,7 @@ use bevy::prelude::Has;
 #[cfg(test)]
 use bevy::prelude::IVec2;
 use bevy::prelude::Insert;
+use bevy::prelude::MessageReader;
 use bevy::prelude::On;
 use bevy::prelude::Query;
 use bevy::prelude::Reflect;
@@ -35,6 +36,7 @@ use bevy::prelude::debug;
 use bevy::window::OnMonitor;
 use bevy::window::PrimaryWindow;
 use bevy::window::WindowMode;
+use bevy::window::WindowMoved;
 use bevy::winit::WINIT_WINDOWS;
 use hana_kana::ToI32;
 
@@ -168,6 +170,41 @@ pub(super) fn clear_monitor_selection_inputs(
     commands
         .entity(removed.entity)
         .try_remove::<MonitorSelectionInputs>();
+}
+
+/// Marks a window whose first `CurrentMonitor` was read before Bevy inserted [`OnMonitor`].
+///
+/// `update_current_monitor` falls back to winit's `current_monitor()` query or the window position
+/// while [`OnMonitor`] is absent. An X11 window answers that query before the window manager maps
+/// it at its requested position, and `bevy_winit`'s `changed_windows` inserts [`OnMonitor`] from
+/// the same query in `Last`, first when the window is added and again when a [`WindowMoved`]
+/// message changes `Window::position`. The display named after the window manager's first
+/// [`WindowMoved`] can therefore differ from the first read without the window having moved.
+#[derive(Clone, Copy, Component, Debug, PartialEq, Eq)]
+pub(crate) enum ProvisionalCurrentMonitor {
+    /// No [`WindowMoved`] has reported where the window manager placed the window.
+    AwaitingPlacement,
+    /// A [`WindowMoved`] reported the placement, so the next `CurrentMonitor` insertion names the
+    /// display the window manager placed the window on.
+    PlacementReported,
+}
+
+/// Advance [`ProvisionalCurrentMonitor`] when winit reports where the window manager placed a
+/// window.
+///
+/// winit writes [`WindowMoved`] before the app update, and this runs in `Update`, ahead of the
+/// `changed_windows` pass in `Last` that reinserts [`OnMonitor`] for the moved window.
+pub(super) fn record_window_manager_placement(
+    mut moved: MessageReader<WindowMoved>,
+    mut windows: Query<&mut ProvisionalCurrentMonitor>,
+) {
+    for message in moved.read() {
+        if let Ok(mut provisional) = windows.get_mut(message.window)
+            && *provisional == ProvisionalCurrentMonitor::AwaitingPlacement
+        {
+            *provisional = ProvisionalCurrentMonitor::PlacementReported;
+        }
+    }
 }
 
 /// Install the exact monitor observation when Bevy inserts or replaces [`OnMonitor`].
@@ -371,6 +408,9 @@ pub(crate) fn update_current_monitor(
         let changed = current_monitor_changed(existing, &current_monitor);
 
         let mut entity_commands = commands.entity(entity);
+        if existing.is_none() && on_monitor.is_none() {
+            entity_commands.insert(ProvisionalCurrentMonitor::AwaitingPlacement);
+        }
         if changed {
             debug!(
                 "[update_current_monitor] source={} index={} scale={} effective_window_mode={:?}",

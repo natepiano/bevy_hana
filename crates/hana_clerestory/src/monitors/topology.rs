@@ -766,7 +766,6 @@ fn display_evidence(
 
     if monitor.cached_index.is_none()
         || matches!(configuration, MonitorConfigurationState::Unavailable(_))
-        || platform.is_wayland()
     {
         return unavailable(identity::attachment_path_when_unreported(platform));
     }

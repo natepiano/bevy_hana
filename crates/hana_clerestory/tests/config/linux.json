@@ -7,10 +7,11 @@
     {
       "id": "wayland_size_restore_mon0",
       "description": "Size persistence on Monitor 0 (position not available on Wayland)",
-      "note": "There is deliberately no Monitor 1 counterpart. WindowMode::Windowed carries no MonitorSelection, so the only lever for a windowed window is its position, and Wayland gives clients no positioning (Platform::position_available is false). A windowed window stays on whatever output the compositor births it on, which KWin picks as the active screen - that is, wherever the previous case left its window. A windowed monitor-1 case therefore asserts nothing about Clerestory: it passes or fails according to which case ran before it. Cross-monitor restore is covered on Wayland by the borderless cases, which use set_fullscreen(output) and genuinely can move.",
+      "note": "There is deliberately no Monitor 1 counterpart. WindowMode::Windowed carries no MonitorSelection, so the only lever for a windowed window is its position, and Wayland gives clients no positioning (Platform::position_available is false). A windowed window stays on whatever output the compositor births it on, which KWin picks as its active output - the output under the pointer. birth_monitor compositor_active_output makes the runner ask KWin for that output (org.kde.KWin.activeOutputName) and substitute its values for the fixture's Monitor 0, so the case restores onto the output the window is born on wherever the pointer rests. A windowed monitor-1 case would repeat that assertion. Cross-monitor restore is covered on Wayland by the borderless cases, which use set_fullscreen(output) and genuinely can move.",
       "automation": "full",
       "backend": "wayland",
       "launch_monitor": 0,
+      "birth_monitor": "compositor_active_output",
       "ron_file": "size_restore_mon0.ron",
       "mutation": {
         "target_monitor": 0,
@@ -72,6 +73,7 @@
       "automation": "full",
       "backend": "wayland",
       "launch_monitor": 0,
+      "birth_monitor": "compositor_active_output",
       "ron_file": "multi_window_0_0.ron",
       "windows": {
         "primary": {
@@ -90,6 +92,7 @@
       "automation": "full",
       "backend": "wayland",
       "launch_monitor": 0,
+      "birth_monitor": "compositor_active_output",
       "ron_file": "multi_window_0_0.ron",
       "windows": {
         "primary": {
@@ -108,6 +111,7 @@
       "automation": "full",
       "backend": "wayland",
       "launch_monitor": 0,
+      "birth_monitor": "compositor_active_output",
       "ron_file": "multi_window_0_0.ron",
       "windows": {
         "primary": {
@@ -436,6 +440,24 @@
       "launch_monitor": 1,
       "requires": {"min_monitors": 2},
       "ron_file": "multi_window_1_1.ron",
+      "windows": {
+        "primary": {
+          "validate": ["position", "size", "monitor_index", "mode"]
+        },
+        "window-1": {
+          "spawn_event": "restore_window::events::SpawnManagedWindow",
+          "validate": ["position", "size", "monitor_index", "mode"]
+        }
+      }
+    },
+    {
+      "id": "x11_legacy_v3_multi_window_1_1",
+      "description": "v3 file with both windows on Monitor 1, launched on Monitor 1 (X11): anonymous legacy targets follow the corrected display and the save keeps the unspawned window",
+      "automation": "full",
+      "backend": "x11",
+      "launch_monitor": 1,
+      "requires": {"min_monitors": 2},
+      "ron_file": "legacy_v3_multi_window_1_1.ron",
       "windows": {
         "primary": {
           "validate": ["position", "size", "monitor_index", "mode"]

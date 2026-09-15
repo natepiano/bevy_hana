@@ -1,5 +1,5 @@
 (
-    version: 3,
+    version: 6,
     entries: [
         (
             key: Primary,
@@ -12,7 +12,7 @@
                 // swapchain larger than the monitor during the cross-DPI move.
                 logical_width: 600,
                 logical_height: 400,
-                monitor_index: ${LOW_SCALE_MONITOR_INDEX},
+                target: Classified(${LOW_SCALE_MONITOR_DEVICE_KEY}),
                 mode: Windowed,
                 app_name: "restore_window",
             )

@@ -1,5 +1,5 @@
 (
-    version: 3,
+    version: 6,
     entries: [
         (
             key: Primary,
@@ -12,7 +12,7 @@
                 // move (700x500 logical = 1400x1000 physical on the scale-2 high monitor).
                 logical_width: 700,
                 logical_height: 500,
-                monitor_index: ${HIGH_SCALE_MONITOR_INDEX},
+                target: Classified(${HIGH_SCALE_MONITOR_DEVICE_KEY}),
                 mode: Windowed,
                 app_name: "restore_window",
             )

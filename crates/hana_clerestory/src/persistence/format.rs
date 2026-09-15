@@ -56,7 +56,9 @@ use ron::from_str;
 use ron::ser::PrettyConfig;
 use ron::value::RawValue;
 use serde::Deserialize;
+use serde::Deserializer;
 use serde::Serialize;
+use serde::Serializer;
 use serde::de::DeserializeOwned;
 use thiserror::Error as ThisError;
 
@@ -239,14 +241,69 @@ impl From<PersistedBindingPolicy> for BindingPolicy {
 }
 
 /// Current v6 entry written on every normal save.
+///
+/// `policy` is absent for a role still at `LoadedBindingPolicy::LegacyWindowMarkers`. That policy
+/// is read from the window's recovery markers when the window spawns, so a save that runs while
+/// the role has no window writes the entry without it, and the next decode loads the role as
+/// `LegacyWindowMarkers` again.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedEntryV6 {
     #[serde(rename = "key")]
     persisted_role: PersistedWindowRole,
     #[serde(rename = "state")]
     window_state:   PersistedWindowState,
-    #[serde(rename = "policy")]
-    binding_policy: PersistedBindingPolicy,
+    #[serde(
+        rename = "policy",
+        default,
+        skip_serializing_if = "PersistedEntryPolicy::is_legacy_window_markers"
+    )]
+    binding_policy: PersistedEntryPolicy,
+}
+
+/// `policy` field of one v6 entry, written as a bare `PersistedBindingPolicy` when present.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum PersistedEntryPolicy {
+    Saved(PersistedBindingPolicy),
+    /// The entry has no `policy` field.
+    #[default]
+    LegacyWindowMarkers,
+}
+
+impl PersistedEntryPolicy {
+    const fn is_legacy_window_markers(&self) -> bool { matches!(self, Self::LegacyWindowMarkers) }
+}
+
+impl Serialize for PersistedEntryPolicy {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Saved(binding_policy) => binding_policy.serialize(serializer),
+            Self::LegacyWindowMarkers => serializer.serialize_unit(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PersistedEntryPolicy {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        PersistedBindingPolicy::deserialize(deserializer).map(Self::Saved)
+    }
+}
+
+impl From<PersistedEntryPolicy> for LoadedBindingPolicy {
+    fn from(entry_policy: PersistedEntryPolicy) -> Self {
+        match entry_policy {
+            PersistedEntryPolicy::Saved(binding_policy) => Self::Saved(binding_policy.into()),
+            PersistedEntryPolicy::LegacyWindowMarkers => Self::LegacyWindowMarkers,
+        }
+    }
+}
+
+impl From<LoadedBindingPolicy> for PersistedEntryPolicy {
+    fn from(loaded_binding_policy: LoadedBindingPolicy) -> Self {
+        match loaded_binding_policy {
+            LoadedBindingPolicy::Saved(binding_policy) => Self::Saved(binding_policy.into()),
+            LoadedBindingPolicy::LegacyWindowMarkers => Self::LegacyWindowMarkers,
+        }
+    }
 }
 
 /// Result of translating a v4 target into v5's reporter-key authority.
@@ -575,10 +632,7 @@ fn decode_v6(
             .map_err(|error| error.to_string())?;
         Ok((
             entry.persisted_role,
-            PersistedWindowPlacement::new(
-                entry.window_state,
-                LoadedBindingPolicy::Saved(entry.binding_policy.into()),
-            ),
+            PersistedWindowPlacement::new(entry.window_state, entry.binding_policy.into()),
         ))
     })
 }
@@ -783,19 +837,12 @@ pub(super) fn encode(
 ) -> Result<String, Error> {
     let mut entries: Vec<PersistedEntryV6> = states
         .iter()
-        .map(|(persisted_role, placement)| {
-            let LoadedBindingPolicy::Saved(binding_policy) = placement.loaded_binding_policy else {
-                return Err(Error::Message(format!(
-                    "role {persisted_role} has not resolved its legacy binding policy"
-                )));
-            };
-            Ok(PersistedEntryV6 {
-                persisted_role: persisted_role.clone(),
-                window_state:   placement.window_state.clone(),
-                binding_policy: binding_policy.into(),
-            })
+        .map(|(persisted_role, placement)| PersistedEntryV6 {
+            persisted_role: persisted_role.clone(),
+            window_state:   placement.window_state.clone(),
+            binding_policy: placement.loaded_binding_policy.into(),
         })
-        .collect::<Result<_, Error>>()?;
+        .collect();
     entries.sort_by(|left, right| left.persisted_role.cmp(&right.persisted_role));
     let envelope = PersistedStateV6 {
         version: CURRENT_STATE_VERSION,
@@ -1191,6 +1238,38 @@ mod tests {
             LoadedBindingPolicy::Saved(test_binding_policy())
         );
         assert_eq!(decoded.len(), 2);
+    }
+
+    /// A role whose window has not spawned still holds `LoadedBindingPolicy::LegacyWindowMarkers`,
+    /// and its entry is saved beside resolved roles instead of failing the whole encode.
+    #[test]
+    fn v6_roundtrip_keeps_an_unresolved_legacy_policy_beside_a_saved_one() {
+        let unspawned = super::super::managed_window_role("unspawned")
+            .unwrap_or_else(|error| panic!("test managed role rejected: {error}"));
+        let states = HashMap::from([
+            (
+                PersistedWindowRole::Primary,
+                saved_placement(awaiting_state()),
+            ),
+            (
+                PersistedWindowRole::Managed(String::from("unspawned")),
+                PersistedWindowPlacement::from(awaiting_state()),
+            ),
+        ]);
+        let encoded = encode(&states).unwrap_or_else(|error| {
+            panic!("v6 state with a legacy policy did not serialize: {error}")
+        });
+        let PersistedWindowStateDecodeOutcome::Decoded(decoded) = decode(&encoded) else {
+            panic!("encoded v6 state did not decode:\n{encoded}");
+        };
+        assert_eq!(
+            decoded[&primary_role()].loaded_binding_policy,
+            LoadedBindingPolicy::Saved(test_binding_policy())
+        );
+        assert_eq!(
+            decoded[&unspawned].loaded_binding_policy,
+            LoadedBindingPolicy::LegacyWindowMarkers
+        );
     }
 
     #[test]

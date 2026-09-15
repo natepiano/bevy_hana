@@ -11,15 +11,17 @@
 //!   no macOS display supplies a serial of its own today. A non-null UUID reaches
 //!   `DeviceIdSource::Synthesized`, which restores a saved window correctly and never authorizes
 //!   output. A null result supplies no durable display name and remains match evidence only.
-//! - **Windows and X11/DRM** validate the complete EDID. A usable numeric or text EDID serial is
-//!   reported under the shared `edid-serial` scheme. A validated EDID with no usable serial keeps
-//!   its descriptor fingerprint and reports synthesized identity. A failed query or an unavailable,
-//!   malformed, or incomplete EDID supplies no display evidence, so it remains match evidence only
-//!   rather than reporting that the unit permanently exposes no serial. On Linux, a checked
-//!   internal connector may still name a non-swappable built-in display; that synthesized identity
-//!   does not mean the display's serial was read and found absent.
-//! - **Wayland** withholds display evidence entirely, so its displays report match evidence with no
-//!   durable name at all.
+//! - **Windows, X11/DRM, and Wayland/DRM** validate the complete EDID. A usable numeric or text
+//!   EDID serial is reported under the shared `edid-serial` scheme. A validated EDID with no usable
+//!   serial keeps its descriptor fingerprint and reports synthesized identity. A failed query or an
+//!   unavailable, malformed, or incomplete EDID supplies no display evidence, so it remains match
+//!   evidence only rather than reporting that the unit permanently exposes no serial. On Linux, a
+//!   checked internal connector may still name a non-swappable built-in display; that synthesized
+//!   identity does not mean the display's serial was read and found absent.
+//! - **Wayland** has no protocol that carries the EDID, so the reader opens the `edid` file of the
+//!   `/sys/class/drm` connector whose name equals the output name `MonitorHandle::name` returns. An
+//!   output name that matches no connector, or matches a connector on more than one card, supplies
+//!   no display evidence and remains match evidence only.
 //!
 //! `MonitorPlugin` registers `edid-serial` before the kernel ingests any display scan. A scheme
 //! names the identity space the display itself publishes, rather than the operating system that
@@ -167,7 +169,7 @@ fn fresh_display_evidence(
             .values()
             .next()
             .ok_or_else(|| discovery_transport_error("no current winit window is available"))?;
-        Ok::<Vec<_>, DeviceAccessError>(window.available_monitors().collect())
+        Ok::<Vec<_>, DeviceAccessError>(distinct_monitor_handles(window.available_monitors()))
     })?;
     if current_handles.is_empty() && !observed.is_empty() {
         return Err(platform::empty_current_display_list_error(observed.len()));
@@ -195,6 +197,24 @@ fn fresh_display_evidence(
             Ok(entry.clone())
         })
         .collect()
+}
+
+/// Keep the first of every group of equal monitor handles, in enumeration order.
+///
+/// winit's Wayland backend can return equal handles for one output from `available_monitors`
+/// (Plasma: four handles for two outputs). Each duplicate would become a second record carrying the
+/// same `DeviceKey`, and the kernel keeps a key reported twice in one scan out of service, so no
+/// window could bind to that display.
+fn distinct_monitor_handles<Handle: PartialEq>(
+    handles: impl IntoIterator<Item = Handle>,
+) -> Vec<Handle> {
+    let mut distinct_handles = Vec::new();
+    for handle in handles {
+        if !distinct_handles.contains(&handle) {
+            distinct_handles.push(handle);
+        }
+    }
+    distinct_handles
 }
 
 #[cfg(any(test, feature = "test"))]
@@ -564,6 +584,11 @@ mod tests {
 
         assert_eq!(record.reported_as, ReportedAs::MatchEvidenceOnly);
         assert_eq!(record.serial, ReportedSerial::PlatformCannotReport);
+    }
+
+    #[test]
+    fn equal_monitor_handles_are_reported_once_in_enumeration_order() {
+        assert_eq!(distinct_monitor_handles([7, 3, 7, 3, 9]), vec![7, 3, 9]);
     }
 
     fn duplicate_descriptor_records() -> Vec<DeviceRecord> {

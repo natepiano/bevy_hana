@@ -5,7 +5,7 @@
 //! ## The Problem
 //!
 //! On macOS with multiple monitors that have different scale factors (e.g., a Retina display
-//! at scale 2.0 and an external monitor at scale 1.0), Bevy's window positioning has issues:
+//! at scale 2.0 and an external monitor at scale 1.0), Bevy's window positioning has flaws:
 //!
 //! 1. **`Window.position` is unreliable at startup**: When a window is created, `Window.position`
 //!    is `Automatic` (not `At(position)`), even though winit has placed the window at a specific
@@ -601,6 +601,7 @@ pub(crate) mod tests {
     use bevy::time::TimeUpdateStrategy;
     use bevy::window::Monitor;
     use bevy::window::OnMonitor;
+    use bevy::window::WindowMoved;
     use bevy::window::WindowPlugin;
     use bevy::winit::WinitMonitors;
     use hana_rigging::WaitingWork;
@@ -1353,9 +1354,8 @@ pub(crate) mod tests {
                 .map_err(|error| format!("failed to write current persisted state: {error}"))
         }
 
-        fn write_absent_classified_primary_placement(&self) -> Result<DeviceKey, String> {
-            let display_fingerprint =
-                DisplayFingerprint::from_evidence_bytes(ABSENT_IDENTIFIED_DISPLAY_EVIDENCE);
+        fn write_classified_primary_placement(&self, evidence: &[u8]) -> Result<DeviceKey, String> {
+            let display_fingerprint = DisplayFingerprint::from_evidence_bytes(evidence);
             let contents = format!(
                 "(\n    version: 5,\n    entries: [\n        (\n            key: Primary,\n            state: (\n                target: Classified((kind: Display, id: Synthesized(digest: {}))),\n                position: MonitorOffset(({}, {})),\n                logical_width: 640,\n                logical_height: 480,\n                mode: Windowed,\n                app_name: \"startup-test\",\n            ),\n        ),\n    ],\n)\n",
                 display_fingerprint.get(),
@@ -1365,23 +1365,21 @@ pub(crate) mod tests {
             let PersistedWindowStateDecodeOutcome::Decoded(decoded) =
                 persistence::decode_persisted_state_for_test(&contents)
             else {
-                return Err(String::from(
-                    "absent classified state fixture did not decode",
-                ));
+                return Err(String::from("classified state fixture did not decode"));
             };
             let role = persistence::primary_window_role()
                 .map_err(|error| format!("failed to create fixture role: {error}"))?;
             let persisted = decoded
                 .get(&role)
                 .ok_or_else(|| String::from("decoded fixture has no primary placement"))?;
-            let device = device_for_identified_display(ABSENT_IDENTIFIED_DISPLAY_EVIDENCE);
+            let device = device_for_identified_display(evidence);
             if persisted.target != PersistedWindowTargetV5::Classified(device.clone()) {
                 return Err(String::from(
-                    "decoded fixture did not retain its absent classified display",
+                    "decoded fixture did not retain its classified display",
                 ));
             }
             fs::write(self.directory.path().join("windows.ron"), contents)
-                .map_err(|error| format!("failed to write absent classified state: {error}"))?;
+                .map_err(|error| format!("failed to write classified state: {error}"))?;
             Ok(device)
         }
 
@@ -1747,6 +1745,17 @@ pub(crate) mod tests {
                 digest: Digest::new(display_fingerprint.get()),
             },
         }
+    }
+
+    fn primary_window_entity(harness: &mut ProductionPluginHarness) -> Result<Entity, String> {
+        let mut primary = harness
+            .app
+            .world_mut()
+            .query_filtered::<Entity, With<PrimaryWindow>>();
+        primary
+            .iter(harness.app.world())
+            .next()
+            .ok_or_else(|| String::from("harness installed no primary window"))
     }
 
     fn set_primary_window_position(
@@ -3967,7 +3976,8 @@ pub(crate) mod tests {
             |_| {},
             |path| WindowManagerPlugin::with_path(path).recover_on_return(),
         )?;
-        let absent_device = harness.write_absent_classified_primary_placement()?;
+        let absent_device =
+            harness.write_classified_primary_placement(ABSENT_IDENTIFIED_DISPLAY_EVIDENCE)?;
         let (_, right_monitor) = harness.install_identified_headless_display_pair();
         let primary_window = harness.primary_window()?;
         set_primary_window_position(&mut harness, primary_window, LEFT_DISPLAY_WINDOW_POSITION)?;
@@ -4059,7 +4069,8 @@ pub(crate) mod tests {
             |_| {},
             |path| WindowManagerPlugin::with_path(path).recover_on_return(),
         )?;
-        let absent_device = harness.write_absent_classified_primary_placement()?;
+        let absent_device =
+            harness.write_classified_primary_placement(ABSENT_IDENTIFIED_DISPLAY_EVIDENCE)?;
         harness.install_identified_headless_window_topology();
         harness
             .app
@@ -4425,6 +4436,187 @@ pub(crate) mod tests {
         assert_ne!(rebound_device, launch_device);
         assert_eq!(rebound_device, expected_device);
         Ok(())
+    }
+
+    /// A saved placement that names its display keeps that display through the first
+    /// `CurrentMonitor` correction.
+    ///
+    /// winit answers `current_monitor()` for an X11 window before the window manager maps it, and
+    /// `install_current_monitor_from_association` reinserts the display the window is really on a
+    /// few frames later. `rebind_window_to_its_current_display` replaced the binding on that
+    /// reinsertion with the launch geometry read back from the window, so a window saved on one
+    /// display and launched on another was never restored.
+    #[test]
+    fn a_display_correction_before_the_first_restore_keeps_a_classified_placement()
+    -> Result<(), String> {
+        let mut harness = ProductionPluginHarness::new(KernelInstallation::WindowManagerOwned)?;
+        let saved_device =
+            harness.write_classified_primary_placement(IDENTIFIED_DISPLAY_EVIDENCE)?;
+        let (_, right) = harness.install_identified_headless_display_pair();
+        let role = persistence::primary_window_role()
+            .map_err(|error| format!("failed to create primary role: {error}"))?;
+
+        let mut attempt = None;
+        for _ in 0..STARTUP_RESTORE_UPDATE_LIMIT {
+            harness.app.update();
+            if let Some(started) = applying_attempt(&harness.app, &role) {
+                attempt = Some(started);
+                break;
+            }
+        }
+        attempt.ok_or_else(|| String::from("classified placement never started a restore"))?;
+
+        let primary_window = primary_window_entity(&mut harness)?;
+        set_primary_window_monitor(
+            &mut harness,
+            primary_window,
+            right,
+            RIGHT_DISPLAY_WINDOW_POSITION,
+        )?;
+        for _ in 0..STARTUP_RESTORE_UPDATE_LIMIT {
+            harness.app.update();
+        }
+
+        let bound_device = harness
+            .app
+            .world()
+            .resource::<Bindings>()
+            .binding(&role)
+            .map_err(|error| format!("primary window lost its binding: {error}"))?
+            .endpoint
+            .device
+            .clone();
+        assert_eq!(bound_device, saved_device);
+        Ok(())
+    }
+
+    /// An anonymous legacy placement follows the first `OnMonitor` association and keeps its saved
+    /// geometry.
+    ///
+    /// A v2 record names no display, so its binding is authored against the display
+    /// `update_current_monitor` reads from winit's `current_monitor()` query before Bevy inserts
+    /// `OnMonitor`. On X11 that query answers before the window manager maps the window, and the
+    /// first `OnMonitor` insertion lands while the role is still waiting for its first restore.
+    /// The endpoint moves to the associated display and the restore dispatches the record's size,
+    /// not the launch size read back from the window.
+    #[test]
+    fn a_display_correction_before_the_first_restore_moves_an_anonymous_placement()
+    -> Result<(), String> {
+        let mut harness = ProductionPluginHarness::new(KernelInstallation::WindowManagerOwned)?;
+        harness.write_legacy_anonymous_primary_placement()?;
+        let (_, right) = harness.install_identified_headless_display_pair();
+        let role = persistence::primary_window_role()
+            .map_err(|error| format!("failed to create primary role: {error}"))?;
+        let corrected_attempt = correct_anonymous_primary_display(&mut harness, &role, right)?;
+
+        let driver_state = harness.app.world().resource::<WindowRoleDriverState>();
+        let RestoreRecord::UnderPreparation(preparation) =
+            driver_state.restore_record(corrected_attempt)
+        else {
+            return Err(String::from(
+                "window driver did not retain the corrected preparation",
+            ));
+        };
+        assert_eq!(preparation.dispatched().logical_size, UVec2::new(640, 480));
+        Ok(())
+    }
+
+    /// A move report during the first restore of an anonymous placement keeps the corrected
+    /// endpoint.
+    ///
+    /// Each restore dispatch moves the window, and `bevy_winit` reinserts `OnMonitor` from
+    /// `current_monitor()` after the move. A report that still names the display the window left
+    /// would otherwise move the endpoint back, and the next dispatch would move the window again,
+    /// alternating the binding between the two displays.
+    #[test]
+    fn a_move_report_during_the_first_restore_keeps_the_corrected_anonymous_endpoint()
+    -> Result<(), String> {
+        let mut harness = ProductionPluginHarness::new(KernelInstallation::WindowManagerOwned)?;
+        harness.write_legacy_anonymous_primary_placement()?;
+        let (left, right) = harness.install_identified_headless_display_pair();
+        let role = persistence::primary_window_role()
+            .map_err(|error| format!("failed to create primary role: {error}"))?;
+        correct_anonymous_primary_display(&mut harness, &role, right)?;
+
+        let primary_window = primary_window_entity(&mut harness)?;
+        set_primary_window_monitor(
+            &mut harness,
+            primary_window,
+            left,
+            LEFT_DISPLAY_WINDOW_POSITION,
+        )?;
+        for _ in 0..STARTUP_RESTORE_UPDATE_LIMIT {
+            harness.app.update();
+        }
+
+        let bound_device = harness
+            .app
+            .world()
+            .resource::<Bindings>()
+            .binding(&role)
+            .map_err(|error| format!("primary window lost its binding: {error}"))?
+            .endpoint
+            .device
+            .clone();
+        assert_eq!(
+            bound_device,
+            device_for_identified_display(SECOND_IDENTIFIED_DISPLAY_EVIDENCE)
+        );
+        Ok(())
+    }
+
+    /// Report the window manager's placement of the primary window on `right` as soon as its
+    /// anonymous binding is authored, and return the restore attempt that starts on that display.
+    ///
+    /// winit writes `WindowMoved` before `changed_windows` reinserts `OnMonitor`, so the message is
+    /// read one update ahead of the association.
+    fn correct_anonymous_primary_display(
+        harness: &mut ProductionPluginHarness,
+        role: &RoleKey,
+        right: Entity,
+    ) -> Result<AttemptRef, String> {
+        for _ in 0..STARTUP_RESTORE_UPDATE_LIMIT {
+            if harness
+                .app
+                .world()
+                .resource::<Bindings>()
+                .binding(role)
+                .is_ok()
+            {
+                break;
+            }
+            harness.app.update();
+        }
+        let primary_window = primary_window_entity(harness)?;
+        harness.app.world_mut().write_message(WindowMoved {
+            window:   primary_window,
+            position: RIGHT_DISPLAY_WINDOW_POSITION,
+        });
+        harness.app.update();
+        set_primary_window_monitor(
+            harness,
+            primary_window,
+            right,
+            RIGHT_DISPLAY_WINDOW_POSITION,
+        )?;
+        let corrected_device = device_for_identified_display(SECOND_IDENTIFIED_DISPLAY_EVIDENCE);
+        for _ in 0..STARTUP_RESTORE_UPDATE_LIMIT {
+            harness.app.update();
+            let on_corrected_display = harness
+                .app
+                .world()
+                .resource::<Bindings>()
+                .binding(role)
+                .is_ok_and(|binding| binding.endpoint.device == corrected_device);
+            if let Some(attempt) =
+                applying_attempt(&harness.app, role).filter(|_| on_corrected_display)
+            {
+                return Ok(attempt);
+            }
+        }
+        Err(String::from(
+            "the display correction did not start a restore on the corrected display",
+        ))
     }
 
     /// A window moved within its display must save the position it was moved to.

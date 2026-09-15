@@ -169,6 +169,24 @@
   buffer sized to the display with a color buffer sized to the window. wgpu
   rejected the frame and Bevy quit. Clerestory now announces its own resizes in
   `PostUpdate`, before cameras read them.
+- Wayland: saved windows are restored again. Wayland displays had no identity,
+  so no saved window could be tied to a display. It waited two seconds, then
+  opened at its saved size on whatever display the compositor picked, windowed
+  even when it was saved fullscreen. Clerestory now reads each output's EDID
+  from the `/sys/class/drm` connector with the same name, the same source X11
+  falls back to, so a display gets the identity it has under X11. An output
+  whose name matches no single connector still has no identity.
+- X11: a window saved on one display and launched on another is restored to
+  its saved display again. winit reports a window's display before the window
+  manager has placed it, and the corrected report that follows was taken as the
+  user moving the window, which replaced the saved placement with the launch
+  position. A window from an older file that names no display now takes the
+  display the window manager places it on and keeps its saved size and
+  position there.
+- A v5 or older saved file that lists a window the application has not opened
+  yet is saved again. Until that window opens, its entry is written without a
+  `policy`, which is read from the window's recovery markers when it does.
+  Before, every save failed and logged a warning each frame.
 
 ## [0.3.0] - 2026-07-30
 

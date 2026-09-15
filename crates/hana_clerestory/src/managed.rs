@@ -71,6 +71,7 @@ use crate::monitors::LiveDisplayDevices;
 use crate::monitors::LiveDisplayEndpointLookup;
 use crate::monitors::LiveDisplayMatchError;
 use crate::monitors::Monitors;
+use crate::monitors::ProvisionalCurrentMonitor;
 use crate::output_proof::OnScreenConfirmation;
 use crate::persistence;
 use crate::persistence::EstablishedWindowPlacement;
@@ -325,17 +326,45 @@ impl WindowRiggingRole {
 pub(crate) struct WindowsWithRiggingRole(Vec<Entity>);
 
 /// Marks a current-monitor change that still needs an exact live-device lookup.
-#[derive(Component)]
-pub(crate) struct WindowDisplayRebindPending;
+#[derive(Clone, Copy, Component, Debug, PartialEq, Eq)]
+pub(crate) enum WindowDisplayRebindPending {
+    /// `CurrentMonitor` was reinserted for a window without [`ProvisionalCurrentMonitor`].
+    ReportedMove,
+    /// `CurrentMonitor` was reinserted while the window carries [`ProvisionalCurrentMonitor`], so
+    /// the display change reflects where the window manager placed the window.
+    AssociationCorrection,
+}
 
 /// Defer display rebind work until reporter capabilities have been projected.
 pub(crate) fn queue_window_display_rebind(
     current_monitor_added: On<Insert, CurrentMonitor>,
+    windows: Query<(
+        Option<&ProvisionalCurrentMonitor>,
+        Option<&WindowDisplayRebindPending>,
+    )>,
     mut commands: Commands,
 ) {
-    commands
-        .entity(current_monitor_added.entity)
-        .insert(WindowDisplayRebindPending);
+    let entity = current_monitor_added.entity;
+    let Ok((provisional, pending)) = windows.get(entity) else {
+        return;
+    };
+    let mut window = commands.entity(entity);
+    match provisional {
+        Some(ProvisionalCurrentMonitor::PlacementReported) => {
+            window
+                .remove::<ProvisionalCurrentMonitor>()
+                .insert(WindowDisplayRebindPending::AssociationCorrection);
+        },
+        Some(ProvisionalCurrentMonitor::AwaitingPlacement) => {
+            window.insert(WindowDisplayRebindPending::AssociationCorrection);
+        },
+        // A correction still waiting for its live-device lookup keeps its kind when a later
+        // reinsertion lands before `rebind_window_to_its_current_display` reads it.
+        None if pending == Some(&WindowDisplayRebindPending::AssociationCorrection) => {},
+        None => {
+            window.insert(WindowDisplayRebindPending::ReportedMove);
+        },
+    }
 }
 
 fn window_endpoint_id(role: &RoleKey) -> Result<EndpointId, PartNameError> {
@@ -744,12 +773,10 @@ pub(crate) fn rebind_window_to_its_current_display(
             &Window,
             &CurrentMonitor,
             &WindowRiggingRole,
+            &WindowDisplayRebindPending,
             Has<PrimaryWindow>,
         ),
-        (
-            With<WindowBindingAuthoring>,
-            With<WindowDisplayRebindPending>,
-        ),
+        With<WindowBindingAuthoring>,
     >,
     registry: Res<ManagedWindowRegistry>,
     live_displays: LiveDisplayEndpointLookup,
@@ -757,10 +784,11 @@ pub(crate) fn rebind_window_to_its_current_display(
     driver: Res<WindowDriverId>,
     role_statuses: Query<&RoleStatus>,
     resolved_devices: Query<&ResolvedToDevice>,
+    persisted: Res<PersistedWindowPlacements>,
     mut bindings: ResMut<Bindings>,
     mut stranded: ResMut<StrandedWindowMovementBaselines>,
 ) {
-    for (entity, window, current_monitor, window_rigging_role, primary) in &windows {
+    for (entity, window, current_monitor, window_rigging_role, rebind, primary) in &windows {
         let role_source = if primary {
             WindowBindingRoleSource::Primary
         } else {
@@ -826,20 +854,39 @@ pub(crate) fn rebind_window_to_its_current_display(
             stranded.restart_placement(role);
             continue;
         }
+        // No accepted placement has set `Binding::last_known_good` yet, so the role's saved
+        // placement is still being carried to its display and `first_restore_rebind` reads the
+        // change against that placement.
+        let first_restore = if existing.last_known_good().is_err() && !stranded.is_tracked(&role) {
+            first_restore_rebind(
+                &role,
+                *rebind,
+                role_statuses.get(window_rigging_role.entity()).ok(),
+                &persisted,
+            )
+        } else {
+            FirstRestoreRebind::ReadBack
+        };
+        let placement = match first_restore {
+            FirstRestoreRebind::KeepSavedEndpoint => continue,
+            FirstRestoreRebind::FollowWithSavedPlacement(placement) => placement,
+            FirstRestoreRebind::ReadBack => {
+                let physical_position = match window.position {
+                    WindowPosition::At(position) => Some(IVec2::new(position.x, position.y)),
+                    _ => None,
+                };
+                EstablishedWindowPlacement::from_readback(
+                    window,
+                    current_monitor,
+                    physical_position,
+                    *platform,
+                )
+            },
+        };
         let endpoint = DeviceEndpoint {
             device,
             id: existing.endpoint.id.clone(),
         };
-        let physical_position = match window.position {
-            WindowPosition::At(position) => Some(IVec2::new(position.x, position.y)),
-            _ => None,
-        };
-        let placement = crate::persistence::EstablishedWindowPlacement::from_readback(
-            window,
-            current_monitor,
-            physical_position,
-            *platform,
-        );
         let replacement =
             window_binding(role.clone(), endpoint, driver.0, placement, binding_policy);
         if let Err(error) = bindings.replace_authoring(replacement) {
@@ -849,6 +896,59 @@ pub(crate) fn rebind_window_to_its_current_display(
             continue;
         }
         stranded.forget(&role);
+    }
+}
+
+/// How `rebind_window_to_its_current_display` treats a display change for a role whose first
+/// restore has not set `Binding::last_known_good`.
+enum FirstRestoreRebind {
+    /// The binding keeps the endpoint it was authored with, and the in-flight restore carries the
+    /// window to that display.
+    KeepSavedEndpoint,
+    /// The endpoint moves to the reported display and the binding keeps the saved geometry.
+    FollowWithSavedPlacement(EstablishedWindowPlacement),
+    /// The change is read back from the window like a move.
+    ReadBack,
+}
+
+/// Read a display change against the role's saved placement.
+///
+/// A record that names its display was authored against that display, so an
+/// `AssociationCorrection` reports only where the window manager placed the window before the
+/// restore moves it. An anonymous record was authored against the display `update_current_monitor`
+/// read before that placement, so the correction moves its endpoint and keeps its saved geometry.
+/// Once the placement is reported, every restore dispatch moves the window and `bevy_winit`
+/// reinserts `OnMonitor` from `current_monitor()` after the move; a `ReportedMove` that lands while
+/// the role is `RoleStatusView::Applying` therefore reflects that dispatch and keeps the endpoint.
+/// A role that is not applying, such as a respawned window whose saved display has just returned,
+/// reads the change back.
+fn first_restore_rebind(
+    role: &RoleKey,
+    rebind: WindowDisplayRebindPending,
+    status: Option<&RoleStatus>,
+    persisted: &PersistedWindowPlacements,
+) -> FirstRestoreRebind {
+    let PersistedWindowPlacementLookup::Saved(saved) = persisted.get(role) else {
+        return FirstRestoreRebind::ReadBack;
+    };
+    let anonymous = matches!(
+        saved.window_state.target,
+        PersistedWindowTargetV5::AwaitingLegacyEvidence(PersistedDisplayIdentityV4::Anonymous)
+    );
+    match rebind {
+        WindowDisplayRebindPending::AssociationCorrection if anonymous => {
+            FirstRestoreRebind::FollowWithSavedPlacement(EstablishedWindowPlacement::from(
+                &saved.window_state,
+            ))
+        },
+        WindowDisplayRebindPending::AssociationCorrection => FirstRestoreRebind::KeepSavedEndpoint,
+        WindowDisplayRebindPending::ReportedMove
+            if status
+                .is_some_and(|status| matches!(status.view(), RoleStatusView::Applying { .. })) =>
+        {
+            FirstRestoreRebind::KeepSavedEndpoint
+        },
+        WindowDisplayRebindPending::ReportedMove => FirstRestoreRebind::ReadBack,
     }
 }
 

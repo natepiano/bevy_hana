@@ -63,6 +63,7 @@ MAX_POLLS: Final = 200  # 10s timeout
 COMP_WINDOW: Final = "bevy_window::window::Window"
 COMP_PRIMARY: Final = "bevy_window::window::PrimaryWindow"
 COMP_MANAGED: Final = "hana_clerestory::managed::ManagedWindow"
+COMP_MANAGED_NAME: Final = "hana_clerestory::managed::ManagedWindowName"
 COMP_CURRENT_MONITOR: Final = "hana_clerestory::monitors::CurrentMonitor"
 COMP_LAUNCH_INFO: Final = "hana_clerestory::restore::RestoreDiagnostics"
 COMP_TARGET_POSITION: Final = "hana_clerestory::restore::TargetPosition"
@@ -122,6 +123,7 @@ class TestEntry(_TestEntryRequired, total=False):
     automation: str
     launch_monitor: int
     launch_monitor_role: str
+    birth_monitor: str
     launch_size: str
     requires: TestRequirements
     mutation: MutationConfig
@@ -157,6 +159,8 @@ class RonWindowValues(TypedDict, total=False):
     width: str
     height: str
     monitor: str
+    # v6: RON text inside `target: Classified(..)`, matched against `MONITOR_{i}_DEVICE_KEY`.
+    target_device_key: str
     mode: str
     mutation_physical_x: str
     mutation_physical_y: str
@@ -329,7 +333,7 @@ class BrpClient:
 
     def query_managed(self) -> JsonDict:
         return self.call("world.query", {
-            "data": {"components": [COMP_WINDOW, COMP_MANAGED, COMP_CURRENT_MONITOR]},
+            "data": {"components": [COMP_WINDOW, COMP_MANAGED_NAME, COMP_CURRENT_MONITOR]},
             "filter": {"with": [COMP_MANAGED], "without": [COMP_PRIMARY]},
         })
 
@@ -369,6 +373,28 @@ def substitute_ron(template: str, env_vars: dict[str, str]) -> str:
     return re.sub(r"\$\{([^}]+)\}", _replacer, template)
 
 
+def _normalize_device_key(text: str) -> str:
+    """Drop whitespace and trailing commas so pretty and compact RON spell one key the same way."""
+    return re.sub(r",\)", ")", re.sub(r"\s+", "", text))
+
+
+def _join_classified_targets(content: str) -> list[str]:
+    """Split RON into lines, joining a `target: Classified(` that pretty RON spreads over several."""
+    lines: list[str] = []
+    pending = ""
+    for line in content.splitlines():
+        if pending or "target: Classified(" in line:
+            pending += line.strip() if pending else line
+            if pending.count("(") <= pending.count(")"):
+                lines.append(pending)
+                pending = ""
+            continue
+        lines.append(line)
+    if pending:
+        lines.append(pending)
+    return lines
+
+
 def parse_ron_values(content: str) -> dict[str, RonWindowValues]:
     """Parse RON file into per-window-key dicts of expected values."""
     result: dict[str, RonWindowValues] = {}
@@ -389,9 +415,10 @@ def parse_ron_values(content: str) -> dict[str, RonWindowValues]:
     re_width = re.compile(r"logical_width: (\d+)")
     re_height = re.compile(r"logical_height: (\d+)")
     re_monitor = re.compile(r"monitor_index: (\d+)")
+    re_classified = re.compile(r"target: Classified\((.+)\),?\s*$")
     re_mode = re.compile(r"mode: (Windowed|BorderlessFullscreen|Fullscreen)")
 
-    for line in content.splitlines():
+    for line in _join_classified_targets(content):
         if "key: Primary" in line:
             current_key = "primary"
             if current_key not in result:
@@ -461,6 +488,11 @@ def parse_ron_values(content: str) -> dict[str, RonWindowValues]:
         m = re_monitor.search(line)
         if m:
             entry["monitor"] = m.group(1)
+            continue
+
+        m = re_classified.search(line)
+        if m:
+            entry["target_device_key"] = _normalize_device_key(m.group(1))
             continue
 
         m = re_mode.search(line)
@@ -683,7 +715,6 @@ def _current_monitor_index(entity: JsonDict) -> str:
     reflected = extract_from_entity(
         entity,
         COMP_CURRENT_MONITOR,
-        "monitor_info",
         "descriptor",
         "index",
     )
@@ -863,11 +894,29 @@ def validate_window(
 
         elif field == "monitor_index":
             actual_idx = _current_monitor_index(entity)
-            exp_idx = ron_values.get("monitor", "")
+            exp_idx = _expected_monitor_index(ron_values, env_vars or {})
             _check_field(key, "monitor_index", exp_idx, actual_idx, prefix)
 
         elif field == "exit_code":
             pass  # handled separately
+
+
+def _expected_monitor_index(ron_values: RonWindowValues, env_vars: dict[str, str]) -> str:
+    """Return the monitor index a saved window is expected on.
+
+    A v6 `Classified(..)` target names a display by its kernel device key, so the index is the
+    discovered monitor whose `MONITOR_{i}_DEVICE_KEY` is the same RON text. Older templates carry
+    `monitor_index` directly.
+    """
+    device_key = ron_values.get("target_device_key", "")
+    if not device_key:
+        return ron_values.get("monitor", "")
+    i = 0
+    while f"MONITOR_{i}_SCALE" in env_vars:
+        if _normalize_device_key(env_vars.get(f"MONITOR_{i}_DEVICE_KEY", "")) == device_key:
+            return str(i)
+        i += 1
+    return ""
 
 
 def _check_position(
@@ -1095,12 +1144,10 @@ def spawn_and_poll_managed(
 
 
 def get_managed_by_name(entities: list[JsonDict], window_name: str) -> JsonDict | None:
+    # `ManagedWindowName(String)` is a newtype, which reflection serializes as its bare string.
     for ent in entities:
-        managed = extract_from_entity(ent, COMP_MANAGED)
-        if isinstance(managed, dict):
-            d = cast(JsonDict, managed)
-            if d.get("name") == window_name:
-                return ent
+        if extract_from_entity(ent, COMP_MANAGED_NAME) == window_name:
+            return ent
     return None
 
 
@@ -1375,10 +1422,10 @@ def resolve_backend(backend: str, test: TestEntry) -> str:
 def _swap_x11_env_vars(env_vars: dict[str, str]) -> None:
     """Swap MONITOR_* env vars with their X11 counterparts for X11 tests.
 
-    Replaces POS, LOGICAL_POS, and SCALE with X11-discovered values so that
+    Replaces POS, LOGICAL_POS, SCALE, and DEVICE_KEY with X11-discovered values so that
     RON template substitution and validation use X11 coordinates.
     """
-    suffixes = ["_POS_X", "_POS_Y", "_LOGICAL_POS_X", "_LOGICAL_POS_Y", "_SCALE"]
+    suffixes = ["_POS_X", "_POS_Y", "_LOGICAL_POS_X", "_LOGICAL_POS_Y", "_SCALE", "_DEVICE_KEY"]
     i = 0
     while f"MONITOR_{i}_SCALE" in env_vars:
         for suffix in suffixes:
@@ -1387,6 +1434,48 @@ def _swap_x11_env_vars(env_vars: dict[str, str]) -> None:
             if x11_key in env_vars:
                 env_vars[base_key] = env_vars[x11_key]
         i += 1
+
+
+COMPOSITOR_ACTIVE_OUTPUT: Final = "compositor_active_output"
+
+
+def _kwin_active_output_index(env_vars: dict[str, str]) -> int:
+    """Return the discovered index of the output KWin maps a new window on.
+
+    Wayland gives a windowed client no positioning, and KWin maps a new window on its active
+    output, the output under the pointer. `org.kde.KWin.activeOutputName` names that output, and
+    discovery exported each monitor's connector name as MONITOR_{i}_NAME.
+    """
+    try:
+        completed = subprocess.run(
+            ["qdbus", "org.kde.KWin", "/KWin", "org.kde.KWin.activeOutputName"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        die(f"KWin active output query failed: {error}")
+    name = completed.stdout.strip()
+    i = 0
+    while f"MONITOR_{i}_NAME" in env_vars:
+        if env_vars[f"MONITOR_{i}_NAME"] == name:
+            return i
+        i += 1
+    die(f"KWin active output {name!r} matches no discovered monitor")
+
+
+def _env_with_monitor_zero_as(env_vars: dict[str, str], index: int) -> dict[str, str]:
+    """Copy env_vars with every MONITOR_0_* value exchanged for its MONITOR_{index}_* value."""
+    exchanged = dict(env_vars)
+    for key, value in env_vars.items():
+        if not key.startswith("MONITOR_0_"):
+            continue
+        other = f"MONITOR_{index}_{key.removeprefix('MONITOR_0_')}"
+        if other in env_vars:
+            exchanged[key] = env_vars[other]
+            exchanged[other] = value
+    return exchanged
 
 
 def setup_test(
@@ -1427,7 +1516,15 @@ def setup_test(
     # (WARP) swapchain before the restore relocates it; only the cross-DPI cases set it.
     configured_launch_size = test.get("launch_size")
 
-    write_ron(test["ron_file"], ron_dir, ron_path, env_vars)
+    # Validation maps each saved display key back to its discovered index, so only the fixture
+    # substitution sees the exchanged monitors.
+    ron_env_vars = env_vars
+    if resolved_backend == "wayland" and test.get("birth_monitor") == COMPOSITOR_ACTIVE_OUTPUT:
+        active_output = _kwin_active_output_index(env_vars)
+        print(f"# KWin active output: monitor {active_output}")
+        ron_env_vars = _env_with_monitor_zero_as(env_vars, active_output)
+
+    write_ron(test["ron_file"], ron_dir, ron_path, ron_env_vars)
     return test, resolved_backend, env_vars
 
 
@@ -1528,6 +1625,10 @@ def run_discovery(
         env_vars[f"MONITOR_{i}_HEIGHT"] = size_h
         env_vars[f"MONITOR_{i}_SCALE"] = scale
         env_vars[f"MONITOR_{i}_REFRESH_RATE_MILLIHERTZ"] = refresh_rate
+        device_key = mon.get("device_key")
+        if isinstance(device_key, str):
+            env_vars[f"MONITOR_{i}_DEVICE_KEY"] = device_key
+            print(f"export MONITOR_{i}_DEVICE_KEY={device_key}")
         name = mon.get("name")
         if isinstance(name, str):
             env_vars[f"MONITOR_{i}_NAME"] = name
@@ -1604,7 +1705,7 @@ def run_discovery(
         for role, index in (("HIGH", high_index), ("LOW", low_index)):
             env_vars[f"{role}_SCALE_MONITOR_INDEX"] = str(index)
             print(f"export {role}_SCALE_MONITOR_INDEX={index}")
-            for suffix in ("LOGICAL_POS_X", "LOGICAL_POS_Y"):
+            for suffix in ("LOGICAL_POS_X", "LOGICAL_POS_Y", "DEVICE_KEY"):
                 value = env_vars.get(f"MONITOR_{index}_{suffix}", "0")
                 env_vars[f"{role}_SCALE_MONITOR_{suffix}"] = value
                 print(f"export {role}_SCALE_MONITOR_{suffix}={value}")
@@ -1648,6 +1749,10 @@ def run_discovery(
                 print(f"export MONITOR_{i}_X11_POS_Y={x11_pos_y}")
                 print(f"export MONITOR_{i}_X11_LOGICAL_POS_X={x11_lpos_x}")
                 print(f"export MONITOR_{i}_X11_LOGICAL_POS_Y={x11_lpos_y}")
+                x11_device_key = x11_list[i].get("device_key")
+                if isinstance(x11_device_key, str):
+                    env_vars[f"MONITOR_{i}_X11_DEVICE_KEY"] = x11_device_key
+                    print(f"export MONITOR_{i}_X11_DEVICE_KEY={x11_device_key}")
 
             x11_query = brp.call("world.query", {
                 "data": {"components": [COMP_MONITOR]},

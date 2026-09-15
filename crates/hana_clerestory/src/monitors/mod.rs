@@ -19,13 +19,16 @@ use bevy::prelude::Resource;
 use bevy::prelude::Update;
 use bevy::prelude::resource_changed;
 use bevy::prelude::warn;
+use bevy::window::WindowMoved;
 use bevy::winit::WinitMonitors;
 pub use current_monitor::CurrentMonitor;
 pub(crate) use current_monitor::CurrentMonitorEntity;
+pub(crate) use current_monitor::ProvisionalCurrentMonitor;
 use current_monitor::clear_monitor_selection_inputs;
 pub(crate) use current_monitor::current_monitor_from_association;
 pub(crate) use current_monitor::exact_monitor_association;
 pub(crate) use current_monitor::install_current_monitor_from_association;
+use current_monitor::record_window_manager_placement;
 pub(crate) use current_monitor::update_current_monitor;
 pub use display_product_name::DisplayProductName;
 use hana_rigging::prelude::AuthoritativeReporterCoverage;
@@ -105,7 +108,10 @@ impl Plugin for MonitorPlugin {
                 std::time::Duration::from_secs(10),
             ),
         );
-        app.insert_resource(configuration)
+        // `record_window_manager_placement` reads `WindowMoved`, which `WindowPlugin` registers
+        // only when an app installs it.
+        app.add_message::<WindowMoved>()
+            .insert_resource(configuration)
             .insert_resource(display_enumeration_source)
             .insert_resource(MonitorReporterId::new(monitor_reporter_id))
             .init_resource::<DisplayTopologyObservation>()
@@ -127,7 +133,11 @@ impl Plugin for MonitorPlugin {
             )
             .add_systems(
                 Update,
-                (update_current_monitor, ApplyDeferred)
+                (
+                    record_window_manager_placement,
+                    update_current_monitor,
+                    ApplyDeferred,
+                )
                     .chain()
                     .in_set(ClerestoryUpdateSet::CurrentMonitor),
             );

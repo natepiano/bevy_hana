@@ -8,7 +8,11 @@ use bevy::window::PrimaryWindow;
 use bevy_remote::BrpResult;
 use bevy_remote::RemotePlugin;
 use bevy_remote::http::RemoteHttpPlugin;
+use hana_clerestory::LiveDisplayDevices;
 use hana_clerestory::Monitors;
+use hana_rigging::prelude::DeviceKey;
+use ron::Options;
+use ron::extensions::Extensions;
 use serde::Serialize;
 use serde::Serializer;
 use serde_json::Value;
@@ -69,6 +73,7 @@ struct TestMonitorSnapshot {
     refresh_rate_millihertz: TestMonitorRefreshRate,
     physical_position:       [i32; 2],
     physical_size:           [u32; 2],
+    device_key:              TestMonitorDeviceKey,
 }
 
 enum TestMonitorName {
@@ -87,6 +92,31 @@ impl Serialize for TestMonitorName {
     {
         match self {
             Self::Reported(name) => serializer.serialize_some(name),
+            Self::Unavailable => serializer.serialize_none(),
+        }
+    }
+}
+
+/// RON text of the kernel `DeviceKey` for one monitor, written with the same `UNWRAP_NEWTYPES`
+/// extension as the save file so a fixture can substitute it into `Classified(..)` unchanged.
+enum TestMonitorDeviceKey {
+    Resolved(String),
+    Unavailable,
+}
+
+impl From<Option<String>> for TestMonitorDeviceKey {
+    fn from(device_key: Option<String>) -> Self {
+        device_key.map_or(Self::Unavailable, Self::Resolved)
+    }
+}
+
+impl Serialize for TestMonitorDeviceKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Resolved(device_key) => serializer.serialize_some(device_key),
             Self::Unavailable => serializer.serialize_none(),
         }
     }
@@ -144,11 +174,22 @@ fn monitor_snapshot(In(params): In<Option<Value>>, world: &mut World) -> BrpResu
                     .into(),
                 physical_position:       [info.physical_position.x, info.physical_position.y],
                 physical_size:           [info.physical_size.x, info.physical_size.y],
+                device_key:              monitor_device_key(world, entity).into(),
             }
         })
         .collect();
     serde_json::to_value(serde_json::json!({ "monitors": values }))
         .map_err(bevy_remote::BrpError::internal)
+}
+
+/// `None` while `LiveDisplayDevices` relates the monitor to no device, or to more than one.
+fn monitor_device_key(world: &World, monitor: Entity) -> Option<String> {
+    let device = world.get::<LiveDisplayDevices>(monitor)?.device().ok()?;
+    let device_key = world.get::<DeviceKey>(device)?;
+    Options::default()
+        .with_default_extension(Extensions::UNWRAP_NEWTYPES)
+        .to_string(device_key)
+        .ok()
 }
 
 fn window_snapshot(In(params): In<Option<Value>>, world: &mut World) -> BrpResult {
@@ -228,11 +269,13 @@ mod tests {
             refresh_rate_millihertz: TestMonitorRefreshRate::Unavailable,
             physical_position:       [0, 0],
             physical_size:           [1_920, 1_080],
+            device_key:              TestMonitorDeviceKey::Unavailable,
         };
 
         let value = serde_json::to_value(test_monitor_snapshot)?;
         assert!(value["name"].is_null());
         assert!(value["refresh_rate_millihertz"].is_null());
+        assert!(value["device_key"].is_null());
         Ok(())
     }
 }

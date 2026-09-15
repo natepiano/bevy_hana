@@ -61,7 +61,7 @@ pub(in crate::monitors) enum QualifiedEvidence {
     #[cfg(test)]
     InternalConnector(InternalConnector),
     #[cfg(test)]
-    X11Edid(EdidIdentityEvidence),
+    LinuxEdid(EdidIdentityEvidence),
     #[cfg(any(test, feature = "test"))]
     Synthetic(Vec<u8>),
 }
@@ -74,7 +74,7 @@ impl QualifiedEvidence {
             #[cfg(test)]
             Self::InternalConnector(connector) => connector.as_bytes(),
             #[cfg(test)]
-            Self::X11Edid(edid) => edid.stable_bytes(),
+            Self::LinuxEdid(edid) => edid.stable_bytes(),
             #[cfg(any(test, feature = "test"))]
             Self::Synthetic(bytes) => bytes,
         }
@@ -456,10 +456,10 @@ mod tests {
     fn qualified_edid_variants_retain_the_extracted_serial_tier() {
         let identity = qualify_edid(Ok(serial_edid())).expect("fixture EDID should qualify");
         let windows = QualifiedEvidence::WindowsEdid(identity.clone());
-        let x11 = QualifiedEvidence::X11Edid(identity);
+        let linux = QualifiedEvidence::LinuxEdid(identity);
 
         assert_eq!(windows.stable_bytes(), b"42");
-        assert_eq!(x11.stable_bytes(), b"42");
+        assert_eq!(linux.stable_bytes(), b"42");
     }
 
     #[test]

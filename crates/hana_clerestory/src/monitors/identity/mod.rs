@@ -77,7 +77,8 @@ impl DisplayFingerprint {
 pub enum DisplayIdentity {
     /// The display reported evidence unique to it. Stable across runs, reboots and replugs.
     Fingerprinted(DisplayFingerprint),
-    /// No usable display evidence. Wayland withholds it, a virtual display may synthesize none,
+    /// No usable display evidence. A Wayland output whose name matches no DRM connector supplies
+    /// none, a virtual display may synthesize none,
     /// and two identical displays reporting no serial number are indistinguishable to the
     /// operating system. A position saved against such a monitor has no cross-restart target.
     #[default]
@@ -185,11 +186,11 @@ pub(super) fn classify_display_evidence(
             synthesized_without_serial(fingerprint)
         },
         #[cfg(any(test, all(unix, not(target_os = "macos"))))]
-        native::QualifiedEvidence::X11Edid(EdidIdentityEvidence::ReportedSerial(serial)) => {
+        native::QualifiedEvidence::LinuxEdid(EdidIdentityEvidence::ReportedSerial(serial)) => {
             DisplayIdentityEvidence::ReportedSerial(serial.clone())
         },
         #[cfg(any(test, all(unix, not(target_os = "macos"))))]
-        native::QualifiedEvidence::X11Edid(EdidIdentityEvidence::Descriptor(_)) => {
+        native::QualifiedEvidence::LinuxEdid(EdidIdentityEvidence::Descriptor(_)) => {
             synthesized_without_serial(fingerprint)
         },
         #[cfg(any(test, target_os = "linux"))]
