@@ -1,12 +1,13 @@
 [package]
-authors.workspace    = true
-description          = "Hardware-free scripted device reporting for hana_rigging tests and examples"
-edition.workspace    = true
-license.workspace    = true
-name                 = "hana_rigging_scripted"
-publish              = false
-repository.workspace = true
-version              = "0.1.0"
+authors.workspace = true
+description       = "Hardware-free scripted device reporting for hana_rigging tests and examples"
+edition.workspace = true
+homepage          = "https://github.com/natepiano/bevy_hana/tree/main/crates/hana_rigging_scripted"
+license.workspace = true
+name              = "hana_rigging_scripted"
+publish           = false
+repository        = "https://github.com/natepiano/bevy_hana"
+version           = "0.1.0"
 
 [lints]
 workspace = true
