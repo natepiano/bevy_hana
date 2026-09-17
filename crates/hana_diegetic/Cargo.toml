@@ -1,16 +1,16 @@
 [package]
-authors.workspace    = true
-categories           = ["game-development", "gui"]
-description          = "Diegetic UI layout engine for Bevy — in-world panels driven by a Clay-inspired layout algorithm"
-edition.workspace    = true
-homepage             = "https://github.com/natepiano/hana/tree/main/crates/hana_diegetic"
-keywords             = ["bevy", "diegetic", "layout", "ui"]
-license.workspace    = true
-name                 = "hana_diegetic"
-publish              = false
-readme               = "README.md"
-repository.workspace = true
-version.workspace    = true
+authors.workspace = true
+categories        = ["game-development", "gui"]
+description       = "Diegetic UI layout engine for Bevy — in-world panels driven by a Clay-inspired layout algorithm"
+edition.workspace = true
+homepage          = "https://github.com/natepiano/bevy_hana/tree/main/crates/hana_diegetic"
+keywords          = ["bevy", "diegetic", "layout", "ui"]
+license.workspace = true
+name              = "hana_diegetic"
+publish           = false
+readme            = "README.md"
+repository        = "https://github.com/natepiano/bevy_hana"
+version.workspace = true
 
 [lints]
 workspace = true
