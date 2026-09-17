@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-17
+
+### Changed
+
+- Depends on `hana_kana` instead of `bevy_kana` — the same crate, renamed. No API
+  change; it is used only internally for numeric conversion traits.
+
 ### Fixed
 
 - Fix `outline_pipeline` and `hull_outline_pipeline` failing wgpu validation on cameras whose view bind group carries layout entries the outline passes did not request, such as an `Atmosphere`

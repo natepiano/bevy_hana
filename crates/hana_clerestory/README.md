@@ -1,9 +1,9 @@
 # hana_clerestory
 
-[![License](https://img.shields.io/badge/license-MIT%2FApache-blue.svg)](https://github.com/natepiano/hana/tree/main/crates/hana_clerestory#license)
+[![License](https://img.shields.io/badge/license-MIT%2FApache-blue.svg)](https://github.com/natepiano/bevy_hana/tree/main/crates/hana_clerestory#license)
 [![Crates.io](https://img.shields.io/crates/v/hana_clerestory.svg)](https://crates.io/crates/hana_clerestory)
 [![Downloads](https://img.shields.io/crates/d/hana_clerestory.svg)](https://crates.io/crates/hana_clerestory)
-[![CI](https://github.com/natepiano/hana/actions/workflows/ci.yml/badge.svg)](https://github.com/natepiano/hana/actions/workflows/ci.yml)
+[![CI](https://github.com/natepiano/bevy_hana/actions/workflows/ci.yml/badge.svg)](https://github.com/natepiano/bevy_hana/actions/workflows/ci.yml)
 
 
 A Bevy plugin that saves and restores window placement, handles mixed-scale

@@ -2,15 +2,15 @@
 
 [![Crates.io](https://img.shields.io/crates/v/hana_liminal.svg)](https://crates.io/crates/hana_liminal)
 [![Downloads](https://img.shields.io/crates/d/hana_liminal.svg)](https://crates.io/crates/hana_liminal)
-[![CI](https://github.com/natepiano/hana/actions/workflows/ci.yml/badge.svg)](https://github.com/natepiano/hana/actions/workflows/ci.yml)
-[![MIT/Apache 2.0](https://img.shields.io/badge/license-MIT%2FApache-blue.svg)](https://github.com/natepiano/hana/tree/main/crates/hana_liminal#license)
+[![CI](https://github.com/natepiano/bevy_hana/actions/workflows/ci.yml/badge.svg)](https://github.com/natepiano/bevy_hana/actions/workflows/ci.yml)
+[![MIT/Apache 2.0](https://img.shields.io/badge/license-MIT%2FApache-blue.svg)](https://github.com/natepiano/bevy_hana/tree/main/crates/hana_liminal#license)
 
 A Bevy plugin for rendering 3D mesh outlines using jump-flood and hull-extrusion methods.
 
 > **Renamed.** This crate was published as `bevy_liminal` through v0.0.5. The
 > API is unchanged; only the crate name and its `TypePath` strings differ.
 
-> **Work in progress.** This crate is in active development (v0.1.0) and not
+> **Work in progress.** This crate is in active development (v0.1.1) and not
 > subject to semver stability guarantees. APIs will change without notice
 > between commits. Do not depend on this in production code yet.
 
@@ -100,7 +100,7 @@ Adding `Outline` to a parent entity automatically propagates it through the `Chi
 
 | Version                   | Bevy |
 |---------------------------|------|
-| hana_liminal 0.1.0        | 0.19 |
+| hana_liminal 0.1.0–0.1.1  | 0.19 |
 | bevy_liminal 0.0.2–0.0.6  | 0.19 |
 | bevy_liminal 0.0.0–0.0.1  | 0.18 |
 
