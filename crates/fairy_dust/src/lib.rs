@@ -46,6 +46,7 @@
 //! HUD panels) ensure the required plugin is registered exactly once via
 //! `ensure_plugin`, regardless of how many capabilities pull it in.
 
+mod atmosphere;
 mod bloom;
 mod brp_extras;
 mod builder;
@@ -69,6 +70,7 @@ mod save_window_position;
 mod screen_panels;
 mod screen_space_lights;
 mod shortcuts;
+mod smaa;
 mod transparency;
 mod unclamp;
 

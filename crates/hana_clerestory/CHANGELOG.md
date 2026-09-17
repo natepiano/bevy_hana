@@ -161,9 +161,7 @@
 - Moving a window between displays is now saved correctly. The saved record
   could name the display the window launched on beside an offset measured
   against the one it had been moved to, sending the window back on the next
-  launch. Moves within one display now reach the saved file too, and v1 and v2
-  files, which record nothing about the display, adopt the display the window is
-  on.
+  launch. Moves within one display now reach the saved file too.
 - Restoring a window across displays of different pixel density resized the
   window without announcing it, so a camera read the old size and paired a depth
   buffer sized to the display with a color buffer sized to the window. wgpu
@@ -182,11 +180,19 @@
   user moving the window, which replaced the saved placement with the launch
   position. A window from an older file that names no display now takes the
   display the window manager places it on and keeps its saved size and
-  position there.
+  position there, unless it is a v1 or v2 window whose saved position lies on a
+  display, which keeps that display.
 - A v5 or older saved file that lists a window the application has not opened
   yet is saved again. Until that window opens, its entry is written without a
   `policy`, which is read from the window's recovery markers when it does.
   Before, every save failed and logged a warning each frame.
+- A window from a v1 or v2 file is restored to its saved position again. Those
+  files store a desktop position and no display, and that position was never
+  converted onto a display, so the window opened wherever the operating system
+  put it. The display that contains the window's saved center now becomes the
+  window's display, and the window is restored to its saved position there. A
+  saved position that lies on no display is dropped, and the window stays on the
+  display the operating system opened it on.
 
 ## [0.3.0] - 2026-07-30
 

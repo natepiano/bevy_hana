@@ -58,6 +58,7 @@ bevy = { workspace = true, features = [
 bevy_brp_extras = { workspace = true }
 fairy_dust = { workspace = true }
 hana_clerestory = { workspace = true }
+hana_diegetic = { workspace = true }
 hana_lagrange = { workspace = true, features = ["fit_overlay"] }
 
 [[example]]
@@ -79,6 +80,9 @@ path = "examples/msaa.rs"
 [[example]]
 name = "benchmark"
 path = "examples/benchmark/main.rs"
+
+[[example]]
+name = "atmosphere"
 
 [[example]]
 name = "all_modes"

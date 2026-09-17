@@ -32,6 +32,7 @@ use super::PrimitiveBuilder;
 use super::StudioLightingBuilder;
 use super::TitleBarBuilder;
 use crate::Anchor;
+use crate::atmosphere;
 use crate::bloom;
 use crate::brp_extras;
 use crate::camera_control_panel;
@@ -58,6 +59,7 @@ use crate::screen_panels;
 use crate::screen_panels::DescriptionPanel;
 use crate::screen_panels::TitleBar;
 use crate::shortcuts;
+use crate::smaa;
 use crate::transparency;
 use crate::unclamp;
 
@@ -765,6 +767,42 @@ impl SprinkleBuilder<WithOrbitCam> {
     #[must_use]
     pub fn with_bloom(mut self) -> Self {
         bloom::install(&mut self.app);
+        self
+    }
+
+    /// Render Bevy's physically-based sky behind the scene: an
+    /// [`Atmosphere`](bevy::light::Atmosphere) entity carrying a
+    /// [`ScatteringMedium`](bevy::light::atmosphere::ScatteringMedium) asset,
+    /// plus [`AtmosphereSettings`](bevy::pbr::AtmosphereSettings) on the orbit
+    /// camera. Installs [`with_hdr`](Self::with_hdr) as well, because a camera
+    /// left in LDR clamps the over-bright sky and renders the 3D view black.
+    ///
+    /// There is no way to turn this back off at runtime — Bevy 0.19.1 leaves
+    /// stale render state behind when either component is removed.
+    #[must_use]
+    pub fn with_atmosphere(mut self) -> Self {
+        atmosphere::install(&mut self.app);
+        self
+    }
+
+    /// **Experimental.** Add SMAA to the orbit camera, reconstructing sub-pixel
+    /// edges from the composited image for content that cannot antialias
+    /// itself — `hana_liminal`'s jump-flood outlines above all, whose mask pass
+    /// is single-sampled by construction and whose distance field is quantized
+    /// to the pixel grid, so MSAA never reaches them and no shader-side ramp can
+    /// smooth them.
+    ///
+    /// Chosen over FXAA because SMAA leaves the interior of a detected band
+    /// pixel-identical and blends only its edges, which keeps `hana_diegetic`
+    /// text legible where FXAA smears it.
+    ///
+    /// Marked experimental while we evaluate whether it should become an
+    /// example default rather than an opt-in. Needs Bevy's `smaa_luts` feature,
+    /// which the workspace manifest names explicitly; without it Bevy
+    /// substitutes a placeholder LUT and SMAA silently stops finding edges.
+    #[must_use]
+    pub fn with_experimental_smaa(mut self) -> Self {
+        smaa::install(&mut self.app);
         self
     }
 

@@ -1,24 +1,38 @@
 {
-  "name": "macOS Dell monitor power",
-  "target_matcher": "DELL S3425DW",
+  "name": "macOS Samsung cable unplugged by the operator",
+  "target_matcher": "C34J79x",
   "inventory_name_field": "_name",
   "probe_monitor_matcher": {
     "physical_size": [3440, 1440],
-    "refresh_rate_millihertz": 120000
+    "refresh_rate_millihertz": 100000
   },
   "minimum_off_seconds": 1,
   "minimum_on_seconds": 5,
   "power_off": {
-    "executable": "/usr/bin/shortcuts",
-    "arguments": ["run", "dell monitor off"],
-    "timeout_seconds": 10,
+    "executable": "/usr/bin/swift",
+    "arguments": [
+      "crates/hana_clerestory/tests/scripts/macos_display_cable_prompt.swift",
+      "off",
+      "4c2d",
+      "f1e",
+      "30544148",
+      "Samsung display cable"
+    ],
+    "timeout_seconds": 120,
     "inherit_environment": ["HOME", "PATH", "TMPDIR", "USER"],
     "accepted_exit_codes": [0]
   },
   "power_on": {
-    "executable": "/usr/bin/shortcuts",
-    "arguments": ["run", "dell monitor on"],
-    "timeout_seconds": 15,
+    "executable": "/usr/bin/swift",
+    "arguments": [
+      "crates/hana_clerestory/tests/scripts/macos_display_cable_prompt.swift",
+      "on",
+      "4c2d",
+      "f1e",
+      "30544148",
+      "Samsung display cable"
+    ],
+    "timeout_seconds": 120,
     "inherit_environment": ["HOME", "PATH", "TMPDIR", "USER"],
     "accepted_exit_codes": [0]
   },

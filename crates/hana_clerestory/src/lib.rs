@@ -681,6 +681,8 @@ pub(crate) mod tests {
     const IDENTIFIED_DISPLAY_EVIDENCE: &[u8] = b"startup-display";
     const SECOND_IDENTIFIED_DISPLAY_EVIDENCE: &[u8] = b"startup-display-two";
     const LEFT_DISPLAY_WINDOW_POSITION: IVec2 = IVec2::new(100, 100);
+    const LEGACY_POSITION_ON_LEFT_DISPLAY: IVec2 = IVec2::new(40, 30);
+    const LEGACY_POSITION_ON_NO_DISPLAY: IVec2 = IVec2::new(-5_000, -5_000);
     const RECOVERY_TOPOLOGY_UPDATE_LIMIT: usize = 32;
     const RIGHT_DISPLAY_WINDOW_POSITION: IVec2 = IVec2::new(2_020, 100);
     const RIGHT_DISPLAY_USER_MOVE_POSITION: IVec2 = IVec2::new(2_300, 200);
@@ -1420,10 +1422,15 @@ pub(crate) mod tests {
         /// `convert_v2_state_to_v4` has no display evidence to carry forward, so every v2 record
         /// becomes `PersistedDisplayIdentityV4::Anonymous`. This fixture is that state, asserted
         /// after decode so the test cannot silently start exercising a resolvable target.
-        fn write_legacy_anonymous_primary_placement(&self) -> Result<(), String> {
+        /// `logical_position` decides whether the record's reconstructed window center lies on a
+        /// live display, which selects the monitor its binding is authored against.
+        fn write_legacy_anonymous_primary_placement(
+            &self,
+            logical_position: IVec2,
+        ) -> Result<(), String> {
             let contents = format!(
-                "(\n    version: {},\n    entries: [\n        (\n            key: Primary,\n            state: (\n                logical_position: Some((40, 30)),\n                logical_width: 640,\n                logical_height: 480,\n                monitor_scale: 1.0,\n                monitor_index: 0,\n                mode: Windowed,\n                app_name: \"startup-test\",\n            ),\n        ),\n    ],\n)\n",
-                2,
+                "(\n    version: {},\n    entries: [\n        (\n            key: Primary,\n            state: (\n                logical_position: Some(({}, {})),\n                logical_width: 640,\n                logical_height: 480,\n                monitor_scale: 1.0,\n                monitor_index: 0,\n                mode: Windowed,\n                app_name: \"startup-test\",\n            ),\n        ),\n    ],\n)\n",
+                2, logical_position.x, logical_position.y,
             );
             let PersistedWindowStateDecodeOutcome::Decoded(decoded) =
                 persistence::decode_persisted_state_for_test(&contents)
@@ -3406,11 +3413,13 @@ pub(crate) mod tests {
     /// `Anonymous` target every v1/v2 file upgrades into matches no monitor and
     /// `resolve_pending` can never reclassify it. Without adopting the occupied monitor,
     /// `author_window_binding` returns `None` forever: the window is never restored, and
-    /// `project_established` reports `AbsentBinding` so the file is never rewritten either.
+    /// `project_established` reports `AbsentBinding` so the file is never rewritten either. The
+    /// saved coordinate lies on no display, so it cannot name a monitor in place of the occupied
+    /// one.
     #[test]
     fn anonymous_legacy_placement_adopts_the_monitor_the_window_occupies() -> Result<(), String> {
         let mut harness = ProductionPluginHarness::new(KernelInstallation::WindowManagerOwned)?;
-        harness.write_legacy_anonymous_primary_placement()?;
+        harness.write_legacy_anonymous_primary_placement(LEGACY_POSITION_ON_NO_DISPLAY)?;
         harness.install_identified_headless_window_topology();
         for _ in 0..STARTUP_RESTORE_UPDATE_LIMIT {
             harness.app.update();
@@ -3447,7 +3456,7 @@ pub(crate) mod tests {
     fn a_restored_anonymous_legacy_placement_is_rewritten_as_a_classified_record()
     -> Result<(), String> {
         let mut harness = ProductionPluginHarness::new(KernelInstallation::WindowManagerOwned)?;
-        harness.write_legacy_anonymous_primary_placement()?;
+        harness.write_legacy_anonymous_primary_placement(LEGACY_POSITION_ON_LEFT_DISPLAY)?;
         harness.install_identified_headless_window_topology();
         let role = persistence::primary_window_role()
             .map_err(|error| format!("failed to create primary role: {error}"))?;
@@ -4490,10 +4499,10 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// An anonymous legacy placement follows the first `OnMonitor` association and keeps its saved
-    /// geometry.
+    /// An anonymous legacy placement whose coordinate lies on no display follows the first
+    /// `OnMonitor` association and keeps its saved geometry.
     ///
-    /// A v2 record names no display, so its binding is authored against the display
+    /// Such a v2 record names no display, so its binding is authored against the display
     /// `update_current_monitor` reads from winit's `current_monitor()` query before Bevy inserts
     /// `OnMonitor`. On X11 that query answers before the window manager maps the window, and the
     /// first `OnMonitor` insertion lands while the role is still waiting for its first restore.
@@ -4503,7 +4512,7 @@ pub(crate) mod tests {
     fn a_display_correction_before_the_first_restore_moves_an_anonymous_placement()
     -> Result<(), String> {
         let mut harness = ProductionPluginHarness::new(KernelInstallation::WindowManagerOwned)?;
-        harness.write_legacy_anonymous_primary_placement()?;
+        harness.write_legacy_anonymous_primary_placement(LEGACY_POSITION_ON_NO_DISPLAY)?;
         let (_, right) = harness.install_identified_headless_display_pair();
         let role = persistence::primary_window_role()
             .map_err(|error| format!("failed to create primary role: {error}"))?;
@@ -4521,6 +4530,41 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// An anonymous legacy placement whose coordinate lies on exactly one display keeps that
+    /// display through the first `OnMonitor` association.
+    ///
+    /// The record's binding is authored against the display containing its reconstructed window
+    /// center, not the display `update_current_monitor` read before placement, so the association
+    /// reports only where the window manager placed the window before the restore moves it.
+    #[test]
+    fn a_display_correction_before_the_first_restore_keeps_a_resolved_legacy_placement()
+    -> Result<(), String> {
+        let mut harness = ProductionPluginHarness::new(KernelInstallation::WindowManagerOwned)?;
+        harness.write_legacy_anonymous_primary_placement(LEGACY_POSITION_ON_LEFT_DISPLAY)?;
+        let (_, right) = harness.install_identified_headless_display_pair();
+        let role = persistence::primary_window_role()
+            .map_err(|error| format!("failed to create primary role: {error}"))?;
+        report_primary_window_manager_placement(&mut harness, &role, right)?;
+        for _ in 0..STARTUP_RESTORE_UPDATE_LIMIT {
+            harness.app.update();
+        }
+
+        let bound_device = harness
+            .app
+            .world()
+            .resource::<Bindings>()
+            .binding(&role)
+            .map_err(|error| format!("primary window lost its binding: {error}"))?
+            .endpoint
+            .device
+            .clone();
+        assert_eq!(
+            bound_device,
+            device_for_identified_display(IDENTIFIED_DISPLAY_EVIDENCE)
+        );
+        Ok(())
+    }
+
     /// A move report during the first restore of an anonymous placement keeps the corrected
     /// endpoint.
     ///
@@ -4532,7 +4576,7 @@ pub(crate) mod tests {
     fn a_move_report_during_the_first_restore_keeps_the_corrected_anonymous_endpoint()
     -> Result<(), String> {
         let mut harness = ProductionPluginHarness::new(KernelInstallation::WindowManagerOwned)?;
-        harness.write_legacy_anonymous_primary_placement()?;
+        harness.write_legacy_anonymous_primary_placement(LEGACY_POSITION_ON_NO_DISPLAY)?;
         let (left, right) = harness.install_identified_headless_display_pair();
         let role = persistence::primary_window_role()
             .map_err(|error| format!("failed to create primary role: {error}"))?;
@@ -4567,14 +4611,42 @@ pub(crate) mod tests {
 
     /// Report the window manager's placement of the primary window on `right` as soon as its
     /// anonymous binding is authored, and return the restore attempt that starts on that display.
-    ///
-    /// winit writes `WindowMoved` before `changed_windows` reinserts `OnMonitor`, so the message is
-    /// read one update ahead of the association.
     fn correct_anonymous_primary_display(
         harness: &mut ProductionPluginHarness,
         role: &RoleKey,
         right: Entity,
     ) -> Result<AttemptRef, String> {
+        report_primary_window_manager_placement(harness, role, right)?;
+        let corrected_device = device_for_identified_display(SECOND_IDENTIFIED_DISPLAY_EVIDENCE);
+        for _ in 0..STARTUP_RESTORE_UPDATE_LIMIT {
+            harness.app.update();
+            let on_corrected_display = harness
+                .app
+                .world()
+                .resource::<Bindings>()
+                .binding(role)
+                .is_ok_and(|binding| binding.endpoint.device == corrected_device);
+            if let Some(attempt) =
+                applying_attempt(&harness.app, role).filter(|_| on_corrected_display)
+            {
+                return Ok(attempt);
+            }
+        }
+        Err(String::from(
+            "the display correction did not start a restore on the corrected display",
+        ))
+    }
+
+    /// Report the window manager's placement of the primary window on `right` as soon as its
+    /// binding is authored, while the window still carries `ProvisionalCurrentMonitor`.
+    ///
+    /// winit writes `WindowMoved` before `changed_windows` reinserts `OnMonitor`, so the message is
+    /// read one update ahead of the association.
+    fn report_primary_window_manager_placement(
+        harness: &mut ProductionPluginHarness,
+        role: &RoleKey,
+        right: Entity,
+    ) -> Result<(), String> {
         for _ in 0..STARTUP_RESTORE_UPDATE_LIMIT {
             if harness
                 .app
@@ -4598,25 +4670,7 @@ pub(crate) mod tests {
             primary_window,
             right,
             RIGHT_DISPLAY_WINDOW_POSITION,
-        )?;
-        let corrected_device = device_for_identified_display(SECOND_IDENTIFIED_DISPLAY_EVIDENCE);
-        for _ in 0..STARTUP_RESTORE_UPDATE_LIMIT {
-            harness.app.update();
-            let on_corrected_display = harness
-                .app
-                .world()
-                .resource::<Bindings>()
-                .binding(role)
-                .is_ok_and(|binding| binding.endpoint.device == corrected_device);
-            if let Some(attempt) =
-                applying_attempt(&harness.app, role).filter(|_| on_corrected_display)
-            {
-                return Ok(attempt);
-            }
-        }
-        Err(String::from(
-            "the display correction did not start a restore on the corrected display",
-        ))
+        )
     }
 
     /// A window moved within its display must save the position it was moved to.

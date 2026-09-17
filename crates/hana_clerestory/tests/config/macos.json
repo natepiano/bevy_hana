@@ -74,7 +74,6 @@
       "description": "Borderless fullscreen restore - starts in borderless mode via RON",
       "automation": "full",
       "launch_monitor": 0,
-      "wait_for_restore_event": false,
 
       "ron_file": "fullscreen_borderless_mon0.ron",
 

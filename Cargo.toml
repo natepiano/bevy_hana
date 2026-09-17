@@ -56,6 +56,11 @@ bevy = { version = "0.19.1", default-features = false, features = [
   "png",
   "reflect_auto_register",
   "serialize",
+  # SMAA's lookup textures. Enabled transitively today because several
+  # dependencies take bevy's default features; named here so the outline
+  # examples keep real anti-aliasing instead of silently falling back to
+  # bevy's placeholder LUT if one of them ever tightens that.
+  "smaa_luts",
   "track_location",
   "webp",
 ] }

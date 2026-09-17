@@ -170,11 +170,21 @@ class HardwareProfileTests(unittest.TestCase):
 
         profile = HardwareProfile.load(profile_path)
 
-        self.assertEqual(profile.power_off.executable, "/usr/bin/shortcuts")
-        self.assertEqual(profile.power_off.arguments, ("run", "dell monitor off"))
+        self.assertEqual(profile.power_off.executable, "/usr/bin/swift")
+        self.assertEqual(
+            profile.power_off.arguments,
+            (
+                "crates/hana_clerestory/tests/scripts/macos_display_cable_prompt.swift",
+                "off",
+                "4c2d",
+                "f1e",
+                "30544148",
+                "Samsung display cable",
+            ),
+        )
         self.assertEqual(profile.minimum_on_seconds, 5)
         self.assertEqual(
-            profile.probe_monitor_matcher.refresh_rate_millihertz, 120000
+            profile.probe_monitor_matcher.refresh_rate_millihertz, 100000
         )
 
 

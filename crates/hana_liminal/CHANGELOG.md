@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Fix `outline_pipeline` and `hull_outline_pipeline` failing wgpu validation on cameras whose view bind group carries layout entries the outline passes did not request, such as an `Atmosphere`
+
 ## [0.1.0] - 2026-07-30
 
 ### Changed

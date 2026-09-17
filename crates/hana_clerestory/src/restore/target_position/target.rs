@@ -5,7 +5,6 @@ use bevy::prelude::ReflectComponent;
 use bevy::prelude::UVec2;
 #[cfg(test)]
 use bevy::prelude::debug;
-#[cfg(test)]
 use bevy::prelude::warn;
 use hana_kana::ToI32;
 use hana_kana::ToU32;
@@ -25,7 +24,6 @@ use crate::persistence::PersistedPosition;
 use crate::persistence::PersistedWindowState;
 use crate::persistence::RestorableWindowPosition;
 use crate::persistence::SavedWindowMode;
-#[cfg(test)]
 use crate::persistence::UnrebasedDesktopPosition;
 use crate::restore::settle_state::SettleState;
 
@@ -169,8 +167,7 @@ pub(crate) fn prepared_established_position_meaning(
 /// window deliberately straddling a boundary has a corner on the *neighbouring* monitor while
 /// still belonging to its own; a corner test or a rectangle test would discard that position even
 /// though nothing about the layout has changed.
-#[cfg(test)]
-fn rebase_legacy_position(
+pub(crate) fn rebase_legacy_position(
     unrebased: UnrebasedDesktopPosition,
     logical_size: UVec2,
     target_info: &MonitorDescriptor,
@@ -195,7 +192,6 @@ fn rebase_legacy_position(
 }
 
 /// Reconstruct the physical center encoded by one pre-v3 desktop coordinate.
-#[cfg(test)]
 pub(crate) fn reconstructed_legacy_window_center(
     unrebased: UnrebasedDesktopPosition,
     logical_size: UVec2,
@@ -222,7 +218,6 @@ pub(crate) fn reconstructed_legacy_window_center(
 }
 
 /// Whether a physical desktop point lies within a monitor's bounds.
-#[cfg(test)]
 pub(crate) fn monitor_contains_physical_point(
     descriptor: &MonitorDescriptor,
     physical_point: IVec2,

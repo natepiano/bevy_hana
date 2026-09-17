@@ -17,6 +17,7 @@ use super::SavedWindowMode;
 use crate::Platform;
 use crate::monitors::CurrentMonitor;
 use crate::monitors::MonitorDescriptor;
+use crate::restore;
 
 /// Meaning of a window position returned by a safe driver readback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Reflect)]
@@ -108,6 +109,33 @@ impl EstablishedWindowPlacement {
         }
     }
 
+    /// Convert one persisted record against the live monitor it restores onto.
+    ///
+    /// A `PersistedPosition::Unrebased` coordinate becomes a `Restorable` offset from
+    /// `live_monitor` when `rebase_legacy_position` finds its reconstructed window center inside
+    /// that monitor, and `CompositorControlled` when it does not. Every other `PersistedPosition`
+    /// converts exactly as `From<&PersistedWindowState>` converts it.
+    #[must_use]
+    pub(crate) fn rebased_onto(
+        persisted: &PersistedWindowState,
+        live_monitor: &MonitorDescriptor,
+    ) -> Self {
+        let placement = Self::from(persisted);
+        let PersistedPosition::Unrebased(unrebased) = persisted.position else {
+            return placement;
+        };
+        let position =
+            restore::rebase_legacy_position(unrebased, placement.logical_size, live_monitor)
+                .map_or(
+                    EstablishedWindowPosition::CompositorControlled,
+                    |logical_offset| EstablishedWindowPosition::Restorable { logical_offset },
+                );
+        Self {
+            position,
+            ..placement
+        }
+    }
+
     /// The same placement drawn back inside a monitor it was not captured on.
     ///
     /// A window whose saved display is absent is shown on whatever display it launched on, and a
@@ -163,10 +191,13 @@ impl EstablishedWindowPlacement {
     }
 }
 
-/// Convert one persisted adapter record into the driver's single configuration type.
+/// Convert one persisted adapter record into the driver's single configuration type without a live
+/// monitor.
 ///
-/// Legacy absolute coordinates become compositor-controlled because their old desktop origin
-/// cannot authorize a new monitor-relative position without an exact live target.
+/// A `PersistedPosition::Unrebased` coordinate is an absolute desktop position that only live
+/// monitor geometry can turn into an offset, so this conversion maps it to `CompositorControlled`.
+/// A caller holding the monitor the record restores onto converts through
+/// `EstablishedWindowPlacement::rebased_onto`, which rebases that coordinate.
 impl From<&PersistedWindowState> for EstablishedWindowPlacement {
     fn from(persisted: &PersistedWindowState) -> Self {
         let position = match persisted.position {

@@ -22,6 +22,7 @@ pub(crate) use restore_attempt::RestorePreparationSource;
 pub(crate) use restore_attempt::WindowRestoreAttempt;
 pub(crate) use restore_attempt::prepare_driver_restore_targets;
 pub(crate) use restore_attempt::remove_window_restore_work;
+pub(crate) use restore_attempt::resolve_legacy_coordinate_monitor;
 pub(crate) use settle_state::check_restore_settling;
 pub(crate) use target_position::FullscreenRestoreState;
 pub(crate) use target_position::MonitorScaleStrategy;
@@ -34,6 +35,7 @@ use target_position::ObservedScaleInputs;
 pub(crate) use target_position::TargetPosition;
 pub(crate) use target_position::WindowRestoreState;
 pub(crate) use target_position::place_window_at_saved_geometry;
+pub(crate) use target_position::rebase_legacy_position;
 #[cfg(test)]
 pub(crate) use winit_info::InjectedWinitWindows;
 #[cfg(all(target_os = "linux", feature = "workaround-winit-4445"))]

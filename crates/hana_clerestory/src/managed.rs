@@ -70,6 +70,7 @@ use crate::monitors::CurrentMonitorEntity;
 use crate::monitors::LiveDisplayDevices;
 use crate::monitors::LiveDisplayEndpointLookup;
 use crate::monitors::LiveDisplayMatchError;
+use crate::monitors::MonitorDescriptor;
 use crate::monitors::Monitors;
 use crate::monitors::ProvisionalCurrentMonitor;
 use crate::output_proof::OnScreenConfirmation;
@@ -84,6 +85,7 @@ use crate::platform::Platform;
 use crate::recovery::StrandedWindowDisplayObservation;
 use crate::recovery::StrandedWindowMovementBaselines;
 use crate::recovery::StrandedWindowObservation;
+use crate::restore;
 use crate::restore::WindowRestoreAttempt;
 use crate::visibility::PlacementAbandoned;
 use crate::visibility::SavedDisplayRevealWait;
@@ -435,6 +437,7 @@ struct WindowBindingAuthoringContext<'a, 'world, 'state, 'live_display_data, 'de
     live_displays:        &'a LiveDisplayEndpointLookup<'world, 'state>,
     live_display_devices: &'a Query<'world, 'state, &'live_display_data LiveDisplayDevices>,
     device_keys:          &'a Query<'world, 'state, &'device_key_data DeviceKey>,
+    monitors:             &'a Monitors,
     platform:             Platform,
     driver:               &'a WindowDriverId,
     stranded:             &'a mut StrandedWindowMovementBaselines,
@@ -460,6 +463,7 @@ impl WindowBindingAuthoringContext<'_, '_, '_, '_, '_> {
 enum WindowBindingDeviceEvidence {
     Classified(DeviceKey),
     CurrentDisplay,
+    LegacyCoordinateDisplay(MonitorDescriptor),
     LegacyIdentity(PersistedDisplayIdentityV4),
 }
 
@@ -510,6 +514,9 @@ fn resolve_window_binding_device(
         WindowBindingDeviceEvidence::CurrentDisplay => {
             context.device_for_current_monitor(current_monitor_entity)
         },
+        WindowBindingDeviceEvidence::LegacyCoordinateDisplay(descriptor) => {
+            context.live_displays.key_for_descriptor(descriptor)
+        },
         WindowBindingDeviceEvidence::LegacyIdentity(legacy_identity) => context
             .live_displays
             .key_for_legacy_identity(legacy_identity.into()),
@@ -519,20 +526,45 @@ fn resolve_window_binding_device(
 fn prepare_window_binding_persistence(
     candidate: &WindowBindingCandidate<'_>,
     persisted: PersistedWindowPlacementLookup<'_>,
+    monitors: &Monitors,
     platform: Platform,
 ) -> PreparedWindowBindingPersistence {
     match persisted {
         PersistedWindowPlacementLookup::Saved(saved) => {
-            let device_evidence = match &saved.window_state.target {
-                PersistedWindowTargetV5::Classified(device_key) => {
-                    WindowBindingDeviceEvidence::Classified(device_key.clone())
-                },
+            // An anonymous record names no display, so a pre-v3 coordinate whose reconstructed
+            // center lies on exactly one live monitor binds to that monitor and is rebased onto
+            // it. Any other anonymous record binds to the display the window occupies.
+            let (device_evidence, placement) = match &saved.window_state.target {
+                PersistedWindowTargetV5::Classified(device_key) => (
+                    WindowBindingDeviceEvidence::Classified(device_key.clone()),
+                    EstablishedWindowPlacement::from(&saved.window_state),
+                ),
                 PersistedWindowTargetV5::AwaitingLegacyEvidence(
                     PersistedDisplayIdentityV4::Anonymous,
-                ) => WindowBindingDeviceEvidence::CurrentDisplay,
-                PersistedWindowTargetV5::AwaitingLegacyEvidence(legacy_identity) => {
-                    WindowBindingDeviceEvidence::LegacyIdentity(*legacy_identity)
-                },
+                ) => restore::resolve_legacy_coordinate_monitor(&saved.window_state, monitors)
+                    .map_or_else(
+                        || {
+                            (
+                                WindowBindingDeviceEvidence::CurrentDisplay,
+                                EstablishedWindowPlacement::from(&saved.window_state),
+                            )
+                        },
+                        |legacy_coordinate_monitor| {
+                            (
+                                WindowBindingDeviceEvidence::LegacyCoordinateDisplay(
+                                    *legacy_coordinate_monitor,
+                                ),
+                                EstablishedWindowPlacement::rebased_onto(
+                                    &saved.window_state,
+                                    legacy_coordinate_monitor,
+                                ),
+                            )
+                        },
+                    ),
+                PersistedWindowTargetV5::AwaitingLegacyEvidence(legacy_identity) => (
+                    WindowBindingDeviceEvidence::LegacyIdentity(*legacy_identity),
+                    EstablishedWindowPlacement::from(&saved.window_state),
+                ),
             };
             let (binding_policy, policy_save_action) = match saved.loaded_binding_policy {
                 LoadedBindingPolicy::Saved(binding_policy) => {
@@ -544,7 +576,7 @@ fn prepare_window_binding_persistence(
                 ),
             };
             PreparedWindowBindingPersistence {
-                placement: EstablishedWindowPlacement::from(&saved.window_state),
+                placement,
                 device_evidence,
                 binding_policy,
                 policy_save_action,
@@ -620,6 +652,7 @@ fn author_window_binding(
     let prepared = prepare_window_binding_persistence(
         &candidate,
         context.persisted.get(&role),
+        context.monitors,
         context.platform,
     );
     if matches!(
@@ -685,6 +718,7 @@ pub(crate) fn author_window_bindings(
     live_display_devices: Query<&LiveDisplayDevices>,
     device_keys: Query<&DeviceKey>,
     role_entities: Query<(Entity, &RoleKey)>,
+    monitors: Res<Monitors>,
     platform: Res<Platform>,
     driver: Res<WindowDriverId>,
     mut registration: BindingRegistration,
@@ -696,6 +730,7 @@ pub(crate) fn author_window_bindings(
         live_displays:        &live_displays,
         live_display_devices: &live_display_devices,
         device_keys:          &device_keys,
+        monitors:             &monitors,
         platform:             *platform,
         driver:               &driver,
         stranded:             &mut stranded,
@@ -785,6 +820,7 @@ pub(crate) fn rebind_window_to_its_current_display(
     role_statuses: Query<&RoleStatus>,
     resolved_devices: Query<&ResolvedToDevice>,
     persisted: Res<PersistedWindowPlacements>,
+    monitors: Res<Monitors>,
     mut bindings: ResMut<Bindings>,
     mut stranded: ResMut<StrandedWindowMovementBaselines>,
 ) {
@@ -863,6 +899,7 @@ pub(crate) fn rebind_window_to_its_current_display(
                 *rebind,
                 role_statuses.get(window_rigging_role.entity()).ok(),
                 &persisted,
+                &monitors,
             )
         } else {
             FirstRestoreRebind::ReadBack
@@ -916,7 +953,11 @@ enum FirstRestoreRebind {
 /// A record that names its display was authored against that display, so an
 /// `AssociationCorrection` reports only where the window manager placed the window before the
 /// restore moves it. An anonymous record was authored against the display `update_current_monitor`
-/// read before that placement, so the correction moves its endpoint and keeps its saved geometry.
+/// read before that placement, so the correction moves its endpoint and keeps its saved size and
+/// mode, discarding any pre-v3 coordinate. The exception is an anonymous record whose pre-v3
+/// coordinate `resolve_legacy_coordinate_monitor` places on exactly one live monitor:
+/// `prepare_window_binding_persistence` authored it against that monitor, so like a record that
+/// names its display it keeps its endpoint through the correction.
 /// Once the placement is reported, every restore dispatch moves the window and `bevy_winit`
 /// reinserts `OnMonitor` from `current_monitor()` after the move; a `ReportedMove` that lands while
 /// the role is `RoleStatusView::Applying` therefore reflects that dispatch and keeps the endpoint.
@@ -927,16 +968,18 @@ fn first_restore_rebind(
     rebind: WindowDisplayRebindPending,
     status: Option<&RoleStatus>,
     persisted: &PersistedWindowPlacements,
+    monitors: &Monitors,
 ) -> FirstRestoreRebind {
     let PersistedWindowPlacementLookup::Saved(saved) = persisted.get(role) else {
         return FirstRestoreRebind::ReadBack;
     };
-    let anonymous = matches!(
-        saved.window_state.target,
-        PersistedWindowTargetV5::AwaitingLegacyEvidence(PersistedDisplayIdentityV4::Anonymous)
-    );
+    let follows_association =
+        matches!(
+            saved.window_state.target,
+            PersistedWindowTargetV5::AwaitingLegacyEvidence(PersistedDisplayIdentityV4::Anonymous)
+        ) && restore::resolve_legacy_coordinate_monitor(&saved.window_state, monitors).is_none();
     match rebind {
-        WindowDisplayRebindPending::AssociationCorrection if anonymous => {
+        WindowDisplayRebindPending::AssociationCorrection if follows_association => {
             FirstRestoreRebind::FollowWithSavedPlacement(EstablishedWindowPlacement::from(
                 &saved.window_state,
             ))
@@ -1400,11 +1443,25 @@ mod tests {
     use crate::persistence::PersistedDisplayFingerprintV4;
     use crate::persistence::PersistedDisplayIdentityV4;
     use crate::persistence::PersistedPosition;
+    use crate::persistence::PersistedWindowPlacement;
     use crate::persistence::PersistedWindowPlacementLookup;
     use crate::persistence::PersistedWindowState;
     use crate::persistence::PersistedWindowTargetV5;
     use crate::persistence::SavedWindowMode;
+    use crate::persistence::UnrebasedDesktopPosition;
     use crate::restore::InjectedWinitWindows;
+
+    const LEGACY_LEFT_MONITOR: MonitorDescriptor =
+        MonitorDescriptor::for_current_enumeration(0, 1.0, IVec2::ZERO, UVec2::new(1_920, 1_080));
+    const LEGACY_RIGHT_MONITOR: MonitorDescriptor = MonitorDescriptor::for_current_enumeration(
+        1,
+        2.0,
+        IVec2::new(1_920, 0),
+        UVec2::new(2_560, 1_440),
+    );
+    const LEGACY_SAVED_OFFSET: IVec2 = IVec2::new(200, 100);
+    const LEGACY_WINDOW_SIZE: UVec2 = UVec2::new(900, 500);
+    const OFF_EVERY_MONITOR: IVec2 = IVec2::new(10_000, 10_000);
 
     #[derive(Default, Resource)]
     struct RetiredRoles(Vec<RoleKey>);
@@ -1514,6 +1571,7 @@ mod tests {
                 .add_observer(record_recovery_marker_warning)
                 .add_systems(Update, author_window_bindings);
             let monitor = app.world_mut().spawn_empty().id();
+            app.insert_resource(Monitors::from_test_monitors([(monitor, descriptor)]));
             app.world_mut().spawn((
                 live_device,
                 LiveDisplayEndpoint {
@@ -1655,6 +1713,158 @@ mod tests {
             LoadedBindingPolicy::Saved(default_window_binding_policy(
                 RecoveryPolicy::ReapplyOnRequest,
             ))
+        );
+        Ok(())
+    }
+
+    /// A v2 record: an `Anonymous` target holding the absolute `logical` coordinate written at
+    /// `captured_scale`.
+    fn anonymous_legacy_state(
+        logical: IVec2,
+        captured_scale: f64,
+    ) -> Result<PersistedWindowState, String> {
+        let unrebased = UnrebasedDesktopPosition::from_test_legacy(logical, captured_scale)
+            .ok_or_else(|| format!("fixture scale {captured_scale} was rejected"))?;
+        Ok(PersistedWindowState {
+            target:            PersistedWindowTargetV5::AwaitingLegacyEvidence(
+                PersistedDisplayIdentityV4::Anonymous,
+            ),
+            position:          PersistedPosition::Unrebased(unrebased),
+            logical_width:     LEGACY_WINDOW_SIZE.x,
+            logical_height:    LEGACY_WINDOW_SIZE.y,
+            saved_window_mode: SavedWindowMode::Windowed,
+            app_name:          String::from("legacy coordinate"),
+        })
+    }
+
+    fn logical_position_on_right_monitor() -> IVec2 {
+        LEGACY_RIGHT_MONITOR.logical_origin_at_scale(LEGACY_RIGHT_MONITOR.scale)
+            + LEGACY_SAVED_OFFSET
+    }
+
+    /// Prepare `window_state` for a window that launched on `LEGACY_LEFT_MONITOR`.
+    fn prepare_legacy_binding(
+        window_state: PersistedWindowState,
+    ) -> PreparedWindowBindingPersistence {
+        let window = Window::default();
+        let current_monitor = CurrentMonitor {
+            descriptor:            LEGACY_LEFT_MONITOR,
+            effective_window_mode: WindowMode::Windowed,
+        };
+        let candidate = WindowBindingCandidate {
+            window:          &window,
+            current_monitor: &current_monitor,
+            monitor_entity:  CurrentMonitorEntity::new(Entity::PLACEHOLDER),
+            role_source:     WindowBindingRoleSource::Primary,
+            recovery:        RecoveryPolicy::Forget,
+        };
+        let saved = PersistedWindowPlacement::from(window_state);
+        let monitors = Monitors::from_test_monitors([
+            (Entity::from_bits(1), LEGACY_LEFT_MONITOR),
+            (Entity::from_bits(2), LEGACY_RIGHT_MONITOR),
+        ]);
+        prepare_window_binding_persistence(
+            &candidate,
+            PersistedWindowPlacementLookup::Saved(&saved),
+            &monitors,
+            Platform::FIXTURE,
+        )
+    }
+
+    /// The README's legacy rebase: a v2 coordinate whose reconstructed center lies on exactly one
+    /// live monitor binds to that monitor and restores at its offset from it, even though the
+    /// window launched on another display.
+    #[test]
+    fn an_anonymous_legacy_coordinate_binds_to_the_one_monitor_containing_its_center()
+    -> Result<(), String> {
+        let prepared = prepare_legacy_binding(anonymous_legacy_state(
+            logical_position_on_right_monitor(),
+            LEGACY_RIGHT_MONITOR.scale,
+        )?);
+
+        let WindowBindingDeviceEvidence::LegacyCoordinateDisplay(descriptor) =
+            prepared.device_evidence
+        else {
+            return Err(String::from(
+                "the legacy coordinate did not select the monitor containing its center",
+            ));
+        };
+        assert_eq!(descriptor, LEGACY_RIGHT_MONITOR);
+        assert_eq!(
+            prepared.placement.position,
+            EstablishedWindowPosition::Restorable {
+                logical_offset: LEGACY_SAVED_OFFSET,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_anonymous_legacy_coordinate_on_no_monitor_is_compositor_controlled_on_the_current_display()
+    -> Result<(), String> {
+        let prepared = prepare_legacy_binding(anonymous_legacy_state(OFF_EVERY_MONITOR, 1.0)?);
+
+        assert!(matches!(
+            prepared.device_evidence,
+            WindowBindingDeviceEvidence::CurrentDisplay
+        ));
+        assert_eq!(
+            prepared.placement.position,
+            EstablishedWindowPosition::CompositorControlled
+        );
+        Ok(())
+    }
+
+    fn correct_anonymous_legacy_display(
+        window_state: PersistedWindowState,
+    ) -> Result<FirstRestoreRebind, String> {
+        let role = persistence::primary_window_role()
+            .map_err(|error| format!("failed to create primary role: {error}"))?;
+        let mut persisted = PersistedWindowPlacements::default();
+        persisted.seed(HashMap::from([(role.clone(), window_state)]));
+        let monitors = Monitors::from_test_monitors([
+            (Entity::from_bits(1), LEGACY_LEFT_MONITOR),
+            (Entity::from_bits(2), LEGACY_RIGHT_MONITOR),
+        ]);
+        Ok(first_restore_rebind(
+            &role,
+            WindowDisplayRebindPending::AssociationCorrection,
+            None,
+            &persisted,
+            &monitors,
+        ))
+    }
+
+    /// A legacy coordinate on exactly one monitor authored its endpoint on that monitor, so a
+    /// correction reporting where the window manager placed the window keeps the endpoint.
+    #[test]
+    fn a_display_correction_keeps_the_endpoint_of_a_resolved_legacy_coordinate()
+    -> Result<(), String> {
+        let rebind = correct_anonymous_legacy_display(anonymous_legacy_state(
+            logical_position_on_right_monitor(),
+            LEGACY_RIGHT_MONITOR.scale,
+        )?)?;
+
+        assert!(matches!(rebind, FirstRestoreRebind::KeepSavedEndpoint));
+        Ok(())
+    }
+
+    /// A legacy coordinate on no monitor authored its endpoint on the provisional display, so the
+    /// correction moves the endpoint and the coordinate stays discarded.
+    #[test]
+    fn a_display_correction_moves_an_unresolved_legacy_coordinate_without_a_position()
+    -> Result<(), String> {
+        let rebind =
+            correct_anonymous_legacy_display(anonymous_legacy_state(OFF_EVERY_MONITOR, 1.0)?)?;
+
+        let FirstRestoreRebind::FollowWithSavedPlacement(placement) = rebind else {
+            return Err(String::from(
+                "an unresolved anonymous placement did not follow its display correction",
+            ));
+        };
+        assert_eq!(
+            placement.position,
+            EstablishedWindowPosition::CompositorControlled
         );
         Ok(())
     }

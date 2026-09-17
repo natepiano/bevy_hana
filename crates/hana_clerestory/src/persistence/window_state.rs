@@ -171,12 +171,10 @@ impl UnrebasedDesktopPosition {
 
     /// The absolute logical desktop coordinate as written.
     #[must_use]
-    #[cfg(test)]
     pub(crate) const fn logical(self) -> IVec2 { self.logical }
 
     /// The monitor scale in force when the coordinate was written.
     #[must_use]
-    #[cfg(test)]
     pub(crate) const fn captured_scale(self) -> f64 { self.captured_scale }
 }
 

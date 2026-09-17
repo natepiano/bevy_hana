@@ -8,7 +8,6 @@ use bevy::prelude::Query;
 use bevy::prelude::Reflect;
 use bevy::prelude::Res;
 use bevy::prelude::ResMut;
-#[cfg(test)]
 use bevy::prelude::UVec2;
 use bevy::prelude::Window;
 use bevy::prelude::With;
@@ -33,13 +32,10 @@ use crate::driver::WindowPlacementTarget;
 use crate::driver::WindowRoleDriverState;
 use crate::monitors;
 use crate::monitors::CurrentMonitor;
-#[cfg(test)]
 use crate::monitors::MonitorDescriptor;
 use crate::monitors::Monitors;
 use crate::persistence::EstablishedWindowPlacement;
-#[cfg(test)]
 use crate::persistence::PersistedPosition;
-#[cfg(test)]
 use crate::persistence::PersistedWindowState;
 use crate::platform::ReturnCapability;
 use crate::recovery::WindowFallbackRecoveryState;
@@ -247,8 +243,12 @@ pub(crate) fn remove_window_restore_work(world: &mut World, window: Entity, atte
     )>();
 }
 
-#[cfg(test)]
-fn resolve_legacy_coordinate_monitor<'a>(
+/// The one live monitor whose physical bounds contain a pre-v3 coordinate's reconstructed window
+/// center.
+///
+/// Returns `None` when `persisted.position` is not `PersistedPosition::Unrebased`, when the center
+/// lies on no monitor in `Monitors`, and when it lies on several overlapping monitors.
+pub(crate) fn resolve_legacy_coordinate_monitor<'a>(
     persisted: &PersistedWindowState,
     monitors: &'a Monitors,
 ) -> Option<&'a MonitorDescriptor> {
@@ -271,20 +271,10 @@ fn resolve_legacy_coordinate_monitor<'a>(
 }
 
 #[cfg(test)]
-fn resolve_persisted_monitor<'a>(
-    persisted: &PersistedWindowState,
-    monitors: &'a Monitors,
-) -> Option<&'a MonitorDescriptor> {
-    resolve_legacy_coordinate_monitor(persisted, monitors)
-}
-
-#[cfg(test)]
 mod tests {
     use bevy::prelude::IVec2;
-    use bevy::prelude::UVec2;
 
     use super::*;
-    use crate::monitors::MonitorDescriptor;
     use crate::persistence::PersistedDisplayIdentityV4;
     use crate::persistence::PersistedWindowTargetV5;
     use crate::persistence::SavedWindowMode;
@@ -322,7 +312,7 @@ mod tests {
         };
 
         assert_eq!(
-            resolve_persisted_monitor(&persisted, &monitors),
+            resolve_legacy_coordinate_monitor(&persisted, &monitors),
             Some(&second)
         );
     }
@@ -339,7 +329,10 @@ mod tests {
             return;
         };
 
-        assert_eq!(resolve_persisted_monitor(&persisted, &monitors), None);
+        assert_eq!(
+            resolve_legacy_coordinate_monitor(&persisted, &monitors),
+            None
+        );
     }
 
     #[test]
@@ -350,6 +343,9 @@ mod tests {
             return;
         };
 
-        assert_eq!(resolve_persisted_monitor(&persisted, &monitors), None);
+        assert_eq!(
+            resolve_legacy_coordinate_monitor(&persisted, &monitors),
+            None
+        );
     }
 }

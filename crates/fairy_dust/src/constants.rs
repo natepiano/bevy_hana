@@ -23,6 +23,13 @@ pub(crate) const AABB_CORNER_SIGNS: [Vec3; 8] = [
     Vec3::new(1.0, 1.0, 1.0),
 ];
 
+// atmosphere
+/// Angular resolution of the precomputed phase-function LUT.
+pub(crate) const ATMOSPHERE_PHASE_RESOLUTION: u32 = 256;
+/// Resolution of the precomputed transmittance LUT, which fixes how finely the
+/// sky's extinction along a view ray is sampled.
+pub(crate) const ATMOSPHERE_TRANSMITTANCE_RESOLUTION: u32 = 256;
+
 // bloom
 pub(crate) const BLOOM_INTENSITY: f32 = 0.25;
 /// Only pixels brighter than this (pre-tonemap luminance) contribute to bloom.

@@ -51,7 +51,6 @@ pub(crate) use window_state::PersistedWindowTargetV5;
 #[cfg(test)]
 pub(crate) use window_state::SavedFullscreenVideoMode;
 pub(crate) use window_state::SavedWindowMode;
-#[cfg(test)]
 pub(crate) use window_state::UnrebasedDesktopPosition;
 
 use crate::ClerestoryPreStartupSet;
