@@ -271,6 +271,31 @@ impl WindowManagerPlugin {
     }
 }
 
+#[cfg(feature = "test")]
+impl WindowManagerPlugin {
+    /// Create a plugin with a custom state file path for an in-process fixture.
+    ///
+    /// The fixture runs under the X11 [`Platform`] on every host, so one test exercises the same
+    /// placement branches wherever it runs. Add the pair where [`Self::with_path`] would go.
+    #[must_use]
+    pub fn with_path_for_test(
+        path: impl Into<PathBuf>,
+    ) -> (FixturePlatformPlugin, ConfiguredWindowManagerPlugin) {
+        (FixturePlatformPlugin, Self::with_path(path))
+    }
+}
+
+/// Pins the fixture [`Platform`] before [`ConfiguredWindowManagerPlugin`] builds.
+///
+/// Created by [`WindowManagerPlugin::with_path_for_test`].
+#[cfg(feature = "test")]
+pub struct FixturePlatformPlugin;
+
+#[cfg(feature = "test")]
+impl Plugin for FixturePlatformPlugin {
+    fn build(&self, app: &mut App) { app.insert_resource(Platform::FIXTURE); }
+}
+
 impl Plugin for WindowManagerPlugin {
     #[expect(clippy::expect_used, reason = "fail fast if path cannot be determined")]
     fn build(&self, app: &mut App) {
@@ -345,10 +370,11 @@ impl ConfiguredWindowManagerPlugin {
 
 /// The platform this plugin build configures for.
 ///
-/// Production always detects. The crate's own tests pin the resource before adding the plugin,
-/// because [`Platform::detect`] reads the environment and would otherwise make one test exercise
-/// different branches on different hosts.
-#[cfg(test)]
+/// Production always detects. The crate's own tests, and consumer fixtures through
+/// [`WindowManagerPlugin::with_path_for_test`], pin the resource before adding the plugin,
+/// because [`Platform::detect`] reads the environment and would otherwise make one test
+/// exercise different branches on different hosts.
+#[cfg(any(test, feature = "test"))]
 fn configured_platform(app: &App) -> Platform {
     app.world()
         .get_resource::<Platform>()
@@ -357,7 +383,7 @@ fn configured_platform(app: &App) -> Platform {
 }
 
 /// The platform this plugin build configures for.
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test")))]
 #[allow(
     clippy::missing_const_for_fn,
     reason = "`Platform::detect` is only `const` on macOS and Windows; on Linux it reads the               environment, so a `const fn` here would not compile there"

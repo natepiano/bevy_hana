@@ -115,7 +115,11 @@ impl Platform {
     /// `ProductionPluginHarness` pins `MacOs` instead: its windowed restore
     /// under `workaround-winit-4445` would wait on the `_NET_FRAME_EXTENTS`
     /// reply that X11 frame compensation needs.
-    #[cfg(test)]
+    ///
+    /// Consumer fixtures get it through `WindowManagerPlugin::with_path_for_test`.
+    /// On a macOS host `detect()` selects the `AppKit` fullscreen sequence, which
+    /// waits on a native window a headless fixture never has.
+    #[cfg(any(test, feature = "test"))]
     pub(crate) const FIXTURE: Self = Self::X11;
 
     /// Whether this is the Linux X11 platform.
