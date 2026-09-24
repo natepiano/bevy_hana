@@ -4,16 +4,16 @@ use bevy::ecs::system::NonSendMarker;
 use bevy::prelude::Commands;
 use bevy::prelude::Component;
 use bevy::prelude::Entity;
+use bevy::prelude::Has;
 use bevy::prelude::Query;
 use bevy::prelude::Reflect;
 use bevy::prelude::Res;
 use bevy::prelude::ResMut;
 use bevy::prelude::UVec2;
 use bevy::prelude::Window;
-use bevy::prelude::With;
-use bevy::prelude::Without;
 use bevy::prelude::World;
 use bevy::window::OnMonitor;
+use bevy::winit::WinitMonitors;
 use hana_rigging::prelude::AttemptRef;
 use hana_rigging::prelude::DeviceAccessError;
 use hana_rigging::prelude::RoleKey;
@@ -23,8 +23,10 @@ use super::target_position::PreparedPositionMeaning;
 use super::target_position::RestoreDiagnostics;
 use super::target_position::TargetPosition;
 use super::winit_info;
-#[cfg(test)]
+#[cfg(any(test, feature = "test"))]
 use super::winit_info::InjectedWinitWindows;
+use super::winit_info::NativeMonitorAssociation;
+use super::winit_info::NativeWindowInfo;
 use super::winit_info::X11FrameCompensated;
 use crate::Platform;
 use crate::driver::RestoreRecord;
@@ -32,11 +34,12 @@ use crate::driver::WindowPlacementTarget;
 use crate::driver::WindowRoleDriverState;
 use crate::monitors;
 use crate::monitors::CurrentMonitor;
+use crate::monitors::CurrentMonitorEntity;
 use crate::monitors::MonitorDescriptor;
 use crate::monitors::Monitors;
-use crate::persistence::EstablishedWindowPlacement;
 use crate::persistence::PersistedPosition;
 use crate::persistence::PersistedWindowState;
+use crate::persistence::WindowPlacementConfiguration;
 use crate::platform::ReturnCapability;
 use crate::recovery::WindowFallbackRecoveryState;
 
@@ -55,7 +58,7 @@ use crate::recovery::WindowFallbackRecoveryState;
 pub(crate) struct RestorePreparation {
     role:       RoleKey,
     target:     WindowPlacementTarget,
-    dispatched: EstablishedWindowPlacement,
+    dispatched: WindowPlacementConfiguration,
 }
 
 /// Copyable window-entity reference to one driver-owned restore preparation.
@@ -72,11 +75,56 @@ pub(crate) enum RestorePreparationSource {
     KernelAttempt(AttemptRef),
 }
 
+enum RestoreMonitorObservation {
+    Live(CurrentMonitor),
+    Pending,
+}
+
+/// Whether Bevy has synchronized an `OnMonitor` association onto this window yet.
+///
+/// Bevy writes `OnMonitor` only after a `Window` change it watched, so its absence is a
+/// synchronization Hana is still waiting for — never an assertion that the window sits on no
+/// monitor.
+enum SynchronizedMonitorAssociation {
+    /// Bevy has synchronized this window onto that exact monitor entity.
+    Synchronized(Entity),
+    /// No association has been synchronized onto this window yet.
+    AwaitingSynchronization,
+}
+
+impl SynchronizedMonitorAssociation {
+    /// Convert the association Bevy writes only after a `Window` change it watched.
+    fn from_component(on_monitor: Option<&OnMonitor>) -> Self {
+        on_monitor.map_or(Self::AwaitingSynchronization, |on_monitor| {
+            Self::Synchronized(on_monitor.0)
+        })
+    }
+}
+
+/// The monitor observation this window still carries from an earlier preparation.
+///
+/// Restore keeps the last observation on the window so an unchanged one is not rewritten every
+/// frame. Its absence means nothing has been observed for this window yet, so any new
+/// observation is a change worth writing.
+enum RetainedMonitorObservation {
+    /// The window carries this observation from an earlier preparation.
+    Retained(CurrentMonitor),
+    /// The window carries no observation, so the first one to arrive is written.
+    NotRetained,
+}
+
+impl RetainedMonitorObservation {
+    /// Convert the observation an earlier preparation left on this window.
+    fn from_component(existing: Option<&CurrentMonitor>) -> Self {
+        existing.map_or(Self::NotRetained, |existing| Self::Retained(*existing))
+    }
+}
+
 impl RestorePreparation {
     pub(crate) const fn new(
         role: RoleKey,
         target: WindowPlacementTarget,
-        dispatched: EstablishedWindowPlacement,
+        dispatched: WindowPlacementConfiguration,
     ) -> Self {
         Self {
             role,
@@ -95,7 +143,7 @@ impl RestorePreparation {
     pub(crate) const fn target(&self) -> &WindowPlacementTarget { &self.target }
 
     #[must_use]
-    pub(crate) const fn dispatched(&self) -> &EstablishedWindowPlacement { &self.dispatched }
+    pub(crate) const fn dispatched(&self) -> &WindowPlacementConfiguration { &self.dispatched }
 }
 
 impl WindowRestoreAttempt {
@@ -124,31 +172,59 @@ impl WindowRestoreAttempt {
     pub(crate) fn for_test(role: RoleKey) -> Self { Self::for_role(role, AttemptRef::default()) }
 }
 
-/// Build one driver-requested target from the monitor facts resolved before attempt issuance.
+/// Refresh exact native monitor observations and prepare each driver's missing placement target.
 pub(crate) fn prepare_driver_restore_targets(
     mut commands: Commands,
-    preparations: Query<
-        (Entity, &WindowRestoreAttempt, &OnMonitor, &CurrentMonitor),
-        (With<Window>, Without<TargetPosition>),
-    >,
+    preparations: Query<(
+        Entity,
+        &WindowRestoreAttempt,
+        &Window,
+        Option<&OnMonitor>,
+        Option<&CurrentMonitor>,
+        Has<TargetPosition>,
+    )>,
     monitors: Res<Monitors>,
+    winit_monitors: Res<WinitMonitors>,
     platform: Res<Platform>,
     mut driver_state: ResMut<WindowRoleDriverState>,
     mut fallback: ResMut<WindowFallbackRecoveryState>,
     _: NonSendMarker,
-    #[cfg(test)] injected_windows: Option<Res<InjectedWinitWindows>>,
+    #[cfg(any(test, feature = "test"))] injected_windows: Option<Res<InjectedWinitWindows>>,
 ) {
-    for (entity, restore_attempt, on_monitor, current_monitor) in &preparations {
-        if monitors::exact_monitor_association(on_monitor, current_monitor, &monitors).is_none() {
-            continue;
-        }
-        let Some(native_window_info) = winit_info::native_window_info(
+    for (entity, restore_attempt, window, on_monitor, existing, has_target) in &preparations {
+        let NativeWindowInfo::Measured(native_window_frame) = winit_info::native_window_info(
             entity,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test"))]
             injected_windows.as_deref(),
+        ) else {
+            if has_target {
+                clear_restore_monitor_observation(&mut commands, entity);
+            }
+            continue;
+        };
+        let native_association = winit_info::native_monitor_association(
+            entity,
+            &monitors,
+            &winit_monitors,
+            #[cfg(any(test, feature = "test"))]
+            injected_windows.as_deref(),
+        );
+        let RestoreMonitorObservation::Live(current_monitor) = refresh_restore_monitor_observation(
+            &mut commands,
+            entity,
+            window,
+            native_association,
+            SynchronizedMonitorAssociation::from_component(on_monitor),
+            RetainedMonitorObservation::from_component(existing),
+            &monitors,
         ) else {
             continue;
         };
+        // Monitor arrival can also occur during fullscreen or cross-DPI placement. Keep its
+        // observation current while retaining the target dispatched for this attempt.
+        if has_target {
+            continue;
+        }
         let attempt = restore_attempt.attempt();
         // An attempt whose success is already queued for the kernel and an attempt this driver
         // never issued are different facts with one consequence here: no preparation is
@@ -184,7 +260,7 @@ pub(crate) fn prepare_driver_restore_targets(
         let target_position = target_position::compute_established_target_position(
             &configuration,
             &descriptor,
-            native_window_info.physical_decoration(),
+            native_window_frame.physical_decoration(),
             current_monitor.scale,
             *platform,
         );
@@ -207,8 +283,8 @@ pub(crate) fn prepare_driver_restore_targets(
         if current_monitor.descriptor != descriptor
             && matches!(
                 platform.fallback_return_capability(
-                    configuration.position,
-                    &configuration.saved_window_mode,
+                    configuration.position(),
+                    configuration.saved_window_mode(),
                 ),
                 ReturnCapability::Supported
             )
@@ -223,6 +299,69 @@ pub(crate) fn prepare_driver_restore_targets(
             commands.entity(entity).insert(X11FrameCompensated);
         }
     }
+}
+
+fn refresh_restore_monitor_observation(
+    commands: &mut Commands,
+    entity: Entity,
+    window: &Window,
+    native_association: NativeMonitorAssociation,
+    synchronized: SynchronizedMonitorAssociation,
+    retained: RetainedMonitorObservation,
+    monitors: &Monitors,
+) -> RestoreMonitorObservation {
+    let association = match native_association {
+        NativeMonitorAssociation::Observed(monitor) => OnMonitor(monitor),
+        NativeMonitorAssociation::AwaitingObservation => {
+            let SynchronizedMonitorAssociation::Synchronized(monitor) = synchronized else {
+                clear_restore_monitor_observation(commands, entity);
+                return RestoreMonitorObservation::Pending;
+            };
+            OnMonitor(monitor)
+        },
+        NativeMonitorAssociation::AwaitingTopology => {
+            clear_restore_monitor_observation(commands, entity);
+            return RestoreMonitorObservation::Pending;
+        },
+    };
+    let Some(current_monitor) =
+        monitors::current_monitor_from_association(window, &association, monitors)
+    else {
+        clear_restore_monitor_observation(commands, entity);
+        return RestoreMonitorObservation::Pending;
+    };
+    let association_changed = match synchronized {
+        SynchronizedMonitorAssociation::AwaitingSynchronization => true,
+        SynchronizedMonitorAssociation::Synchronized(previous) => previous != association.0,
+    };
+    let observation_changed = match retained {
+        RetainedMonitorObservation::NotRetained => true,
+        RetainedMonitorObservation::Retained(previous) => {
+            monitors::exact_monitor_association(&association, &previous, monitors).is_none()
+                || previous.effective_window_mode != current_monitor.effective_window_mode
+        },
+    };
+    if association_changed || observation_changed {
+        commands.entity(entity).insert((
+            CurrentMonitorEntity::new(association.0),
+            current_monitor,
+            association,
+        ));
+    }
+    RestoreMonitorObservation::Live(current_monitor)
+}
+
+/// Discard geometry derived from an association the native window no longer confirms.
+/// The driver retains the attempt and prepares again once an exact live observation arrives.
+fn clear_restore_monitor_observation(commands: &mut Commands, entity: Entity) {
+    commands.entity(entity).remove::<(
+        OnMonitor,
+        CurrentMonitor,
+        CurrentMonitorEntity,
+        TargetPosition,
+        PreparedPositionMeaning,
+        X11FrameCompensated,
+    )>();
 }
 
 pub(crate) fn remove_window_restore_work(world: &mut World, window: Entity, attempt: AttemptRef) {

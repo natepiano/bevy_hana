@@ -7,3 +7,11 @@ use bevy::prelude::ReflectDefault;
 #[derive(Component, Clone, Copy, Debug, Default, Reflect)]
 #[reflect(Component, Default)]
 pub struct CameraInputDisabled;
+
+/// Withholds wheel and trackpad scroll from a camera while every other input still reaches it.
+///
+/// An app inserts this while the pointer rests over something that consumes scroll itself, such
+/// as a scrollable panel body; drag, keyboard, pinch, and touch input keep driving the camera.
+#[derive(Component, Clone, Copy, Debug, Default, Reflect)]
+#[reflect(Component, Default)]
+pub struct CameraScrollInputDisabled;

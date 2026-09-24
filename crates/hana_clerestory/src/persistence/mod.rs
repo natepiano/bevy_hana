@@ -21,9 +21,13 @@ use bevy::prelude::ResMut;
 use bevy::prelude::Resource;
 use bevy::prelude::Update;
 use bevy::prelude::warn;
-pub(crate) use established_window_placement::EstablishedWindowPlacement;
+pub use established_window_placement::EstablishedWindowPlacement;
 pub(crate) use established_window_placement::EstablishedWindowPosition;
+pub use established_window_placement::InvalidWindowDisplay;
+pub use established_window_placement::ReadbackWindowPosition;
+pub use established_window_placement::RequestedWindowPlacement;
 pub(crate) use established_window_placement::RestorableWindowPosition;
+pub use established_window_placement::WindowPlacementConfiguration;
 pub(crate) use format::PersistedWindowIdentityMigrationOutcome;
 pub(crate) use format::PersistedWindowStateDecodeOutcome;
 use hana_rigging::prelude::BindingPolicy;
@@ -48,9 +52,9 @@ pub(crate) use window_state::PersistedWindowPlacement;
 pub(crate) use window_state::PersistedWindowPlacementLookup;
 pub(crate) use window_state::PersistedWindowState;
 pub(crate) use window_state::PersistedWindowTargetV5;
-#[cfg(test)]
-pub(crate) use window_state::SavedFullscreenVideoMode;
-pub(crate) use window_state::SavedWindowMode;
+pub use window_state::SavedFullscreenVideoMode;
+pub use window_state::SavedVideoMode;
+pub use window_state::SavedWindowMode;
 pub(crate) use window_state::UnrebasedDesktopPosition;
 
 use crate::ClerestoryPreStartupSet;

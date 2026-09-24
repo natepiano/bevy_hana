@@ -370,6 +370,11 @@ struct MergedDevice<'a> {
     presence:     CoReportedPresence,
     claim:        Claim,
     contributors: Vec<ReporterId>,
+    /// The accepted batch each contributor's record came from, in `Self::contributors` order.
+    ///
+    /// Carried into the register so it can tell a pass that merely re-reads the same retained
+    /// sets from one where a reporter looked at the hardware again.
+    batches:      Vec<BatchRef>,
     capabilities: CoReportView<'a>,
 }
 
@@ -402,10 +407,12 @@ fn reconcile_devices(
 
 /// Whether this frame reaches the merge at all.
 enum ReconcileWork {
-    /// No reporter completed a scan and no lease has anything left to apply, so the retained
-    /// device set already says what this frame would conclude.
+    /// No reporter completed a scan, no authored key awaits its connection conclusion, and no
+    /// lease has anything left to apply, so the retained device set already says what this frame
+    /// would conclude.
     Settled,
-    /// Either new evidence arrived or a lease expired, so the device set has to be rebuilt.
+    /// New evidence arrived, a key was authored, or a lease expired, so the device set has to be
+    /// rebuilt.
     Merges(Box<ReconcilePublication>),
 }
 
@@ -441,6 +448,7 @@ fn reconcile_work(
     departure_grace_deadline_reached: bool,
 ) -> ReconcileWork {
     if reporters.any_reporter_changed()
+        || hardware_inventory.awaits_connection_conclusion()
         || bindings.bound_device_keys().any(|key| {
             matches!(
                 devices.key_availability(key),
@@ -525,6 +533,7 @@ fn freshness_lease(
 /// platform handle names.
 struct EvidenceOnlyReport<'a> {
     reporter:      ReporterId,
+    batch:         BatchRef,
     handle:        &'a ReportedId,
     device_record: &'a DeviceRecord,
     presence:      CoReportedPresence,
@@ -781,7 +790,9 @@ fn merge_retained_records<'reports>(
     for registered_reporter in reporters.registered_reporters() {
         let freshness = freshness_lease.freshness_of(&registered_reporter);
         let reporter = registered_reporter.reporter;
-        let ReporterContribution::Completed { device_set, .. } = registered_reporter.contribution
+        let ReporterContribution::Completed {
+            batch, device_set, ..
+        } = registered_reporter.contribution
         else {
             continue;
         };
@@ -811,10 +822,12 @@ fn merge_retained_records<'reports>(
                                 presence:     reported_presence(device_record),
                                 claim:        device_record.claim.clone(),
                                 contributors: Vec::new(),
+                                batches:      Vec::new(),
                                 capabilities: HashMap::new(),
                             }
                         }),
                         reporter,
+                        batch,
                         device_record,
                         reported_presence(device_record),
                         &mut duplicate_keys,
@@ -827,6 +840,7 @@ fn merge_retained_records<'reports>(
                     {
                         evidence_only.push(EvidenceOnlyReport {
                             reporter,
+                            batch,
                             handle,
                             device_record,
                             presence: reported_presence(device_record),
@@ -869,6 +883,7 @@ fn join_evidence_only_records<'reports>(
         merge_keyed_record(
             merged_device,
             evidence_only_report.reporter,
+            evidence_only_report.batch,
             evidence_only_report.device_record,
             evidence_only_report.presence,
             duplicate_keys,
@@ -905,6 +920,10 @@ fn calculate_reconcile_publication(
     };
 
     let reported = fold_presence_roots_first(&merged, ingest_order, devices, identity_evidence);
+    let evidence_batches = merged
+        .iter()
+        .map(|(key, merged_device)| (key.clone(), merged_device.batches.clone()))
+        .collect();
     let fresh_reports = fresh_retained_reports(reporters, freshness_lease);
     let (reconciled, availability) = KeyAvailabilityReconciliation {
         reporters,
@@ -942,6 +961,7 @@ fn calculate_reconcile_publication(
             reported_handle_owners,
             unregistered_schemes,
             withdrawn_reporters,
+            evidence_batches,
         },
         connection_changes: configured_device_connection_changes(
             reporters,
@@ -1252,6 +1272,7 @@ fn record_handle_owner<'a>(
 fn merge_keyed_record<'a>(
     merged_device: &mut MergedDevice<'a>,
     reporter: ReporterId,
+    batch: BatchRef,
     device_record: &'a DeviceRecord,
     reported_presence: CoReportedPresence,
     duplicate_keys: &mut HashSet<DeviceKey>,
@@ -1261,10 +1282,11 @@ fn merge_keyed_record<'a>(
         duplicate_keys.insert(key.clone());
     } else {
         merged_device.contributors.push(reporter);
+        merged_device.batches.push(batch);
     }
 
     merged_device.presence = merged_device.presence.merge(reported_presence);
-    if claim_restriction(&device_record.claim) > claim_restriction(&merged_device.claim) {
+    if device_record.claim.restriction() > merged_device.claim.restriction() {
         merged_device.claim = device_record.claim.clone();
     }
     if matches!(merged_device.parent, ReportedParent::Root) {
@@ -1282,20 +1304,6 @@ fn merge_keyed_record<'a>(
             .entry(capability.value().as_any().type_id())
             .or_default()
             .push(capability);
-    }
-}
-
-/// How much a reported claim restricts this process, so co-reported claims merge to the most
-/// restrictive report.
-///
-/// One reporter seeing an idle camera does not make it idle when another reporter watched a second
-/// application open it; authorizing capture on the optimistic report would fail at the driver.
-const fn claim_restriction(claim: &Claim) -> u8 {
-    match claim {
-        Claim::NotApplicable | Claim::Free => 0,
-        Claim::Held => 1,
-        Claim::Contended { .. } => 2,
-        Claim::Blocked { .. } => 3,
     }
 }
 
@@ -4191,7 +4199,7 @@ mod tests {
             app.world()
                 .resource::<HardwareInventory>()
                 .connection(&authored),
-            Ok(ConfiguredDeviceConnection::NotObserved)
+            Ok(ConfiguredDeviceConnection::AwaitingConclusion)
         );
 
         let reported_units = add_set_reporter(
@@ -4221,6 +4229,38 @@ mod tests {
         assert!(device_entity_of(&app, &authored).is_some());
         advance_past_departure_grace(&mut app);
         assert_eq!(device_entity_of(&app, &authored), None);
+    }
+
+    /// A key authored after the reporter's only scan concludes from the evidence already
+    /// retained, rather than reading as unobserved until the hardware next changes.
+    #[test]
+    fn a_key_authored_after_the_only_scan_concludes_present_without_a_new_scan() {
+        let mut app = app_with_scheme();
+        let authored = key("panel-a");
+        registered_set_reporter(
+            &mut app,
+            vec![unit(authored.clone())],
+            ReporterCoverage::MatchingEvidenceOnly,
+            DiscoveryCadence::OnDemand,
+        );
+        run_until_reconciled(&mut app);
+        assert!(device_entity_of(&app, &authored).is_some());
+
+        app.world_mut()
+            .resource_mut::<HardwareInventory>()
+            .configure(ConfiguredDevice {
+                key:  authored.clone(),
+                mode: ConfiguredDeviceMode::Managed,
+                name: ConfiguredDeviceName::NeverDerived,
+            });
+        app.update();
+
+        assert_eq!(
+            app.world()
+                .resource::<HardwareInventory>()
+                .connection(&authored),
+            Ok(ConfiguredDeviceConnection::Present)
+        );
     }
 
     #[test]

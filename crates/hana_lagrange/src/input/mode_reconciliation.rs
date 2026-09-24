@@ -427,16 +427,16 @@ mod tests {
     use crate::OrbitCamInput;
     use crate::OrbitCamInputMode;
     use crate::TranslateDelta;
-    use crate::input::FreeCamKeyboardMousePreset;
+    use crate::free_cam::FreeCamKeyboardMousePreset;
+    use crate::free_cam::FreeCamPreset;
     use crate::input::FreeCamManualInputWriter;
-    use crate::input::FreeCamPreset;
     use crate::input::INVALID_SOURCE_INPUT_GAIN;
     use crate::input::InteractionSources;
     use crate::input::ManualInputSource;
-    use crate::input::OrbitCamBlenderLikePreset;
-    use crate::input::OrbitCamInputGain;
     use crate::input::OrbitCamManualInputWriter;
-    use crate::input::OrbitCamPreset;
+    use crate::orbit_cam::OrbitCamBlenderLikePreset;
+    use crate::orbit_cam::OrbitCamInputGain;
+    use crate::orbit_cam::OrbitCamPreset;
     use crate::system_sets::LagrangeSystemSetsPlugin;
 
     #[derive(Resource)]

@@ -19,7 +19,3 @@ pub use gamepad::OrbitCamGamepadPresetBuilder;
 pub use keyboard::OrbitCamKeyboardPreset;
 pub use simple_mouse::OrbitCamSimpleMousePreset;
 pub use simple_mouse_keyboard::OrbitCamSimpleMouseKeyboardPreset;
-
-pub use crate::input::GamepadInputGain;
-pub use crate::input::MouseInputGain;
-pub use crate::input::SmoothScrollInputGain;

@@ -9,6 +9,7 @@ use bevy::prelude::Window;
 use hana_kana::ToI32;
 use hana_kana::ToU32;
 use hana_rigging::prelude::DeviceKey;
+use hana_rigging::prelude::DeviceKind;
 
 use super::PersistedPosition;
 use super::PersistedWindowState;
@@ -40,45 +41,142 @@ pub(crate) enum RestorableWindowPosition {
     CompositorControlled,
 }
 
-/// Window-driver value retained as the binding's last known good configuration.
+/// Window placement retained after safe readback or restored from persistence.
 ///
-/// This contains only the configuration a safe readback established. Attempt lifecycle, write
-/// eligibility, and role ownership stay in `hana_rigging::Bindings`.
-#[derive(Component, Clone, Debug, PartialEq, Reflect)]
+/// Attempt lifecycle, write eligibility, selected display and role ownership stay in
+/// `hana_rigging::Bindings`.
+#[derive(Component, Clone, Debug, PartialEq, Eq, Reflect)]
 #[reflect(Component, PartialEq)]
-pub(crate) struct EstablishedWindowPlacement {
+pub struct EstablishedWindowPlacement {
     pub(crate) position:          EstablishedWindowPosition,
     pub(crate) logical_size:      UVec2,
     pub(crate) saved_window_mode: SavedWindowMode,
+}
+
+/// A window placement was requested for a device that is not a display.
+#[derive(Debug, thiserror::Error)]
+#[error("window placement requires a display, received {0:?}")]
+pub struct InvalidWindowDisplay(DeviceKind);
+
+/// Placement authored before a window has supplied driver readback.
+#[derive(Clone, Debug, PartialEq, Eq, Reflect)]
+pub struct RequestedWindowPlacement {
+    /// Logical window size used before fullscreen applies.
+    pub logical_size:      UVec2,
+    /// Requested window mode.
+    pub saved_window_mode: SavedWindowMode,
+}
+
+/// Placement intent or the last placement established by safe readback.
+#[derive(Component, Clone, Debug, PartialEq, Eq, Reflect)]
+#[reflect(Component, PartialEq)]
+pub enum WindowPlacementConfiguration {
+    /// A placement request that has not supplied readback.
+    Requested(RequestedWindowPlacement),
+    /// Placement measured from a window or restored from a persisted record.
+    Established(EstablishedWindowPlacement),
+}
+
+impl WindowPlacementConfiguration {
+    pub(crate) const fn logical_size(&self) -> UVec2 {
+        match self {
+            Self::Requested(placement) => placement.logical_size,
+            Self::Established(placement) => placement.logical_size,
+        }
+    }
+
+    pub(crate) const fn saved_window_mode(&self) -> &SavedWindowMode {
+        match self {
+            Self::Requested(placement) => &placement.saved_window_mode,
+            Self::Established(placement) => &placement.saved_window_mode,
+        }
+    }
+
+    pub(crate) const fn position(&self) -> EstablishedWindowPosition {
+        match self {
+            Self::Requested(_) => EstablishedWindowPosition::CompositorControlled,
+            Self::Established(placement) => placement.position,
+        }
+    }
+
+    pub(crate) fn restorable_position(
+        &self,
+        monitor: &MonitorDescriptor,
+    ) -> RestorableWindowPosition {
+        match self {
+            Self::Requested(_) => RestorableWindowPosition::CompositorControlled,
+            Self::Established(placement) => placement.restorable_position(monitor),
+        }
+    }
+}
+
+impl From<EstablishedWindowPlacement> for WindowPlacementConfiguration {
+    fn from(placement: EstablishedWindowPlacement) -> Self { Self::Established(placement) }
+}
+
+/// Whether platform readback supplied a physical window position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadbackWindowPosition {
+    /// Physical position observed by the platform.
+    Observed(IVec2),
+    /// The platform supplied no position.
+    Unavailable,
+}
+
+impl From<Option<IVec2>> for ReadbackWindowPosition {
+    fn from(position: Option<IVec2>) -> Self { position.map_or(Self::Unavailable, Self::Observed) }
+}
+
+impl RequestedWindowPlacement {
+    /// Requests borderless fullscreen on the display named by the binding endpoint.
+    ///
+    /// The display may be absent. Its key remains solely in the binding endpoint; the driver
+    /// resolves its current monitor when applying. The windowed fallback size uses Bevy's
+    /// default resolution, while fullscreen size is supplied by the selected monitor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidWindowDisplay`] for a non-display device key.
+    pub fn fullscreen_for_display(device: &DeviceKey) -> Result<Self, InvalidWindowDisplay> {
+        if device.kind != DeviceKind::Display {
+            return Err(InvalidWindowDisplay(device.kind));
+        }
+        let resolution = Window::default().resolution;
+        Ok(Self {
+            logical_size:      UVec2::new(
+                resolution.width().to_u32(),
+                resolution.height().to_u32(),
+            ),
+            saved_window_mode: SavedWindowMode::BorderlessFullscreen,
+        })
+    }
 }
 
 impl EstablishedWindowPlacement {
     pub(crate) fn from_readback(
         window: &Window,
         current_monitor: &CurrentMonitor,
-        physical_position: Option<IVec2>,
+        physical_position: ReadbackWindowPosition,
         platform: Platform,
     ) -> Self {
         let monitor_descriptor = current_monitor.descriptor;
-        let position = if platform.position_available() {
-            physical_position.map_or(
-                EstablishedWindowPosition::CompositorControlled,
-                |position| {
-                    let physical_offset = position - monitor_descriptor.physical_position;
-                    EstablishedWindowPosition::Restorable {
-                        logical_offset: IVec2::new(
-                            (f64::from(physical_offset.x) / monitor_descriptor.scale)
-                                .round()
-                                .to_i32(),
-                            (f64::from(physical_offset.y) / monitor_descriptor.scale)
-                                .round()
-                                .to_i32(),
-                        ),
-                    }
-                },
-            )
-        } else {
-            EstablishedWindowPosition::CompositorControlled
+        let position = match physical_position {
+            ReadbackWindowPosition::Observed(position) if platform.position_available() => {
+                let physical_offset = position - monitor_descriptor.physical_position;
+                EstablishedWindowPosition::Restorable {
+                    logical_offset: IVec2::new(
+                        (f64::from(physical_offset.x) / monitor_descriptor.scale)
+                            .round()
+                            .to_i32(),
+                        (f64::from(physical_offset.y) / monitor_descriptor.scale)
+                            .round()
+                            .to_i32(),
+                    ),
+                }
+            },
+            ReadbackWindowPosition::Observed(_) | ReadbackWindowPosition::Unavailable => {
+                EstablishedWindowPosition::CompositorControlled
+            },
         };
 
         Self {
@@ -172,7 +270,7 @@ impl EstablishedWindowPlacement {
         }
     }
 
-    pub(crate) fn project(&self, device_key: DeviceKey, app_name: &str) -> PersistedWindowState {
+    pub(super) fn project(&self, device_key: DeviceKey, app_name: &str) -> PersistedWindowState {
         let position = match self.position {
             EstablishedWindowPosition::Restorable { logical_offset } => {
                 PersistedPosition::MonitorOffset(logical_offset)
@@ -225,6 +323,26 @@ mod tests {
     use hana_rigging::prelude::DeviceKind;
 
     use super::*;
+
+    #[test]
+    fn fullscreen_request_accepts_an_absent_display_and_rejects_other_devices() -> Result<(), String>
+    {
+        let mut device = DeviceKey {
+            kind: DeviceKind::Display,
+            id:   DeviceIdSource::Synthesized {
+                digest: hana_rigging::prelude::Digest::new(43),
+            },
+        };
+        let placement = RequestedWindowPlacement::fullscreen_for_display(&device)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            placement.saved_window_mode,
+            SavedWindowMode::BorderlessFullscreen
+        );
+        device.kind = DeviceKind::Camera;
+        assert!(RequestedWindowPlacement::fullscreen_for_display(&device).is_err());
+        Ok(())
+    }
 
     #[test]
     fn established_configuration_projects_only_serialized_fields() {

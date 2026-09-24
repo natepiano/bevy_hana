@@ -7,15 +7,12 @@ use bevy_enhanced_input::prelude::Binding;
 use bevy_enhanced_input::prelude::ModKeys;
 
 use super::BindingGates;
-use super::CameraInputGamepadSelectionPolicy;
 use super::CameraInputModeKind;
 use super::CameraSemanticAction;
 use super::CameraSlowMode;
-use super::FreeCamBindings;
 use super::FreeCamControlDirection;
 use super::FreeCamInputMode;
 use super::FreeCamInteractionKind;
-use super::FreeCamLookPitch;
 use super::GateInput;
 use super::GatePolarity;
 use super::HeldActionBindingEntry;
@@ -26,16 +23,8 @@ use super::InputBindingDescriptor;
 use super::InputBindingEntry;
 use super::InputMode;
 use super::InteractionSources;
-use super::OrbitCamBindingWithInputGain;
-use super::OrbitCamBindings;
-use super::OrbitCamButtonDragZoom;
 use super::OrbitCamInputMode;
 use super::OrbitCamInteractionKind;
-use super::OrbitCamLineScroll;
-use super::OrbitCamTouchBinding;
-use super::OrbitCamTouchBindingConfig;
-use super::OrbitCamTrackpadScroll;
-use super::ZoomInversion;
 use super::bindings;
 use super::constants::APP_AUTHORED_INPUT_ROW_LABEL;
 use super::constants::CUSTOM_BINDINGS_MODE_VALUE;
@@ -74,6 +63,17 @@ use super::constants::WHEEL_ZOOM_IN_LABEL;
 use super::constants::WHEEL_ZOOM_OUT_LABEL;
 use crate::FreeCam;
 use crate::ScalarLimit;
+use crate::free_cam::FreeCamBindings;
+use crate::free_cam::FreeCamLookPitch;
+use crate::orbit_cam::CameraInputGamepadSelectionPolicy;
+use crate::orbit_cam::OrbitCamBindingWithInputGain;
+use crate::orbit_cam::OrbitCamBindings;
+use crate::orbit_cam::OrbitCamButtonDragZoom;
+use crate::orbit_cam::OrbitCamLineScroll;
+use crate::orbit_cam::OrbitCamTouchBinding;
+use crate::orbit_cam::OrbitCamTouchBindingConfig;
+use crate::orbit_cam::OrbitCamTrackpadScroll;
+use crate::orbit_cam::ZoomInversion;
 
 /// Derived, read-only display summary of the controls configured for a
 /// lagrange camera input mode.
@@ -1535,28 +1535,28 @@ fn camera_control_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::free_cam::FreeCamBindings;
+    use crate::free_cam::FreeCamKeyboardMousePreset;
+    use crate::free_cam::FreeCamMouseLook;
+    use crate::free_cam::FreeCamPreset;
+    use crate::free_cam::FreeCamRollBinding;
+    use crate::free_cam::FreeCamTranslateKeys;
     use crate::input::BindingsError;
     use crate::input::CUSTOM_SLOW_SCALE;
     use crate::input::CameraInputScalePolicy;
     use crate::input::CameraSlowMode;
-    use crate::input::FreeCamBindings;
-    use crate::input::FreeCamKeyboardMousePreset;
-    use crate::input::FreeCamMouseLook;
-    use crate::input::FreeCamPreset;
-    use crate::input::FreeCamRollBinding;
-    use crate::input::FreeCamTranslateKeys;
     use crate::input::InputBinding;
     use crate::input::InputGain;
-    use crate::input::OrbitCamBlenderLikePreset;
-    use crate::input::OrbitCamButtonDragZoom;
-    use crate::input::OrbitCamGamepadPreset;
-    use crate::input::OrbitCamInputGain;
-    use crate::input::OrbitCamMouseDrag;
-    use crate::input::OrbitCamMouseWheelZoom;
-    use crate::input::OrbitCamPinchZoom;
-    use crate::input::OrbitCamPreset;
-    use crate::input::OrbitCamTouchBinding;
-    use crate::input::OrbitCamTrackpadScroll;
+    use crate::orbit_cam::OrbitCamBlenderLikePreset;
+    use crate::orbit_cam::OrbitCamButtonDragZoom;
+    use crate::orbit_cam::OrbitCamGamepadPreset;
+    use crate::orbit_cam::OrbitCamInputGain;
+    use crate::orbit_cam::OrbitCamMouseDrag;
+    use crate::orbit_cam::OrbitCamMouseWheelZoom;
+    use crate::orbit_cam::OrbitCamPinchZoom;
+    use crate::orbit_cam::OrbitCamPreset;
+    use crate::orbit_cam::OrbitCamTouchBinding;
+    use crate::orbit_cam::OrbitCamTrackpadScroll;
 
     #[test]
     fn forwarded_trackpad_summary_reports_wheel_modifiers() {

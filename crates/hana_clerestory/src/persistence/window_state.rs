@@ -26,7 +26,7 @@ use crate::monitors::DisplayIdentity;
 
 /// Saved video mode for exclusive fullscreen.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Reflect)]
-pub(crate) struct SavedVideoMode {
+pub struct SavedVideoMode {
     pub(super) physical_size:           UVec2,
     pub(super) bit_depth:               u16,
     pub(super) refresh_rate_millihertz: u32,
@@ -50,7 +50,7 @@ impl SavedVideoMode {
 /// exact mode that was active when Clerestory observed it. A bare optional mode would make those
 /// two instructions indistinguishable at a persistence boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Reflect)]
-pub(crate) enum SavedFullscreenVideoMode {
+pub enum SavedFullscreenVideoMode {
     /// Re-enter exclusive fullscreen using the target display's current video mode.
     Current,
     /// Re-enter exclusive fullscreen using this exact observed video mode.
@@ -59,8 +59,10 @@ pub(crate) enum SavedFullscreenVideoMode {
 
 /// Serializable window mode.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Reflect)]
-pub(crate) enum SavedWindowMode {
+pub enum SavedWindowMode {
+    /// A decorated, freely sized window.
     Windowed,
+    /// Borderless fullscreen on the selected display.
     BorderlessFullscreen,
     /// Exclusive fullscreen with a named current-or-specific video-mode request.
     Fullscreen {
@@ -255,7 +257,7 @@ pub(crate) enum PersistedWindowTargetV5 {
 /// monitor's live scale. Position is scale-independent by construction; see
 /// [`PersistedPosition`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct PersistedWindowState {
+pub struct PersistedWindowState {
     /// Exact display authority, or a retained v4 target that needs fresh reporter evidence.
     pub(crate) target:            PersistedWindowTargetV5,
     /// Placement of the window relative to the target display.

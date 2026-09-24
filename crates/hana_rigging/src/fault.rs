@@ -17,11 +17,46 @@ pub(crate) enum ApplyFailureDisposition {
 /// Why a driver failure ends apply work without retrying.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DriverStopReason {
+    /// The operator cancelled or revoked permission and must explicitly request recovery.
+    Cancelled {
+        /// Provider detail identifying the cancellation.
+        detail: String,
+    },
     /// The driver cannot perform this operation on the current platform.
     Unsupported {
         /// Provider-supplied text naming the unsupported platform contract.
         detail: String,
     },
+}
+
+/// The class a driver assigns to a device-access failure at the moment and place it happens.
+///
+/// A backend knows why its own call refused long before the detail string reaches the kernel, and
+/// that knowledge is what [`DeviceAccessClass`] carries. Pairing one with the provider detail
+/// builds the matching [`DeviceAccessError`], so retry policy never has to read message text to
+/// recover a class the failing call already knew.
+///
+/// Unlike [`DeviceAccessError`], this enum is closed: every producer states one of these classes,
+/// and adding a class must break each site that maps one rather than silently falling to a
+/// wildcard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceAccessClass {
+    /// The operator cancelled or revoked this operation.
+    Cancelled,
+    /// Another owner holds exclusive access to the device.
+    Contended,
+    /// The operating system or device policy refuses access.
+    Blocked,
+    /// The device is not reachable for the authorized operation.
+    Absent,
+    /// The device opened but never delivered its first datum.
+    Unresponsive,
+    /// Hana still holds this device from its own earlier open, which has not returned yet.
+    Releasing,
+    /// Communication with the device or its provider failed outside the other classes.
+    Transport,
+    /// The current platform has no implementation that can perform this operation.
+    Unsupported,
 }
 
 /// A classified device-access failure from discovery, capture, apply, or an established session.
@@ -35,6 +70,11 @@ pub enum DriverStopReason {
 #[derive(Clone, PartialEq, Eq, Debug, Reflect)]
 #[non_exhaustive]
 pub enum DeviceAccessError {
+    /// The operator cancelled or revoked this operation; only explicit recovery may resume it.
+    Cancelled {
+        /// Provider detail identifying the cancelled consent or closed session.
+        detail: String,
+    },
     /// Another owner holds exclusive access, such as a camera open by a video-conferencing
     /// application.
     Contended {
@@ -52,6 +92,18 @@ pub enum DeviceAccessError {
         /// Provider-supplied text that identifies the departure or missing-device response.
         detail: String,
     },
+    /// The device opened but never delivered its first datum, such as a camera that accepts the
+    /// open and then starves its capture queue.
+    Unresponsive {
+        /// Provider-supplied text that identifies the wait that expired without a datum.
+        detail: String,
+    },
+    /// Hana's own earlier open of this device has not returned from the driver yet, so the device
+    /// is held by this process rather than by another application.
+    Releasing {
+        /// Provider-supplied text that identifies the earlier open still holding the device.
+        detail: String,
+    },
     /// Communication with the device or its provider failed for a reason outside the other
     /// access classes, such as a HID transport error.
     Transport {
@@ -65,15 +117,80 @@ pub enum DeviceAccessError {
     },
 }
 
+impl From<(DeviceAccessClass, String)> for DeviceAccessError {
+    /// Builds the error a driver reports from the class its failing call knew and the provider
+    /// detail it carried out.
+    fn from((class, detail): (DeviceAccessClass, String)) -> Self {
+        match class {
+            DeviceAccessClass::Cancelled => Self::Cancelled { detail },
+            DeviceAccessClass::Contended => Self::Contended { detail },
+            DeviceAccessClass::Blocked => Self::Blocked { detail },
+            DeviceAccessClass::Absent => Self::Absent { detail },
+            DeviceAccessClass::Unresponsive => Self::Unresponsive { detail },
+            DeviceAccessClass::Releasing => Self::Releasing { detail },
+            DeviceAccessClass::Transport => Self::Transport { detail },
+            DeviceAccessClass::Unsupported => Self::Unsupported { detail },
+        }
+    }
+}
+
 impl DeviceAccessError {
+    /// Report the class this failure was given where it happened.
+    ///
+    /// This is the inverse of the `From<(DeviceAccessClass, String)>` conversion, for a caller
+    /// holding the error that needs the class it was built from.
+    #[must_use]
+    pub const fn access_class(&self) -> DeviceAccessClass {
+        match self {
+            Self::Cancelled { .. } => DeviceAccessClass::Cancelled,
+            Self::Contended { .. } => DeviceAccessClass::Contended,
+            Self::Blocked { .. } => DeviceAccessClass::Blocked,
+            Self::Absent { .. } => DeviceAccessClass::Absent,
+            Self::Unresponsive { .. } => DeviceAccessClass::Unresponsive,
+            Self::Releasing { .. } => DeviceAccessClass::Releasing,
+            Self::Transport { .. } => DeviceAccessClass::Transport,
+            Self::Unsupported { .. } => DeviceAccessClass::Unsupported,
+        }
+    }
+
+    /// Report the provider detail this failure carried out of the call that refused.
+    ///
+    /// Every class names its own condition, so every variant carries a detail worth printing. A
+    /// caller reads it through this accessor rather than matching the variants itself: the match
+    /// lives here, where a new variant cannot compile without answering for its detail, and a
+    /// downstream wildcard can never quietly drop one.
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::Cancelled { detail }
+            | Self::Contended { detail }
+            | Self::Blocked { detail }
+            | Self::Absent { detail }
+            | Self::Unresponsive { detail }
+            | Self::Releasing { detail }
+            | Self::Transport { detail }
+            | Self::Unsupported { detail } => detail,
+        }
+    }
+
     /// Report the [`ApplyFailureDisposition`] the kernel uses when this failure occurs during
     /// apply.
     #[must_use]
     pub(crate) fn apply_failure_disposition(&self) -> ApplyFailureDisposition {
         match self {
-            Self::Contended { .. } | Self::Blocked { .. } => {
-                ApplyFailureDisposition::AwaitClearance
+            Self::Cancelled { detail } => {
+                ApplyFailureDisposition::Stop(DriverStopReason::Cancelled {
+                    detail: detail.clone(),
+                })
             },
+            // Unresponsive and Releasing both name a device that is held rather than broken: a
+            // camera that opened without starting its stream, or a node Hana's own earlier open
+            // still holds while it waits on the driver. The clearance re-probe answers Free once
+            // that hold ends, so neither spends the device's retry budget waiting for it.
+            Self::Contended { .. }
+            | Self::Blocked { .. }
+            | Self::Unresponsive { .. }
+            | Self::Releasing { .. } => ApplyFailureDisposition::AwaitClearance,
             Self::Absent { .. } => ApplyFailureDisposition::Reconsider,
             Self::Transport { .. } => ApplyFailureDisposition::Fault,
             Self::Unsupported { detail } => {
@@ -94,6 +211,7 @@ mod tests {
     use bevy::ecs::reflect::ReflectComponent;
 
     use super::ApplyFailureDisposition;
+    use super::DeviceAccessClass;
     use super::DeviceAccessError;
     use super::DriverStopReason;
 
@@ -128,6 +246,74 @@ mod tests {
             .apply_failure_disposition(),
             ApplyFailureDisposition::Reconsider
         );
+    }
+
+    #[test]
+    fn an_unresponsive_device_awaits_clearance_without_spending_retry_budget() {
+        assert_eq!(
+            DeviceAccessError::Unresponsive {
+                detail: String::new(),
+            }
+            .apply_failure_disposition(),
+            ApplyFailureDisposition::AwaitClearance
+        );
+    }
+
+    #[test]
+    fn a_device_this_process_is_still_releasing_awaits_clearance() {
+        assert_eq!(
+            DeviceAccessError::Releasing {
+                detail: String::new(),
+            }
+            .apply_failure_disposition(),
+            ApplyFailureDisposition::AwaitClearance
+        );
+    }
+
+    #[test]
+    fn every_class_round_trips_through_the_error_it_builds() {
+        let classes = [
+            DeviceAccessClass::Cancelled,
+            DeviceAccessClass::Contended,
+            DeviceAccessClass::Blocked,
+            DeviceAccessClass::Absent,
+            DeviceAccessClass::Unresponsive,
+            DeviceAccessClass::Releasing,
+            DeviceAccessClass::Transport,
+            DeviceAccessClass::Unsupported,
+        ];
+
+        for class in classes {
+            let detail = String::from("provider detail");
+            let error = DeviceAccessError::from((class, detail.clone()));
+
+            assert_eq!(error.access_class(), class);
+            assert!(format!("{error:?}").contains(&detail));
+        }
+    }
+
+    #[test]
+    fn every_error_reports_the_detail_its_failing_call_carried() {
+        let classes = [
+            DeviceAccessClass::Cancelled,
+            DeviceAccessClass::Contended,
+            DeviceAccessClass::Blocked,
+            DeviceAccessClass::Absent,
+            DeviceAccessClass::Unresponsive,
+            DeviceAccessClass::Releasing,
+            DeviceAccessClass::Transport,
+            DeviceAccessClass::Unsupported,
+        ];
+
+        for class in classes {
+            let detail = format!("{class:?} provider detail");
+
+            assert_eq!(
+                DeviceAccessError::from((class, detail.clone())).detail(),
+                detail,
+                "{class:?} must report its own detail, not a generic substitute"
+            );
+        }
     }
 
     #[test]

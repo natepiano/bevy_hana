@@ -10,14 +10,14 @@ use bevy::reflect::TypePath;
 
 use super::CameraControlSummary;
 use super::CameraInputKind;
-use super::FreeCamBindings;
-use super::FreeCamPreset;
-use super::OrbitCamBindings;
-use super::OrbitCamPreset;
 use super::control_summary;
 use crate::FreeCam;
 use crate::FreeCamKind;
 use crate::OrbitCamKind;
+use crate::free_cam::FreeCamBindings;
+use crate::free_cam::FreeCamPreset;
+use crate::orbit_cam::OrbitCamBindings;
+use crate::orbit_cam::OrbitCamPreset;
 
 mod sealed {
     pub trait Sealed {}

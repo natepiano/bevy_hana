@@ -59,6 +59,7 @@ use super::element::ElementContent;
 use super::element::LayoutTree;
 use super::element::PrecomposeMode;
 use super::element::ScrollAnchor;
+use super::element::ScrollLine;
 use crate::DimensionMatch;
 use crate::ImeEditableFieldSpec;
 use crate::ImePanelField;
@@ -553,6 +554,7 @@ struct CommonEl {
     scroll_offset:     Vec2,
     scroll_anchor_x:   ScrollAnchor,
     scroll_anchor_y:   ScrollAnchor,
+    scroll_line:       ScrollLine,
     material:          Cascade<Handle<StandardMaterial>>,
     interactivity:     Cascade<WidgetInteractivity>,
     editable:          Option<ImePanelField>,
@@ -765,6 +767,7 @@ impl Default for CommonEl {
             scroll_offset:     Vec2::ZERO,
             scroll_anchor_x:   ScrollAnchor::Start,
             scroll_anchor_y:   ScrollAnchor::Start,
+            scroll_line:       ScrollLine::PanelDefaultFont,
             material:          Cascade::Inherit,
             interactivity:     Cascade::Inherit,
             editable:          None,
@@ -802,6 +805,7 @@ fn text_leaf_element(mut common: CommonEl, content: ElementContent) -> Element {
         scroll_offset: common.scroll_offset,
         scroll_anchor_x: common.scroll_anchor_x,
         scroll_anchor_y: common.scroll_anchor_y,
+        scroll_line: common.scroll_line,
         material: common.material,
         interactivity: common.interactivity,
         editable: common.editable,
@@ -1063,9 +1067,16 @@ impl<L, Role> El<L, Role> {
         self
     }
 
-    /// Sets overflow to `Clipped`; default is `Visible`.
+    /// Clips overflowing children to the content box; default is visible
+    /// overflow.
+    ///
+    /// Clipping alone does not make the element scroll: only `scroll_x`,
+    /// `scroll_y`, and `scroll_y_from_end` do, and an element already set to
+    /// scroll keeps scrolling.
     pub const fn clip(mut self) -> Self {
-        self.common.overflow = ChildOverflow::Clipped;
+        if !matches!(self.common.overflow, ChildOverflow::Scrolled) {
+            self.common.overflow = ChildOverflow::Clipped;
+        }
         self
     }
 
@@ -1077,7 +1088,7 @@ impl<L, Role> El<L, Role> {
     pub const fn scroll_y(mut self, offset: f32) -> Self {
         self.common.scroll_offset.y = offset;
         self.common.scroll_anchor_y = ScrollAnchor::Start;
-        self.common.overflow = ChildOverflow::Clipped;
+        self.common.overflow = ChildOverflow::Scrolled;
         self
     }
 
@@ -1090,7 +1101,19 @@ impl<L, Role> El<L, Role> {
     pub const fn scroll_y_from_end(mut self, scrollback: f32) -> Self {
         self.common.scroll_offset.y = scrollback;
         self.common.scroll_anchor_y = ScrollAnchor::End;
-        self.common.overflow = ChildOverflow::Clipped;
+        self.common.overflow = ChildOverflow::Scrolled;
+        self
+    }
+
+    /// Declares the text line this element moves by when it scrolls: a wheel
+    /// line moves the content by one line of `style` plus the element's child
+    /// gap.
+    ///
+    /// Without a declaration the line is one of the panel's default font size.
+    /// Only a scrolling element (`scroll_x`, `scroll_y`, `scroll_y_from_end`)
+    /// reads it.
+    pub fn scroll_line(mut self, style: TextStyle) -> Self {
+        self.common.scroll_line = ScrollLine::Declared(Box::new(style));
         self
     }
 
@@ -1101,7 +1124,7 @@ impl<L, Role> El<L, Role> {
     pub const fn scroll_x(mut self, offset: f32) -> Self {
         self.common.scroll_offset.x = offset;
         self.common.scroll_anchor_x = ScrollAnchor::Start;
-        self.common.overflow = ChildOverflow::Clipped;
+        self.common.overflow = ChildOverflow::Scrolled;
         self
     }
 
@@ -1883,6 +1906,7 @@ impl<L, Role> El<L, Role> {
             scroll_offset: common.scroll_offset,
             scroll_anchor_x: common.scroll_anchor_x,
             scroll_anchor_y: common.scroll_anchor_y,
+            scroll_line: common.scroll_line,
             material: common.material,
             interactivity: common.interactivity,
             editable: common.editable,

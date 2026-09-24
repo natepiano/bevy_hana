@@ -63,10 +63,10 @@ pub(super) struct PanelShapeMember<'a> {
 
 /// One member's panel-space contour with its per-contour packing inputs.
 struct MemberContour {
-    segments:      Vec<QuadraticSegment>,
+    segments:             Vec<QuadraticSegment>,
     /// World-unit narrowest stroke (hairline dilation input).
-    min_feature:   f32,
-    fade_exponent: f32,
+    minimum_feature_size: f32,
+    fade_exponent:        f32,
 }
 
 /// Converts one mergeable group of resolved panel-line primitives (same
@@ -109,7 +109,7 @@ fn member_contour(
     member: &PanelShapeMember<'_>,
     context: &PanelShapePathContext,
 ) -> Option<MemberContour> {
-    let (segments, min_feature) = match member.primitive.geometry() {
+    let (segments, minimum_feature_size) = match member.primitive.geometry() {
         PanelShapePrimitiveGeometry::Segment { start, end, width } => (
             segment_contour(start, end, width, context)?,
             width * context.points_to_world,
@@ -134,7 +134,7 @@ fn member_contour(
     };
     Some(MemberContour {
         segments,
-        min_feature,
+        minimum_feature_size,
         fade_exponent: member.fade_exponent,
     })
 }
@@ -253,9 +253,10 @@ fn local_design_outline(contours: Vec<MemberContour>, translation: PathTranslati
                 segment.end = translation.to_design(segment.end);
             }
             PathContour {
-                segments:      contour.segments,
-                min_feature:   contour.min_feature * translation.design_units_per_world,
-                fade_exponent: contour.fade_exponent,
+                segments:             contour.segments,
+                minimum_feature_size: contour.minimum_feature_size
+                    * translation.design_units_per_world,
+                fade_exponent:        contour.fade_exponent,
             }
         })
         .collect();

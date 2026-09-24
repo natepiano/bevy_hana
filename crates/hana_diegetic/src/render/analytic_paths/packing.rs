@@ -124,13 +124,13 @@ pub(crate) struct BandRecord {
 #[derive(Clone, Copy, Debug, PartialEq, ShaderType)]
 pub(crate) struct PackedPathRecord {
     /// Bounds minimum in `.xy`, bounds size in `.zw`, in font design-space units.
-    pub bounds_min_size: Vec4,
+    pub bounds_min_size:      Vec4,
     /// Horizontal band start/count in `.xy`, vertical band start/count in `.zw`.
-    pub band_range:      UVec4,
+    pub band_range:           UVec4,
     /// Narrowest stroke of the path in design-space units; the shader dilates
     /// the silhouette so that stroke covers at least one screen pixel
     /// (hairline rendering). `0.0` disables — text paths stay undilated.
-    pub min_feature:     f32,
+    pub minimum_feature_size: f32,
 }
 
 impl PackedPathRecord {
@@ -142,7 +142,7 @@ impl PackedPathRecord {
         horizontal_band_count: u32,
         vertical_band_start: u32,
         vertical_band_count: u32,
-        min_feature: f32,
+        minimum_feature_size: f32,
     ) -> Self {
         Self {
             bounds_min_size: Vec4::new(bounds.min.x, bounds.min.y, bounds.width(), bounds.height()),
@@ -152,7 +152,7 @@ impl PackedPathRecord {
                 vertical_band_start,
                 vertical_band_count,
             ),
-            min_feature,
+            minimum_feature_size,
         }
     }
 }
@@ -333,11 +333,11 @@ pub(super) fn build_packed_path_with_layout(path: PathOutline, layout: BandLayou
         .flat_map(|contour| {
             let chirality = contour_signed_area(contour).signum();
             contour.segments.iter().map(move |segment| BandedSegment {
-                segment:       *segment,
-                orientation:   segment_orientation(segment),
-                min_feature:   contour.min_feature,
-                fade_exponent: contour.fade_exponent,
-                edge_normal:   segment_outward_normal(segment, chirality),
+                segment:              *segment,
+                orientation:          segment_orientation(segment),
+                minimum_feature_size: contour.minimum_feature_size,
+                fade_exponent:        contour.fade_exponent,
+                edge_normal:          segment_outward_normal(segment, chirality),
             })
         })
         .collect();
@@ -455,11 +455,11 @@ enum CurveOrientation {
 /// One outline segment with the per-band packing inputs it carries.
 #[derive(Clone, Copy)]
 struct BandedSegment {
-    segment:       QuadraticSegment,
-    orientation:   CurveOrientation,
-    min_feature:   f32,
-    fade_exponent: f32,
-    edge_normal:   Vec2,
+    segment:              QuadraticSegment,
+    orientation:          CurveOrientation,
+    minimum_feature_size: f32,
+    fade_exponent:        f32,
+    edge_normal:          Vec2,
 }
 
 fn append_bands(
@@ -521,7 +521,7 @@ fn append_band_curves(
     });
     curves.extend(filtered.iter().map(|banded| {
         let mut record = CurveRecord::from(&banded.segment);
-        record.solver.w = banded.min_feature;
+        record.solver.w = banded.minimum_feature_size;
         record.fade_exponent = banded.fade_exponent;
         record.edge_normal = banded.edge_normal;
         record
@@ -563,7 +563,7 @@ fn segment_outward_normal(segment: &QuadraticSegment, chirality: f32) -> Vec2 {
 /// contour stroke for a degenerate (zero-normal) edge.
 fn edge_slab_width(contour: &PathContour, segment: &QuadraticSegment, normal: Vec2) -> f32 {
     if normal == Vec2::ZERO {
-        return contour.min_feature;
+        return contour.minimum_feature_size;
     }
     let edge_support = normal.dot(segment.start);
     let min_support = contour

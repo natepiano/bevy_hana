@@ -15,7 +15,6 @@ use super::preset::FreeCamLookPitch;
 use crate::input;
 use crate::input::ActionBindingDescriptor;
 use crate::input::BindingsError;
-use crate::input::CameraInputGamepadSelectionPolicy;
 use crate::input::CameraSlowMode;
 use crate::input::FREE_CAM_HOME_ACTION_NAME;
 use crate::input::FREE_CAM_LOOK_ACTION_NAME;
@@ -23,6 +22,7 @@ use crate::input::FREE_CAM_ROLL_ACTION_NAME;
 use crate::input::FREE_CAM_TRANSLATE_ACTION_NAME;
 use crate::input::HeldBindingDescriptor;
 use crate::input::ImpulseActionBindingSet;
+use crate::orbit_cam::CameraInputGamepadSelectionPolicy;
 
 /// Validates and builds `FreeCamBindings` from the builder's per-action descriptor lists.
 ///

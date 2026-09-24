@@ -14,15 +14,19 @@ use thiserror::Error;
 
 use crate::AttachmentPath;
 use crate::AttemptRef;
+use crate::BatchRef;
 use crate::Claim;
+use crate::ClaimHolder;
 use crate::ConfiguredDeviceConnection;
 use crate::ConfiguredDeviceMode;
+use crate::DeviceAccessError;
 use crate::DeviceId;
 use crate::DeviceKey;
 use crate::IdentityDecisionOwed;
 use crate::IdentityVerdict;
 use crate::KeyAvailability;
 use crate::NonEmptyReporterRefs;
+use crate::PermissionGate;
 use crate::Presence;
 use crate::PresentEvidence;
 use crate::ReportedId;
@@ -292,6 +296,59 @@ pub(crate) struct ReconcilePassConclusions {
     pub(crate) reported_handle_owners: HashMap<ReportedId, HandleOwner>,
     pub(crate) unregistered_schemes:   HashSet<SchemeName>,
     pub(crate) withdrawn_reporters:    HashSet<ReporterId>,
+    /// The accepted batch behind each contributor's record, per key, in contributor order.
+    pub(crate) evidence_batches:       HashMap<DeviceKey, Vec<BatchRef>>,
+}
+
+/// A refusal a driver met at the hardware, held as the device's claim until a contributor looks at
+/// the unit again.
+///
+/// Reporters only see what a scan shows, and a scan taken before another process opened the
+/// device says `Claim::Free`. The driver that then fails to open it is the first to learn
+/// otherwise, and if the register never recorded that, a later scan reporting `Free` again would
+/// read as no change, so a role waiting on the device's revision would never retry.
+#[derive(Clone, Debug, PartialEq, Eq, Reflect)]
+struct DriverObservedClaim {
+    claim:    Claim,
+    /// The contributing batches when the driver reported the refusal. A pass whose batches differ
+    /// is one where a reporter looked again, and its report replaces this observation.
+    evidence: Vec<BatchRef>,
+}
+
+impl DriverObservedClaim {
+    /// The claim the register holds for a device whose driver reported `error`, or nothing when
+    /// the error says nothing about who may claim the device.
+    fn from_access_error(error: &DeviceAccessError) -> Option<Claim> {
+        match error {
+            DeviceAccessError::Contended { .. } => Some(Claim::Contended {
+                holder: ClaimHolder::Unidentified,
+            }),
+            DeviceAccessError::Blocked { detail } => Some(Claim::Blocked {
+                gate: PermissionGate::Other {
+                    detail: detail.clone(),
+                },
+            }),
+            // Unresponsive and Releasing are both this process holding the device: a stream that
+            // never started, or Hana's own prior session still closing. Recording either as a
+            // claim would tell the register another application owns the unit.
+            DeviceAccessError::Cancelled { .. }
+            | DeviceAccessError::Absent { .. }
+            | DeviceAccessError::Unresponsive { .. }
+            | DeviceAccessError::Releasing { .. }
+            | DeviceAccessError::Transport { .. }
+            | DeviceAccessError::Unsupported { .. } => None,
+        }
+    }
+}
+
+/// What recording a driver's refusal changed in the register.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DriverClaimObservation {
+    /// The device's claim now carries the refusal and its revision advanced.
+    Recorded,
+    /// Nothing changed: the error names no claim, the device is retired, or the register already
+    /// holds an equal or stricter claim for it.
+    Unchanged,
 }
 
 /// The kernel's recorded state for every device, keyed by the handle it issued.
@@ -325,6 +382,11 @@ pub struct Devices {
     unregistered_schemes:   HashSet<SchemeName>,
     /// Reporters whose retained records the latest reconciliation excluded from current evidence.
     withdrawn_reporters:    HashSet<ReporterId>,
+    /// The accepted batches each retained device's record came from, so a driver's refusal can be
+    /// held until a contributor looks at the unit again.
+    evidence_batches:       HashMap<DeviceId, Vec<BatchRef>>,
+    /// Refusals drivers met at the hardware that no contributor has looked past yet.
+    driver_observed_claims: HashMap<DeviceId, DriverObservedClaim>,
 }
 
 impl Devices {
@@ -461,22 +523,41 @@ impl Devices {
             reported_handle_owners,
             unregistered_schemes,
             withdrawn_reporters,
+            mut evidence_batches,
         } = conclusions;
         let mut ids = HashMap::with_capacity(reconciled.len());
         let mut state = HashMap::with_capacity(reconciled.len());
         let mut revision = HashMap::with_capacity(reconciled.len());
+        let mut retained_evidence = HashMap::with_capacity(reconciled.len());
+        let mut driver_observed_claims = HashMap::new();
         let mut changes = ReconciledDeviceChanges::default();
+        let changed_handle_owners =
+            find_changed_handle_owners(&self.reported_handle_owners, &reported_handle_owners);
 
-        for reconciled_device_state in reconciled {
+        for mut reconciled_device_state in reconciled {
             let device_id = self
                 .ids
                 .get(&reconciled_device_state.key)
                 .copied()
                 .unwrap_or_else(|| self.issue());
+            let evidence = evidence_batches
+                .remove(&reconciled_device_state.key)
+                .unwrap_or_default();
+            if let Some(observed) =
+                self.retained_driver_claim(device_id, &evidence, &mut reconciled_device_state)
+            {
+                driver_observed_claims.insert(device_id, observed);
+            }
+            retained_evidence.insert(device_id, evidence);
             let key_availability = &availability[&reconciled_device_state.key];
             revision.insert(
                 device_id,
-                self.advanced_revision(device_id, &reconciled_device_state, key_availability),
+                self.advanced_revision(
+                    device_id,
+                    &reconciled_device_state,
+                    key_availability,
+                    &changed_handle_owners,
+                ),
             );
             let dispute_changed = self
                 .state
@@ -491,17 +572,7 @@ impl Devices {
             state.insert(device_id, reconciled_device_state);
         }
 
-        for (key, next) in &availability {
-            if let Some(previous) = self.availability.get(key)
-                && !same_key_availability_conclusion(previous, next)
-            {
-                changes.availability.push(DeviceAvailabilityChange {
-                    key:  key.clone(),
-                    from: previous.clone(),
-                    to:   next.clone(),
-                });
-            }
-        }
+        changes.availability = self.availability_changes(&availability);
         let device_register_change_detection = if self.ids == ids
             && self.state.len() == state.len()
             && state.iter().all(|(device_id, reported)| {
@@ -540,11 +611,53 @@ impl Devices {
         self.reported_handle_owners = reported_handle_owners;
         self.unregistered_schemes = unregistered_schemes;
         self.withdrawn_reporters = withdrawn_reporters;
+        self.evidence_batches = retained_evidence;
+        self.driver_observed_claims = driver_observed_claims;
 
         ReconciledDeviceReplacement {
             changes,
             device_register_change_detection,
         }
+    }
+
+    /// Every key whose availability conclusion differs from the one this register holds.
+    fn availability_changes(
+        &self,
+        next: &HashMap<DeviceKey, KeyAvailability>,
+    ) -> Vec<DeviceAvailabilityChange> {
+        next.iter()
+            .filter_map(|(key, next)| {
+                let previous = self.availability.get(key)?;
+                (!same_key_availability_conclusion(previous, next)).then(|| {
+                    DeviceAvailabilityChange {
+                        key:  key.clone(),
+                        from: previous.clone(),
+                        to:   next.clone(),
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Keep a driver-observed claim over a pass whose contributing batches have not changed.
+    ///
+    /// The reporters have not looked at the unit since the driver was refused, so their older
+    /// report cannot loosen the claim; a pass built from different batches retires the observation
+    /// and lets the fresh report stand. Returns the observation to carry into the next register.
+    fn retained_driver_claim(
+        &self,
+        device_id: DeviceId,
+        evidence: &[BatchRef],
+        reconciled_device_state: &mut ReconciledDeviceState,
+    ) -> Option<DriverObservedClaim> {
+        let observed = self.driver_observed_claims.get(&device_id)?;
+        if observed.evidence != evidence
+            || reconciled_device_state.claim.restriction() >= observed.claim.restriction()
+        {
+            return None;
+        }
+        reconciled_device_state.claim = observed.claim.clone();
+        Some(observed.clone())
     }
 
     /// Record which entity mirrors one handle, so the next pass updates that entity instead of
@@ -682,7 +795,45 @@ impl Devices {
         Ok(reconciled_device_state)
     }
 
-    /// Carry one handle's revision into this pass, advancing it only for a device that moved.
+    /// Record a refusal a driver met at the hardware as the device's claim.
+    ///
+    /// The claim stands, and refuses dispatch, until a contributor's later batch reports the unit
+    /// again; that report replaces it whatever it says. The revision advances now because the
+    /// device's facts changed, and it advances again when the fresh report differs — which is what
+    /// lets a role paced by `crate::RetryOn::NewRevision` retry once the other holder lets go. A
+    /// reporter that already holds an equal or stricter claim leaves the register as it was.
+    pub(crate) fn observe_driver_claim(
+        &mut self,
+        device_id: DeviceId,
+        error: &DeviceAccessError,
+    ) -> DriverClaimObservation {
+        let Some(claim) = DriverObservedClaim::from_access_error(error) else {
+            return DriverClaimObservation::Unchanged;
+        };
+        let Some(state) = self.state.get_mut(&device_id) else {
+            return DriverClaimObservation::Unchanged;
+        };
+        if state.claim.restriction() >= claim.restriction() {
+            return DriverClaimObservation::Unchanged;
+        }
+        state.claim = claim.clone();
+        let device_revision = self.revision.entry(device_id).or_default();
+        *device_revision = device_revision.advanced();
+        self.driver_observed_claims.insert(
+            device_id,
+            DriverObservedClaim {
+                claim,
+                evidence: self
+                    .evidence_batches
+                    .get(&device_id)
+                    .cloned()
+                    .unwrap_or_default(),
+            },
+        );
+        DriverClaimObservation::Recorded
+    }
+
+    /// Advance the revision when this device's facts or reported platform handles change.
     ///
     /// A device the kernel is meeting for the first time starts at `DeviceRevision::default()`:
     /// there is no retained state for the incoming one to differ from, so nothing has changed yet.
@@ -693,12 +844,14 @@ impl Devices {
         device_id: DeviceId,
         reported: &ReconciledDeviceState,
         availability: &KeyAvailability,
+        changed_handle_owners: &HashSet<DeviceKey>,
     ) -> DeviceRevision {
         let Some(retained) = self.state.get(&device_id) else {
             return DeviceRevision::default();
         };
         let device_revision = self.revision.get(&device_id).copied().unwrap_or_default();
         if retained.holds_same_facts(reported)
+            && !changed_handle_owners.contains(&reported.key)
             && self
                 .availability
                 .get(&reported.key)
@@ -716,6 +869,28 @@ impl Devices {
 
         device_id
     }
+}
+
+/// Find the devices whose open evidence changed, including removed or reassigned handles.
+fn find_changed_handle_owners(
+    retained: &HashMap<ReportedId, HandleOwner>,
+    reported: &HashMap<ReportedId, HandleOwner>,
+) -> HashSet<DeviceKey> {
+    let mut changed = HashSet::new();
+    for (previous, next) in [(retained, reported), (reported, retained)] {
+        for (handle, owner) in previous {
+            if next.get(handle) == Some(owner) {
+                continue;
+            }
+            match owner {
+                HandleOwner::OneKey(key) => {
+                    changed.insert(key.clone());
+                },
+                HandleOwner::SeveralKeys(keys) => changed.extend(keys.iter().cloned()),
+            }
+        }
+    }
+    changed
 }
 
 fn same_key_availability_conclusions(
@@ -1198,6 +1373,8 @@ mod tests {
     use super::DeviceRevisionLookup;
     use super::DeviceStateLookup;
     use super::Devices;
+    use super::DriverClaimObservation;
+    use super::HandleOwner;
     use super::PresentWithUsableClaim;
     use super::PriorKeyAvailability;
     use super::ReconcilePassConclusions;
@@ -1210,6 +1387,7 @@ mod tests {
     use crate::ClaimHolder;
     use crate::ConfiguredDeviceMode;
     use crate::ContributorView;
+    use crate::DeviceAccessError;
     use crate::DeviceId;
     use crate::DeviceIdSource;
     use crate::DeviceKey;
@@ -1400,6 +1578,49 @@ mod tests {
             DeviceRevisionLookup::Retained(DeviceRevision::default().advanced())
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn refreshed_platform_handles_advance_only_their_devices_revision() -> Result<(), Box<dyn Error>>
+    {
+        let key = reported_key("camera")?;
+        let unrelated = reported_key("other-camera")?;
+        let mut devices = Devices::default();
+        let states = vec![reconciled(key.clone()), reconciled(unrelated.clone())];
+        let mut conclusions = conclusions_for(&states);
+        conclusions.reported_handle_owners.insert(
+            ReportedId::new("original-attachment")?,
+            HandleOwner::OneKey(key.clone()),
+        );
+        devices.replace_reconciled(states, conclusions);
+        let DeviceResolution::Resolved(device_id) = devices.resolve(&key) else {
+            panic!("camera must resolve");
+        };
+        let DeviceResolution::Resolved(unrelated_id) = devices.resolve(&unrelated) else {
+            panic!("other camera must resolve");
+        };
+
+        for (handle, expected_revision) in [
+            ("original-attachment", DeviceRevision::default()),
+            ("new-attachment", DeviceRevision::default().advanced()),
+            ("new-attachment", DeviceRevision::default().advanced()),
+        ] {
+            let states = vec![reconciled(key.clone()), reconciled(unrelated.clone())];
+            let mut conclusions = conclusions_for(&states);
+            conclusions
+                .reported_handle_owners
+                .insert(ReportedId::new(handle)?, HandleOwner::OneKey(key.clone()));
+            devices.replace_reconciled(states, conclusions);
+            assert_eq!(
+                devices.revision(device_id),
+                DeviceRevisionLookup::Retained(expected_revision)
+            );
+            assert_eq!(
+                devices.revision(unrelated_id),
+                DeviceRevisionLookup::Retained(DeviceRevision::default())
+            );
+        }
         Ok(())
     }
 
@@ -1654,6 +1875,232 @@ mod tests {
     }
 
     // --- attempt identifier issuance ---
+
+    // --- refusals drivers meet at the hardware ---
+
+    /// Replace the register from one reporter's batch, so a test can say whether a reporter
+    /// looked at the hardware again (a new batch) or the pass only re-read what it already held.
+    fn replace_from_batch(
+        devices: &mut Devices,
+        states: Vec<ReconciledDeviceState>,
+        batch: u64,
+    ) -> super::ReconciledDeviceReplacement {
+        let mut conclusions = conclusions_for(&states);
+        for (key, availability) in &mut conclusions.availability {
+            let PriorKeyAvailability::Published(previous) = devices.key_availability(key) else {
+                continue;
+            };
+            if std::mem::discriminant(previous) == std::mem::discriminant(availability) {
+                *availability = previous.clone();
+            }
+        }
+        conclusions.evidence_batches = states
+            .iter()
+            .map(|state| {
+                (
+                    state.key.clone(),
+                    vec![BatchRef::from_batch_id(DiscoveryBatchId(batch))],
+                )
+            })
+            .collect();
+        devices.replace_reconciled(states, conclusions)
+    }
+
+    fn free_camera(key: DeviceKey) -> ReconciledDeviceState {
+        let mut state = reconciled(key);
+        state.claim = Claim::Free;
+        state
+    }
+
+    fn busy() -> DeviceAccessError {
+        DeviceAccessError::Contended {
+            detail: "VIDIOC_STREAMON: Device or resource busy (os error 16)".into(),
+        }
+    }
+
+    fn revision_of(devices: &Devices, device_id: DeviceId) -> DeviceRevision {
+        match devices.revision(device_id) {
+            DeviceRevisionLookup::Retained(device_revision) => device_revision,
+            DeviceRevisionLookup::Retired => panic!("the device must still be retained"),
+        }
+    }
+
+    #[test]
+    fn a_driver_refusal_becomes_the_device_claim_and_refuses_service() -> Result<(), Box<dyn Error>>
+    {
+        let key = reported_key("CAMERA")?;
+        let mut devices = Devices::default();
+        replace_from_batch(&mut devices, vec![free_camera(key.clone())], 0);
+        let device_id = handle(&devices, &key);
+        let before = revision_of(&devices, device_id);
+
+        assert_eq!(
+            devices.observe_driver_claim(device_id, &busy()),
+            DriverClaimObservation::Recorded
+        );
+        let DeviceStateLookup::Retained(state) = devices.state(device_id) else {
+            return Err("the device stays retained".into());
+        };
+        assert_eq!(
+            state.claim,
+            Claim::Contended {
+                holder: ClaimHolder::Unidentified,
+            }
+        );
+        assert_eq!(revision_of(&devices, device_id), before.advanced());
+        assert_eq!(
+            devices.authorize_service(device_id).err(),
+            Some(ApplyAuthorizationError::ClaimUnavailable { key })
+        );
+        // Reporting the same refusal again changes nothing the first report did not.
+        assert_eq!(
+            devices.observe_driver_claim(device_id, &busy()),
+            DriverClaimObservation::Unchanged
+        );
+        assert_eq!(revision_of(&devices, device_id), before.advanced());
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_driver_refusal_survives_a_pass_that_re_reads_the_same_batches()
+    -> Result<(), Box<dyn Error>> {
+        let key = reported_key("CAMERA")?;
+        let mut devices = Devices::default();
+        replace_from_batch(&mut devices, vec![free_camera(key.clone())], 0);
+        let device_id = handle(&devices, &key);
+        devices.observe_driver_claim(device_id, &busy());
+        let observed = revision_of(&devices, device_id);
+
+        // A lease or grace deadline re-runs the merge over the retained sets: nobody looked again.
+        let replacement = replace_from_batch(&mut devices, vec![free_camera(key)], 0);
+
+        let DeviceStateLookup::Retained(state) = devices.state(device_id) else {
+            return Err("the device stays retained".into());
+        };
+        assert_eq!(
+            state.claim,
+            Claim::Contended {
+                holder: ClaimHolder::Unidentified,
+            }
+        );
+        assert_eq!(revision_of(&devices, device_id), observed);
+        assert_eq!(
+            replacement.device_register_change_detection,
+            DeviceRegisterChangeDetection::Preserve
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_fresh_batch_reporting_free_retires_the_refusal_and_advances_the_revision()
+    -> Result<(), Box<dyn Error>> {
+        let key = reported_key("CAMERA")?;
+        let mut devices = Devices::default();
+        replace_from_batch(&mut devices, vec![free_camera(key.clone())], 0);
+        let device_id = handle(&devices, &key);
+        devices.observe_driver_claim(device_id, &busy());
+        let observed = revision_of(&devices, device_id);
+
+        // The other holder let go and the reporter scanned again, reporting the same facts as
+        // its first scan: for a role waiting on this device, that is the change worth a retry.
+        let replacement = replace_from_batch(&mut devices, vec![free_camera(key.clone())], 1);
+
+        let DeviceStateLookup::Retained(state) = devices.state(device_id) else {
+            return Err("the device stays retained".into());
+        };
+        assert_eq!(state.claim, Claim::Free);
+        assert_eq!(revision_of(&devices, device_id), observed.advanced());
+        assert_eq!(
+            replacement.device_register_change_detection,
+            DeviceRegisterChangeDetection::MarkChanged
+        );
+        devices.authorize_service(device_id)?;
+        // The refusal is gone for good: a later re-read of this batch does not bring it back.
+        replace_from_batch(&mut devices, vec![free_camera(key)], 1);
+        assert_eq!(revision_of(&devices, device_id), observed.advanced());
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_reporter_that_already_names_the_holder_is_left_as_it_stands() -> Result<(), Box<dyn Error>>
+    {
+        let key = reported_key("CAMERA")?;
+        let mut state = reconciled(key.clone());
+        state.claim = Claim::Contended {
+            holder: ClaimHolder::Named("zoom".into()),
+        };
+        let mut devices = Devices::default();
+        replace_from_batch(&mut devices, vec![state], 0);
+        let device_id = handle(&devices, &key);
+        let before = revision_of(&devices, device_id);
+
+        assert_eq!(
+            devices.observe_driver_claim(device_id, &busy()),
+            DriverClaimObservation::Unchanged
+        );
+        let DeviceStateLookup::Retained(state) = devices.state(device_id) else {
+            return Err("the device stays retained".into());
+        };
+        assert_eq!(
+            state.claim,
+            Claim::Contended {
+                holder: ClaimHolder::Named("zoom".into()),
+            }
+        );
+        assert_eq!(revision_of(&devices, device_id), before);
+
+        Ok(())
+    }
+
+    #[test]
+    fn only_contention_and_policy_refusals_speak_about_the_claim() -> Result<(), Box<dyn Error>> {
+        let key = reported_key("CAMERA")?;
+        let mut devices = Devices::default();
+        replace_from_batch(&mut devices, vec![free_camera(key.clone())], 0);
+        let device_id = handle(&devices, &key);
+
+        for error in [
+            DeviceAccessError::Transport {
+                detail: "read timed out".into(),
+            },
+            DeviceAccessError::Absent {
+                detail: "unplugged".into(),
+            },
+            DeviceAccessError::Cancelled {
+                detail: "consent revoked".into(),
+            },
+        ] {
+            assert_eq!(
+                devices.observe_driver_claim(device_id, &error),
+                DriverClaimObservation::Unchanged
+            );
+        }
+        assert_eq!(
+            devices.observe_driver_claim(
+                device_id,
+                &DeviceAccessError::Blocked {
+                    detail: "camera access denied".into(),
+                }
+            ),
+            DriverClaimObservation::Recorded
+        );
+        let DeviceStateLookup::Retained(state) = devices.state(device_id) else {
+            return Err("the device stays retained".into());
+        };
+        assert_eq!(
+            state.claim,
+            Claim::Blocked {
+                gate: PermissionGate::Other {
+                    detail: "camera access denied".into(),
+                },
+            }
+        );
+
+        Ok(())
+    }
 
     #[test]
     fn successive_issued_attempt_identifiers_differ_and_none_equals_the_default() {

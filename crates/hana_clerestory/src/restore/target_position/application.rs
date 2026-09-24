@@ -64,7 +64,7 @@ use crate::restore::RestorePreparationSource;
 use crate::restore::WindowRestoreAttempt;
 use crate::restore::settle_state::SettleState;
 use crate::restore::winit_info;
-#[cfg(test)]
+#[cfg(any(test, feature = "test"))]
 use crate::restore::winit_info::InjectedWinitWindows;
 use crate::restore::winit_info::X11FrameCompensated;
 use crate::visibility::PlacementAbandoned;
@@ -540,7 +540,7 @@ pub(crate) fn place_window_at_saved_geometry(
     scale_inputs: Res<ObservedScaleInputs>,
     time: Option<Res<Time>>,
     mut fallback: ResMut<WindowFallbackRecoveryState>,
-    #[cfg(test)] injected_windows: Option<Res<InjectedWinitWindows>>,
+    #[cfg(any(test, feature = "test"))] injected_windows: Option<Res<InjectedWinitWindows>>,
 ) {
     let delta = time.as_deref().map_or(Duration::ZERO, Time::delta);
     for (
@@ -554,7 +554,7 @@ pub(crate) fn place_window_at_saved_geometry(
     {
         let native_window_exists = winit_info::native_window_exists(
             entity,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test"))]
             injected_windows.as_deref(),
         );
         #[cfg(target_os = "macos")]

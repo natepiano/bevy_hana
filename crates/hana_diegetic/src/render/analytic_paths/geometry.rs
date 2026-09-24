@@ -36,11 +36,11 @@ impl Bounds {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PathContour {
     /// Quadratic segments in contour order.
-    pub segments:      Vec<QuadraticSegment>,
+    pub segments:             Vec<QuadraticSegment>,
     /// Narrowest stroke of this contour in design-space units, packed per
     /// curve for hairline dilation. `0.0` disables — text path contours
     /// stay undilated.
-    pub min_feature:   f32,
+    pub minimum_feature_size: f32,
     /// Resolved hairline fade exponent for this contour, packed per curve
     /// (`CurveRecord::fade_exponent`). The shader's winning (nearest) curve
     /// supplies the exponent for each coverage evaluation, so contours with
@@ -48,7 +48,7 @@ pub(crate) struct PathContour {
     /// junction. `0.0` renders sub-floor strokes at full alpha
     /// ([`HairlineFade::Full`](crate::HairlineFade::Full)); text path
     /// contours carry `0.0` and are exempt regardless (dilation 0).
-    pub fade_exponent: f32,
+    pub fade_exponent:        f32,
 }
 
 /// Renderer-owned quadratic outline representation.
@@ -62,15 +62,15 @@ pub(crate) struct PathOutline {
 
 impl PathOutline {
     /// Narrowest dilating stroke across all contours, forwarded to
-    /// `PackedPathRecord::min_feature` so the shader sizes its distance scan for
+    /// `PackedPathRecord::minimum_feature_size` so the shader sizes its distance scan for
     /// the largest dilation in the path. `0.0` when no contour dilates.
     #[must_use]
-    pub(crate) fn min_feature(&self) -> f32 {
+    pub(crate) fn minimum_feature_size(&self) -> f32 {
         let narrowest = self
             .contours
             .iter()
-            .map(|contour| contour.min_feature)
-            .filter(|min_feature| *min_feature > 0.0)
+            .map(|contour| contour.minimum_feature_size)
+            .filter(|minimum_feature_size| *minimum_feature_size > 0.0)
             .fold(f32::INFINITY, f32::min);
         if narrowest.is_finite() {
             narrowest
@@ -112,7 +112,7 @@ impl PathOutline {
             .contours
             .into_iter()
             .map(|contour| PathContour {
-                segments:      contour
+                segments:             contour
                     .segments
                     .into_iter()
                     .map(|segment| QuadraticSegment {
@@ -121,8 +121,8 @@ impl PathOutline {
                         end:     rebase(segment.end),
                     })
                     .collect(),
-                min_feature:   contour.min_feature / extent,
-                fade_exponent: contour.fade_exponent,
+                minimum_feature_size: contour.minimum_feature_size / extent,
+                fade_exponent:        contour.fade_exponent,
             })
             .collect();
         let bounds = Bounds {

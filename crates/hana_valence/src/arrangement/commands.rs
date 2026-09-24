@@ -27,7 +27,7 @@ use crate::fold;
 ///
 /// Synchronous association, provider, and plan failures preserve their
 /// [`ArrangementError`] variant and provider source. They queue cleanup for
-/// every reserved entity and never call a member-scene factory. Once deferred
+/// every reserved entity and never call a member-scene recipe. Once deferred
 /// commands begin applying, an application-owned entity that has since been
 /// removed is skipped: an existing binding that is gone by then is neither
 /// recreated nor checked in advance.

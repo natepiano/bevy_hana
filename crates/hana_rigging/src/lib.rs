@@ -74,6 +74,8 @@ pub use binding::ResolvedBindings;
 pub use binding::ResolvedToDevice;
 pub use binding::RetirementOutcome;
 pub use binding::WaitingWork;
+pub use binding::cancel_pending_binding_registration;
+pub use binding::cancel_pending_binding_replacement;
 pub use binding::register_binding;
 pub use binding::replace_binding;
 pub use capabilities::Capabilities;
@@ -213,6 +215,7 @@ pub use evidence::AttachmentPath;
 pub use evidence::DeviceDescriptor;
 pub use evidence::PlatformDeviceHandle;
 pub(crate) use fault::ApplyFailureDisposition;
+pub use fault::DeviceAccessClass;
 pub use fault::DeviceAccessError;
 pub(crate) use fault::DriverStopReason;
 pub use flow::ContinuousFlowExpectation;
@@ -425,6 +428,7 @@ pub mod prelude {
     pub use crate::CoveredDeviceIdentitySpaceView;
     pub use crate::CurrentRoleRecord;
     pub use crate::CurrentRoleRecordMut;
+    pub use crate::DeviceAccessClass;
     pub use crate::DeviceAccessError;
     pub use crate::DeviceAccessErrorView;
     pub use crate::DeviceArrived;
@@ -657,6 +661,8 @@ pub mod prelude {
     pub use crate::WaitTiming;
     pub use crate::WaitingStatusView;
     pub use crate::WaitingWork;
+    pub use crate::cancel_pending_binding_registration;
+    pub use crate::cancel_pending_binding_replacement;
     pub use crate::register_binding;
     pub use crate::replace_binding;
 }

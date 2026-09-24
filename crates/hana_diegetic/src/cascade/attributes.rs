@@ -8,12 +8,12 @@ use hana_kana::CascadeAttribute;
 use hana_kana::CascadeEntityCommandsExt as _;
 
 use super::CascadeRoot;
-pub use super::resolved::FontUnit;
-pub use super::resolved::HdrTextCoverageBias;
-pub use super::resolved::SdfMaterial;
-pub use super::resolved::ShapeMaterial;
-pub use super::resolved::TextAlpha;
-pub use super::resolved::TextMaterial;
+use super::resolved::FontUnit;
+use super::resolved::HdrTextCoverageBias;
+use super::resolved::SdfMaterial;
+use super::resolved::ShapeMaterial;
+use super::resolved::TextAlpha;
+use super::resolved::TextMaterial;
 use crate::layout::GlyphShadowMode;
 use crate::layout::Lighting;
 use crate::layout::ShadowCasting;

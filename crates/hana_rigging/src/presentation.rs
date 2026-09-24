@@ -122,6 +122,8 @@ pub enum ConnectedCause {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Reflect, Serialize)]
 #[reflect(Serialize)]
 pub enum RoleUnavailableCause {
+    /// The operator cancelled or revoked consent; explicit recovery is required.
+    Cancelled,
     /// Completed reporter evidence confirms neither presence nor absence of the key.
     IdentityUnconfirmed,
     /// Retained reporter evidence cannot establish that the device is reachable.
@@ -172,6 +174,7 @@ pub(crate) fn derive_role_presentation(
     match status {
         RoleStatusView::Stopped(stopped) => RolePresentationView::Unavailable(match stopped {
             StoppedStatusView::RepeatedFailures { .. } => RoleUnavailableCause::RepeatedFailures,
+            StoppedStatusView::Cancelled { .. } => RoleUnavailableCause::Cancelled,
             StoppedStatusView::Unsupported { .. } => RoleUnavailableCause::Unsupported,
         }),
         RoleStatusView::Established { flow, .. } => established_presentation(*flow),
@@ -601,11 +604,18 @@ mod tests {
         ])
     }
 
-    /// One sample of both [`StoppedStatusView`] variants, with the cause each must derive.
+    /// One sample of every [`StoppedStatusView`] variant, with the cause each must derive.
     fn every_stopped_status()
     -> Result<Vec<(StoppedStatusView, RoleUnavailableCause)>, Box<dyn Error>> {
         let failures = NonZeroU32::new(3).ok_or("three is not zero")?;
         Ok(vec![
+            (
+                StoppedStatusView::Cancelled {
+                    detail:       "the operator cancelled consent".to_owned(),
+                    resumes_when: ResumeCondition::ExplicitRestart,
+                },
+                RoleUnavailableCause::Cancelled,
+            ),
             (
                 StoppedStatusView::RepeatedFailures {
                     failures,

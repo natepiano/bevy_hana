@@ -2,6 +2,9 @@ use bevy::math::Vec2;
 use hana_kana::ToF32;
 
 use super::layout_engine::ComputedLayout;
+use super::layout_engine::MeasureTextFn;
+use super::layout_engine::SolvedScroll;
+use super::layout_engine::VisibleScrollRegion;
 use super::sizing;
 use super::sizing::ContentBox;
 use super::wrapping::WrappedText;
@@ -64,8 +67,8 @@ struct GeometryStackEntry {
 
 /// Clip state threaded down the DFS.
 ///
-/// `inherited` is the viewport ∩ every [`ChildOverflow::Clipped`] ancestor, and applies to
-/// owner-bound content. `scissor` is only the explicit [`ChildOverflow::Clipped`] ancestors, with
+/// `inherited` is the viewport ∩ every clipping ([`ChildOverflow::clips`]) ancestor, and applies to
+/// owner-bound content. `scissor` is only the explicit clipping ancestors, with
 /// no viewport term: line geometry that overflows a panel is not clipped to the panel viewport,
 /// but is still clipped to these regions.
 #[derive(Clone, Copy)]
@@ -83,7 +86,7 @@ impl ClipContext {
     }
 
     fn child(self, element: &Element, bounds: BoundingBox) -> Self {
-        if matches!(element.overflow, ChildOverflow::Clipped) {
+        if element.overflow.clips() {
             let scissor_bounds = element.child_clip_bounds(bounds);
             Self {
                 inherited: self
@@ -107,6 +110,7 @@ impl ClipContext {
 struct ChildStackContext<'a> {
     parent:        &'a Element,
     content_box:   ContentBox,
+    content_size:  Vec2,
     flow:          ChildFlow,
     scroll_offset: Vec2,
     clip_context:  ClipContext,
@@ -203,7 +207,7 @@ fn emit_up_traversal_commands(
         emit_child_dividers(tree, computed, commands, index, divider);
     }
 
-    if matches!(element.overflow, ChildOverflow::Clipped) {
+    if element.overflow.clips() {
         push_command(
             commands,
             bounds,
@@ -222,7 +226,7 @@ fn needs_up_traversal(element: &Element) -> bool {
             .child_layout
             .divider()
             .is_some_and(|divider| divider.width().value > 0.0)
-        || matches!(element.overflow, ChildOverflow::Clipped)
+        || element.overflow.clips()
 }
 
 /// Emits background, scissor-start, and text render commands during the
@@ -254,7 +258,7 @@ fn emit_down_traversal_commands(
     // must be balanced even when the parent is off-screen).
     // Clip to the border's inner edge — content can fill up to (but
     // not into) the border. Padding is inside this region.
-    if matches!(element.overflow, ChildOverflow::Clipped) {
+    if element.overflow.clips() {
         let clip_bounds = element.child_clip_bounds(bounds);
         push_command(
             commands,
@@ -481,6 +485,52 @@ const fn empty_clip() -> BoundingBox {
     }
 }
 
+/// Text measured to find one line's height for a scrolling element's wheel
+/// line pitch; any single-line glyph run yields the style's line height.
+const SCROLL_LINE_PROBE_TEXT: &str = "M";
+
+/// Collects the solved state of each scrolling parent during positioning,
+/// measuring its wheel line pitch with the engine's text measurer.
+pub(super) struct ScrollSolver<'a> {
+    measure_text: &'a MeasureTextFn,
+    font_scale:   f32,
+    solved:       Vec<SolvedScroll>,
+}
+
+impl<'a> ScrollSolver<'a> {
+    pub(super) const fn new(measure_text: &'a MeasureTextFn, font_scale: f32) -> Self {
+        Self {
+            measure_text,
+            font_scale,
+            solved: Vec::new(),
+        }
+    }
+
+    pub(super) fn into_solved(self) -> Vec<SolvedScroll> { self.solved }
+
+    fn record(
+        &mut self,
+        parent: &Element,
+        element_index: usize,
+        child_context: &ChildStackContext<'_>,
+        visible_region: VisibleScrollRegion,
+    ) {
+        let line = (self.measure_text)(
+            SCROLL_LINE_PROBE_TEXT,
+            &parent.scroll_line.measure().scaled(self.font_scale),
+        );
+        let gap = parent.child_layout.main_gap().map_or(0.0, |gap| gap.value);
+        self.solved.push(SolvedScroll {
+            element_index,
+            content_points: child_context.content_size,
+            viewport_points: child_context.content_box.size,
+            offset_points: child_context.scroll_offset,
+            visible_region,
+            line_pitch_points: line.line_height + gap,
+        });
+    }
+}
+
 /// Resolves the clamped per-axis scroll offset for a scrolling parent, returning
 /// `Vec2::ZERO` for the common non-scrolling case. Each axis clamps to
 /// `[0, content - viewport]`; `End`-anchored axes measure the offset from the
@@ -557,6 +607,7 @@ fn child_stack_context<'a>(
     ChildStackContext {
         parent,
         content_box,
+        content_size: child_content_size,
         flow,
         scroll_offset,
         clip_context,
@@ -613,13 +664,15 @@ fn main_gap_total(child_layout: &ChildLayout, child_count: usize) -> f32 {
 ///
 /// Children are pushed in reverse so the first child is processed first during
 /// iteration. Uses a reverse cursor to compute positions without allocation.
+/// A scrolling parent also records its solved scroll state. `clip_context` is
+/// the parent's own clip; its children's clip is derived here.
 fn push_children_to_stack(
     tree: &LayoutTree,
     computed: &[ComputedLayout],
     stack: &mut Vec<PositionStackEntry>,
+    scrolls: &mut ScrollSolver<'_>,
     index: usize,
-    x: f32,
-    y: f32,
+    bounds: BoundingBox,
     clip_context: ClipContext,
 ) {
     let children = tree.children_of(index);
@@ -633,10 +686,22 @@ fn push_children_to_stack(
         computed,
         children,
         Vec2::new(computed[index].width, computed[index].height),
-        clip_context,
+        clip_context.child(parent_el, bounds),
     );
 
-    let origin = Vec2::new(x, y);
+    if matches!(parent_el.overflow, ChildOverflow::Scrolled) {
+        scrolls.record(
+            parent_el,
+            index,
+            &child_context,
+            bounds.intersect(&clip_context.inherited).map_or(
+                VisibleScrollRegion::ClippedOut,
+                VisibleScrollRegion::Visible,
+            ),
+        );
+    }
+
+    let origin = Vec2::new(bounds.x, bounds.y);
     if let Some(mut reverse_cursor) = child_context.reverse_cursor_start() {
         // Walk children in reverse, subtracting each child's main size from the
         // cursor to produce positions in stack-push order.
@@ -682,6 +747,7 @@ pub(super) fn position_and_render(
     root: usize,
     wrapped: &[Option<WrappedText>],
     font_scale: f32,
+    scrolls: &mut ScrollSolver<'_>,
 ) -> Vec<RenderCommand> {
     let mut commands = Vec::with_capacity(tree.len() * 2);
     let root_clip = root_box_clip(computed[root].width, computed[root].height);
@@ -724,7 +790,6 @@ pub(super) fn position_and_render(
                     entry.clip_context,
                 );
 
-                let child_clip = entry.clip_context.child(element, bounds);
                 if needs_up_traversal(element) {
                     stack.push(PositionStackEntry {
                         visited: true,
@@ -732,7 +797,13 @@ pub(super) fn position_and_render(
                     });
                 }
                 push_children_to_stack(
-                    tree, computed, &mut stack, index, entry.x, entry.y, child_clip,
+                    tree,
+                    computed,
+                    &mut stack,
+                    scrolls,
+                    index,
+                    bounds,
+                    entry.clip_context,
                 );
             }
         }

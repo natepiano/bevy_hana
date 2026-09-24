@@ -35,6 +35,7 @@
 
 mod constants;
 mod deadline;
+mod display_endpoint;
 #[cfg(any(test, feature = "test"))]
 mod display_test_adapter;
 mod driver;
@@ -92,6 +93,7 @@ use bevy::prelude::Window;
 use bevy::prelude::With;
 use bevy::prelude::debug;
 use bevy::window::PrimaryWindow;
+pub use display_endpoint::DisplayEndpointPart;
 #[cfg(any(test, feature = "test"))]
 pub use display_test_adapter::DisplayTestAdapter;
 #[cfg(any(test, feature = "test"))]
@@ -106,7 +108,9 @@ pub use display_test_adapter::DisplayTestEnumeration;
 pub use display_test_adapter::DisplayTestReporterLookup;
 use driver::WindowDriverId;
 use driver::WindowEndpointDriver;
+pub use driver::WindowPlacementDriverUnavailable;
 use driver::WindowRoleDriverState;
+pub use driver::window_placement_driver;
 pub use events::ExpectedLogicalPosition;
 pub use events::ExpectedPhysicalPosition;
 pub use events::ObservedLogicalPosition;
@@ -153,7 +157,15 @@ pub use monitors::MonitorDescriptor;
 use monitors::MonitorPlugin;
 pub use monitors::MonitorTopologyRevision;
 pub use monitors::Monitors;
+pub use persistence::EstablishedWindowPlacement;
+pub use persistence::InvalidWindowDisplay;
 use persistence::PersistencePlugin;
+pub use persistence::ReadbackWindowPosition;
+pub use persistence::RequestedWindowPlacement;
+pub use persistence::SavedFullscreenVideoMode;
+pub use persistence::SavedVideoMode;
+pub use persistence::SavedWindowMode;
+pub use persistence::WindowPlacementConfiguration;
 pub use persistence::managed_window_role;
 pub use persistence::primary_window_role;
 pub use platform::Platform;
@@ -418,6 +430,10 @@ impl Plugin for ConfiguredWindowManagerPlugin {
         .add_observer(on_managed_window_added)
         .add_observer(on_managed_window_removed)
         .add_observer(on_primary_window_removed)
+        .add_systems(
+            Update,
+            managed::sync_binding_window_monitor.in_set(ClerestoryUpdateSet::CurrentMonitor),
+        )
         .add_observer(on_window_rigging_role_removed)
         .add_observer(on_managed_window_load)
         .add_observer(mark_primary_window_as_managed)
@@ -1555,9 +1571,12 @@ pub(crate) mod tests {
         else {
             return Err(String::from("window driver did not retain its preparation"));
         };
-        assert_eq!(preparation.dispatched().logical_size, UVec2::new(640, 480));
         assert_eq!(
-            preparation.dispatched().position,
+            preparation.dispatched().logical_size(),
+            UVec2::new(640, 480)
+        );
+        assert_eq!(
+            preparation.dispatched().position(),
             persistence::EstablishedWindowPosition::Restorable {
                 logical_offset: IVec2::new(40, 30),
             }
@@ -1814,7 +1833,7 @@ pub(crate) mod tests {
         Ok(EstablishedWindowPlacement::from_readback(
             window,
             current_monitor,
-            physical_position,
+            physical_position.into(),
             *world.resource::<Platform>(),
         ))
     }
@@ -1884,7 +1903,7 @@ pub(crate) mod tests {
                 id: endpoint_id,
             },
             harness.app.world().resource::<WindowDriverId>().0,
-            placement,
+            placement.into(),
             BindingPolicy::new(
                 RecoveryPolicy::Forget,
                 RetryOn::NewRevision,
@@ -2376,7 +2395,7 @@ pub(crate) mod tests {
                 ),
             },
             harness.app.world().resource::<WindowDriverId>().0,
-            placement,
+            placement.into(),
             BindingPolicy::new(
                 RecoveryPolicy::Forget,
                 RetryOn::NewRevision,
@@ -3119,8 +3138,8 @@ pub(crate) mod tests {
         assert_eq!(
             configuration
                 .as_any()
-                .downcast_ref::<EstablishedWindowPlacement>(),
-            Some(&applied)
+                .downcast_ref::<WindowPlacementConfiguration>(),
+            Some(&WindowPlacementConfiguration::Established(applied))
         );
         Ok(())
     }
@@ -3150,7 +3169,7 @@ pub(crate) mod tests {
             started.role.clone(),
             rebound_endpoint.clone(),
             harness.app.world().resource::<WindowDriverId>().0,
-            placement,
+            placement.into(),
             BindingPolicy::new(
                 RecoveryPolicy::Forget,
                 RetryOn::NewRevision,
@@ -3242,7 +3261,7 @@ pub(crate) mod tests {
             started.role.clone(),
             rebound_endpoint,
             harness.app.world().resource::<WindowDriverId>().0,
-            placement,
+            placement.into(),
             BindingPolicy::new(
                 RecoveryPolicy::Forget,
                 RetryOn::NewRevision,
@@ -4526,7 +4545,10 @@ pub(crate) mod tests {
                 "window driver did not retain the corrected preparation",
             ));
         };
-        assert_eq!(preparation.dispatched().logical_size, UVec2::new(640, 480));
+        assert_eq!(
+            preparation.dispatched().logical_size(),
+            UVec2::new(640, 480)
+        );
         Ok(())
     }
 
@@ -4798,3 +4820,10 @@ pub(crate) mod tests {
         Ok(())
     }
 }
+
+pub use managed::WindowRoleAttachmentError;
+pub use managed::attach_window_to_binding_role;
+
+#[cfg(test)]
+#[path = "../tests/window_binding_attachment_driver/mod.rs"]
+mod window_binding_attachment_driver;

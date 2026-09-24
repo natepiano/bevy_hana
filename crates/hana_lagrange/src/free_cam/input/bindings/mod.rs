@@ -40,10 +40,10 @@ pub use preset::FreeCamLookPitch;
 pub use preset::FreeCamPreset;
 pub use preset::FreeCamPresetKind;
 
-use crate::input::CameraInputGamepadSelectionPolicy;
 use crate::input::CameraSlowMode;
 use crate::input::FreeCamHomeAction;
 use crate::input::ImpulseActionBindingEntry;
+use crate::orbit_cam::CameraInputGamepadSelectionPolicy;
 
 /// Validated runtime binding specification for a `FreeCam`.
 #[derive(Clone, Debug, PartialEq, Reflect)]

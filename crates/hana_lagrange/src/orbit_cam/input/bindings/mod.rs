@@ -47,8 +47,6 @@ pub use builder::OrbitCamOrbitBinding;
 pub use builder::OrbitCamPanBinding;
 pub use builder::OrbitCamZoomBinding;
 pub use input_gain::OrbitCamInputGain;
-pub use preset::GamepadInputGain;
-pub use preset::MouseInputGain;
 pub use preset::OrbitCamBlenderLikeKeyboardPreset;
 pub use preset::OrbitCamBlenderLikePreset;
 pub use preset::OrbitCamGamepadPreset;
@@ -58,15 +56,14 @@ pub use preset::OrbitCamPreset;
 pub use preset::OrbitCamPresetKind;
 pub use preset::OrbitCamSimpleMouseKeyboardPreset;
 pub use preset::OrbitCamSimpleMousePreset;
-pub use preset::SmoothScrollInputGain;
 
-pub use crate::input::BindingsError;
-pub use crate::input::CameraInputScalePolicy;
-pub use crate::input::CameraSlowMode;
-pub use crate::input::HeldBinding;
+use crate::input::BindingsError;
+use crate::input::CameraInputScalePolicy;
+use crate::input::CameraSlowMode;
+use crate::input::HeldBinding;
 use crate::input::ImpulseActionBindingEntry;
-pub use crate::input::InputBinding;
-pub use crate::input::InputDeadZone;
+use crate::input::InputBinding;
+use crate::input::InputDeadZone;
 use crate::input::OrbitCamHomeAction;
 
 /// Validated runtime binding specification for an `OrbitCam`.

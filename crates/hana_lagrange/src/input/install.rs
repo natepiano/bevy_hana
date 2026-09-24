@@ -11,6 +11,8 @@
 //! - [`CameraInstallKind`] — the per-camera install hook.
 //! - [`CameraBindingGateCondition`] — enhanced-input condition that fires a binding only when its
 //!   gate actions are in the required state.
+//! - [`CameraWheelBindingCondition`] — enhanced-input blocker that withholds a mouse-wheel binding
+//!   while its camera's blockers withhold scroll.
 //! - [`MotionActions`] — the normal/slow action pair a held motion binding routes to by
 //!   [`ControlSpeed`].
 //! - [`GateActionCache`] — dedups the gate action spawned per distinct [`GateInput`] within one
@@ -20,6 +22,8 @@ use std::collections::HashMap;
 
 use bevy::prelude::Component;
 use bevy::prelude::Entity;
+use bevy::prelude::Query;
+use bevy::prelude::Res;
 use bevy::prelude::World;
 use bevy_enhanced_input::prelude::Accumulation;
 use bevy_enhanced_input::prelude::Action;
@@ -42,11 +46,13 @@ use bevy_enhanced_input::prelude::Scale;
 use bevy_enhanced_input::prelude::SwizzleAxis;
 use bevy_enhanced_input::prelude::TriggerState;
 
+use super::CameraInputBlockers;
 use super::CameraInputModeKind;
 use super::CameraSemanticAction;
 use super::ControlSpeed;
 use super::HeldCameraAction;
 use super::InteractionSources;
+use super::ResolvedCameraInputRoute;
 use super::bindings::BindingGates;
 use super::bindings::GateInput;
 use super::bindings::GatePolarity;
@@ -113,6 +119,58 @@ impl InputCondition for CameraBindingGateCondition {
     }
 
     fn kind(&self) -> ConditionKind { ConditionKind::Implicit }
+}
+
+/// Enhanced-input blocker on every mouse-wheel binding: withholds the binding
+/// while its camera's blockers withhold scroll, so a wheel bound through
+/// enhanced input obeys [`CameraScrollInputDisabled`](super::CameraScrollInputDisabled)
+/// exactly as the adapter's wheel bindings do. Bindings on other devices keep
+/// resolving.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CameraWheelBindingCondition {
+    camera:   Entity,
+    delivery: WheelDelivery,
+}
+
+/// Whether a camera's wheel bindings receive the wheel this frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WheelDelivery {
+    Delivered,
+    Withheld,
+}
+
+impl InputCondition for CameraWheelBindingCondition {
+    fn evaluate(&mut self, _: &ActionsQuery, _: &ContextTime, _: ActionValue) -> TriggerState {
+        match self.delivery {
+            WheelDelivery::Delivered => TriggerState::Fired,
+            WheelDelivery::Withheld => TriggerState::None,
+        }
+    }
+
+    fn kind(&self) -> ConditionKind { ConditionKind::Blocker }
+}
+
+/// Withholds each camera's wheel bindings while its blockers withhold scroll.
+///
+/// Runs after routing resolves the blockers and before enhanced input
+/// evaluates the bindings.
+pub(crate) fn withhold_wheel_bindings_of_scroll_blocked_cameras(
+    route: Res<ResolvedCameraInputRoute>,
+    mut conditions: Query<&mut CameraWheelBindingCondition>,
+) {
+    for mut condition in &mut conditions {
+        let delivery = if route
+            .blockers_for(condition.camera)
+            .is_some_and(CameraInputBlockers::blocks_scroll)
+        {
+            WheelDelivery::Withheld
+        } else {
+            WheelDelivery::Delivered
+        };
+        if condition.delivery != delivery {
+            condition.delivery = delivery;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -290,13 +348,18 @@ pub(crate) fn spawn_single_binding<K: CameraInstallKind>(
     camera: Entity,
     binding: Binding,
 ) -> Entity {
-    world
-        .spawn((
-            binding,
-            BindingOf(action),
-            CameraInputInstallationOf::<K>::new(camera),
-        ))
-        .id()
+    let mut entity = world.spawn((
+        binding,
+        BindingOf(action),
+        CameraInputInstallationOf::<K>::new(camera),
+    ));
+    if matches!(binding, Binding::MouseWheel { .. }) {
+        entity.insert(CameraWheelBindingCondition {
+            camera,
+            delivery: WheelDelivery::Delivered,
+        });
+    }
+    entity.id()
 }
 
 const fn dead_zone_modifier(dead_zone: InputDeadZone) -> DeadZone {

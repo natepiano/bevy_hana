@@ -6,18 +6,18 @@ use bevy::prelude::Query;
 use bevy::prelude::With;
 
 use super::CameraManual;
-use super::CoarseZoomDelta;
-use super::FreeCamInput;
-use super::LookDelta;
 use super::ManualInputSource;
-use super::OrbitCamInput;
-use super::OrbitDelta;
-use super::PanDelta;
-use super::RollDelta;
-use super::SmoothZoomDelta;
-use super::TranslateDelta;
 use crate::FreeCamKind;
 use crate::OrbitCamKind;
+use crate::free_cam::FreeCamInput;
+use crate::free_cam::LookDelta;
+use crate::free_cam::RollDelta;
+use crate::free_cam::TranslateDelta;
+use crate::orbit_cam::CoarseZoomDelta;
+use crate::orbit_cam::OrbitCamInput;
+use crate::orbit_cam::OrbitDelta;
+use crate::orbit_cam::PanDelta;
+use crate::orbit_cam::SmoothZoomDelta;
 
 /// System parameter for writing app-authored manual `OrbitCamInput`.
 #[derive(SystemParam)]

@@ -445,6 +445,8 @@ fn read_primary_actions(
                     input.location.position,
                 ));
             },
+            // A wheel reaches panels as `Pointer<Scroll>` through
+            // `scroll::scroll_from_pointer`; capture has nothing to track.
             PointerAction::Press(_)
             | PointerAction::Release(_)
             | PointerAction::Move { .. }

@@ -63,18 +63,18 @@ where
             // grazing lines wave; coverage is scale-invariant, so the only
             // change is restored precision.
             let (path, scale) = path.normalized();
-            let min_feature = path.min_feature();
-            // Straight-edge convex line marks (min_feature > 0, every contour
+            let minimum_feature_size = path.minimum_feature_size();
+            // Straight-edge convex line marks (minimum_feature_size > 0, every contour
             // linear) pack as half-plane polygons: each contour's coverage is
             // the product of its edges' band ramps, with no radial point field
             // to bulge a grazing-corner wing. A curved contour (a Circle cap's
             // ellipse arcs) keeps the single-band curve-distance scan; a tight
             // line path packs into one band so every fragment scans every curve
             // once (a multi-band layout misses the nearest curve at grazing).
-            let packed = if min_feature > 0.0 && packing::path_is_straight_polygon(&path) {
+            let packed = if minimum_feature_size > 0.0 && packing::path_is_straight_polygon(&path) {
                 packing::build_packed_polygons(path)
             } else {
-                let layout = if min_feature > 0.0 {
+                let layout = if minimum_feature_size > 0.0 {
                     BandLayout::uniform(1)
                 } else {
                     BandLayout::for_extents(
@@ -101,7 +101,7 @@ where
                 packed.horizontal_band_count(),
                 band_start + packed.horizontal_band_count(),
                 packed.vertical_band_count(),
-                min_feature,
+                minimum_feature_size,
             ));
             self.indices.insert(key, record_index);
         }

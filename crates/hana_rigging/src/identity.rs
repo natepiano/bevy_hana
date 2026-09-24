@@ -1,3 +1,6 @@
+use std::fmt::Display;
+use std::fmt::Formatter;
+
 use bevy::ecs::reflect::ReflectComponent;
 use bevy::prelude::Component;
 use bevy::prelude::Reflect;
@@ -91,6 +94,27 @@ impl DeviceKey {
         Self {
             kind,
             id: DeviceIdSource::Reported { scheme, value: id },
+        }
+    }
+}
+
+impl Display for DeviceKey {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        let kind = match self.kind {
+            DeviceKind::Display => "display",
+            DeviceKind::Camera => "camera",
+            DeviceKind::AudioInterface => "audio interface",
+            DeviceKind::DmxUniverse => "DMX universe",
+            DeviceKind::ControlSurface => "control surface",
+        };
+        match &self.id {
+            DeviceIdSource::Reported { scheme, value } => {
+                write!(formatter, "{kind} {} ({})", value.as_str(), scheme.as_str())
+            },
+            DeviceIdSource::Synthesized { digest } => {
+                write!(formatter, "{kind} at attachment {digest}")
+            },
+            DeviceIdSource::Authored { value } => write!(formatter, "{kind} {}", value.as_str()),
         }
     }
 }

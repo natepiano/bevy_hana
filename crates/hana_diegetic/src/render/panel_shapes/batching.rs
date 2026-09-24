@@ -3041,9 +3041,9 @@ mod tests {
                 max: Vec2::ONE,
             },
             contours: vec![PathContour {
-                min_feature:   0.0,
-                fade_exponent: 0.0,
-                segments:      vec![
+                minimum_feature_size: 0.0,
+                fade_exponent:        0.0,
+                segments:             vec![
                     QuadraticSegment {
                         start:   Vec2::ZERO,
                         control: Vec2::new(0.5, 0.0),

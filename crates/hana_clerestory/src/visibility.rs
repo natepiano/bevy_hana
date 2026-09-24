@@ -57,6 +57,7 @@ use crate::persistence::PersistedWindowPlacementLookup;
 use crate::persistence::PersistedWindowPlacements;
 use crate::persistence::PersistedWindowTargetV5;
 use crate::persistence::RestorableWindowPosition;
+use crate::persistence::WindowPlacementConfiguration;
 use crate::platform;
 use crate::recovery::StrandedWindowMovementBaselines;
 use crate::recovery::WindowFallbackRecoveryState;
@@ -399,7 +400,9 @@ fn resume_role_on_returned_display(
             id:     existing.endpoint.id.clone(),
         },
         driver.0,
-        EstablishedWindowPlacement::from(&saved.window_state),
+        WindowPlacementConfiguration::Established(EstablishedWindowPlacement::from(
+            &saved.window_state,
+        )),
         existing.policy(),
     );
     if let Err(error) = bindings.replace_authoring(authoring) {
@@ -803,9 +806,10 @@ fn fit_saved_geometry_to_live_monitor(
     let placement = if let Ok(configuration) = bindings.configuration_for(role) {
         let (AvailableConfiguration::LastKnownGood(configuration)
         | AvailableConfiguration::Requested(configuration)) = configuration;
-        let Some(placement) = configuration
-            .as_any()
-            .downcast_ref::<EstablishedWindowPlacement>()
+        let Some(WindowPlacementConfiguration::Established(placement)) =
+            configuration
+                .as_any()
+                .downcast_ref::<WindowPlacementConfiguration>()
         else {
             return SavedGeometryPlacementOutcome::Unavailable;
         };
@@ -991,6 +995,7 @@ pub(crate) mod tests {
     use crate::persistence::PersistedWindowState;
     use crate::persistence::PersistedWindowTargetV5;
     use crate::persistence::SavedWindowMode;
+    use crate::persistence::WindowPlacementConfiguration;
     use crate::platform;
     use crate::recovery::StrandedWindowMovementBaselines;
     use crate::recovery::WindowFallbackRecoveryPhase;
@@ -1352,7 +1357,7 @@ pub(crate) mod tests {
     }
 
     impl EndpointDriver for BoundDisplayWindowDriver {
-        type Configuration = EstablishedWindowPlacement;
+        type Configuration = WindowPlacementConfiguration;
         type Target = ();
 
         fn resolve_target(
@@ -1655,7 +1660,7 @@ pub(crate) mod tests {
     struct RetryWindowDriver(WindowEndpointDriver);
 
     impl EndpointDriver for RetryWindowDriver {
-        type Configuration = EstablishedWindowPlacement;
+        type Configuration = WindowPlacementConfiguration;
         type Target = WindowPlacementTarget;
 
         fn resolve_target(
@@ -1958,8 +1963,8 @@ pub(crate) mod tests {
     fn retry_binding_authoring(
         role: RoleKey,
         device: DeviceKey,
-        driver: EndpointDriverRegistration<EstablishedWindowPlacement>,
-    ) -> BindingAuthoring<EstablishedWindowPlacement> {
+        driver: EndpointDriverRegistration<WindowPlacementConfiguration>,
+    ) -> BindingAuthoring<WindowPlacementConfiguration> {
         BindingAuthoring::new(
             role,
             DeviceEndpoint {
@@ -1967,7 +1972,7 @@ pub(crate) mod tests {
                 id: EndpointId::Whole,
             },
             driver,
-            saved_placement(),
+            saved_placement().into(),
             BindingPolicy::new(
                 RecoveryPolicy::ReapplyOnReturn,
                 RetryOn::NewRevision,
@@ -2134,7 +2139,7 @@ pub(crate) mod tests {
                 id:     EndpointId::Whole,
             },
             driver,
-            saved_placement(),
+            saved_placement().into(),
             BindingPolicy::new(
                 recovery,
                 RetryOn::NewRevision,
@@ -2226,7 +2231,7 @@ pub(crate) mod tests {
                 role.clone(),
                 endpoint,
                 driver,
-                saved_placement(),
+                saved_placement().into(),
                 BindingPolicy::new(
                     RecoveryPolicy::ReapplyOnReturn,
                     RetryOn::NewRevision,
@@ -2527,7 +2532,7 @@ pub(crate) mod tests {
                 id:     EndpointId::Whole,
             },
             driver,
-            saved_placement(),
+            saved_placement().into(),
             BindingPolicy::new(
                 RecoveryPolicy::Forget,
                 RetryOn::NewRevision,
@@ -2807,12 +2812,12 @@ pub(crate) mod tests {
             | AvailableConfiguration::Requested(configuration)) = configuration;
             let requested_placement = configuration
                 .as_any()
-                .downcast_ref::<EstablishedWindowPlacement>()
+                .downcast_ref::<WindowPlacementConfiguration>()
                 .ok_or_else(|| {
                     String::from("the fallback role has the wrong configuration type")
                 })?;
             assert_eq!(
-                requested_placement.logical_size,
+                requested_placement.logical_size(),
                 UVec2::new(SAVED_LOGICAL_WIDTH, SAVED_LOGICAL_HEIGHT)
             );
             let fallback_monitor = app

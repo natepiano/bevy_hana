@@ -43,23 +43,24 @@ use super::install::TrackpadBindingCondition;
 use crate::OrbitCamKind;
 use crate::input;
 use crate::input::BUTTON_ZOOM_SCALE;
+use crate::input::CameraInputBlockers;
 use crate::input::CameraInputContextGated;
 use crate::input::CameraInstalledBindings;
 use crate::input::InputGain;
 use crate::input::InteractionSources;
 use crate::input::LiveInputs;
-use crate::input::OrbitCamBindingWithInputGain;
-use crate::input::OrbitCamBindings;
-use crate::input::OrbitCamButtonDragZoomAxis;
 use crate::input::OrbitCamInputInstallationOf;
-use crate::input::OrbitCamTouchBinding;
-use crate::input::OrbitCamTrackpadScroll;
 use crate::input::PINCH_GESTURE_AMPLIFICATION;
 use crate::input::ResolvedCameraInputRoute;
 use crate::input::TOUCH_PINCH_SCALE;
 use crate::input::TouchGestures;
 use crate::input::TouchTracker;
-use crate::input::ZoomInversion;
+use crate::orbit_cam::OrbitCamBindingWithInputGain;
+use crate::orbit_cam::OrbitCamBindings;
+use crate::orbit_cam::OrbitCamButtonDragZoomAxis;
+use crate::orbit_cam::OrbitCamTouchBinding;
+use crate::orbit_cam::OrbitCamTrackpadScroll;
+use crate::orbit_cam::ZoomInversion;
 
 pub(super) fn inject_adapter_actions(
     route: Res<ResolvedCameraInputRoute>,
@@ -105,11 +106,10 @@ pub(super) fn inject_adapter_actions(
 
     for (camera, bindings, adapter_inputs, gated, mut frame_sources) in &mut cameras {
         *frame_sources = OrbitCamAdapterFrameSources::default();
+        let blockers = route.blockers_for(camera);
         if route.routed_camera() != Some(camera)
             || route.metrics_for(camera).is_none()
-            || route
-                .blockers_for(camera)
-                .is_some_and(crate::input::CameraInputBlockers::is_blocked)
+            || blockers.is_some_and(CameraInputBlockers::is_blocked)
             || gated.is_some_and(|gated| !gated.context_gate.is_allowed())
         {
             refresh_trackpad_conditions(camera, None, &mut trackpad_conditions);
@@ -121,6 +121,11 @@ pub(super) fn inject_adapter_actions(
             continue;
         }
 
+        let scroll = if blockers.is_some_and(CameraInputBlockers::blocks_scroll) {
+            AccumulatedMouseScroll::default()
+        } else {
+            scroll
+        };
         let trackpad_selection =
             selected_trackpad_binding(&bindings.0, scroll, keyboard.as_deref());
         refresh_trackpad_conditions(camera, trackpad_selection, &mut trackpad_conditions);

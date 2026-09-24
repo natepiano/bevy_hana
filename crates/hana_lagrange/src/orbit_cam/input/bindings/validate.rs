@@ -127,8 +127,8 @@ mod tests {
 
     use super::*;
     use crate::input::InputGain;
-    use crate::input::OrbitCamLineScroll;
-    use crate::input::OrbitCamMouseDrag;
+    use crate::orbit_cam::OrbitCamLineScroll;
+    use crate::orbit_cam::OrbitCamMouseDrag;
 
     #[test]
     fn line_scroll_rejects_invalid_gains_and_preserves_disabled_bindings()

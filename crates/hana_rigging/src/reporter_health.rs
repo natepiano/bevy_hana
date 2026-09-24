@@ -1061,6 +1061,11 @@ pub enum PreviousSuccess {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Reflect)]
 #[reflect(Serialize)]
 pub enum DeviceAccessErrorView {
+    /// The operator cancelled or revoked this operation; only explicit recovery may resume it.
+    Cancelled {
+        /// Provider detail identifying the cancelled consent or closed session.
+        detail: String,
+    },
     /// Another owner holds exclusive access.
     Contended {
         /// Provider detail.
@@ -1076,6 +1081,16 @@ pub enum DeviceAccessErrorView {
         /// Provider detail.
         detail: String,
     },
+    /// The device opened but never delivered its first datum.
+    Unresponsive {
+        /// Provider detail.
+        detail: String,
+    },
+    /// Hana's own earlier open of this device has not returned from the driver yet.
+    Releasing {
+        /// Provider detail.
+        detail: String,
+    },
     /// Communication with the device or provider failed.
     Transport {
         /// Provider detail.
@@ -1086,6 +1101,35 @@ pub enum DeviceAccessErrorView {
         /// Provider detail.
         detail: String,
     },
+}
+
+impl Display for DeviceAccessErrorView {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FormatResult {
+        match self {
+            Self::Cancelled { detail } => {
+                write!(formatter, "permission was cancelled or revoked: {detail}")
+            },
+            Self::Contended { detail } => write!(formatter, "device busy: {detail}"),
+            Self::Blocked { detail } => write!(formatter, "device access was refused: {detail}"),
+            Self::Absent { detail } => write!(formatter, "device is unreachable: {detail}"),
+            Self::Unresponsive { detail } => {
+                write!(formatter, "device opened but sent nothing: {detail}")
+            },
+            Self::Releasing { detail } => {
+                write!(
+                    formatter,
+                    "Hana still holds the device from an earlier open: {detail}"
+                )
+            },
+            Self::Transport { detail } => {
+                write!(formatter, "device communication failed: {detail}")
+            },
+            Self::Unsupported { detail } => write!(
+                formatter,
+                "this platform cannot perform the operation: {detail}"
+            ),
+        }
+    }
 }
 
 impl ReporterHealth {
@@ -1301,6 +1345,9 @@ impl From<&DiscoveryProgress> for DiscoveryProgressView {
 impl From<&DeviceAccessError> for DeviceAccessErrorView {
     fn from(error: &DeviceAccessError) -> Self {
         match error {
+            DeviceAccessError::Cancelled { detail } => Self::Cancelled {
+                detail: detail.clone(),
+            },
             DeviceAccessError::Contended { detail } => Self::Contended {
                 detail: detail.clone(),
             },
@@ -1308,6 +1355,12 @@ impl From<&DeviceAccessError> for DeviceAccessErrorView {
                 detail: detail.clone(),
             },
             DeviceAccessError::Absent { detail } => Self::Absent {
+                detail: detail.clone(),
+            },
+            DeviceAccessError::Unresponsive { detail } => Self::Unresponsive {
+                detail: detail.clone(),
+            },
+            DeviceAccessError::Releasing { detail } => Self::Releasing {
                 detail: detail.clone(),
             },
             DeviceAccessError::Transport { detail } => Self::Transport {

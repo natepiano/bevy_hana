@@ -17,7 +17,6 @@ use crate::events::ExpectedLogicalPosition;
 use crate::events::ExpectedPhysicalPosition;
 use crate::monitors::CurrentMonitorIndex;
 use crate::monitors::MonitorDescriptor;
-use crate::persistence::EstablishedWindowPlacement;
 #[cfg(test)]
 use crate::persistence::PersistedPosition;
 #[cfg(test)]
@@ -25,6 +24,7 @@ use crate::persistence::PersistedWindowState;
 use crate::persistence::RestorableWindowPosition;
 use crate::persistence::SavedWindowMode;
 use crate::persistence::UnrebasedDesktopPosition;
+use crate::persistence::WindowPlacementConfiguration;
 use crate::restore::settle_state::SettleState;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Reflect)]
@@ -118,7 +118,7 @@ fn prepare_persisted_position(
 /// Rebase an established driver configuration through the one exact live monitor descriptor.
 #[must_use]
 fn prepare_established_position(
-    placement: &EstablishedWindowPlacement,
+    placement: &WindowPlacementConfiguration,
     target_monitor: &MonitorDescriptor,
 ) -> SavedWindowPlacementDecision {
     match placement.restorable_position(target_monitor) {
@@ -138,7 +138,7 @@ fn prepare_established_position(
 /// Explain whether an established configuration can supply a platform position.
 #[must_use]
 pub(crate) fn prepared_established_position_meaning(
-    placement: &EstablishedWindowPlacement,
+    placement: &WindowPlacementConfiguration,
     target_monitor: &MonitorDescriptor,
     platform: Platform,
 ) -> PreparedPositionMeaning {
@@ -501,15 +501,15 @@ fn compute_target_position(
 /// Build a target from one kernel-owned window configuration without a second configuration type.
 #[must_use]
 pub(crate) fn compute_established_target_position(
-    placement: &EstablishedWindowPlacement,
+    placement: &WindowPlacementConfiguration,
     target_monitor: &MonitorDescriptor,
     physical_decoration: UVec2,
     starting_scale: f64,
     platform: Platform,
 ) -> TargetPosition {
     compute_target_position(
-        placement.logical_size,
-        &placement.saved_window_mode,
+        placement.logical_size(),
+        placement.saved_window_mode(),
         target_monitor,
         prepare_established_position(placement, target_monitor),
         physical_decoration,

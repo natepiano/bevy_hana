@@ -71,6 +71,7 @@ use crate::devices::ApplyAuthorizationError;
 use crate::devices::DeviceEntityLookup;
 use crate::devices::DeviceRevision;
 use crate::devices::DeviceRevisionLookup;
+use crate::devices::DriverClaimObservation;
 use crate::devices::PriorKeyAvailability;
 use crate::reconcile::FrameClockReading;
 use crate::registration::ApplyPermit;
@@ -201,14 +202,26 @@ impl PendingAttemptEndingPublication {
 pub(crate) struct PendingAttemptEndingPublications(Vec<PendingAttemptEndingPublication>);
 
 struct AttemptLifecycleResources<'a> {
-    bindings:           &'a mut Bindings,
-    drivers:            &'a mut Drivers,
-    devices:            &'a Devices,
-    hardware_inventory: &'a HardwareInventory,
-    reports:            &'a DriverReports,
-    now:                FrameClockReading,
-    apply_overrun:      Duration,
-    endings:            Vec<PendingAttemptEndingPublication>,
+    bindings:        &'a mut Bindings,
+    drivers:         &'a mut Drivers,
+    /// Borrowed past change detection: a pass that only starts and settles attempts must not wake
+    /// every consumer of the device set. `AttemptLifecycleOutcome::devices_changed` says when a
+    /// driver's refusal actually changed a device's claim.
+    devices:         &'a mut Devices,
+    reports:         &'a DriverReports,
+    now:             FrameClockReading,
+    apply_overrun:   Duration,
+    endings:         Vec<PendingAttemptEndingPublication>,
+    /// Whether a completion in this pass changed a device's claim in the register.
+    devices_changed: bool,
+}
+
+/// What one attempt-lifecycle pass leaves for the rest of the frame.
+struct AttemptLifecycleOutcome {
+    endings:         Vec<PendingAttemptEndingPublication>,
+    /// A driver reported a refusal that changed a device's claim, so the device set's consumers
+    /// must wake even though no reporter contributed.
+    devices_changed: bool,
 }
 
 struct BindingTransitionDriverCleanup {
@@ -423,22 +436,24 @@ pub(crate) fn advance_attempt_lifecycle(world: &mut World) {
     {
         return;
     }
-    let endings = world.resource_scope::<Bindings, _>(|world, mut bindings| {
+    let outcome = world.resource_scope::<Bindings, _>(|world, mut bindings| {
         world.resource_scope::<Drivers, _>(|world, mut drivers| {
-            world.resource_scope::<Devices, _>(|world, devices| {
-                world.resource_scope::<HardwareInventory, _>(|world, hardware_inventory| {
-                    AttemptLifecycleResources {
-                        bindings: &mut bindings,
-                        drivers: &mut drivers,
-                        devices: &devices,
-                        hardware_inventory: &hardware_inventory,
-                        reports: &reports,
-                        now,
-                        apply_overrun,
-                        endings: Vec::new(),
-                    }
-                    .advance(world, completions, session_reports)
-                })
+            world.resource_scope::<Devices, _>(|world, mut devices| {
+                let outcome = AttemptLifecycleResources {
+                    bindings: &mut bindings,
+                    drivers: &mut drivers,
+                    devices: devices.bypass_change_detection(),
+                    reports: &reports,
+                    now,
+                    apply_overrun,
+                    endings: Vec::new(),
+                    devices_changed: false,
+                }
+                .advance(world, completions, session_reports);
+                if outcome.devices_changed {
+                    devices.set_changed();
+                }
+                outcome
             })
         })
     });
@@ -446,7 +461,7 @@ pub(crate) fn advance_attempt_lifecycle(world: &mut World) {
     world
         .resource_mut::<PendingAttemptEndingPublications>()
         .0
-        .extend(endings);
+        .extend(outcome.endings);
 }
 
 /// Credit continuous-flow testimony, publish newly crossed stalls, and release stalls retained
@@ -519,7 +534,7 @@ impl AttemptLifecycleResources<'_> {
         world: &mut World,
         completions: VecDeque<QueuedCompletion>,
         session_reports: VecDeque<QueuedSessionReport>,
-    ) -> Vec<PendingAttemptEndingPublication> {
+    ) -> AttemptLifecycleOutcome {
         // (1) Synchronous start errors are recorded while starting successors below.
         // (2) Revalidate every non-time guard before accepting any completion.
         self.revalidate_attempts(world);
@@ -539,7 +554,10 @@ impl AttemptLifecycleResources<'_> {
         );
         // (6) Resolution precedes issuance for every successor.
         self.start_successors(world);
-        self.endings
+        AttemptLifecycleOutcome {
+            endings:         self.endings,
+            devices_changed: self.devices_changed,
+        }
     }
 
     fn revalidate_attempts(&mut self, world: &mut World) {
@@ -548,7 +566,7 @@ impl AttemptLifecycleResources<'_> {
                 &retained,
                 self.bindings,
                 self.devices,
-                self.hardware_inventory,
+                world.resource::<HardwareInventory>(),
             ) else {
                 continue;
             };
@@ -579,7 +597,7 @@ impl AttemptLifecycleResources<'_> {
                 refused.push(queued);
                 continue;
             }
-            accept_completion(
+            let accepted = accept_completion(
                 world,
                 self.bindings,
                 self.drivers,
@@ -590,6 +608,9 @@ impl AttemptLifecycleResources<'_> {
                 self.now,
                 &mut self.endings,
             );
+            if accepted.devices_changed {
+                self.devices_changed = true;
+            }
         }
         refused
     }
@@ -631,7 +652,6 @@ impl AttemptLifecycleResources<'_> {
                 self.bindings,
                 self.drivers,
                 self.devices,
-                self.hardware_inventory,
                 self.reports,
                 &role,
                 self.now,
@@ -754,13 +774,14 @@ fn accept_completion(
     world: &mut World,
     bindings: &mut Bindings,
     drivers: &mut Drivers,
-    devices: &Devices,
+    devices: &mut Devices,
     reports: &DriverReports,
     retained: ActiveAttemptRecord,
     queued: QueuedCompletion,
     now: FrameClockReading,
     endings: &mut Vec<PendingAttemptEndingPublication>,
-) {
+) -> AcceptedCompletion {
+    let mut devices_changed = false;
     match queued.completion {
         ErasedDriverCompletion::Succeeded(applied) => {
             let applied_kind = match &applied {
@@ -773,7 +794,7 @@ fn accept_completion(
                     "role `{}`: successful attempt has no live role entity",
                     retained.role
                 );
-                return;
+                return AcceptedCompletion { devices_changed };
             };
             match drivers.established(
                 world,
@@ -812,12 +833,21 @@ fn accept_completion(
             }
         },
         ErasedDriverCompletion::Failed(error) => {
+            // The gate is stamped with the revision before the refusal is recorded, so a claim
+            // the driver just observed reopens it at once and the role waits on the claim's
+            // release rather than on an unnamed device change.
+            let device_revision = role_device_revision(devices, bindings, &retained.role);
+            if devices.observe_driver_claim(retained.attempt.device_id(), &error)
+                == DriverClaimObservation::Recorded
+            {
+                devices_changed = true;
+            }
             let outcome = DriverOutcomeStatus::Failed(error);
             bindings.record_attempt_ending(
                 &retained.role,
                 retained.attempt.generation(),
                 outcome.clone(),
-                role_device_revision(devices, bindings, &retained.role),
+                device_revision,
                 now,
             );
             endings.push(PendingAttemptEndingPublication::live(
@@ -840,6 +870,13 @@ fn accept_completion(
             ));
         },
     }
+    AcceptedCompletion { devices_changed }
+}
+
+/// What accepting one driver completion changed beyond the role's own ledger.
+struct AcceptedCompletion {
+    /// A failure carried a refusal that changed the device's claim in the register.
+    devices_changed: bool,
 }
 
 fn record_contract_failure(
@@ -888,7 +925,7 @@ fn process_session_reports(
                     configuration,
                 );
             },
-            ErasedSessionReport::Loss(_error) => {
+            ErasedSessionReport::Loss(error) => {
                 let Some(established) =
                     bindings.established_sessions().into_iter().find(|session| {
                         session.role == queued.role && session.session == queued.session
@@ -913,7 +950,12 @@ fn process_session_reports(
                     SessionReleaseCause::ReportedLoss,
                 );
                 let device_revision = role_device_revision(devices, bindings, &established.role);
-                let _ = bindings.apply_session_loss(&established.role, device_revision, now);
+                let _ = bindings.apply_reported_session_loss(
+                    &established.role,
+                    &error,
+                    device_revision,
+                    now,
+                );
             },
         }
     }
@@ -939,7 +981,6 @@ fn start_one_apply(
     bindings: &mut Bindings,
     drivers: &mut Drivers,
     devices: &Devices,
-    hardware_inventory: &HardwareInventory,
     reports: &DriverReports,
     role: &RoleKey,
     now: FrameClockReading,
@@ -987,7 +1028,10 @@ fn start_one_apply(
             return None;
         },
     };
-    if let Err(error) = hardware_inventory.ensure_operational(&endpoint.device) {
+    if let Err(error) = world
+        .resource::<HardwareInventory>()
+        .ensure_operational(&endpoint.device)
+    {
         record_prestart_rejection(
             bindings,
             role,

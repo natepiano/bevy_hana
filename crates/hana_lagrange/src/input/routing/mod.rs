@@ -242,6 +242,10 @@ mod tests {
     use crate::FreeCamKind;
     use crate::OrbitCam;
     use crate::OrbitCamKind;
+    use crate::free_cam::FreeCamBindings;
+    use crate::free_cam::FreeCamMouseLook;
+    use crate::free_cam::FreeCamRollBinding;
+    use crate::free_cam::FreeCamTranslateKeys;
     use crate::input::BindingsError;
     use crate::input::CUSTOM_SLOW_SCALE;
     use crate::input::CameraInputDisabled;
@@ -249,18 +253,14 @@ mod tests {
     use crate::input::CameraInputScalePolicy;
     use crate::input::CameraResolvedBindings;
     use crate::input::CameraSlowMode;
-    use crate::input::FreeCamBindings;
     use crate::input::FreeCamInputMode;
-    use crate::input::FreeCamMouseLook;
-    use crate::input::FreeCamRollBinding;
-    use crate::input::FreeCamTranslateKeys;
     use crate::input::InputBinding;
     use crate::input::InputGain;
     use crate::input::InteractionSources;
-    use crate::input::OrbitCamBindings;
     use crate::input::OrbitCamInputMode;
-    use crate::input::OrbitCamMouseDrag;
-    use crate::input::OrbitCamPreset;
+    use crate::orbit_cam::OrbitCamBindings;
+    use crate::orbit_cam::OrbitCamMouseDrag;
+    use crate::orbit_cam::OrbitCamPreset;
     use crate::system_sets::LagrangeSystemSetsPlugin;
 
     fn test_app() -> App {

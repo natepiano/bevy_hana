@@ -39,15 +39,25 @@ impl DeviceEndpoint {
     }
 }
 
+impl Display for DeviceEndpoint {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FormatResult {
+        match &self.id {
+            EndpointId::Whole => Display::fmt(&self.device, formatter),
+            EndpointId::Part(part) => write!(formatter, "{}, {part}", self.device),
+        }
+    }
+}
+
 /// Address within a device that distinguishes its whole surface from one provider-named part.
 ///
-/// A display has one endpoint, so it uses [`Self::Whole`] rather than inventing a part name.
+/// A provider that splits one device into named parts — a display's capture and output
+/// surfaces, say — addresses each with [`Self::Part`]; [`Self::Whole`] names an undivided device.
 /// [`Self::Part`] keeps the provider's vocabulary because nothing in the kernel says whether
 /// `ch/7` is an audio channel, `key/3` is a control surface key, or `nfc` is a reader.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, Reflect)]
 #[reflect(Serialize, Deserialize)]
 pub enum EndpointId {
-    /// The device exposes one undivided endpoint, as with a display surface.
+    /// The device exposes one undivided endpoint.
     Whole,
     /// A provider-defined endpoint within a multi-part device, such as one audio channel.
     Part(PartName),

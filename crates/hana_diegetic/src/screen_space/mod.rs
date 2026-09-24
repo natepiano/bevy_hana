@@ -829,12 +829,15 @@ mod tests {
     use super::ScreenSpaceLight;
     use super::ScreenSpacePlugin;
     use super::resolve_screen_axis;
+    use crate::AlignX;
+    use crate::AlignY;
     use crate::Anchor;
     use crate::Fit;
     use crate::HeadlessLayoutPlugin;
     use crate::PanelDimensionsChanged;
     use crate::Px;
     use crate::TextStyle;
+    use crate::Unit;
     use crate::constants::MONOSPACE_WIDTH_RATIO;
     use crate::layout::Dimension;
     use crate::layout::Sizing;
@@ -1475,6 +1478,87 @@ mod tests {
             1,
             "the surviving view keeps its light"
         );
+    }
+
+    /// A `Percent(1.0)` screen panel solves on its spawn frame before its axes
+    /// resolve against the window. An identical tree replacement on the next
+    /// frame must re-solve against the window instead of keeping that solve.
+    #[test]
+    fn identical_replacement_after_spawn_solves_against_the_window() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(monospace_measurer())
+            .add_plugins(HeadlessLayoutPlugin)
+            .add_plugins(ScreenSpacePlugin);
+        app.world_mut().spawn((
+            Window {
+                resolution: (1280_u32, 720_u32).into(),
+                ..Default::default()
+            },
+            PrimaryWindow,
+        ));
+
+        let mut builder = crate::LayoutBuilder::with_root(
+            crate::El::overlay()
+                .width(Sizing::GROW)
+                .height(Sizing::GROW)
+                .alignment(AlignX::Center, AlignY::Center),
+        );
+        builder.with(
+            crate::El::column()
+                .width(Sizing::fixed(700.0))
+                .height(Sizing::fixed(300.0)),
+            |_| {},
+        );
+        let panel = DiegeticPanel::screen()
+            .size(crate::Percent(1.0), crate::Percent(1.0))
+            .with_tree(builder.build())
+            .build()
+            .expect("percent screen panel should build");
+        let panel = app.world_mut().spawn(panel).id();
+
+        // Frame one solves before the percent axes resolve against the window.
+        app.update();
+
+        // An identical replacement on the next frame, which the palette sends
+        // on open, must not keep the first frame's zero-sized solve.
+        let mut replacement = crate::LayoutBuilder::with_root(
+            crate::El::overlay()
+                .width(Sizing::GROW)
+                .height(Sizing::GROW)
+                .alignment(AlignX::Center, AlignY::Center),
+        );
+        replacement.with(
+            crate::El::column()
+                .width(Sizing::fixed(700.0))
+                .height(Sizing::fixed(300.0)),
+            |_| {},
+        );
+        let replacement = replacement.build();
+        crate::panel::DiegeticPanelCommands::set_tree(
+            &mut app.world_mut().commands(),
+            panel,
+            replacement,
+        )
+        .expect("replacement tree should be accepted");
+        app.update();
+        app.update();
+
+        let computed = app
+            .world()
+            .get::<ComputedDiegeticPanel>(panel)
+            .expect("percent screen panel should have a computed layout");
+        let solved = computed
+            .layout()
+            .solved()
+            .expect("percent screen panel should solve its layout");
+        let to_points = Unit::Pixels.to_points();
+        let root = solved.computed[0].bounds;
+        let child = solved.computed[1].bounds;
+        assert_close(root.width, 1280.0 * to_points);
+        assert_close(root.height, 720.0 * to_points);
+        assert_close(child.x, 1280.0f32.mul_add(to_points, -child.width) * 0.5);
+        assert_close(child.y, 720.0f32.mul_add(to_points, -child.height) * 0.5);
     }
 
     /// Despawning both windows tears down every camera, light, and panel.

@@ -2,8 +2,8 @@ use bevy::prelude::Bundle;
 
 use super::FreeCam;
 use super::FreeCamBindings;
+use super::FreeCamPreset;
 use crate::input::FreeCamInputMode;
-use crate::input::FreeCamPreset;
 
 impl FreeCam {
     /// Returns a `FreeCam` bundle using a built-in input preset.
@@ -28,9 +28,9 @@ mod tests {
     use bevy::prelude::World;
 
     use super::*;
+    use crate::free_cam::FreeCamGamepadPreset;
+    use crate::free_cam::FreeCamInputGain;
     use crate::input::BindingsError;
-    use crate::input::FreeCamGamepadPreset;
-    use crate::input::FreeCamInputGain;
 
     const TUNED_GAMEPAD_INPUT_GAIN: f32 = 0.5;
     const TUNED_MOVE_SCALE: f32 = 2.0;

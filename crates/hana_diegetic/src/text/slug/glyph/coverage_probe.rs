@@ -707,9 +707,9 @@ fn sharp_corner_glyph() -> (Glyph, Vec<QuadraticSegment>) {
             max: Vec2::new(580.0, 700.0),
         },
         contours:  vec![Contour {
-            segments:      segments.clone(),
-            min_feature:   0.0,
-            fade_exponent: 0.0,
+            segments:             segments.clone(),
+            minimum_feature_size: 0.0,
+            fade_exponent:        0.0,
         }],
     };
     (glyph, segments)
@@ -1007,11 +1007,11 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 // ---- panel-line tick scale probe -------------------------------------------
 
 /// Builds a probe for an axis-aligned rectangle outline with the given design
-/// size, packed exactly like a panel-line tick. `min_feature > 0` marks the
+/// size, packed exactly like a panel-line tick. `minimum_feature_size > 0` marks the
 /// rectangle as a hairline-dilating stroke of that design width (the panel
 /// line path); `0.0` packs it like a text glyph.
-fn rectangle_probe(size: Vec2, band_count: usize, min_feature: f32) -> Probe {
-    rectangle_probe_with_fade(size, band_count, min_feature, 0.0)
+fn rectangle_probe(size: Vec2, band_count: usize, minimum_feature_size: f32) -> Probe {
+    rectangle_probe_with_fade(size, band_count, minimum_feature_size, 0.0)
 }
 
 /// `rectangle_probe` with a per-contour fade exponent (the panel-line fade
@@ -1019,7 +1019,7 @@ fn rectangle_probe(size: Vec2, band_count: usize, min_feature: f32) -> Probe {
 fn rectangle_probe_with_fade(
     size: Vec2,
     band_count: usize,
-    min_feature: f32,
+    minimum_feature_size: f32,
     fade_exponent: f32,
 ) -> Probe {
     let glyph = Glyph {
@@ -1032,7 +1032,7 @@ fn rectangle_probe_with_fade(
         contours:  vec![rectangle_contour(
             Vec2::ZERO,
             size,
-            min_feature,
+            minimum_feature_size,
             fade_exponent,
         )],
     };
@@ -1045,7 +1045,7 @@ fn rectangle_probe_with_fade(
             band_count,
             band_count,
             band_count,
-            min_feature,
+            minimum_feature_size,
         ),
         curves: packed.curves().to_vec(),
         bands:  packed.bands().to_vec(),
@@ -1054,7 +1054,12 @@ fn rectangle_probe_with_fade(
 
 /// An axis-aligned rectangle contour from `min` to `min + size` with the
 /// given per-contour packing inputs.
-fn rectangle_contour(min: Vec2, size: Vec2, min_feature: f32, fade_exponent: f32) -> Contour {
+fn rectangle_contour(
+    min: Vec2,
+    size: Vec2,
+    minimum_feature_size: f32,
+    fade_exponent: f32,
+) -> Contour {
     let corners = [
         min,
         min + Vec2::new(size.x, 0.0),
@@ -1069,7 +1074,7 @@ fn rectangle_contour(min: Vec2, size: Vec2, min_feature: f32, fade_exponent: f32
             .take(corners.len())
             .map(|(start, end)| line(start, end))
             .collect(),
-        min_feature,
+        minimum_feature_size,
         fade_exponent,
     }
 }
@@ -1230,7 +1235,7 @@ fn atlas_packed_tall_spine_covers_full_length() {
             },
             contours:  vec![Contour {
                 segments,
-                min_feature: 0.0,
+                minimum_feature_size: 0.0,
                 fade_exponent: 0.0,
             }],
         };
@@ -1458,7 +1463,7 @@ fn fade_scales_subfloor_stroke_coverage_by_natural_ratio() {
     }
 }
 
-/// Text exemption is structural: a path packed with `min_feature = 0` (every
+/// Text exemption is structural: a path packed with `minimum_feature_size = 0` (every
 /// text glyph) has zero dilation, so its fade factor is 1 under any exponent.
 #[test]
 fn text_paths_are_exempt_from_fade() {

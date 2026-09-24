@@ -47,6 +47,9 @@ fn propagation_targets(
     targets
 }
 
+// Propagated copies use `try_insert`: a target found by the walk can be
+// despawned by a command queued earlier in the same flush (a visual root
+// retired as its children move to a new parent), and a plain insert panics.
 /// When `Outline` is added to an entity, propagate it to all descendant `Mesh3d` entities.
 /// Skips entities with `NoOutline` and subtrees behind an [`OutlineBarrier`].
 /// Sets `group_source` for `Grouped` overlap mode.
@@ -72,7 +75,7 @@ pub(crate) fn propagate_outline_to_descendants(
     propagated.group_source = Some(source);
 
     for target in propagation_targets(source, &children_query, &barrier_query, &mesh_query) {
-        commands.entity(target).insert(propagated.clone());
+        commands.entity(target).try_insert(propagated.clone());
     }
 }
 
@@ -108,7 +111,7 @@ pub(crate) fn propagate_outline_on_child_added(
             let source = outline.group_source.unwrap_or(parent);
             let mut propagated = outline.clone();
             propagated.group_source = Some(source);
-            commands.entity(child).insert(propagated);
+            commands.entity(child).try_insert(propagated);
             return;
         }
         current = parent;
@@ -150,7 +153,7 @@ pub(crate) fn propagate_outline_on_mesh_added(
             let source = outline.group_source.unwrap_or(parent);
             let mut propagated = outline.clone();
             propagated.group_source = Some(source);
-            commands.entity(child).insert(propagated);
+            commands.entity(child).try_insert(propagated);
             return;
         }
         current = parent;
@@ -180,7 +183,7 @@ pub(crate) fn propagate_outline_on_scene_ready(
     propagated.group_source = Some(source);
 
     for target in propagation_targets(source, &children_query, &barrier_query, &mesh_query) {
-        commands.entity(target).insert(propagated.clone());
+        commands.entity(target).try_insert(propagated.clone());
     }
 }
 
@@ -253,6 +256,11 @@ pub(crate) fn sync_propagated_outlines(
     reason = "tests should panic on unexpected values"
 )]
 mod tests {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/propagation/outline_retirement.rs"
+    ));
+
     use bevy::ecs::system::RunSystemOnce;
     use bevy::prelude::Handle;
     use bevy::prelude::World;

@@ -5,7 +5,8 @@
 //!   not receive input this frame. Computed once per frame from a
 //!   [`CameraRoutingSnapshot`](super::snapshot::CameraRoutingSnapshot).
 //! - [`CameraInputBlockerBits`] — internal bitflag set of blocker reasons
-//!   (`DISABLED`/`INACTIVE_CAMERA`/`ANIMATION_IGNORE`/`UNAVAILABLE_OWNER`).
+//!   (`DISABLED`/`INACTIVE_CAMERA`/`ANIMATION_IGNORE`/`UNAVAILABLE_OWNER` block all input;
+//!   `SCROLL_DISABLED` blocks scroll alone).
 //! - [`CameraInputContextGated`] — component flipping each camera's interaction context between
 //!   allowed and blocked, derived from `CameraInputBlockers::is_blocked`.
 //! - [`ContextGate`] — `Allowed`/`Blocked` enum that `CameraInputContextGated` wraps.
@@ -23,6 +24,12 @@ bitflags::bitflags! {
         const INACTIVE_CAMERA = 1 << 1;
         const ANIMATION_IGNORE = 1 << 2;
         const UNAVAILABLE_OWNER = 1 << 3;
+        const SCROLL_DISABLED = 1 << 4;
+        /// Reasons that withhold every input from the camera.
+        const ALL_INPUT = Self::DISABLED.bits()
+            | Self::INACTIVE_CAMERA.bits()
+            | Self::ANIMATION_IGNORE.bits()
+            | Self::UNAVAILABLE_OWNER.bits();
     }
 }
 
@@ -32,7 +39,15 @@ pub(crate) struct CameraInputBlockers {
 }
 
 impl CameraInputBlockers {
-    pub(crate) const fn is_blocked(self) -> bool { !self.bits.is_empty() }
+    pub(crate) const fn is_blocked(self) -> bool {
+        self.bits.intersects(CameraInputBlockerBits::ALL_INPUT)
+    }
+
+    pub(crate) const fn blocks_scroll(self) -> bool {
+        self.bits.intersects(
+            CameraInputBlockerBits::ALL_INPUT.union(CameraInputBlockerBits::SCROLL_DISABLED),
+        )
+    }
 
     pub(super) fn from_snapshot(
         snapshot: &CameraRoutingSnapshot,
@@ -49,6 +64,9 @@ impl CameraInputBlockers {
         }
         if snapshot.has(CameraRoutingSnapshotFlags::ANIMATION_IGNORE) {
             bits.insert(CameraInputBlockerBits::ANIMATION_IGNORE);
+        }
+        if snapshot.has(CameraRoutingSnapshotFlags::SCROLL_DISABLED) {
+            bits.insert(CameraInputBlockerBits::SCROLL_DISABLED);
         }
         Self { bits }
     }

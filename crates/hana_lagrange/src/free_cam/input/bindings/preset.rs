@@ -21,7 +21,6 @@ use super::FreeCamInputGain;
 use super::builder::FreeCamMouseLook;
 use super::builder::FreeCamTranslateKeys;
 use crate::input::BindingsError;
-use crate::input::CameraInputGamepadSelectionPolicy;
 use crate::input::CameraInputScalePolicy;
 use crate::input::CameraSlowMode;
 use crate::input::GamepadInputGain;
@@ -29,6 +28,7 @@ use crate::input::HeldBinding;
 use crate::input::InputBinding;
 use crate::input::InputDeadZone;
 use crate::input::MouseInputGain;
+use crate::orbit_cam::CameraInputGamepadSelectionPolicy;
 
 /// Pitch-axis direction for `FreeCam` look input.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Reflect)]

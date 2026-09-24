@@ -51,7 +51,6 @@ use crate::input::OrbitCamAdapterOrbitAction;
 use crate::input::OrbitCamAdapterPanAction;
 use crate::input::OrbitCamAdapterZoomCoarseAction;
 use crate::input::OrbitCamAdapterZoomSmoothAction;
-use crate::input::OrbitCamBindings;
 use crate::input::OrbitCamHomeAction;
 use crate::input::OrbitCamOrbitAction;
 use crate::input::OrbitCamOrbitEngagedAction;
@@ -64,6 +63,7 @@ use crate::input::OrbitCamZoomEngagedAction;
 use crate::input::OrbitCamZoomSmoothAction;
 use crate::input::OrbitCamZoomSmoothSlowAction;
 use crate::input::ResetOrbitCamToHome;
+use crate::orbit_cam::OrbitCamBindings;
 use crate::orbit_cam::OrbitCamInput;
 
 impl CameraActionResolutionKind for OrbitCamKind {

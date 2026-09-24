@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use bevy::math::Vec2;
+
 use super::positioning;
 use super::sizing;
 use super::sizing::Axis;
@@ -127,12 +129,21 @@ impl LayoutEngine {
 
         // Phase 4: Position elements and generate the complete render
         // command stream (DFS).
-        let commands =
-            positioning::position_and_render(tree, &mut computed, root, &wrapped, font_scale);
+        let mut scrolls = positioning::ScrollSolver::new(&self.measure_text, font_scale);
+        let commands = positioning::position_and_render(
+            tree,
+            &mut computed,
+            root,
+            &wrapped,
+            font_scale,
+            &mut scrolls,
+        );
+        let scrolls = scrolls.into_solved();
 
         LayoutResult {
             computed,
             commands,
+            scrolls,
             wrapped,
             viewport_width,
             viewport_height,
@@ -199,6 +210,54 @@ impl LayoutEngine {
     }
 }
 
+/// Solved scroll state of one scrolling parent, in layout points.
+///
+/// The engine solves in the tree's own units; a panel scales its tree to layout
+/// points before the solve, so for a panel every length here is in points.
+/// Only elements built with `scroll_x`, `scroll_y`, or `scroll_y_from_end`
+/// produce one; a clip-only element does not.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SolvedScroll {
+    /// Index of the scrolling parent in the [`LayoutTree`].
+    pub element_index:     usize,
+    /// Size of the parent's children, gaps included, in layout points.
+    pub content_points:    Vec2,
+    /// Size of the parent's content box, the visible window onto the children,
+    /// in layout points.
+    pub viewport_points:   Vec2,
+    /// Offset from the start the engine applied, clamped to
+    /// `[0, content_points - viewport_points]` per axis, in layout points.
+    pub offset_points:     Vec2,
+    /// Part of the parent left visible by its clipping ancestors and the
+    /// layout viewport, in layout points.
+    pub visible_region:    VisibleScrollRegion,
+    /// Distance one wheel line moves the content: the measured height of one
+    /// line of the parent's scroll line style plus its child gap, in layout
+    /// points.
+    pub line_pitch_points: f32,
+}
+
+/// Part of a scrolling element that its clipping ancestors leave visible.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VisibleScrollRegion {
+    /// The visible rectangle, in the same layout-point space as the element's
+    /// bounds.
+    Visible(BoundingBox),
+    /// Clipping ancestors hide the whole element, so no point lies over it.
+    ClippedOut,
+}
+
+impl VisibleScrollRegion {
+    /// Returns `true` when `point` lies in the visible part of the element.
+    #[must_use]
+    pub fn contains(self, point: Vec2) -> bool {
+        match self {
+            Self::Visible(bounds) => bounds.contains(point),
+            Self::ClippedOut => false,
+        }
+    }
+}
+
 /// Result of a layout computation.
 #[derive(Clone, Debug, Default)]
 pub struct LayoutResult {
@@ -206,6 +265,9 @@ pub struct LayoutResult {
     pub computed:    Vec<ComputedLayout>,
     /// Render commands in draw order.
     pub commands:    Vec<RenderCommand>,
+    /// Solved scroll state of every scrolling parent with children, in
+    /// positioning order (outer parents before the parents they contain).
+    pub scrolls:     Vec<SolvedScroll>,
     wrapped:         Vec<Option<WrappedText>>,
     viewport_width:  f32,
     viewport_height: f32,
@@ -226,6 +288,13 @@ impl LayoutResult {
     /// Returns `None` if the root has no child element.
     #[must_use = "callers use the content bounds to resolve fit-sized panels"]
     pub fn content_bounds(&self) -> Option<BoundingBox> { self.computed.get(1).map(|c| c.bounds) }
+
+    /// Whether this result was solved against exactly this viewport.
+    #[must_use]
+    pub const fn solved_for_viewport(&self, viewport_width: f32, viewport_height: f32) -> bool {
+        self.viewport_width.to_bits() == viewport_width.to_bits()
+            && self.viewport_height.to_bits() == viewport_height.to_bits()
+    }
 
     /// Regenerates render commands from cached geometry and wrapped text data.
     pub fn regenerate_commands(&mut self, tree: &LayoutTree) {

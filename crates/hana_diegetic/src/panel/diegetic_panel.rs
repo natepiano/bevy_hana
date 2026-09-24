@@ -60,6 +60,9 @@ use super::field;
 use super::field::PanelFieldRecord;
 use super::lifecycle;
 use super::precompose::PanelPrecomposeCache;
+use super::scroll;
+use super::scroll::ComputedScrollRecord;
+use super::scroll::ScrollRecordUnderPoint;
 use super::validate_screen_conversion;
 use super::validate_world_conversion;
 use crate::cascade::Cascade;
@@ -1860,6 +1863,8 @@ pub struct ComputedDiegeticPanel {
     widget_records:     Vec<ComputedWidgetRecord>,
     #[reflect(ignore)]
     tooltip_records:    Vec<ComputedTooltipRecord>,
+    #[reflect(ignore)]
+    scroll_records:     Vec<ComputedScrollRecord>,
     content_width:      f32,
     content_height:     f32,
     #[cfg(test)]
@@ -1907,6 +1912,25 @@ impl ComputedDiegeticPanel {
             .find(|record| !record.duplicate_id && record.contains(panel_local))
     }
 
+    /// Returns computed scroll records for named clipping elements, outer
+    /// elements before the elements they contain.
+    #[must_use]
+    pub fn scroll_records(&self) -> &[ComputedScrollRecord] { &self.scroll_records }
+
+    /// Resolves the innermost named scrolling element whose visible region
+    /// holds a panel-local layout point.
+    #[must_use]
+    pub fn scroll_record_at_local_position(&self, panel_local: Vec2) -> ScrollRecordUnderPoint<'_> {
+        self.scroll_records
+            .iter()
+            .rev()
+            .find(|record| record.contains(panel_local))
+            .map_or(
+                ScrollRecordUnderPoint::OutsideScrollingElements,
+                ScrollRecordUnderPoint::Inside,
+            )
+    }
+
     /// Returns whether this panel's layout has been solved.
     ///
     /// Match on [`layout`](Self::layout) instead when the solved
@@ -1933,7 +1957,10 @@ impl ComputedDiegeticPanel {
     /// Regenerates `LayoutResult::commands` and keeps `DrawOrder` synchronized.
     ///
     /// Returns `false` when this panel's layout is still unsolved.
-    pub(super) fn regenerate_commands(&mut self, tree: &LayoutTree) -> bool {
+    /// Element-keyed records are rebuilt from the retained solve, since a
+    /// visual-only change can rename elements; `layout_to_points` converts the
+    /// scroll records back to the panel's layout unit.
+    pub(super) fn regenerate_commands(&mut self, tree: &LayoutTree, layout_to_points: f32) -> bool {
         let PanelLayout::Solved(result) = &mut self.layout else {
             return false;
         };
@@ -1945,6 +1972,7 @@ impl ComputedDiegeticPanel {
         self.field_id_conflicts = field_id_conflicts;
         self.widget_records = tree.computed_widget_records(result);
         self.tooltip_records = tree.computed_tooltip_records();
+        self.scroll_records = scroll::collect_panel_scroll_records(tree, result, layout_to_points);
         true
     }
 
@@ -1956,6 +1984,7 @@ impl ComputedDiegeticPanel {
         self.field_id_conflicts.clear();
         self.widget_records.clear();
         self.tooltip_records.clear();
+        self.scroll_records.clear();
     }
 
     pub(super) fn set_result_with_fields(
@@ -1965,6 +1994,7 @@ impl ComputedDiegeticPanel {
         field_id_conflicts: Vec<crate::PanelElementId>,
         widget_records: Vec<ComputedWidgetRecord>,
         tooltip_records: Vec<ComputedTooltipRecord>,
+        scroll_records: Vec<ComputedScrollRecord>,
     ) {
         self.draw_order = DrawOrder::from_commands(&result.commands);
         self.layout = PanelLayout::Solved(result);
@@ -1972,6 +2002,7 @@ impl ComputedDiegeticPanel {
         self.field_id_conflicts = field_id_conflicts;
         self.widget_records = widget_records;
         self.tooltip_records = tooltip_records;
+        self.scroll_records = scroll_records;
         #[cfg(test)]
         {
             self.layout_solves += 1;

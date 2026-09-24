@@ -3,8 +3,6 @@ mod bindings;
 
 pub use adapter::OrbitCamInputAdapterPlugin;
 pub use bindings::CameraInputGamepadSelectionPolicy;
-pub use bindings::GamepadInputGain;
-pub use bindings::MouseInputGain;
 pub use bindings::OrbitCamBindingWithInputGain;
 pub use bindings::OrbitCamBindings;
 pub use bindings::OrbitCamBindingsBuilder;
@@ -36,5 +34,4 @@ pub use bindings::OrbitCamZoomBinding;
 pub use bindings::OrbitCamZoomCoarseActionBindings;
 pub use bindings::OrbitCamZoomSmoothActionBindings;
 pub use bindings::PinchGestureZoom;
-pub use bindings::SmoothScrollInputGain;
 pub use bindings::ZoomInversion;

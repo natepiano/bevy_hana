@@ -21,6 +21,8 @@ use bevy::prelude::resource_changed;
 use bevy::prelude::warn;
 use bevy::window::WindowMoved;
 use bevy::winit::WinitMonitors;
+#[cfg(feature = "monitor-probe")]
+use bevy_diagnostic::FrameCount;
 pub use current_monitor::CurrentMonitor;
 pub(crate) use current_monitor::CurrentMonitorEntity;
 pub(crate) use current_monitor::ProvisionalCurrentMonitor;
@@ -110,6 +112,10 @@ impl Plugin for MonitorPlugin {
         );
         // `record_window_manager_placement` reads `WindowMoved`, which `WindowPlugin` registers
         // only when an app installs it.
+        // The probe stamps each topology record with `FrameCount`. `FrameCountPlugin` registers it
+        // the same way, so an app that also adds that plugin gets one resource either way.
+        #[cfg(feature = "monitor-probe")]
+        app.init_resource::<FrameCount>();
         app.add_message::<WindowMoved>()
             .insert_resource(configuration)
             .insert_resource(display_enumeration_source)
@@ -268,8 +274,6 @@ fn mark_monitor_reporter_dirty(
 mod tests {
     use bevy::app::TaskPoolPlugin;
     use bevy::asset::AssetPlugin;
-    #[cfg(feature = "monitor-probe")]
-    use bevy::diagnostic::FrameCount;
     use bevy::prelude::IVec2;
     use bevy::prelude::On;
     use bevy::window::Monitor;
@@ -459,8 +463,6 @@ mod tests {
             .init_resource::<DiscoveryLifecycleObservations>()
             .add_observer(observe_discovery_finished)
             .add_observer(observe_startup_discovery_changed);
-        #[cfg(feature = "monitor-probe")]
-        app.init_resource::<FrameCount>();
 
         match reporter_collection_order {
             ReporterCollectionOrder::TopologyBeforeCollection => {

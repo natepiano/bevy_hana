@@ -32,6 +32,7 @@ use super::Padding;
 use super::PanelDraw;
 use super::ShadowCasting;
 use super::Sizing;
+use super::TextMeasure;
 use super::TextSizing;
 use super::TextStyle;
 use super::Unit;
@@ -70,12 +71,22 @@ pub(crate) enum FieldDisplayTextUpdate {
     MissingText,
 }
 
-/// Whether overflowing children are clipped to the parent's content box.
+/// Whether overflowing children are clipped to the parent's content box, and
+/// whether the element scrolls them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum ChildOverflow {
     #[default]
     Visible,
+    /// Clipped by [`El::clip`](crate::El::clip) alone: children never scroll.
     Clipped,
+    /// Clipped and offset by the element's scroll offset; set by the builder's
+    /// `scroll_x`, `scroll_y`, and `scroll_y_from_end`.
+    Scrolled,
+}
+
+impl ChildOverflow {
+    /// Whether children are clipped to the element's content box.
+    pub(super) const fn clips(self) -> bool { matches!(self, Self::Clipped | Self::Scrolled) }
 }
 
 /// Which edge [`Element::scroll_offset`] measures from. `Start` is an absolute
@@ -87,6 +98,55 @@ pub(super) enum ScrollAnchor {
     #[default]
     Start,
     End,
+}
+
+/// Text line a scrolling element moves by, one wheel line at a time.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) enum ScrollLine {
+    /// A line of the panel's default font size, used when the author declares
+    /// no style.
+    #[default]
+    PanelDefaultFont,
+    /// A line of the style declared with [`El::scroll_line`](crate::El::scroll_line).
+    /// Boxed so an element that never scrolls pays one pointer.
+    Declared(Box<TextStyle>),
+    /// The declared or default line after a scale pass converted it to the
+    /// tree's resolved font units; only scaled trees carry it.
+    Resolved(Box<TextStyle>),
+}
+
+impl ScrollLine {
+    /// Measurement inputs for one line of this style, in the tree's font units.
+    pub(super) fn measure(&self) -> TextMeasure {
+        match self {
+            Self::PanelDefaultFont => TextStyle::default().as_measure(),
+            Self::Declared(style) | Self::Resolved(style) => style.as_measure(),
+        }
+    }
+
+    /// The line resolved to points for a tree scaled by `font_scale`.
+    ///
+    /// A declared style with its own unit converts from that unit, as a text
+    /// leaf does; the panel default and unitless styles take `font_scale`.
+    fn to_points(&self, font_scale: f32) -> Self {
+        let style = match self {
+            Self::PanelDefaultFont => TextStyle::default(),
+            Self::Declared(style) | Self::Resolved(style) => (**style).clone(),
+        };
+        let scale = style.unit().map_or(font_scale, Unit::to_points);
+        Self::Resolved(Box::new(style.scaled(scale)))
+    }
+
+    /// The resolved line re-expressed in pixels for a screen-space source
+    /// tree; a line no scale pass resolved is never read and stays as is.
+    fn to_pixels(&self, points_to_pixels: f32) -> Self {
+        match self {
+            Self::Resolved(style) => Self::Resolved(Box::new(
+                style.scaled_as_unit(points_to_pixels, Unit::Pixels),
+            )),
+            Self::PanelDefaultFont | Self::Declared(_) => self.clone(),
+        }
+    }
 }
 
 /// Whether an element subtree should be rendered directly or flattened first.
@@ -133,6 +193,8 @@ pub(super) struct Element {
     pub(super) scroll_anchor_x:   ScrollAnchor,
     /// Which vertical edge `scroll_offset.y` measures from.
     pub(super) scroll_anchor_y:   ScrollAnchor,
+    /// Text line this element moves by when it scrolls.
+    pub(super) scroll_line:       ScrollLine,
     /// Authored PBR source-material handle for this element's surfaces.
     ///
     /// When overridden, render systems use this over the panel material handle
@@ -246,6 +308,7 @@ impl Default for Element {
             scroll_offset:     Vec2::ZERO,
             scroll_anchor_x:   ScrollAnchor::Start,
             scroll_anchor_y:   ScrollAnchor::Start,
+            scroll_line:       ScrollLine::PanelDefaultFont,
             material:          Cascade::Inherit,
             interactivity:     Cascade::Inherit,
             editable:          None,
@@ -429,9 +492,11 @@ impl LayoutTree {
         Some(tree)
     }
 
-    /// Returns an iterator over child indices of the given element.
+    /// Child element indices of the element at `index`, in layout order; empty
+    /// for a leaf or an index outside the tree. The indices address
+    /// [`LayoutResult::computed`].
     #[must_use]
-    pub(super) fn children_of(&self, index: usize) -> &[usize] {
+    pub fn children_of(&self, index: usize) -> &[usize] {
         self.elements
             .get(index)
             .map_or(&[], |element| match &element.content {
@@ -917,7 +982,7 @@ impl LayoutTree {
                     });
             }
             preorder += 1;
-            let child_clip = if matches!(element.overflow, ChildOverflow::Clipped) {
+            let child_clip = if element.overflow.clips() {
                 inherited_clip
                     .intersect(&element.child_clip_bounds(computed.bounds))
                     .unwrap_or_default()
@@ -1206,6 +1271,9 @@ impl LayoutTree {
                 *panel_draw = panel_draw.scaled(layout_scale);
             }
             element.scroll_offset *= layout_scale;
+            if matches!(element.overflow, ChildOverflow::Scrolled) {
+                element.scroll_line = element.scroll_line.to_points(font_scale);
+            }
             scale_editor_part(&mut element.editor_text, layout_scale);
             scale_editor_part(&mut element.editor_selection, layout_scale);
             scale_editor_part(&mut element.editor_caret, layout_scale);
@@ -1248,6 +1316,7 @@ impl LayoutTree {
                 *panel_draw = panel_draw.scaled(points_to_pixels);
             }
             element.scroll_offset *= points_to_pixels;
+            element.scroll_line = element.scroll_line.to_pixels(points_to_pixels);
             scale_editor_part(&mut element.editor_text, points_to_pixels);
             scale_editor_part(&mut element.editor_selection, points_to_pixels);
             scale_editor_part(&mut element.editor_caret, points_to_pixels);
@@ -1407,6 +1476,7 @@ fn classify_element_change(element: &Element, next: &Element) -> LayoutTreeChang
         scroll_offset,
         scroll_anchor_x,
         scroll_anchor_y,
+        scroll_line,
         material: _,
         interactivity: _,
         editable,
@@ -1440,6 +1510,7 @@ fn classify_element_change(element: &Element, next: &Element) -> LayoutTreeChang
         scroll_offset: n_scroll_offset,
         scroll_anchor_x: n_scroll_anchor_x,
         scroll_anchor_y: n_scroll_anchor_y,
+        scroll_line: n_scroll_line,
         material: _,
         interactivity: _,
         editable: n_editable,
@@ -1470,6 +1541,7 @@ fn classify_element_change(element: &Element, next: &Element) -> LayoutTreeChang
         || scroll_offset != n_scroll_offset
         || scroll_anchor_x != n_scroll_anchor_x
         || scroll_anchor_y != n_scroll_anchor_y
+        || scroll_line != n_scroll_line
     {
         return LayoutTreeChange::LayoutAffecting;
     }
@@ -1715,6 +1787,7 @@ mod tests {
     use super::LayoutTree;
     use super::LayoutTreeChange;
     use super::PrecomposeMode;
+    use super::ScrollLine;
     use super::element_visual_capabilities;
     use crate::Appearance;
     use crate::CalloutCap;
@@ -3050,5 +3123,38 @@ mod tests {
         let update = tree.set_field_display_text(&"gain".into(), "11");
 
         assert_eq!(update, FieldDisplayTextUpdate::DuplicateField);
+    }
+
+    /// A scrolling element's line after the scale pass, declared or not.
+    fn scaled_scroll_line(declared: bool) -> Option<ScrollLine> {
+        let mut builder = LayoutBuilder::new(100.0, 50.0);
+        let mut body = El::column().id("body").scroll_y(0.0);
+        if declared {
+            body = body.scroll_line(TextStyle::new(10.0));
+        }
+        builder.with(body, |_| {});
+        let tree = builder.build().scaled(2.0, 3.0);
+        tree.elements
+            .iter()
+            .find(|element| element.id == Some(PanelElementId::named("body")))
+            .map(|element| element.scroll_line.clone())
+    }
+
+    #[test]
+    fn the_scale_pass_resolves_a_scroll_line_without_claiming_a_declaration() {
+        let undeclared = scaled_scroll_line(false);
+        assert_eq!(
+            undeclared,
+            Some(ScrollLine::Resolved(Box::new(
+                TextStyle::default().scaled(3.0)
+            )))
+        );
+        let declared = scaled_scroll_line(true);
+        assert_eq!(
+            declared,
+            Some(ScrollLine::Resolved(Box::new(
+                TextStyle::new(10.0).scaled(3.0)
+            )))
+        );
     }
 }

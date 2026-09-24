@@ -436,6 +436,12 @@ impl Digest {
     pub const fn new(value: u64) -> Self { Self(value) }
 }
 
+impl Display for Digest {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FormatResult {
+        write!(formatter, "{:016x}", self.0)
+    }
+}
+
 /// App-build registry of identity spaces providers are allowed to report.
 ///
 /// [`RegisteredSchemes`] keeps syntax and startup registration separate: [`SchemeName`] can reject

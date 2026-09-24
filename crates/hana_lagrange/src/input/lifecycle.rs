@@ -28,7 +28,6 @@ use super::CameraInputSourceLatches;
 use super::CameraInputSurfaceMetrics;
 use super::ControlSpeed;
 use super::FreeCamActiveDirections;
-use super::FreeCamInput;
 use super::FreeCamInteractionEnded;
 use super::FreeCamInteractionKind;
 use super::FreeCamInteractionSourcesChanged;
@@ -37,7 +36,6 @@ use super::FreeCamInteractionStarted;
 use super::FreeCamInteractionState;
 use super::InputIntent;
 use super::InteractionSources;
-use super::OrbitCamInput;
 use super::OrbitCamInteractionEnded;
 use super::OrbitCamInteractionKind;
 use super::OrbitCamInteractionSourcesChanged;
@@ -50,6 +48,8 @@ use super::constants::DEFAULT_REPORTING_DEBOUNCE;
 use super::constants::INTERACTION_CHANNEL_COUNT;
 use crate::FreeCamKind;
 use crate::OrbitCamKind;
+use crate::free_cam::FreeCamInput;
+use crate::orbit_cam::OrbitCamInput;
 use crate::system_sets::CameraInputPhase;
 
 /// Settle delay that smooths the reported interaction state — both the active
@@ -991,10 +991,10 @@ mod tests {
     use crate::input::CameraInputRoutingConfig;
     use crate::input::CameraInputRoutingPlugin;
     use crate::input::InputGain;
-    use crate::input::OrbitCamInputGain;
     use crate::input::OrbitCamInputMode;
-    use crate::input::OrbitCamPreset;
-    use crate::input::OrbitCamSimpleMousePreset;
+    use crate::orbit_cam::OrbitCamInputGain;
+    use crate::orbit_cam::OrbitCamPreset;
+    use crate::orbit_cam::OrbitCamSimpleMousePreset;
     use crate::system_sets::LagrangeSystemSetsPlugin;
 
     #[derive(Resource, Default)]

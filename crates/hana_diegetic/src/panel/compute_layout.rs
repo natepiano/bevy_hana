@@ -25,6 +25,7 @@ use super::events::LastPanelDimensions;
 use super::events::PanelChangeKind;
 use super::field;
 use super::perf::DiegeticPerfStats;
+use super::scroll;
 use crate::cascade::FontUnit;
 use crate::cascade::PanelDefaults;
 use crate::cascade::Resolved;
@@ -104,10 +105,21 @@ pub(super) fn compute_panel_layouts(
         let layout_to_points = layout_unit.to_points();
         let font_to_points = font_unit.to_points();
 
+        let viewport_width = panel_ref.width() * layout_to_points;
+        let viewport_height = panel_ref.height() * layout_to_points;
+
         let (pending_change, tree_visual_geometry_stable) =
             tree_change.take_with_tree_visual_geometry_stable();
+        // An identical replacement skips the solve only while the last solve
+        // still matches the panel. A screen panel with dynamic axes solves on
+        // its spawn frame before those axes resolve against the window, so an
+        // identical tree sent on the next frame must not retain that solve.
+        let solved_for_panel = computed
+            .layout()
+            .solved()
+            .is_some_and(|result| result.solved_for_viewport(viewport_width, viewport_height));
         if matches!(pending_change, Some(LayoutTreeChange::Identical))
-            && computed.is_solved()
+            && solved_for_panel
             && !font_unit_changed
         {
             continue;
@@ -119,9 +131,6 @@ pub(super) fn compute_panel_layouts(
             layout_to_points,
             font_to_points,
         );
-
-        let viewport_width = panel_ref.width() * layout_to_points;
-        let viewport_height = panel_ref.height() * layout_to_points;
 
         // Geometry-stable skip: regenerate render commands from cached positions
         // without re-running the layout solve. Safe only when
@@ -142,7 +151,7 @@ pub(super) fn compute_panel_layouts(
                 }));
         if matches!(pending_change, Some(LayoutTreeChange::VisualOnly))
             && can_reuse_geometry
-            && computed.regenerate_commands(scaled_tree)
+            && computed.regenerate_commands(scaled_tree, layout_to_points)
         {
             events::trigger_panel_changed(&mut commands, entity, PanelChangeKind::VisualOnly);
             panel_count += 1;
@@ -221,12 +230,18 @@ fn commit_layout_result(
     }
     let widget_records = scaled_tree.computed_widget_records(&result);
     let tooltip_records = scaled_tree.computed_tooltip_records();
+    let scroll_records = scroll::collect_panel_scroll_records(
+        scaled_tree,
+        &result,
+        panel_ref.layout_unit().to_points(),
+    );
     computed.set_result_with_fields(
         result,
         field_records,
         field_id_conflicts,
         widget_records,
         tooltip_records,
+        scroll_records,
     );
 }
 

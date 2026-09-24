@@ -29,6 +29,7 @@ use hana_rigging::prelude::EstablishedContext;
 use hana_rigging::prelude::Establishing;
 use hana_rigging::prelude::Establishment;
 use hana_rigging::prelude::EstablishmentRefusal;
+use hana_rigging::prelude::HeldSession;
 use hana_rigging::prelude::InFlightAttemptMut;
 use hana_rigging::prelude::ReleasedLease;
 use hana_rigging::prelude::RoleKey;
@@ -50,6 +51,7 @@ use crate::managed;
 use crate::monitors::LiveDisplayEndpoint;
 use crate::monitors::MonitorReporterId;
 use crate::persistence::EstablishedWindowPlacement;
+use crate::persistence::WindowPlacementConfiguration;
 use crate::restore;
 use crate::restore::RestorePreparation;
 use crate::restore::WindowRestoreAttempt;
@@ -155,8 +157,8 @@ struct AbandonedRestoreWork {
 /// going away. `on_primary_window_removed` fires on `Remove<PrimaryWindow>`, and a registered name
 /// keeps that entity managed and alive: its `TargetPosition`, `PreparedPositionMeaning` and
 /// `X11FrameCompensated` would stand on a live window forever, and a stale `TargetPosition` keeps
-/// `prepare_driver_restore_targets` — whose query is `Without<TargetPosition>` — from ever
-/// re-targeting it. A window that really is despawning makes each strip a no-op, so both callers
+/// `prepare_driver_restore_targets` from preparing a replacement target. A window that really is
+/// despawning makes each strip a no-op, so both callers
 /// take the same path.
 #[must_use]
 pub(crate) struct AbandonedWindowRestoreWork(Vec<AbandonedRestoreWork>);
@@ -200,7 +202,7 @@ enum WindowEstablishment {
 /// binding's last-known-good configuration.
 #[derive(Default, Resource)]
 pub(crate) struct WindowRoleDriverState {
-    ledger:   DriverLedger<EstablishedWindowPlacement, WindowRecords>,
+    ledger:   DriverLedger<WindowPlacementConfiguration, WindowRecords>,
     /// Every cleanup verb the kernel sent this driver, per role, oldest first.
     #[cfg(test)]
     cleanups: HashMap<RoleKey, Vec<RecordedCleanup>>,
@@ -208,7 +210,34 @@ pub(crate) struct WindowRoleDriverState {
 
 /// Process-local identifier the rigging kernel issued for `WindowEndpointDriver`.
 #[derive(Resource)]
-pub(crate) struct WindowDriverId(pub(crate) EndpointDriverRegistration<EstablishedWindowPlacement>);
+pub(crate) struct WindowDriverId(
+    pub(crate) EndpointDriverRegistration<WindowPlacementConfiguration>,
+);
+
+/// The window manager has not installed its endpoint driver in this world.
+#[derive(Debug, thiserror::Error)]
+#[error("the Clerestory window placement driver is not installed")]
+pub struct WindowPlacementDriverUnavailable;
+
+/// Returns the existing window manager's typed endpoint-driver registration.
+///
+/// Authoring a binding does not create a window. The driver waits until the application
+/// attaches a managed window to the binding's role before applying its placement.
+///
+/// # Errors
+///
+/// Returns [`WindowPlacementDriverUnavailable`] before [`crate::WindowManagerPlugin`] is installed.
+pub fn window_placement_driver(
+    world: &World,
+) -> Result<
+    EndpointDriverRegistration<WindowPlacementConfiguration>,
+    WindowPlacementDriverUnavailable,
+> {
+    world
+        .get_resource::<WindowDriverId>()
+        .map(|driver| driver.0)
+        .ok_or(WindowPlacementDriverUnavailable)
+}
 
 impl WindowRoleDriverState {
     #[must_use]
@@ -239,8 +268,17 @@ impl WindowRoleDriverState {
         attempt: AttemptRef,
         placement: EstablishedWindowPlacement,
     ) {
-        self.ledger
-            .succeed_attempt(attempt, Applied::DiffersFromDispatched(placement));
+        let configuration = WindowPlacementConfiguration::Established(placement);
+        if matches!(
+            self.restore_record(attempt),
+            RestoreRecord::UnderPreparation(preparation)
+                if preparation.dispatched() == &configuration
+        ) {
+            self.finish_as_dispatched(attempt);
+        } else {
+            self.ledger
+                .succeed_attempt(attempt, Applied::DiffersFromDispatched(configuration));
+        }
     }
 
     /// Report that the display an applying attempt was placing onto is no longer live.
@@ -325,7 +363,7 @@ impl WindowRoleDriverState {
     /// judge, then establish, then read the session record back.
     fn establish(
         &mut self,
-        context: EstablishedContext<'_, EstablishedWindowPlacement>,
+        context: EstablishedContext<'_, WindowPlacementConfiguration>,
     ) -> WindowEstablishment {
         let role = context.role().clone();
         let hardware = match self.ledger.attempt_record(context.attempt()) {
@@ -370,6 +408,26 @@ impl WindowRoleDriverState {
         }
     }
 
+    /// Reports the end of a derived window through its existing session lease.
+    pub(crate) fn report_removed_window(&mut self, window: Entity) {
+        let roles = self
+            .ledger
+            .sessions()
+            .filter_map(|(role, session)| {
+                matches!(session, HeldSession::Holding(record) if record.window() == window)
+                    .then(|| role.clone())
+            })
+            .collect::<Vec<_>>();
+        for role in roles {
+            let _ = self.ledger.report_loss(
+                &role,
+                DeviceAccessError::Absent {
+                    detail: format!("output window {window} no longer exists"),
+                },
+            );
+        }
+    }
+
     /// Give the role's lease back to the ledger and let its window record go with it.
     ///
     /// The answer is the guard on everything the release path does to the window itself: only
@@ -390,7 +448,10 @@ impl WindowRoleDriverState {
         role: &RoleKey,
         configuration: EstablishedWindowPlacement,
     ) {
-        self.ledger.change_configuration(role, configuration);
+        self.ledger.change_configuration(
+            role,
+            WindowPlacementConfiguration::Established(configuration),
+        );
     }
 }
 
@@ -448,8 +509,7 @@ impl EstablishedWindow {
 /// the successor's marker goes on: both may name the same window,
 /// [`restore::remove_window_restore_work`] matches on the marker's own attempt, and a strip
 /// running second would find the successor's marker, decline, and leave a stale `TargetPosition`
-/// standing — which keeps `prepare_driver_restore_targets`, whose query is
-/// `Without<TargetPosition>`, from ever building the successor a target.
+/// standing — which keeps `prepare_driver_restore_targets` from building the successor a target.
 fn strip_superseded_restore_work(
     world: &mut World,
     superseded: AttemptRef,
@@ -511,7 +571,7 @@ pub(crate) fn recorded_window_cleanups(world: &World, role: &RoleKey) -> Recorde
 pub(crate) struct WindowEndpointDriver;
 
 impl EndpointDriver for WindowEndpointDriver {
-    type Configuration = EstablishedWindowPlacement;
+    type Configuration = WindowPlacementConfiguration;
     type Target = WindowPlacementTarget;
 
     fn resolve_target(
@@ -688,6 +748,22 @@ mod tests {
     use crate::restore::TargetPosition;
     use crate::tests;
 
+    #[test]
+    fn public_window_driver_is_the_existing_registration() -> Result<(), String> {
+        let mut app = bevy::prelude::App::new();
+        assert!(window_placement_driver(app.world()).is_err());
+        app.add_plugins(crate::WindowManagerPlugin);
+        assert_eq!(
+            window_placement_driver(app.world()).map_err(|error| error.to_string())?,
+            app.world().resource::<WindowDriverId>().0,
+        );
+        assert_eq!(
+            app.world_mut().query::<&Window>().iter(app.world()).count(),
+            0
+        );
+        Ok(())
+    }
+
     /// [`strip_superseded_restore_work`] takes every restore marker off the window it was named.
     ///
     /// What this proves, and what it does not. It exercises the helper directly, on a record built
@@ -713,8 +789,7 @@ mod tests {
     /// Why the helper is worth pinning anyway: the record names the window, but the four restore
     /// markers the attempt left are in the world, where the ledger cannot reach. Left standing, a
     /// stale `TargetPosition` keeps `check_restore_settling` running against geometry no attempt
-    /// is chasing and keeps `prepare_driver_restore_targets` — whose query is
-    /// `Without<TargetPosition>` — from ever building the successor a target.
+    /// is chasing and keeps `prepare_driver_restore_targets` from building the successor a target.
     #[test]
     fn strip_superseded_restore_work_removes_the_named_attempt_s_markers() -> Result<(), String> {
         let mut fixture = tests::applying_window_role()?;

@@ -93,14 +93,14 @@ bevy_time = { version = "0.19.1", default-features = false, features = ["std"] }
 bevy_transform = { version = "0.19.1", features = ["std"] }
 bevy_tween = { version = "0.13.0", default-features = false }
 bitflags = "2"
-blake3 = "1.8.2"
+blake3 = "1.8.7"
 bytemuck = "1"
-clap = { version = "4.6.6", features = ["derive"] }
-crossbeam-channel = "0.5.15"
-dirs = "6.0.0"
-flume = "0.11"
+clap = { version = "4.6.7", features = ["derive"] }
+crossbeam-channel = "0.5.17"
+dirs = "7.0.0"
+flume = "0.12.0"
 getrandom = { version = "0.4.3", features = ["wasm_js"] }
-glam = { version = "0.33.5", features = ["serde"] }
+glam = { version = "0.33.9", features = ["serde"] }
 image = { version = "0.25", default-features = false }
 moonshine-save = "0.7.0"
 moonshine-util = "0.5"
@@ -125,22 +125,24 @@ objc2-core-media = { version = "0.3.2", default-features = false, features = [
   "objc2",
 ] }
 parley = { version = "0.9.0", default-features = false, features = ["std"] }
+pipewire = "0.10.1"
 proc-macro2 = "1.0.107"
 quote = "1.0.47"
-rand = "0.10.2"
+rand = "0.10.3"
 ron = "0.12.2"
 schemars = "1.2.2"
-screencapturekit = "8.0.1"
+screencapturekit = "10.0.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json_lenient = "0.2"
 smallvec = "1"
 strum = { version = "0.28.0", features = ["derive"] }
-syn = { version = "3.0.3", features = ["full"] }
-thiserror = "2.0.20"
-toml = "1.1.4"
+syn = { version = "3.0.6", features = ["full"] }
+thiserror = "2.0.21"
+toml = "1.1.6"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 ttf-parser = "0.25"
 ureq = "3.4"
+v4l = "0.14.0"
 # Pinned to the exact winit that bevy 0.19 resolves so `MonitorHandle` unifies to
 # one crate instance; used only for per-platform native monitor ids.
 winit = { version = "0.30.13", default-features = false, features = [
@@ -148,13 +150,14 @@ winit = { version = "0.30.13", default-features = false, features = [
   "x11",
 ] }
 xcap = "0.9.8"
+zbus = "5.19.0"
 
 # dev-dependencies
-bevy_brp_extras   = "0.22.3"
+bevy_brp_extras   = "0.22.7"
 clay-layout       = { path = "vendor/clay-layout" }
 criterion         = { version = "0.8.2", features = ["html_reports"] }
 float-cmp         = "0.10.0"
-jsonschema        = { version = "0.50.1", default-features = false }
+jsonschema        = { version = "0.57.0", default-features = false }
 serde_json        = "1.0.151"
 static_assertions = "1.1.0"
 tempfile          = "3.27.0"

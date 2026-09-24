@@ -37,7 +37,6 @@ use crate::input;
 use crate::input::BindingGates;
 use crate::input::CameraActionResolutionContext;
 use crate::input::CameraActionResolutionKind;
-use crate::input::CameraInputGamepadSelectionPolicy;
 use crate::input::CameraInstallKind;
 use crate::input::CameraInstalledBindings;
 use crate::input::CameraSlowMode;
@@ -65,6 +64,7 @@ use crate::input::LiveInputs;
 use crate::input::MotionActions;
 use crate::input::NoActionFrameState;
 use crate::input::ResetFreeCamToHome;
+use crate::orbit_cam::CameraInputGamepadSelectionPolicy;
 use crate::system_sets::CameraInputInternalSet;
 
 /// Installs and resolves `FreeCam` preset/binding actions.
@@ -570,16 +570,16 @@ mod tests {
 
     use super::*;
     use crate::FreeCamPreset;
+    use crate::free_cam::FreeCamGamepadPreset;
     use crate::free_cam::FreeCamInput;
+    use crate::free_cam::FreeCamInputGain;
+    use crate::free_cam::FreeCamKeyboardMousePreset;
+    use crate::free_cam::FreeCamLookPitch;
     use crate::input::CameraHomed;
     use crate::input::CameraInputModesPlugin;
     use crate::input::CameraInputRoutingConfig;
     use crate::input::CameraInputRoutingPlugin;
-    use crate::input::FreeCamGamepadPreset;
-    use crate::input::FreeCamInputGain;
     use crate::input::FreeCamInputMode;
-    use crate::input::FreeCamKeyboardMousePreset;
-    use crate::input::FreeCamLookPitch;
     use crate::operation::LookAngles;
     use crate::operation::Position;
     use crate::operation::Roll;

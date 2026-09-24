@@ -16,6 +16,7 @@ mod gizmos;
 mod lifecycle;
 mod perf;
 mod precompose;
+mod scroll;
 mod sizing;
 mod valence_provider;
 
@@ -115,6 +116,9 @@ pub use perf::PanelTextPerfStats;
 pub(crate) use precompose::PanelPrecomposeCache;
 pub(crate) use precompose::PrecomposeCacheEntry;
 pub use precompose::PrecomposeHelper;
+pub use scroll::ComputedScrollRecord;
+pub use scroll::ScrollExtent;
+pub use scroll::ScrollRecordUnderPoint;
 pub use sizing::AnyUnit;
 pub use sizing::CompatibleUnits;
 pub use sizing::Fit;

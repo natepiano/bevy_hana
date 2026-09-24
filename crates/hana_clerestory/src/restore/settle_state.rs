@@ -48,6 +48,7 @@ use crate::events::WindowRestored;
 use crate::monitors::CurrentMonitor;
 use crate::monitors::CurrentMonitorIndex;
 use crate::persistence::EstablishedWindowPlacement;
+use crate::persistence::ReadbackWindowPosition;
 use crate::recovery::WindowFallbackRecoveryState;
 
 /// Window-state observation used to detect changes between frames.
@@ -135,7 +136,7 @@ struct SettleActual {
     logical_size:       UVec2,
 }
 
-/// Placement information available when a window settles away from its requested target.
+/// Placement information available when a window finishes settling.
 enum SettlePlacementEvidence {
     /// The live window and current monitor produced an exact placement value.
     ReadBack(EstablishedWindowPlacement),
@@ -446,38 +447,45 @@ pub(crate) fn check_restore_settling(
             settle_target.scale,
         );
 
-        if stable && comparison.all_match() {
-            emit_settle_success(
-                &mut commands,
-                entity,
-                restore_attempt,
-                &settle_target,
-                total_elapsed_ms,
-                stability_elapsed_ms,
-                &mut driver_state,
-                &mut fallback,
-            );
-        } else if stable || matches!(deadline_status, OperatingSystemWorkDeadlineStatus::Expired) {
-            let placement_evidence =
-                current_monitor.map_or(SettlePlacementEvidence::NotProduced, |current_monitor| {
-                    SettlePlacementEvidence::ReadBack(established_placement_from_readback(
-                        window,
-                        current_monitor,
-                        &current_observation,
-                        *platform,
-                    ))
-                });
-            emit_settle_mismatch(
-                &mut commands,
-                entity,
-                restore_attempt,
-                &settle_target,
-                &build_settle_actual(window, current_observation, actual_scale),
-                placement_evidence,
-                total_elapsed_ms,
-                &mut driver_state,
-                &mut fallback,
-            );
+        if !stable && matches!(deadline_status, OperatingSystemWorkDeadlineStatus::Pending) {
+            continue;
+        }
+        let placement_evidence =
+            current_monitor.map_or(SettlePlacementEvidence::NotProduced, |current_monitor| {
+                SettlePlacementEvidence::ReadBack(established_placement_from_readback(
+                    window,
+                    current_monitor,
+                    &current_observation,
+                    *platform,
+                ))
+            });
+        match (comparison.all_match(), placement_evidence) {
+            (true, SettlePlacementEvidence::ReadBack(placement)) if stable => {
+                emit_settle_success(
+                    &mut commands,
+                    entity,
+                    restore_attempt,
+                    &settle_target,
+                    placement,
+                    total_elapsed_ms,
+                    stability_elapsed_ms,
+                    &mut driver_state,
+                    &mut fallback,
+                );
+            },
+            (_, placement_evidence) => {
+                emit_settle_mismatch(
+                    &mut commands,
+                    entity,
+                    restore_attempt,
+                    &settle_target,
+                    &build_settle_actual(window, current_observation, actual_scale),
+                    placement_evidence,
+                    total_elapsed_ms,
+                    &mut driver_state,
+                    &mut fallback,
+                );
+            },
         }
     }
 }
@@ -489,8 +497,8 @@ fn established_placement_from_readback(
     platform: Platform,
 ) -> EstablishedWindowPlacement {
     let physical_position = match current_observation.physical_position {
-        ObservedPhysicalPosition::Observed(position) => Some(position),
-        ObservedPhysicalPosition::PlatformCannotReport => None,
+        ObservedPhysicalPosition::Observed(position) => ReadbackWindowPosition::Observed(position),
+        ObservedPhysicalPosition::PlatformCannotReport => ReadbackWindowPosition::Unavailable,
     };
     crate::persistence::EstablishedWindowPlacement::from_readback(
         window,
@@ -521,6 +529,7 @@ fn emit_settle_success(
     entity: Entity,
     restore_attempt: &WindowRestoreAttempt,
     settle_target: &SettleTarget,
+    placement: EstablishedWindowPlacement,
     total_elapsed_ms: f32,
     stability_elapsed_ms: f32,
     driver_state: &mut WindowRoleDriverState,
@@ -542,7 +551,7 @@ fn emit_settle_success(
         monitor_index: settle_target.monitor.adapter_value(),
     };
     commands.trigger(restored);
-    driver_state.finish_as_dispatched(restore_attempt.attempt());
+    driver_state.finish_with_readback(restore_attempt.attempt(), placement);
     fallback.finish(&role);
     commands
         .entity(entity)

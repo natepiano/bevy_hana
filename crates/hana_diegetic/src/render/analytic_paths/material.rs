@@ -78,7 +78,7 @@ struct PathUniform {
     /// which fixes the convex-corner flare at grazing angles.
     aa_band:          u32,
     /// Minimum on-screen stroke width in device pixels for hairline-dilated
-    /// paths (`PackedPathRecord::min_feature > 0`). Mirrored from
+    /// paths (`PackedPathRecord::minimum_feature_size > 0`). Mirrored from
     /// [`HairlineWidth`](crate::HairlineWidth) by `sync_hairline_width`.
     hairline_min_px:  f32,
 }

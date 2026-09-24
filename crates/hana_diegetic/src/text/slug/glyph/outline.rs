@@ -145,9 +145,9 @@ impl QuadraticOutlineBuilder {
             return;
         }
         self.contours.push(Contour {
-            segments:      std::mem::take(&mut self.current),
-            min_feature:   0.0,
-            fade_exponent: 0.0,
+            segments:             std::mem::take(&mut self.current),
+            minimum_feature_size: 0.0,
+            fade_exponent:        0.0,
         });
         self.contour_start = None;
         self.current_point = None;

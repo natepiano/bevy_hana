@@ -35,7 +35,7 @@ use hana_kana::ToI32;
 use hana_kana::ToU32;
 use hana_rigging::prelude::AttachmentPath;
 use hana_rigging::prelude::PlatformDeviceHandle;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use hana_rigging::prelude::ReportedId;
 use hana_rigging::prelude::ReportedSerial;
 use winit::monitor::MonitorHandle;
@@ -362,12 +362,23 @@ impl Monitors {
     pub fn from_test_monitors(
         monitors: impl IntoIterator<Item = (Entity, MonitorDescriptor)>,
     ) -> Self {
+        Self::from_test_monitors_with_product_names(monitors.into_iter().map(
+            |(entity, descriptor)| (entity, descriptor, DisplayProductName::PlatformHasNoConcept),
+        ))
+    }
+
+    /// Builds a regression topology with explicit platform product-name evidence.
+    #[cfg(any(test, feature = "test"))]
+    #[must_use]
+    pub fn from_test_monitors_with_product_names(
+        monitors: impl IntoIterator<Item = (Entity, MonitorDescriptor, DisplayProductName)>,
+    ) -> Self {
         let live = monitors
             .into_iter()
-            .map(|(entity, descriptor)| InstalledMonitor {
+            .map(|(entity, descriptor, product_name)| InstalledMonitor {
                 entity,
                 descriptor,
-                product_name: DisplayProductName::PlatformHasNoConcept,
+                product_name,
                 device_evidence: DisplayDeviceEvidence::unavailable(),
                 legacy_identity: DisplayIdentity::Anonymous,
             })
@@ -804,8 +815,24 @@ fn platform_device_handle(monitor_handle: Option<&MonitorHandle>) -> PlatformDev
     )
 }
 
+/// Join capture evidence using the compositor's exact connector name.
+/// The durable device identity still comes from the display's EDID evidence.
+#[cfg(target_os = "linux")]
+fn platform_device_handle(monitor_handle: Option<&MonitorHandle>) -> PlatformDeviceHandle {
+    let Some(name) = monitor_handle
+        .and_then(MonitorHandle::name)
+        .filter(|name| !name.is_empty())
+    else {
+        return PlatformDeviceHandle::PlatformReportedNothing;
+    };
+    ReportedId::new(format!("linux-output:{name}")).map_or(
+        PlatformDeviceHandle::PlatformReportedNothing,
+        PlatformDeviceHandle::Reported,
+    )
+}
+
 /// Report that this platform supplies no handle shared with another display reporter.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 const fn platform_device_handle(_: Option<&MonitorHandle>) -> PlatformDeviceHandle {
     PlatformDeviceHandle::PlatformHasNoConcept
 }

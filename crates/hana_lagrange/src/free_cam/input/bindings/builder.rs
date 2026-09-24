@@ -22,12 +22,12 @@ use super::validate;
 use crate::input::ActionBindingDescriptor;
 use crate::input::BindingRoutePolicy;
 use crate::input::BindingsError;
-use crate::input::CameraInputGamepadSelectionPolicy;
 use crate::input::CameraSlowMode;
 use crate::input::HeldBinding;
 use crate::input::HeldBindingDescriptor;
 use crate::input::InputBinding;
 use crate::input::InteractionSources;
+use crate::orbit_cam::CameraInputGamepadSelectionPolicy;
 
 /// Named translation-key bindings for a `FreeCam`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Reflect)]

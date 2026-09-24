@@ -62,6 +62,7 @@ use crate::AttemptRef;
 use crate::CapabilityProjectionFailure;
 use crate::ClaimHolder;
 use crate::ClaimHolderView;
+use crate::DeviceAccessError;
 use crate::DeviceEndpoint;
 use crate::DeviceId;
 use crate::DeviceKey;
@@ -394,7 +395,7 @@ impl BindingRegistration<'_, '_> {
         Configuration: Reflect,
     {
         let role = authoring.role().clone();
-        self.bindings.replace_authoring(authoring)?;
+        self.bindings.replace_pending(authoring.erase())?;
         self.bindings.role_entity(&role)
     }
 
@@ -452,8 +453,60 @@ where
     let role = authoring.role().clone();
     world
         .resource_mut::<Bindings>()
-        .replace_authoring(authoring)?;
+        .replace_pending(authoring.erase())?;
     world.resource::<Bindings>().role_entity(&role)
+}
+
+/// Revert the newest pending replacement made by [`replace_binding`] or
+/// [`BindingRegistration::replace`], restoring its prior binding and lifecycle state.
+///
+/// Cancellation removes only that replacement's transition, restores endpoint ownership and
+/// device indexes, and retains the role entity. It consumes no transition capacity or sequence.
+///
+/// # Errors
+///
+/// Returns [`BindingError::RoleNotBound`] for an absent role,
+/// [`BindingError::ReplacementNotPending`] after the replacement drains or starts applying,
+/// or [`BindingError::EndpointAlreadyOwned`] if another role acquired the prior endpoint.
+/// A refusal changes nothing.
+pub fn cancel_pending_binding_replacement(
+    world: &mut World,
+    role: &RoleKey,
+) -> Result<(), BindingError> {
+    world
+        .resource_mut::<Bindings>()
+        .cancel_pending_replacement(role)
+}
+
+/// Cancel the newest role registration before the kernel publishes or applies it.
+///
+/// This is rollback for an exclusive-world authoring operation: it removes the
+/// still-pending registration, its endpoint ownership, and its role entity.
+/// It needs no additional transition capacity and never discards earlier work
+/// for the same role. Ordinary lifecycle retirement remains [`Bindings::retire`].
+///
+/// # Errors
+///
+/// Returns [`BindingError::RoleNotBound`] for an absent role, or
+/// [`BindingError::RegistrationNotPending`] once its registration has drained,
+/// been replaced, or started an application. A refusal changes nothing.
+pub fn cancel_pending_binding_registration(
+    world: &mut World,
+    role: &RoleKey,
+) -> Result<(), BindingError> {
+    let entity = world
+        .resource_mut::<Bindings>()
+        .cancel_pending_registration(role)?;
+    if let Some(mut lost) = world.get_resource_mut::<LostRegisteredRoleEntities>() {
+        lost.0.remove(role);
+    }
+    if let Some(mut lost) = world.get_resource_mut::<LostRoleRelationships>() {
+        lost.0.remove(role);
+    }
+    if let Ok(entity) = world.get_entity_mut(entity) {
+        entity.despawn();
+    }
+    Ok(())
 }
 
 fn role_entity_bundle(
@@ -1444,8 +1497,8 @@ enum StoppedState {
         reacquisition: ReacquisitionProgress,
         last_ending:   AttemptEnding,
     },
-    Unsupported {
-        failure: DriverStopReason,
+    ExplicitRecovery {
+        reason: DriverStopReason,
     },
 }
 
@@ -1839,17 +1892,25 @@ pub(crate) enum DriverCleanup {
     },
 }
 
+/// Prior registration retained only while its replacement can still be cancelled.
+struct PendingBindingReplacement {
+    sequence: BindingTransitionSequence,
+    previous: RegisteredRole,
+}
+
 struct PendingBindingTransitions {
-    capacity: NonZeroUsize,
-    queue:    VecDeque<BindingTransition>,
+    replacements: Vec<PendingBindingReplacement>,
+    capacity:     NonZeroUsize,
+    queue:        VecDeque<BindingTransition>,
 }
 
 impl Default for PendingBindingTransitions {
     fn default() -> Self {
         Self {
-            capacity: NonZeroUsize::new(DEFAULT_PENDING_TRANSITION_CAPACITY)
+            capacity:     NonZeroUsize::new(DEFAULT_PENDING_TRANSITION_CAPACITY)
                 .unwrap_or(NonZeroUsize::MIN),
-            queue:    VecDeque::new(),
+            queue:        VecDeque::new(),
+            replacements: Vec::new(),
         }
     }
 }
@@ -2036,6 +2097,20 @@ impl Bindings {
     /// Returns `BindingError` when no old binding exists, a different role owns the proposed
     /// endpoint, or the transition handoff has no space for this replacement.
     pub(crate) fn replace(&mut self, binding: Binding) -> Result<Binding, BindingError> {
+        self.replace_role(binding)
+            .map(|replacement| replacement.previous.binding)
+    }
+
+    fn replace_pending(&mut self, binding: Binding) -> Result<(), BindingError> {
+        let replacement = self.replace_role(binding)?;
+        self.pending_transitions.replacements.push(replacement);
+        Ok(())
+    }
+
+    fn replace_role(
+        &mut self,
+        binding: Binding,
+    ) -> Result<PendingBindingReplacement, BindingError> {
         let old_binding =
             self.by_role
                 .get(&binding.role)
@@ -2076,6 +2151,7 @@ impl Bindings {
                 .or_default()
                 .push(role.clone());
         }
+        let sequence = reserved_transition.sequence;
         self.enqueue(
             BindingTransitionKind::Replaced {
                 displaced_entity,
@@ -2086,7 +2162,10 @@ impl Bindings {
             reserved_transition,
         );
 
-        Ok(displaced.binding)
+        Ok(PendingBindingReplacement {
+            sequence,
+            previous: displaced,
+        })
     }
 
     /// Replace one role through the same typed driver-configuration boundary as registration.
@@ -2377,6 +2456,106 @@ impl Bindings {
         Ok(RetirementOutcome::Retired(Box::new(
             registered_role.binding,
         )))
+    }
+
+    fn cancel_pending_registration(&mut self, role: &RoleKey) -> Result<Entity, BindingError> {
+        let registered = self
+            .by_role
+            .get(role)
+            .ok_or_else(|| BindingError::RoleNotBound { role: role.clone() })?;
+        let refusal = || BindingError::RegistrationNotPending { role: role.clone() };
+        let pending = self
+            .pending_transitions
+            .queue
+            .iter()
+            .rposition(|transition| match transition {
+                BindingTransition::Registered { role: pending, .. }
+                | BindingTransition::Replaced { role: pending, .. }
+                | BindingTransition::Retired { role: pending, .. } => pending == role,
+            })
+            .ok_or_else(refusal)?;
+        if !matches!(
+            self.pending_transitions.queue.get(pending),
+            Some(BindingTransition::Registered { .. })
+        ) || !matches!(
+            registered.application_run,
+            RegistrationApplicationRun::NotStarted
+        ) || !matches!(registered.state, RoleState::Waiting(_))
+        {
+            return Err(refusal());
+        }
+        let registered = self
+            .by_role
+            .remove(role)
+            .ok_or_else(|| BindingError::RoleNotBound { role: role.clone() })?;
+        self.pending_transitions.queue.remove(pending);
+        self.owner_by_endpoint.remove(&registered.binding.endpoint);
+        self.remove_role_from_device(&registered.binding.endpoint.device, role);
+        Ok(registered.entity)
+    }
+
+    fn cancel_pending_replacement(&mut self, role: &RoleKey) -> Result<(), BindingError> {
+        let registered = self
+            .by_role
+            .get(role)
+            .ok_or_else(|| BindingError::RoleNotBound { role: role.clone() })?;
+        let refusal = || BindingError::ReplacementNotPending { role: role.clone() };
+        let pending = self
+            .pending_transitions
+            .queue
+            .iter()
+            .rposition(|transition| match transition {
+                BindingTransition::Registered { role: pending, .. }
+                | BindingTransition::Replaced { role: pending, .. }
+                | BindingTransition::Retired { role: pending, .. } => pending == role,
+            })
+            .ok_or_else(refusal)?;
+        let Some(BindingTransition::Replaced { sequence, .. }) =
+            self.pending_transitions.queue.get(pending)
+        else {
+            return Err(refusal());
+        };
+        if !matches!(
+            registered.application_run,
+            RegistrationApplicationRun::NotStarted
+        ) || !matches!(registered.state, RoleState::Waiting(_))
+        {
+            return Err(refusal());
+        }
+        let retained = self
+            .pending_transitions
+            .replacements
+            .iter()
+            .position(|replacement| replacement.sequence == *sequence)
+            .ok_or_else(refusal)?;
+        let previous_endpoint = &self.pending_transitions.replacements[retained]
+            .previous
+            .binding
+            .endpoint;
+        if let Some(owner) = self.owner_by_endpoint.get(previous_endpoint)
+            && owner != role
+        {
+            return Err(BindingError::EndpointAlreadyOwned {
+                endpoint: previous_endpoint.clone(),
+                owner:    owner.clone(),
+            });
+        }
+        let current_endpoint = registered.binding.endpoint.clone();
+        let replacement = self.pending_transitions.replacements.remove(retained);
+        let previous_endpoint = replacement.previous.binding.endpoint.clone();
+        self.pending_transitions.queue.remove(pending);
+        if current_endpoint != previous_endpoint {
+            self.owner_by_endpoint.remove(&current_endpoint);
+            self.remove_role_from_device(&current_endpoint.device, role);
+            self.owner_by_endpoint
+                .insert(previous_endpoint.clone(), role.clone());
+            self.roles_by_device
+                .entry(previous_endpoint.device)
+                .or_default()
+                .push(role.clone());
+        }
+        self.by_role.insert(role.clone(), replacement.previous);
+        Ok(())
     }
 
     /// Read the generation of the binding currently installed under `role`.
@@ -2819,7 +2998,8 @@ impl Bindings {
                 failures:    *failures,
                 last_ending: last_ending.clone(),
             },
-            RoleState::Established(_) | RoleState::Stopped(StoppedState::Unsupported { .. }) => {
+            RoleState::Established(_)
+            | RoleState::Stopped(StoppedState::ExplicitRecovery { .. }) => {
                 RoleApplyFailureRun::Clear
             },
         }
@@ -2941,10 +3121,10 @@ impl Bindings {
         );
     }
 
-    fn stop_role_for_driver_repair(&mut self, role: &RoleKey, failure: DriverStopReason) {
+    fn stop_role_after_driver_failure(&mut self, role: &RoleKey, reason: DriverStopReason) {
         self.set_role_state(
             role,
-            RoleState::Stopped(StoppedState::Unsupported { failure }),
+            RoleState::Stopped(StoppedState::ExplicitRecovery { reason }),
         );
     }
 
@@ -3237,7 +3417,7 @@ impl Bindings {
                     }
                 },
                 ApplyFailureDisposition::Stop(failure) => {
-                    self.stop_role_for_driver_repair(role, failure);
+                    self.stop_role_after_driver_failure(role, failure);
                 },
             },
         }
@@ -3288,6 +3468,24 @@ impl Bindings {
             }
             self.set_role_retry_pacing(role, RetryPacing::Blocked(retry_gate));
         }
+    }
+
+    /// A revoked session stops even when ordinary transport loss would recreate it.
+    pub(crate) fn apply_reported_session_loss(
+        &mut self,
+        role: &RoleKey,
+        error: &DeviceAccessError,
+        device_revision: DeviceRevisionLookup,
+        now: FrameClockReading,
+    ) -> SessionLossApplication {
+        if !self.by_role.contains_key(role) {
+            return SessionLossApplication::BindingAbsent;
+        }
+        if let ApplyFailureDisposition::Stop(reason) = error.apply_failure_disposition() {
+            self.stop_role_after_driver_failure(role, reason);
+            return SessionLossApplication::Applied;
+        }
+        self.apply_session_loss(role, device_revision, now)
     }
 
     /// Apply an established role's session-loss policy after the caller validates its exact
@@ -3487,7 +3685,7 @@ impl Bindings {
                         return;
                     },
                 },
-                RoleState::Stopped(StoppedState::Unsupported { .. }) => return,
+                RoleState::Stopped(StoppedState::ExplicitRecovery { .. }) => return,
                 RoleState::Waiting(_) | RoleState::Applying(_) | RoleState::Established(_) => {},
             }
         }
@@ -3563,6 +3761,7 @@ impl Bindings {
     }
 
     fn take_pending_transitions(&mut self) -> VecDeque<BindingTransition> {
+        self.pending_transitions.replacements.clear();
         std::mem::take(&mut self.pending_transitions.queue)
     }
 
@@ -3691,11 +3890,18 @@ fn project_status(
             last_ending:  project_attempt_ending(last_ending),
             resumes_when: ResumeCondition::ExplicitRestartOrReacquisition,
         }),
-        RoleState::Stopped(StoppedState::Unsupported { failure }) => {
-            RoleStatusView::Stopped(StoppedStatusView::Unsupported {
-                reason:       DriverStopReasonView::from(failure),
-                resumes_when: ResumeCondition::ExplicitRestart,
-            })
+        RoleState::Stopped(StoppedState::ExplicitRecovery { reason }) => {
+            let stopped = match reason {
+                DriverStopReason::Cancelled { detail } => StoppedStatusView::Cancelled {
+                    detail:       detail.clone(),
+                    resumes_when: ResumeCondition::ExplicitRestart,
+                },
+                DriverStopReason::Unsupported { .. } => StoppedStatusView::Unsupported {
+                    reason:       DriverStopReasonView::from(reason),
+                    resumes_when: ResumeCondition::ExplicitRestart,
+                },
+            };
+            RoleStatusView::Stopped(stopped)
         },
     }
 }
@@ -3964,31 +4170,31 @@ pub enum RetirementOutcome {
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum BindingError {
     /// The submitted role already has an authored binding whose endpoint ownership must remain.
-    #[error("role `{role}` is already bound")]
+    #[error("the requested role is already bound")]
     RoleAlreadyBound {
         /// Existing application role that rejected a second binding record.
         role: RoleKey,
     },
     /// An operation required a binding for this role, but none remains registered.
-    #[error("role `{role}` is not bound")]
+    #[error("the requested role is not bound")]
     RoleNotBound {
         /// Application role that did not select a retained binding record.
         role: RoleKey,
     },
     /// A lifecycle operation required the role's currently active apply.
-    #[error("role `{role}` has no active apply")]
+    #[error("the requested role has no operation in progress")]
     RoleNotApplying {
         /// Bound role whose apply had already ended or had not started.
         role: RoleKey,
     },
     /// Role status projection was requested before the rigging runtime clock was installed.
-    #[error("role `{role}` has no installed role-status runtime clock")]
+    #[error("the requested role cannot report its status because the runtime clock is unavailable")]
     RoleStatusClockNotInstalled {
         /// Bound role whose status cannot be projected without the shared runtime time origin.
         role: RoleKey,
     },
     /// A different role already owns the proposed endpoint, so two drivers cannot race it.
-    #[error("endpoint `{endpoint:?}` is already owned by role `{owner}`")]
+    #[error("{endpoint} is already assigned to another role")]
     EndpointAlreadyOwned {
         /// Endpoint the operation proposed for a second role.
         endpoint: DeviceEndpoint,
@@ -3998,25 +4204,37 @@ pub enum BindingError {
     /// The lifecycle handoff is full, so accepting another authored mutation would lose work.
     #[error("pending binding transition capacity has been reached")]
     PendingTransitionCapacityReached,
+    /// Cancellation cannot retract a registration that has already entered its lifecycle.
+    #[error("the requested role has no pending, unstarted registration to cancel")]
+    RegistrationNotPending {
+        /// Role whose latest registration cannot be cancelled without lifecycle work.
+        role: RoleKey,
+    },
+    /// Cancellation cannot revert a replacement that has entered its lifecycle.
+    #[error("the requested role has no pending, unstarted replacement to cancel")]
+    ReplacementNotPending {
+        /// Role whose latest replacement cannot be reverted without lifecycle work.
+        role: RoleKey,
+    },
     /// The next lifecycle handoff sequence cannot advance without reusing a prior transition id.
     #[error("binding transition sequence is exhausted")]
     TransitionSequenceExhausted,
     /// A restore was requested before a safe readback established a value to restore.
-    #[error("role `{role}` has no last-known-good configuration")]
+    #[error("the requested role has no previously working configuration")]
     LastKnownGoodNotEstablished {
         /// Role whose configuration remains authored intent rather than endpoint evidence.
         role: RoleKey,
     },
     /// The configured device is offline, so passive discovery may observe it but no driver call
     /// may be issued for its endpoint.
-    #[error("configured device `{device_key:?}` is offline")]
+    #[error("configured {device_key} is offline")]
     ConfiguredDeviceOffline {
         /// Durable key whose authored offline mode blocks operational requests.
         device_key: DeviceKey,
     },
     /// A restart was requested for a role the kernel had not stopped, which would have cancelled
     /// whatever that role was doing instead.
-    #[error("role `{role}` was not stopped after repeated failures")]
+    #[error("the requested role was not stopped after repeated failures")]
     RoleNotStopped {
         /// Role whose lifecycle state is not stopped.
         role: RoleKey,
@@ -4247,6 +4465,9 @@ pub struct ConfiguredDevice {
 /// Connectivity conclusion retained for one authored device without changing its operational mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Reflect)]
 pub enum ConfiguredDeviceConnection {
+    /// Authored since the last reconcile pass; the next pass concludes it from the reporter
+    /// evidence already retained, without waiting for any reporter to scan again.
+    AwaitingConclusion,
     /// No enabled reporter completed a discovery capable of observing this authored key.
     NotObserved,
     /// Current passive reporter evidence contains this authored key.
@@ -4285,7 +4506,7 @@ impl HardwareInventory {
             .insert(device_key.clone(), configured_device);
         self.connections
             .entry(device_key)
-            .or_insert(ConfiguredDeviceConnection::NotObserved);
+            .or_insert(ConfiguredDeviceConnection::AwaitingConclusion);
     }
 
     /// Replace every authored entry of one device kind, dropping keys this application no
@@ -4326,7 +4547,7 @@ impl HardwareInventory {
                 .insert(device_key.clone(), configured_device);
             self.connections
                 .entry(device_key)
-                .or_insert(ConfiguredDeviceConnection::NotObserved);
+                .or_insert(ConfiguredDeviceConnection::AwaitingConclusion);
         }
 
         Ok(())
@@ -4347,7 +4568,7 @@ impl HardwareInventory {
         let connection = self
             .connections
             .remove(saved)
-            .unwrap_or(ConfiguredDeviceConnection::NotObserved);
+            .unwrap_or(ConfiguredDeviceConnection::AwaitingConclusion);
         configured_device.key = candidate.clone();
         self.configured.insert(candidate.clone(), configured_device);
         self.connections.insert(candidate, connection);
@@ -4388,6 +4609,16 @@ impl HardwareInventory {
         })
     }
 
+    /// Whether any authored key still awaits its first connection conclusion.
+    ///
+    /// Reconciliation otherwise runs only when reporter evidence changes, so a key authored after
+    /// the last scan would keep this state until the hardware changed.
+    pub(crate) fn awaits_connection_conclusion(&self) -> bool {
+        self.connections
+            .values()
+            .any(|connection| *connection == ConfiguredDeviceConnection::AwaitingConclusion)
+    }
+
     /// Iterate every durable key application code authored into this inventory.
     ///
     /// Reconciliation walks these rather than the reported device set: an authored unit that no
@@ -4395,6 +4626,13 @@ impl HardwareInventory {
     /// case a walk over live evidence would miss.
     pub(crate) fn configured_keys(&self) -> impl Iterator<Item = &DeviceKey> {
         self.configured.keys()
+    }
+
+    /// Iterate every authored device key of one physical kind, including unnamed devices.
+    pub fn authored_device_keys(&self, kind: DeviceKind) -> impl Iterator<Item = &DeviceKey> {
+        self.configured
+            .keys()
+            .filter(move |device_key| device_key.kind == kind)
     }
 
     /// Iterate every named authored device of one physical kind.
@@ -4979,6 +5217,173 @@ mod tests {
             })
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn pending_registration_cancellation_needs_no_transition_slot_or_sequence()
+    -> Result<(), Box<dyn Error>> {
+        let (mut app, role) = app_with_role("output/cancel")?;
+        let entity = registered_entity(&app, &role);
+        let endpoint = app
+            .world()
+            .resource::<Bindings>()
+            .binding(&role)?
+            .endpoint
+            .clone();
+        {
+            let mut bindings = app.world_mut().resource_mut::<Bindings>();
+            bindings.set_pending_transition_capacity(NonZeroUsize::MIN)?;
+            bindings.mark_transition_sequence_exhausted();
+            assert!(matches!(
+                bindings.retire(&role),
+                Err(BindingError::PendingTransitionCapacityReached)
+            ));
+        }
+
+        super::cancel_pending_binding_registration(app.world_mut(), &role)?;
+
+        let bindings = app.world().resource::<Bindings>();
+        assert!(bindings.binding(&role).is_err());
+        assert!(bindings.role_entity(&role).is_err());
+        assert!(!bindings.owner_by_endpoint.contains_key(&endpoint));
+        assert_eq!(bindings.roles_for(&endpoint.device).count(), 0);
+        assert!(bindings.pending_transitions.queue.is_empty());
+        assert_eq!(bindings.next_transition_sequence, u64::MAX);
+        assert!(app.world().get_entity(entity).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn pending_registration_cancellation_preserves_older_same_role_work()
+    -> Result<(), Box<dyn Error>> {
+        let role = RoleKey::new("output/reused")?;
+        let other = RoleKey::new("output/other")?;
+        let old_endpoint = display_endpoint("old")?;
+        let new_endpoint = display_endpoint("new")?;
+        let mut bindings = Bindings::default();
+        bindings.register(binding(role.clone(), old_endpoint.clone()))?;
+        bindings.retire(&role)?;
+        bindings.register(binding(role.clone(), new_endpoint.clone()))?;
+        bindings.register(binding(other.clone(), display_endpoint("other")?))?;
+
+        bindings.cancel_pending_registration(&role)?;
+
+        assert_eq!(bindings.pending_transitions.queue.len(), 3);
+        assert!(
+            matches!(&bindings.pending_transitions.queue[0], BindingTransition::Registered { role: retained, .. } if retained == &role)
+        );
+        assert!(
+            matches!(&bindings.pending_transitions.queue[1], BindingTransition::Retired { endpoint, .. } if endpoint == &old_endpoint)
+        );
+        assert!(
+            matches!(&bindings.pending_transitions.queue[2], BindingTransition::Registered { role: retained, .. } if retained == &other)
+        );
+        assert!(bindings.binding(&role).is_err());
+        assert!(bindings.binding(&other).is_ok());
+        assert!(!bindings.owner_by_endpoint.contains_key(&new_endpoint));
+        assert_eq!(bindings.next_transition_sequence, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn registration_cancellation_refuses_replacement_without_mutation() -> Result<(), Box<dyn Error>>
+    {
+        let role = RoleKey::new("output/replaced")?;
+        let endpoint = display_endpoint("new")?;
+        let mut bindings = Bindings::default();
+        bindings.register(binding(role.clone(), display_endpoint("old")?))?;
+        bindings.replace(binding(role.clone(), endpoint.clone()))?;
+
+        assert!(matches!(
+            bindings.cancel_pending_registration(&role),
+            Err(BindingError::RegistrationNotPending { .. })
+        ));
+        assert_eq!(bindings.pending_transitions.queue.len(), 2);
+        assert_eq!(bindings.binding(&role)?.endpoint, endpoint);
+        assert_eq!(bindings.owner_by_endpoint.get(&endpoint), Some(&role));
+        Ok(())
+    }
+
+    #[test]
+    fn registration_cancellation_refuses_started_or_drained_registration()
+    -> Result<(), Box<dyn Error>> {
+        let role = RoleKey::new("output/started")?;
+        let endpoint = display_endpoint("display")?;
+        let mut bindings = Bindings::default();
+        bindings.register(binding(role.clone(), endpoint.clone()))?;
+        let registered = bindings.by_role.get_mut(&role).ok_or("registered role")?;
+        registered.application_run = super::RegistrationApplicationRun::InitialApplication;
+        assert!(matches!(
+            bindings.cancel_pending_registration(&role),
+            Err(BindingError::RegistrationNotPending { .. })
+        ));
+        assert_eq!(bindings.pending_transitions.queue.len(), 1);
+        let registered = bindings.by_role.get_mut(&role).ok_or("retained role")?;
+        registered.application_run = super::RegistrationApplicationRun::NotStarted;
+        let _ = bindings.take_pending_transitions();
+        assert!(matches!(
+            bindings.cancel_pending_registration(&role),
+            Err(BindingError::RegistrationNotPending { .. })
+        ));
+        assert_eq!(bindings.binding(&role)?.endpoint, endpoint);
+        assert_eq!(bindings.owner_by_endpoint.get(&endpoint), Some(&role));
+        Ok(())
+    }
+
+    #[test]
+    fn replacement_cancellation_restores_generation_without_capacity_or_sequence()
+    -> Result<(), Box<dyn Error>> {
+        let role = RoleKey::new("output/cancel-replacement")?;
+        let old_endpoint = display_endpoint("old")?;
+        let new_endpoint = display_endpoint("new")?;
+        let mut bindings = Bindings::default();
+        bindings.register(binding(role.clone(), old_endpoint.clone()))?;
+        let generation = bindings.generation(&role);
+        let _ = bindings.take_pending_transitions();
+        bindings.set_pending_transition_capacity(NonZeroUsize::MIN)?;
+        bindings.replace_pending(binding(role.clone(), new_endpoint.clone()))?;
+        bindings.mark_transition_sequence_exhausted();
+        bindings.cancel_pending_replacement(&role)?;
+        assert_eq!(bindings.next_transition_sequence, u64::MAX);
+        assert_eq!(bindings.generation(&role), generation);
+        assert!(bindings.pending_transitions.queue.is_empty());
+        assert!(bindings.pending_transitions.replacements.is_empty());
+        assert_eq!(bindings.binding(&role)?.endpoint, old_endpoint);
+        assert_eq!(bindings.owner_by_endpoint.get(&old_endpoint), Some(&role));
+        assert!(!bindings.owner_by_endpoint.contains_key(&new_endpoint));
+        Ok(())
+    }
+
+    #[test]
+    fn replacement_cancellation_refuses_started_or_drained_work_without_mutation()
+    -> Result<(), Box<dyn Error>> {
+        let role = RoleKey::new("output/started-replacement")?;
+        let endpoint = display_endpoint("new")?;
+        let mut bindings = Bindings::default();
+        bindings.register(binding(role.clone(), display_endpoint("old")?))?;
+        bindings.replace_pending(binding(role.clone(), endpoint.clone()))?;
+        let generation = bindings.generation(&role);
+        let registered = bindings.by_role.get_mut(&role).ok_or("registered role")?;
+        registered.application_run = super::RegistrationApplicationRun::InitialApplication;
+        assert!(matches!(
+            bindings.cancel_pending_replacement(&role),
+            Err(BindingError::ReplacementNotPending { .. })
+        ));
+        assert_eq!(bindings.pending_transitions.queue.len(), 2);
+        assert_eq!(bindings.pending_transitions.replacements.len(), 1);
+        assert_eq!(bindings.generation(&role), generation);
+        let registered = bindings.by_role.get_mut(&role).ok_or("registered role")?;
+        registered.application_run = super::RegistrationApplicationRun::NotStarted;
+        let _ = bindings.take_pending_transitions();
+        assert!(bindings.pending_transitions.replacements.is_empty());
+        assert!(matches!(
+            bindings.cancel_pending_replacement(&role),
+            Err(BindingError::ReplacementNotPending { .. })
+        ));
+        assert_eq!(bindings.binding(&role)?.endpoint, endpoint);
+        assert_eq!(bindings.generation(&role), generation);
+        assert_eq!(bindings.owner_by_endpoint.get(&endpoint), Some(&role));
         Ok(())
     }
 
@@ -6629,7 +7034,7 @@ mod tests {
                 .get(&role)
                 .ok_or("registered role is absent")?
                 .state,
-            super::RoleState::Stopped(super::StoppedState::Unsupported { .. })
+            super::RoleState::Stopped(super::StoppedState::ExplicitRecovery { .. })
         ));
 
         Ok(())
@@ -6670,8 +7075,8 @@ mod tests {
             .get_mut(&role)
             .ok_or("registered role is absent")?;
         registered_role.set_state(super::RoleState::Stopped(
-            super::StoppedState::Unsupported {
-                failure: DriverStopReason::Unsupported {
+            super::StoppedState::ExplicitRecovery {
+                reason: DriverStopReason::Unsupported {
                     detail: String::from("the test driver does not support this operation"),
                 },
             },
@@ -6699,8 +7104,8 @@ mod tests {
                     transport_failure(),
                 )),
             },
-            super::StoppedState::Unsupported {
-                failure: DriverStopReason::Unsupported {
+            super::StoppedState::ExplicitRecovery {
+                reason: DriverStopReason::Unsupported {
                     detail: String::from("the test driver does not support this operation"),
                 },
             },

@@ -24,10 +24,12 @@ use hana_rigging::prelude::RoleKey;
 use hana_rigging::prelude::RoleStatus;
 use hana_rigging::prelude::RoleStatusView;
 
+#[cfg(test)]
 use super::EstablishedWindowPlacement;
 use super::PendingWrite;
 use super::PersistedWindowPlacement;
 use super::PersistedWindowPlacements;
+use super::WindowPlacementConfiguration;
 use super::constants::STATE_TEMPORARY_EXTENSION;
 use super::format;
 use super::window_state::LoadedBindingPolicy;
@@ -157,10 +159,10 @@ fn project_established_values(
     let Ok(configuration) = last_known_good else {
         return EstablishedWindowPersistenceProjection::MissingLastKnownGoodConfiguration;
     };
-    let Some(placement) = configuration
+    let Some(WindowPlacementConfiguration::Established(placement)) = configuration
         .as_any()
-        .downcast_ref::<EstablishedWindowPlacement>()
-    else {
+        .downcast_ref::<WindowPlacementConfiguration>(
+    ) else {
         return EstablishedWindowPersistenceProjection::WrongErasedConfiguration;
     };
     EstablishedWindowPersistenceProjection::WritableSerializedValue(Box::new(
@@ -423,7 +425,7 @@ mod tests {
     struct TestWindowDriver;
 
     impl EndpointDriver for TestWindowDriver {
-        type Configuration = EstablishedWindowPlacement;
+        type Configuration = WindowPlacementConfiguration;
         type Target = ();
 
         fn resolve_target(
@@ -666,7 +668,7 @@ mod tests {
     struct ProjectionBinding {
         endpoint:        DeviceEndpoint,
         readiness:       EstablishedRoleReadiness,
-        requested:       EstablishedWindowPlacement,
+        requested:       WindowPlacementConfiguration,
         last_known_good: LastKnownGoodConfiguration,
     }
 
@@ -701,16 +703,16 @@ mod tests {
                 id:     EndpointId::Whole,
             },
             readiness:       EstablishedRoleReadiness::Established,
-            requested:       placement(),
+            requested:       placement().into(),
             last_known_good: LastKnownGoodConfiguration::MatchesRequested,
         }
     }
 
     fn binding_for(
         role: RoleKey,
-        driver: EndpointDriverRegistration<EstablishedWindowPlacement>,
+        driver: EndpointDriverRegistration<WindowPlacementConfiguration>,
         key: DeviceKey,
-    ) -> BindingAuthoring<EstablishedWindowPlacement> {
+    ) -> BindingAuthoring<WindowPlacementConfiguration> {
         BindingAuthoring::new(
             role,
             DeviceEndpoint {
@@ -718,7 +720,7 @@ mod tests {
                 id:     EndpointId::Whole,
             },
             driver,
-            placement(),
+            placement().into(),
             BindingPolicy::new(
                 RecoveryPolicy::ReapplyOnReturn,
                 RetryOn::NewRevision,

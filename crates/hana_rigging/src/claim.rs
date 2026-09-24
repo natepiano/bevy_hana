@@ -31,6 +31,24 @@ pub enum Claim {
     },
 }
 
+impl Claim {
+    /// How much this claim restricts this process, so co-reported claims merge to the most
+    /// restrictive report and a refusal a driver met at the hardware never loosens what a reporter
+    /// already said.
+    ///
+    /// One reporter seeing an idle camera does not make it idle when another reporter watched a
+    /// second application open it; authorizing capture on the optimistic report would fail at the
+    /// driver.
+    pub(crate) const fn restriction(&self) -> u8 {
+        match self {
+            Self::NotApplicable | Self::Free => 0,
+            Self::Held => 1,
+            Self::Contended { .. } => 2,
+            Self::Blocked { .. } => 3,
+        }
+    }
+}
+
 /// Information the platform provides about a process that contends for a device.
 ///
 /// A missing name is not represented with `Option<String>` because macOS can report camera

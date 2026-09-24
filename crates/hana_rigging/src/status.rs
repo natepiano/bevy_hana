@@ -1,3 +1,6 @@
+use std::fmt::Display;
+use std::fmt::Formatter;
+use std::fmt::Result as FormatResult;
 use std::num::NonZeroU32;
 use std::time::Duration;
 
@@ -296,6 +299,13 @@ impl HardwareWait {
 #[derive(Clone, Debug, PartialEq, Eq, Reflect, Serialize)]
 #[reflect(Serialize)]
 pub enum StoppedStatusView {
+    /// The operator cancelled or revoked permission for this operation.
+    Cancelled {
+        /// Provider detail identifying the cancellation.
+        detail:       String,
+        /// Explicit recovery is required before another attempt.
+        resumes_when: ResumeCondition,
+    },
     /// Consecutive device-operation failures exhausted the automatic retry run.
     RepeatedFailures {
         /// Number of consecutive failed attempts.
@@ -370,6 +380,16 @@ pub enum AttemptEndingView {
     ContractFailed(DriverContractFailureView),
 }
 
+impl Display for AttemptEndingView {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FormatResult {
+        match self {
+            Self::Reported(outcome) => outcome.fmt(formatter),
+            Self::Invalidated(reason) => reason.fmt(formatter),
+            Self::ContractFailed(reason) => reason.fmt(formatter),
+        }
+    }
+}
+
 /// Owned projection of a driver-reported terminal result.
 #[derive(Clone, Debug, PartialEq, Eq, Reflect, Serialize)]
 #[reflect(Serialize)]
@@ -380,6 +400,21 @@ pub enum AttemptOutcomeView {
     Failed(DeviceAccessErrorView),
     /// The kernel or driver abandoned the operation.
     Aborted,
+}
+
+impl Display for AttemptOutcomeView {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FormatResult {
+        match self {
+            Self::Succeeded(AppliedKind::AsDispatched) => {
+                formatter.write_str("the requested configuration was applied")
+            },
+            Self::Succeeded(AppliedKind::DiffersFromDispatched) => {
+                formatter.write_str("the device applied a different configuration")
+            },
+            Self::Failed(error) => error.fmt(formatter),
+            Self::Aborted => formatter.write_str("the operation was abandoned"),
+        }
+    }
 }
 
 /// Owned projection of a kernel attempt invalidation.
@@ -410,15 +445,51 @@ pub enum AttemptInvalidationView {
     DriverContractFailed,
 }
 
+impl Display for AttemptInvalidationView {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FormatResult {
+        formatter.write_str(match self {
+            Self::DeviceChanged => "the endpoint now refers to a different device",
+            Self::RevisionAdvanced => "the device information changed during the operation",
+            Self::ClaimLost => "access to the device was lost",
+            Self::IdentityNoLongerConfirmed => "the device identity is no longer confirmed",
+            Self::DeviceNotPresent => "the device is no longer present",
+            Self::InventoryWithdrewTheDevice => "the device was taken offline",
+            Self::OverrunExhausted => "the operation exceeded its time limit",
+            Self::RoleRetired => "the device operation was retired",
+            Self::BindingReplaced => "the device assignment was replaced",
+            Self::DriverContractFailed => "the driver could not accept the operation",
+        })
+    }
+}
+
 /// Owned projection of a driver stop reason.
 #[derive(Clone, Debug, PartialEq, Eq, Reflect, Serialize)]
 #[reflect(Serialize)]
 pub enum DriverStopReasonView {
+    /// The operator cancelled or revoked permission for this operation.
+    Cancelled {
+        /// Provider detail identifying the cancellation.
+        detail: String,
+    },
     /// The current platform cannot perform this operation.
     Unsupported {
         /// Provider detail naming the unsupported contract.
         detail: String,
     },
+}
+
+impl Display for DriverStopReasonView {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FormatResult {
+        match self {
+            Self::Cancelled { detail } => {
+                write!(formatter, "permission was cancelled or revoked: {detail}")
+            },
+            Self::Unsupported { detail } => write!(
+                formatter,
+                "this platform cannot perform the operation: {detail}"
+            ),
+        }
+    }
 }
 
 /// Owned projection of an erased driver contract failure.
@@ -447,6 +518,24 @@ pub enum DriverContractFailureView {
         /// Role whose restore value was unavailable.
         role: RoleKey,
     },
+}
+
+impl Display for DriverContractFailureView {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FormatResult {
+        match self {
+            Self::DriverNotRegistered { .. } => {
+                formatter.write_str("no driver is registered for this route")
+            },
+            Self::DriverTypeMismatch { .. } => {
+                formatter.write_str("the registered driver cannot handle this route")
+            },
+            Self::ConfigurationTypeMismatch { .. } => {
+                formatter.write_str("the driver cannot read the retained configuration")
+            },
+            Self::LastKnownGoodConfigurationUnavailable { .. } => formatter
+                .write_str("no previously working configuration is available for this role"),
+        }
+    }
 }
 
 /// Process-local diagnostic reference for one registered driver.
@@ -1006,6 +1095,9 @@ impl From<ClaimHolder> for ClaimHolderView {
 impl From<&DriverStopReason> for DriverStopReasonView {
     fn from(reason: &DriverStopReason) -> Self {
         match reason {
+            DriverStopReason::Cancelled { detail } => Self::Cancelled {
+                detail: detail.clone(),
+            },
             DriverStopReason::Unsupported { detail } => Self::Unsupported {
                 detail: detail.clone(),
             },
@@ -1033,5 +1125,45 @@ impl From<Presence> for PresenceView {
             Presence::Absent => Self::Absent,
             Presence::Unreachable { since } => Self::Unreachable { since },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AttemptEndingView;
+    use super::AttemptInvalidationView;
+    use super::AttemptOutcomeView;
+    use super::DeviceAccessErrorView;
+    use super::DriverContractFailureView;
+    use super::DriverRef;
+    use super::DriverStopReasonView;
+
+    #[test]
+    fn attempt_failures_keep_provider_detail_in_operator_prose() {
+        let detail = "capture is owned by another application";
+        let ending = AttemptEndingView::Reported(AttemptOutcomeView::Failed(
+            DeviceAccessErrorView::Contended {
+                detail: detail.into(),
+            },
+        ));
+        assert_eq!(ending.to_string(), format!("device busy: {detail}"));
+        assert_eq!(
+            AttemptInvalidationView::DeviceNotPresent.to_string(),
+            "the device is no longer present"
+        );
+        assert_eq!(
+            DriverStopReasonView::Unsupported {
+                detail: detail.into(),
+            }
+            .to_string(),
+            format!("this platform cannot perform the operation: {detail}")
+        );
+        assert_eq!(
+            DriverContractFailureView::DriverNotRegistered {
+                driver: DriverRef(1),
+            }
+            .to_string(),
+            "no driver is registered for this route"
+        );
     }
 }

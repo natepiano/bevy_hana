@@ -10,6 +10,7 @@ mod interactivity;
 mod picking;
 mod reify;
 mod relationship;
+mod scroll;
 mod slider;
 mod tooltip;
 mod visual;
@@ -103,6 +104,9 @@ pub(crate) use relationship::ScreenWidgetAnchoredTo;
 pub use relationship::TooltipFor;
 pub use relationship::Tooltips;
 pub use relationship::WidgetOf;
+pub use scroll::HoveredScrollTargets;
+pub use scroll::PanelScrolled;
+pub use scroll::PointerScrollTarget;
 pub use slider::RequestSliderAdjustment;
 pub use slider::Slider;
 pub use slider::SliderAdjustment;
@@ -221,7 +225,8 @@ fn add_widget_observers(app: &mut App) {
         .add_observer(button::cancel_from_widget_removal)
         .add_observer(button::cancel_before_widget_despawn)
         .add_observer(button::handle_semantic_intent)
-        .add_observer(button::dispatch_click_callback);
+        .add_observer(button::dispatch_click_callback)
+        .add_observer(scroll::scroll_from_pointer);
 }
 
 fn add_mesh_anchor_systems(app: &mut App) {

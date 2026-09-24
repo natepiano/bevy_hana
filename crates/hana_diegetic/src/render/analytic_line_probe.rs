@@ -330,9 +330,9 @@ fn rectangle_outline(design: Vec2) -> PathOutline {
             max: design,
         },
         contours: vec![PathContour {
-            min_feature:   design.x.min(design.y),
-            fade_exponent: 0.0,
-            segments:      corners
+            minimum_feature_size: design.x.min(design.y),
+            fade_exponent:        0.0,
+            segments:             corners
                 .iter()
                 .copied()
                 .zip(corners.iter().copied().cycle().skip(1))

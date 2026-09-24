@@ -14,6 +14,7 @@ use bevy::prelude::EntityEvent;
 use bevy::prelude::Has;
 use bevy::prelude::IVec2;
 use bevy::prelude::Insert;
+use bevy::prelude::Mut;
 use bevy::prelude::On;
 use bevy::prelude::Query;
 use bevy::prelude::Reflect;
@@ -34,6 +35,7 @@ use bevy::window::OnMonitor;
 use bevy::window::PrimaryWindow;
 use hana_rigging::prelude::ApplyDeadline;
 use hana_rigging::prelude::BindingAuthoring;
+use hana_rigging::prelude::BindingError;
 use hana_rigging::prelude::BindingPolicy;
 use hana_rigging::prelude::BindingRegistration;
 use hana_rigging::prelude::Bindings;
@@ -81,6 +83,8 @@ use crate::persistence::PersistedDisplayIdentityV4;
 use crate::persistence::PersistedWindowPlacementLookup;
 use crate::persistence::PersistedWindowPlacements;
 use crate::persistence::PersistedWindowTargetV5;
+use crate::persistence::ReadbackWindowPosition;
+use crate::persistence::WindowPlacementConfiguration;
 use crate::platform::Platform;
 use crate::recovery::StrandedWindowDisplayObservation;
 use crate::recovery::StrandedWindowMovementBaselines;
@@ -319,6 +323,74 @@ impl WindowRiggingRole {
     pub(crate) const fn new(role_entity: Entity) -> Self { Self(role_entity) }
 
     pub(crate) const fn entity(self) -> Entity { self.0 }
+}
+
+/// Why a derived window could not attach to an existing rigging binding.
+#[derive(Debug, thiserror::Error)]
+pub enum WindowRoleAttachmentError {
+    /// No registered role can receive this window.
+    #[error("window binding role is not registered: {0}")]
+    RoleNotRegistered(BindingError),
+    /// The entity has no live window.
+    #[error("the output window no longer exists")]
+    WindowMissing,
+}
+
+/// Attaches a derived window to the current entity of an application-owned role.
+///
+/// # Errors
+/// Returns `WindowMissing` for an absent window or `RoleNotRegistered` for an absent role.
+pub fn attach_window_to_binding_role(
+    world: &mut World,
+    window: Entity,
+    role: &RoleKey,
+) -> Result<(), WindowRoleAttachmentError> {
+    if world.get::<Window>(window).is_none() {
+        return Err(WindowRoleAttachmentError::WindowMissing);
+    }
+    let bindings = world.get_resource::<Bindings>().ok_or_else(|| {
+        WindowRoleAttachmentError::RoleNotRegistered(BindingError::RoleNotBound {
+            role: role.clone(),
+        })
+    })?;
+    let role_entity = bindings
+        .role_entity(role)
+        .map_err(WindowRoleAttachmentError::RoleNotRegistered)?;
+    if world
+        .get::<WindowRiggingRole>(window)
+        .map(|attached| attached.entity())
+        != Some(role_entity)
+    {
+        world
+            .entity_mut(window)
+            .insert(WindowRiggingRole::new(role_entity));
+    }
+    Ok(())
+}
+
+/// Supplies exact OS monitor readback to application-owned attached windows.
+pub(crate) fn sync_binding_window_monitor(
+    windows: Query<
+        (Entity, &Window, &OnMonitor, Option<&CurrentMonitor>),
+        (With<WindowRiggingRole>, Without<ManagedWindow>),
+    >,
+    monitors: Res<Monitors>,
+    mut commands: Commands,
+) {
+    for (entity, window, association, existing) in &windows {
+        let Some(current) =
+            monitors::current_monitor_from_association(window, association, &monitors)
+        else {
+            commands.entity(entity).remove::<CurrentMonitor>();
+            continue;
+        };
+        if existing.is_none_or(|existing| {
+            existing.descriptor != current.descriptor
+                || existing.effective_window_mode != current.effective_window_mode
+        }) {
+            commands.entity(entity).insert(current);
+        }
+    }
 }
 
 /// Window entities whose local relationship names this rigging role entity.
@@ -584,8 +656,10 @@ fn prepare_window_binding_persistence(
         },
         PersistedWindowPlacementLookup::NotSaved => {
             let physical_position = match candidate.window.position {
-                WindowPosition::At(position) => Some(IVec2::new(position.x, position.y)),
-                _ => None,
+                WindowPosition::At(position) => {
+                    ReadbackWindowPosition::Observed(IVec2::new(position.x, position.y))
+                },
+                _ => ReadbackWindowPosition::Unavailable,
             };
             PreparedWindowBindingPersistence {
                 placement:          EstablishedWindowPlacement::from_readback(
@@ -779,11 +853,17 @@ pub(crate) fn author_window_bindings(
 const fn window_binding(
     role: RoleKey,
     endpoint: DeviceEndpoint,
-    driver: EndpointDriverRegistration<EstablishedWindowPlacement>,
+    driver: EndpointDriverRegistration<WindowPlacementConfiguration>,
     placement: EstablishedWindowPlacement,
     binding_policy: BindingPolicy,
-) -> BindingAuthoring<EstablishedWindowPlacement> {
-    BindingAuthoring::new(role, endpoint, driver, placement, binding_policy)
+) -> BindingAuthoring<WindowPlacementConfiguration> {
+    BindingAuthoring::new(
+        role,
+        endpoint,
+        driver,
+        WindowPlacementConfiguration::Established(placement),
+        binding_policy,
+    )
 }
 
 /// Move a role's binding to the display its window now occupies.
@@ -909,8 +989,10 @@ pub(crate) fn rebind_window_to_its_current_display(
             FirstRestoreRebind::FollowWithSavedPlacement(placement) => placement,
             FirstRestoreRebind::ReadBack => {
                 let physical_position = match window.position {
-                    WindowPosition::At(position) => Some(IVec2::new(position.x, position.y)),
-                    _ => None,
+                    WindowPosition::At(position) => {
+                        ReadbackWindowPosition::Observed(IVec2::new(position.x, position.y))
+                    },
+                    _ => ReadbackWindowPosition::Unavailable,
                 };
                 EstablishedWindowPlacement::from_readback(
                     window,
@@ -1085,8 +1167,10 @@ pub(crate) fn adopt_live_display_for_stranded_window(
         }
         let endpoint_id = existing.endpoint.id.clone();
         let physical_position = match window.position {
-            WindowPosition::At(position) => Some(IVec2::new(position.x, position.y)),
-            _ => None,
+            WindowPosition::At(position) => {
+                ReadbackWindowPosition::Observed(IVec2::new(position.x, position.y))
+            },
+            _ => ReadbackWindowPosition::Unavailable,
         };
         let live = persistence::EstablishedWindowPlacement::from_readback(
             window,
@@ -1167,15 +1251,18 @@ pub(crate) fn forget_stale_window_captures(
         let Ok(configuration) = binding.last_known_good() else {
             continue;
         };
-        let Some(captured) = configuration
-            .as_any()
-            .downcast_ref::<EstablishedWindowPlacement>()
+        let Some(WindowPlacementConfiguration::Established(captured)) =
+            configuration
+                .as_any()
+                .downcast_ref::<WindowPlacementConfiguration>()
         else {
             continue;
         };
         let physical_position = match window.position {
-            WindowPosition::At(position) => Some(IVec2::new(position.x, position.y)),
-            _ => None,
+            WindowPosition::At(position) => {
+                ReadbackWindowPosition::Observed(IVec2::new(position.x, position.y))
+            },
+            _ => ReadbackWindowPosition::Unavailable,
         };
         let live = persistence::EstablishedWindowPlacement::from_readback(
             window,
@@ -1366,8 +1453,20 @@ pub(crate) fn on_window_rigging_role_removed(
     remove: On<Remove, WindowRiggingRole>,
     mut commands: Commands,
 ) {
+    let window = remove.entity;
+    commands.queue(move |world: &mut World| {
+        if world.get::<Window>(window).is_some()
+            || !world.contains_resource::<WindowRoleDriverState>()
+        {
+            return;
+        }
+        world.resource_scope(|world, mut state: Mut<WindowRoleDriverState>| {
+            state.abort_window(window).strip(&mut world.commands());
+            state.report_removed_window(window);
+        });
+    });
     commands
-        .entity(remove.entity)
+        .entity(window)
         .try_remove::<OutputConfirmationSource<OnScreenConfirmation>>();
 }
 
@@ -1472,7 +1571,7 @@ mod tests {
     struct ProjectionBindingDriver;
 
     impl EndpointDriver for ProjectionBindingDriver {
-        type Configuration = EstablishedWindowPlacement;
+        type Configuration = WindowPlacementConfiguration;
         type Target = ();
 
         fn resolve_target(

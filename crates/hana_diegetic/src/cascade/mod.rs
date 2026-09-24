@@ -12,12 +12,6 @@ mod defaults;
 mod resolved;
 
 pub use attributes::CascadeEntityCommandsExt;
-pub use attributes::FontUnit;
-pub use attributes::HdrTextCoverageBias;
-pub use attributes::SdfMaterial;
-pub use attributes::ShapeMaterial;
-pub use attributes::TextAlpha;
-pub use attributes::TextMaterial;
 pub(crate) use attributes::apply_cascade_override;
 pub(crate) use attributes::remove_cascade_override;
 pub use attributes::resolved_anti_alias;
@@ -41,6 +35,12 @@ pub(crate) use hana_kana::CascadeFrom;
 pub(crate) use hana_kana::CascadePlugin;
 pub(crate) use hana_kana::Resolved;
 pub(crate) use resolved::CascadeRoot;
+pub use resolved::FontUnit;
+pub use resolved::HdrTextCoverageBias;
+pub use resolved::SdfMaterial;
+pub use resolved::ShapeMaterial;
+pub use resolved::TextAlpha;
+pub use resolved::TextMaterial;
 
 pub(crate) fn cascade_plugin<A: CascadeRoot>() -> CascadePlugin<A, A::Root> {
     CascadePlugin::new(A::root_default())

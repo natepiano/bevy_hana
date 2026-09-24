@@ -36,8 +36,10 @@ use crate::OrbitCamKind;
 use crate::input;
 use crate::input::CameraBindingGateCondition;
 use crate::input::CameraInputScalePolicy;
+use crate::input::CameraWheelBindingCondition;
 use crate::input::InteractionSources;
 use crate::system_sets::CameraInputInternalSet;
+use crate::system_sets::CameraInputPhase;
 
 pub struct OrbitCamInputAdapterPlugin;
 
@@ -136,6 +138,13 @@ impl Plugin for OrbitCamInputAdapterPlugin {
         app.init_resource::<OrbitCamAdapterDiagnostics>()
             .add_input_condition::<install::TrackpadBindingCondition>()
             .add_input_condition::<CameraBindingGateCondition>()
+            .add_input_condition::<CameraWheelBindingCondition>()
+            .add_systems(
+                PreUpdate,
+                input::withhold_wheel_bindings_of_scroll_blocked_cameras
+                    .in_set(CameraInputPhase::PreInput)
+                    .after(CameraInputInternalSet::Installation),
+            )
             .add_systems(
                 PreUpdate,
                 (
@@ -217,11 +226,11 @@ mod tests {
     use crate::input::CameraBindingGateCondition;
     use crate::input::CameraHomed;
     use crate::input::CameraInputDisabled;
-    use crate::input::CameraInputGamepadSelectionPolicy;
     use crate::input::CameraInputModeReplaced;
     use crate::input::CameraInputModesPlugin;
     use crate::input::CameraInputRoutingConfig;
     use crate::input::CameraInputRoutingPlugin;
+    use crate::input::CameraScrollInputDisabled;
     use crate::input::ControlSpeed;
     use crate::input::DISABLED_INPUT_GAIN;
     use crate::input::HeldBinding;
@@ -229,20 +238,8 @@ mod tests {
     use crate::input::InputBinding;
     use crate::input::InteractionSources;
     use crate::input::OneFingerGestures;
-    use crate::input::OrbitCamBlenderLikePreset;
-    use crate::input::OrbitCamButtonDragZoom;
-    use crate::input::OrbitCamButtonDragZoomAxis;
-    use crate::input::OrbitCamGamepadPreset;
     use crate::input::OrbitCamInputContext;
-    use crate::input::OrbitCamInputGain;
     use crate::input::OrbitCamInputMode;
-    use crate::input::OrbitCamLineScroll;
-    use crate::input::OrbitCamMouseDrag;
-    use crate::input::OrbitCamMouseWheelZoom;
-    use crate::input::OrbitCamPinchZoom;
-    use crate::input::OrbitCamPreset;
-    use crate::input::OrbitCamTouchBinding;
-    use crate::input::OrbitCamTrackpadScroll;
     use crate::input::PINCH_GESTURE_AMPLIFICATION;
     use crate::input::PINCH_INPUT_GAIN;
     use crate::input::PIXEL_SCROLL_SCALE;
@@ -251,10 +248,24 @@ mod tests {
     use crate::input::TouchTracker;
     use crate::input::TwoFingerGestures;
     use crate::input::WHEEL_INPUT_GAIN;
-    use crate::input::ZoomInversion;
+    use crate::orbit_cam::CameraInputGamepadSelectionPolicy;
     use crate::orbit_cam::OrbitCam;
+    use crate::orbit_cam::OrbitCamBlenderLikePreset;
+    use crate::orbit_cam::OrbitCamButtonDragZoom;
+    use crate::orbit_cam::OrbitCamButtonDragZoomAxis;
+    use crate::orbit_cam::OrbitCamGamepadPreset;
     use crate::orbit_cam::OrbitCamInput;
+    use crate::orbit_cam::OrbitCamInputGain;
+    use crate::orbit_cam::OrbitCamLineScroll;
+    use crate::orbit_cam::OrbitCamMouseDrag;
+    use crate::orbit_cam::OrbitCamMouseWheelZoom;
+    use crate::orbit_cam::OrbitCamPinchZoom;
+    use crate::orbit_cam::OrbitCamPreset;
+    use crate::orbit_cam::OrbitCamTouchBinding;
+    use crate::orbit_cam::OrbitCamTrackpadScroll;
+    use crate::orbit_cam::OrbitCamZoomBinding;
     use crate::orbit_cam::OrbitDelta;
+    use crate::orbit_cam::ZoomInversion;
     use crate::system_sets::LagrangeSystemSetsPlugin;
 
     fn test_app() -> App {
@@ -861,6 +872,129 @@ mod tests {
             .insert(CameraInputDisabled);
         app.update();
         assert_no_camera_input(&app, camera)
+    }
+
+    #[test]
+    fn scroll_disabled_camera_ignores_line_and_pixel_scroll_but_keeps_drag_orbit() -> TestResult {
+        let mut app = test_app();
+        let bindings = OrbitCamBindings::builder()
+            .orbit(OrbitCamMouseDrag::new(MouseButton::Left))
+            .zoom(OrbitCamMouseWheelZoom)
+            .zoom(OrbitCamTrackpadScroll::default())
+            .build()
+            .map_err(|_| "bindings should validate")?;
+        let marked = spawn_camera(
+            app.world_mut(),
+            (
+                OrbitCamInputMode::Bindings(bindings.clone()),
+                CameraScrollInputDisabled,
+            ),
+        );
+        let unmarked = spawn_camera(app.world_mut(), OrbitCamInputMode::Bindings(bindings));
+        let drag = Vec2::new(5.0, -2.0);
+
+        route_to(&mut app, marked);
+        for unit in [MouseScrollUnit::Line, MouseScrollUnit::Pixel] {
+            *app.world_mut().resource_mut::<AccumulatedMouseScroll>() = AccumulatedMouseScroll {
+                unit,
+                delta: Vec2::new(0.0, WHEEL_SCROLL_DELTA),
+            };
+            app.update();
+            let input = camera_input(&app, marked)?;
+            assert_f32_close(input.zoom_coarse().amount(), 0.0);
+            assert_f32_close(input.zoom_smooth().amount(), 0.0);
+            assert!(!input.sources().contains(InteractionSources::WHEEL));
+            assert!(!input.sources().contains(InteractionSources::SMOOTH_SCROLL));
+        }
+
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        app.world_mut()
+            .resource_mut::<AccumulatedMouseMotion>()
+            .delta = drag;
+        app.update();
+        let input = camera_input(&app, marked)?;
+        assert_eq!(input.orbit(), OrbitDelta::from(drag));
+        assert_f32_close(input.zoom_smooth().amount(), 0.0);
+
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .release(MouseButton::Left);
+        app.world_mut()
+            .resource_mut::<AccumulatedMouseMotion>()
+            .delta = Vec2::ZERO;
+        route_to(&mut app, unmarked);
+        *app.world_mut().resource_mut::<AccumulatedMouseScroll>() = AccumulatedMouseScroll {
+            unit:  MouseScrollUnit::Line,
+            delta: Vec2::new(0.0, WHEEL_SCROLL_DELTA),
+        };
+        app.update();
+        assert_f32_close(
+            camera_input(&app, unmarked)?.zoom_coarse().amount(),
+            WHEEL_SCROLL_DELTA,
+        );
+        *app.world_mut().resource_mut::<AccumulatedMouseScroll>() = AccumulatedMouseScroll {
+            unit:  MouseScrollUnit::Pixel,
+            delta: Vec2::new(0.0, PIXEL_SCROLL_DELTA_Y),
+        };
+        app.update();
+        assert_f32_close(
+            camera_input(&app, unmarked)?.zoom_smooth().amount(),
+            PIXEL_SCROLL_DELTA_Y * PIXEL_SCROLL_SCALE,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scroll_disabled_camera_withholds_an_enhanced_input_wheel_zoom_but_keeps_key_orbit()
+    -> TestResult {
+        let mut app = test_app();
+        let bindings = OrbitCamBindings::builder()
+            .orbit(InputBinding::cardinal_keys(
+                KeyCode::ArrowUp,
+                KeyCode::ArrowRight,
+                KeyCode::ArrowDown,
+                KeyCode::ArrowLeft,
+            ))
+            .zoom(OrbitCamZoomBinding::Held(HeldBinding::same(
+                Binding::mouse_wheel(),
+            )))
+            .build()
+            .map_err(|_| "bindings should validate")?;
+        let marked = spawn_camera(
+            app.world_mut(),
+            (
+                OrbitCamInputMode::Bindings(bindings.clone()),
+                CameraScrollInputDisabled,
+            ),
+        );
+        let unmarked = spawn_camera(app.world_mut(), OrbitCamInputMode::Bindings(bindings));
+        // An unmodified BEI Vec2 binding supplies its X component to scalar zoom.
+        let wheel = || AccumulatedMouseScroll {
+            unit:  MouseScrollUnit::Line,
+            delta: Vec2::new(WHEEL_SCROLL_DELTA, 0.0),
+        };
+
+        route_to(&mut app, unmarked);
+        *app.world_mut().resource_mut::<AccumulatedMouseScroll>() = wheel();
+        app.update();
+        let input = camera_input(&app, unmarked)?;
+        assert!(input.zoom_smooth().amount().abs() > 0.0);
+        assert!(input.sources().contains(InteractionSources::WHEEL));
+
+        route_to(&mut app, marked);
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::ArrowRight);
+        *app.world_mut().resource_mut::<AccumulatedMouseScroll>() = wheel();
+        app.update();
+        let input = camera_input(&app, marked)?;
+        assert_f32_close(input.zoom_smooth().amount(), 0.0);
+        assert!(!input.sources().contains(InteractionSources::WHEEL));
+        assert_eq!(input.orbit().pixels(), Vec2::new(1.0, 0.0));
+        assert!(input.sources().contains(InteractionSources::KEYBOARD));
+        Ok(())
     }
 
     #[test]

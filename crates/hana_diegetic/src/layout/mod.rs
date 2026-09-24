@@ -88,6 +88,8 @@ pub use element::LayoutTreeChange;
 pub use engine::LayoutEngine;
 pub use engine::LayoutResult;
 pub use engine::MeasureTextFn;
+pub use engine::SolvedScroll;
+pub use engine::VisibleScrollRegion;
 pub use font_features::FontFeatureFlags;
 pub use font_features::FontFeatures;
 pub use geometry::Border;

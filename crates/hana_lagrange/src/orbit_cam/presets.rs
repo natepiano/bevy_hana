@@ -2,8 +2,8 @@ use bevy::prelude::Bundle;
 
 use super::OrbitCam;
 use super::OrbitCamBindings;
+use super::OrbitCamPreset;
 use crate::input::OrbitCamInputMode;
-use crate::input::OrbitCamPreset;
 
 impl OrbitCam {
     /// Returns an `OrbitCam` bundle using the simple mouse input preset.
@@ -42,8 +42,8 @@ mod tests {
     use super::*;
     use crate::input;
     use crate::input::BindingsError;
-    use crate::input::OrbitCamBlenderLikePreset;
-    use crate::input::OrbitCamInputGain;
+    use crate::orbit_cam::OrbitCamBlenderLikePreset;
+    use crate::orbit_cam::OrbitCamInputGain;
 
     const TUNED_MOUSE_INPUT_GAIN: f32 = 0.5;
 

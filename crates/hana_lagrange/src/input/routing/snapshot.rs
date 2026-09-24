@@ -5,8 +5,8 @@
 //! - [`WindowSnapshot`] — captured window size.
 //! - [`CameraRoutingSnapshot`] — captured per-camera routing inputs (entity, draw order, surface
 //!   metrics, and the bit flags below).
-//! - [`CameraRoutingSnapshotFlags`] — `ACTIVE`/`MANUAL`/`DISABLED`/`ANIMATION_IGNORE`/`CURSOR_HIT`
-//!   bitset.
+//! - [`CameraRoutingSnapshotFlags`] — `ACTIVE`/`MANUAL`/`DISABLED`/`SCROLL_DISABLED`/
+//!   `ANIMATION_IGNORE`/`CURSOR_HIT` bitset.
 //!
 //! [`collect_window_snapshots`] and [`collect_camera_snapshots`] are the entry points the
 //! parent `resolve_camera_input_routing` system calls each frame.
@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use bevy::camera::RenderTarget;
 use bevy::prelude::Camera;
 use bevy::prelude::Entity;
+use bevy::prelude::Has;
 use bevy::prelude::Rect;
 use bevy::prelude::Vec2;
 use bevy::prelude::Window;
@@ -34,6 +35,7 @@ use crate::animation::CameraSequencePlayback;
 use crate::input::CameraInputDisabled;
 use crate::input::CameraInputSurfaceMetrics;
 use crate::input::CameraManual;
+use crate::input::CameraScrollInputDisabled;
 
 #[derive(Clone, Copy)]
 pub(super) struct WindowSnapshot {
@@ -119,6 +121,7 @@ bitflags::bitflags! {
         const DISABLED = 1 << 2;
         const ANIMATION_IGNORE = 1 << 3;
         const CURSOR_HIT = 1 << 4;
+        const SCROLL_DISABLED = 1 << 5;
     }
 }
 
@@ -141,6 +144,7 @@ struct CameraSnapshotInputs<'a> {
     target:           &'a RenderTarget,
     manual:           bool,
     disabled:         Option<&'a CameraInputDisabled>,
+    scroll_disabled:  bool,
     playback:         Option<&'a CameraSequencePlayback>,
     interrupt:        Option<&'a CameraInputInterruptBehavior>,
     explicit_metrics: Option<&'a CameraInputSurfaceMetrics>,
@@ -174,13 +178,24 @@ pub(super) fn collect_camera_snapshots(
         &RenderTarget,
         Option<&CameraManual<OrbitCamKind>>,
         Option<&CameraInputDisabled>,
+        Has<CameraScrollInputDisabled>,
         Option<&CameraSequencePlayback>,
         Option<&CameraInputInterruptBehavior>,
         Option<&CameraInputSurfaceMetrics>,
     ), With<OrbitCam>>();
 
     snapshots.extend(orbit_query.iter(world).map(
-        |(entity, camera, target, manual, disabled, playback, interrupt, explicit_metrics)| {
+        |(
+            entity,
+            camera,
+            target,
+            manual,
+            disabled,
+            scroll_disabled,
+            playback,
+            interrupt,
+            explicit_metrics,
+        )| {
             camera_snapshot(
                 CameraSnapshotInputs {
                     entity,
@@ -188,6 +203,7 @@ pub(super) fn collect_camera_snapshots(
                     target,
                     manual: manual.is_some(),
                     disabled,
+                    scroll_disabled,
                     playback,
                     interrupt,
                     explicit_metrics,
@@ -203,13 +219,24 @@ pub(super) fn collect_camera_snapshots(
         &RenderTarget,
         Option<&CameraManual<FreeCamKind>>,
         Option<&CameraInputDisabled>,
+        Has<CameraScrollInputDisabled>,
         Option<&CameraSequencePlayback>,
         Option<&CameraInputInterruptBehavior>,
         Option<&CameraInputSurfaceMetrics>,
     ), (With<FreeCam>, Without<OrbitCam>)>();
 
     snapshots.extend(free_query.iter(world).map(
-        |(entity, camera, target, manual, disabled, playback, interrupt, explicit_metrics)| {
+        |(
+            entity,
+            camera,
+            target,
+            manual,
+            disabled,
+            scroll_disabled,
+            playback,
+            interrupt,
+            explicit_metrics,
+        )| {
             camera_snapshot(
                 CameraSnapshotInputs {
                     entity,
@@ -217,6 +244,7 @@ pub(super) fn collect_camera_snapshots(
                     target,
                     manual: manual.is_some(),
                     disabled,
+                    scroll_disabled,
                     playback,
                     interrupt,
                     explicit_metrics,
@@ -239,6 +267,7 @@ fn camera_snapshot(
         target,
         manual,
         disabled,
+        scroll_disabled,
         playback,
         interrupt,
         explicit_metrics,
@@ -254,6 +283,7 @@ fn camera_snapshot(
     flags.set(CameraRoutingSnapshotFlags::ACTIVE, camera.is_active);
     flags.set(CameraRoutingSnapshotFlags::MANUAL, manual);
     flags.set(CameraRoutingSnapshotFlags::DISABLED, disabled.is_some());
+    flags.set(CameraRoutingSnapshotFlags::SCROLL_DISABLED, scroll_disabled);
     flags.set(CameraRoutingSnapshotFlags::ANIMATION_IGNORE, animation);
     flags.set(CameraRoutingSnapshotFlags::CURSOR_HIT, cursor_hit);
 

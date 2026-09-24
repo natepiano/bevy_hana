@@ -155,6 +155,7 @@ use crate::monitors::Monitors;
 use crate::persistence::EstablishedWindowPlacement;
 use crate::persistence::EstablishedWindowPosition;
 use crate::persistence::SavedWindowMode;
+use crate::persistence::WindowPlacementConfiguration;
 use crate::restore::InjectedWinitWindows;
 
 /// Identity space the walk's scripted display is named in.
@@ -412,7 +413,7 @@ impl WindowPlacementSubject {
 }
 
 impl ConformanceSubject for WindowPlacementSubject {
-    type Configuration = EstablishedWindowPlacement;
+    type Configuration = WindowPlacementConfiguration;
 
     /// A window binding carries no stream, so nothing about its session is judged by data arrival.
     ///
@@ -509,13 +510,13 @@ impl ConformanceSubject for WindowPlacementSubject {
     }
 
     fn requested(&self) -> Self::Configuration {
-        EstablishedWindowPlacement {
+        WindowPlacementConfiguration::Established(EstablishedWindowPlacement {
             position:          EstablishedWindowPosition::Restorable {
                 logical_offset: WALK_WINDOW_OFFSET,
             },
             logical_size:      WALK_WINDOW_LOGICAL_SIZE,
             saved_window_mode: SavedWindowMode::Windowed,
-        }
+        })
     }
 
     fn declare(&mut self, _: &DeviceKey) -> CapabilityDeclaration {

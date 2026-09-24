@@ -180,7 +180,7 @@ pub(super) fn propagate_fit_sizes(
     // overflow (and may scroll), so it reports only its own chrome to ancestors.
     // Without this, a scrollable container's min size equals its full content,
     // forcing every ancestor to grow to the content instead of clipping it.
-    let clipped = matches!(element.overflow, ChildOverflow::Clipped);
+    let clipped = element.overflow.clips();
     let content_acc = if clipped { 0.0 } else { content_acc };
     let min_acc = if clipped { 0.0 } else { min_acc };
     let gap_for_size = if clipped || matches!(axis_role, AxisRole::Cross | AxisRole::Overlay) {
@@ -340,7 +340,7 @@ fn finish_propagated_axis(
         };
 
     let chrome = padding + border;
-    let clipped = matches!(element.overflow, ChildOverflow::Clipped);
+    let clipped = element.overflow.clips();
     let content_acc = if clipped { 0.0 } else { content_acc };
     let min_acc = if clipped { 0.0 } else { min_acc };
     let gap_for_size = if clipped || matches!(axis_role, AxisRole::Cross | AxisRole::Overlay) {

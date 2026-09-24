@@ -426,6 +426,8 @@ pub enum DiscoveryProgressSendError {
 ///
 /// - `Contended` and `Blocked` retry behind the pacing gate and count no failure against the
 ///   device: someone else holds it, or policy refuses, and neither is the device malfunctioning.
+///   The kernel also records the refusal as the device's claim until a reporter looks at the unit
+///   again, so a later scan that finds it free is a change the role can retry on.
 /// - `Absent` has reconciliation re-answer. Nothing is paced, nothing is counted, and no retry
 ///   budget is spent — the device is simply not there to attempt.
 /// - `Transport` is counted, paced, and surfaced as a fault; three consecutively stop the role.
