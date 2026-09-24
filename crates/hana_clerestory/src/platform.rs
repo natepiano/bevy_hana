@@ -536,3 +536,46 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod selector_placement_tests {
+    use std::error::Error;
+    use std::io;
+    use std::path::Path;
+
+    /// Counts lines that choose a target, the `target_os =` form every selector uses.
+    fn target_selector_lines(source: &Path) -> io::Result<usize> {
+        Ok(std::fs::read_to_string(source)?
+            .lines()
+            .filter(|line| {
+                line.split("target_os")
+                    .skip(1)
+                    .any(|rest| rest.trim_start().starts_with('='))
+            })
+            .count())
+    }
+
+    /// This module and `monitors/identity/native/mod.rs` select the target. The native identity
+    /// backends they mount and the reporter stay target-free.
+    #[test]
+    fn target_selection_stays_in_the_platform_facades() -> Result<(), Box<dyn Error>> {
+        let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut offenders = Vec::new();
+        for relative in [
+            "src/reporter.rs",
+            "src/monitors/identity/native/linux.rs",
+            "src/monitors/identity/native/macos.rs",
+            "src/monitors/identity/native/windows.rs",
+        ] {
+            let source = crate_root.join(relative);
+            if target_selector_lines(&source)? > 0 {
+                offenders.push(source.display().to_string());
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "target selection belongs in the platform facades, found in {offenders:?}"
+        );
+        Ok(())
+    }
+}
