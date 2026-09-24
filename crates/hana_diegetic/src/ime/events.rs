@@ -81,6 +81,31 @@ pub enum ImeCancelCause {
     LeaseLost,
 }
 
+/// Which vertical arrow key was pressed in the active session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImeVerticalArrow {
+    /// The Up arrow.
+    Up,
+    /// The Down arrow.
+    Down,
+}
+
+/// Fired for each Up or Down press, key repeats included, in the active session
+/// while it is not composing.
+///
+/// A single-line buffer has no line above or below its caret, so the editor
+/// leaves these keys to the field's owner, such as a result list under a search
+/// field.
+#[derive(Event, Clone, Debug)]
+pub struct ImeVerticalArrowPressed {
+    /// Id of the active session.
+    pub session_id: ImeSessionId,
+    /// Semantic backing target for the session.
+    pub target:     ImeTarget,
+    /// Which arrow was pressed.
+    pub arrow:      ImeVerticalArrow,
+}
+
 /// Fired after an IME session is canceled.
 #[derive(Event, Clone, Debug)]
 pub struct ImeCanceled {

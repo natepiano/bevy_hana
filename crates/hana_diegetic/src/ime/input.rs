@@ -27,6 +27,8 @@ use super::ImeRequestCancel;
 use super::ImeSessionId;
 use super::ImeTarget;
 use super::ImeValidationRejected;
+use super::ImeVerticalArrow;
+use super::ImeVerticalArrowPressed;
 use super::buffer::ImeEditCommand;
 use super::buffer::ImeMovementDirection;
 use super::buffer::ImeMovementUnit;
@@ -220,6 +222,10 @@ pub(super) fn handle_keyboard(
         return;
     }
 
+    if !frame.saw_platform_ime && !active_session.is_pending_commit() {
+        trigger_vertical_arrows(&active_session, events.as_slice(), &mut commands);
+    }
+
     if let Some(command) = command_from_keyboard_events(&keys, events.as_slice()) {
         let changed = active_session.apply_edit_command(command, &input_blocker);
         trigger_text_changed(changed, &mut commands);
@@ -307,6 +313,42 @@ pub(super) fn clear_widget_traversal_after_cancel(
     {
         pending.0 = None;
     }
+}
+
+/// Hands each Up or Down press in the session's window to the field's owner.
+fn trigger_vertical_arrows(
+    active_session: &ActiveImeSession,
+    events: &[KeyboardInput],
+    commands: &mut Commands,
+) {
+    let (Some(session_id), Some(window), Some(target)) = (
+        active_session.active_session_id(),
+        active_session.active_window(),
+        active_session.active_target(),
+    ) else {
+        return;
+    };
+    for arrow in vertical_arrows(events, window) {
+        commands.trigger(ImeVerticalArrowPressed {
+            session_id,
+            target: target.clone(),
+            arrow,
+        });
+    }
+}
+
+fn vertical_arrows(
+    events: &[KeyboardInput],
+    window: Entity,
+) -> impl Iterator<Item = ImeVerticalArrow> + '_ {
+    events
+        .iter()
+        .filter(move |event| event.state == ButtonState::Pressed && event.window == window)
+        .filter_map(|event| match event.key_code {
+            KeyCode::ArrowUp => Some(ImeVerticalArrow::Up),
+            KeyCode::ArrowDown => Some(ImeVerticalArrow::Down),
+            _ => None,
+        })
 }
 
 fn editable_keyboard_text(text: &str) -> Option<&str> {
@@ -517,10 +559,13 @@ mod tests {
     use bevy::prelude::ButtonInput;
     use bevy::prelude::Entity;
     use bevy::prelude::KeyCode;
+    use bevy::prelude::World;
 
     use super::command_from_key_code;
     use super::command_from_keyboard_events;
     use super::editable_keyboard_text;
+    use super::vertical_arrows;
+    use crate::ime::ImeVerticalArrow;
     use crate::ime::buffer::ImeEditCommand;
     use crate::ime::buffer::ImeMovementDirection;
     use crate::ime::buffer::ImeMovementUnit;
@@ -621,6 +666,33 @@ mod tests {
         assert_eq!(
             command_from_keyboard_events(&keys, &events),
             Some(ImeEditCommand::DeleteBackward(ImeMovementUnit::Character))
+        );
+    }
+
+    #[test]
+    fn vertical_arrows_count_each_press_and_repeat_in_the_session_window() {
+        let session_window = Entity::PLACEHOLDER;
+        let other_window = World::new().spawn_empty().id();
+        let mut released_up = key_event(KeyCode::ArrowUp, false);
+        released_up.state = ButtonState::Released;
+        let mut other_window_down = key_event(KeyCode::ArrowDown, false);
+        other_window_down.window = other_window;
+        let events = [
+            key_event(KeyCode::ArrowDown, false),
+            key_event(KeyCode::ArrowDown, true),
+            released_up,
+            other_window_down,
+            key_event(KeyCode::ArrowLeft, false),
+            key_event(KeyCode::ArrowUp, false),
+        ];
+
+        assert_eq!(
+            vertical_arrows(&events, session_window).collect::<Vec<_>>(),
+            [
+                ImeVerticalArrow::Down,
+                ImeVerticalArrow::Down,
+                ImeVerticalArrow::Up
+            ]
         );
     }
 

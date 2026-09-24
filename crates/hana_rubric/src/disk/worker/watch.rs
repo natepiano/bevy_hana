@@ -435,7 +435,6 @@ mod tests {
     const DEBOUNCE_INTERVAL: Duration = Duration::from_millis(100);
     const POLL_AUDIT_INTERVAL: Duration = Duration::from_millis(20);
     const RETRY_INTERVAL: Duration = Duration::from_millis(30);
-    const MISSING_SYMLINK_TARGET: &str = "missing-keymap-target/user-keymap.jsonc";
     /// How long the probe below asks the operating system's notification service for an answer.
     ///
     /// The one wall clock left in these tests, and it bounds the external service rather than
@@ -503,47 +502,6 @@ mod tests {
 
     fn wait_for_dirty_notifications(worker: &DiskWorkerChannels, expected: usize) {
         worker.wait_for_activity(|activity| activity.dirty_notifications >= expected);
-    }
-
-    /// A symlinked keymap file whose target directory is missing fails the same way on every
-    /// watcher recreation, and `recreate_watcher` clears the reported watch error before it
-    /// reports that failure. The report must still be compared against what was reported last.
-    #[cfg(unix)]
-    #[test]
-    fn a_repeated_symlink_parent_failure_is_reported_once() -> Result<(), String> {
-        let environment_lock = ENVIRONMENT_LOCK
-            .lock()
-            .expect("environment lock is available");
-        let temporary_directory =
-            TestDirectory::new("symlink-parent-failure").expect("temporary directory exists");
-        let xdg_config_home = XdgConfigHome::set(temporary_directory.path());
-        let paths = isolated_paths(&temporary_directory)?;
-        fs::create_dir_all(paths.config_directory())
-            .map_err(|error| format!("configuration directory creation failed: {error}"))?;
-        std::os::unix::fs::symlink(
-            temporary_directory.path().join(MISSING_SYMLINK_TARGET),
-            paths.user_keymap(),
-        )
-        .map_err(|error| format!("user keymap symlink creation failed: {error}"))?;
-
-        let (mut disk_worker, slot) = runtime::watch_test_worker(&paths);
-        disk_worker.recreate_watcher(&paths);
-        disk_worker.recreate_watcher(&paths);
-
-        let symlink_failures = slot
-            .take()
-            .ok_or_else(|| {
-                String::from("the symlinked keymap target did not produce a watch diagnostic")
-            })?
-            .diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.message.contains("symlink"))
-            .count();
-        assert_eq!(symlink_failures, 1);
-
-        drop(xdg_config_home);
-        drop(environment_lock);
-        Ok(())
     }
 
     #[test]
@@ -752,71 +710,6 @@ mod tests {
         Ok(())
     }
 
-    /// A dotfile manager links one tracked file into an otherwise untracked directory, so the
-    /// keymap path is a symlink to a file the configuration directory does not contain. An editor
-    /// then saves by renaming a temporary file over that target, which replaces the file a
-    /// file-only watch was placed on.
-    #[cfg(unix)]
-    #[test]
-    fn a_native_watch_carries_edits_to_a_symlinked_keymap_file() -> Result<(), String> {
-        if !native_watch_is_observable("a_native_watch_carries_edits_to_a_symlinked_keymap_file") {
-            return Ok(());
-        }
-
-        let environment_lock = ENVIRONMENT_LOCK
-            .lock()
-            .expect("environment lock is available");
-        let temporary_directory =
-            TestDirectory::new("symlinked-keymap").expect("temporary directory exists");
-        let xdg_config_home = XdgConfigHome::set(temporary_directory.path());
-        let paths = isolated_paths(&temporary_directory)?;
-        let keymap_store = temporary_directory.path().join("keymap-store");
-        let linked_keymap = keymap_store.join("tracked-keymap.jsonc");
-
-        fs::create_dir_all(paths.config_directory())
-            .map_err(|error| format!("configuration directory setup failed: {error}"))?;
-        fs::create_dir_all(&keymap_store)
-            .map_err(|error| format!("keymap store setup failed: {error}"))?;
-        fs::write(&linked_keymap, runtime::USER_KEYMAP_STUB)
-            .map_err(|error| format!("linked keymap setup failed: {error}"))?;
-        std::os::unix::fs::symlink(&linked_keymap, paths.user_keymap())
-            .map_err(|error| format!("keymap symlink setup failed: {error}"))?;
-
-        let worker_timings = WorkerTimings {
-            debounce: DEBOUNCE_INTERVAL,
-            poll:     None,
-            retry:    RETRY_INTERVAL,
-        };
-        let mut worker = start_worker(worker_timings, WatchMode::Native);
-
-        wait_for_snapshot(
-            &worker,
-            paths.user_keymap(),
-            Some(runtime::USER_KEYMAP_STUB),
-        );
-        wait_for_watcher(&worker, true);
-
-        // Both saves assert delivery and nothing about how quickly it arrived, for the reason
-        // given on the direct-edit test above.
-        let edited_contents = b"{\"bindings\": [{\"bindings\": {}}]}";
-        fs::write(paths.user_keymap(), edited_contents)
-            .map_err(|error| format!("symlinked keymap write failed: {error}"))?;
-        wait_for_snapshot(&worker, paths.user_keymap(), Some(edited_contents));
-
-        let renamed_contents = b"{\"bindings\": [{\"context\": \"resting\"}]}";
-        let staged_keymap = keymap_store.join("tracked-keymap.jsonc.tmp");
-        fs::write(&staged_keymap, renamed_contents)
-            .map_err(|error| format!("staged keymap write failed: {error}"))?;
-        fs::rename(&staged_keymap, &linked_keymap)
-            .map_err(|error| format!("rename-over-target save failed: {error}"))?;
-        wait_for_snapshot(&worker, paths.user_keymap(), Some(renamed_contents));
-
-        worker.shutdown();
-        drop(xdg_config_home);
-        drop(environment_lock);
-        Ok(())
-    }
-
     #[test]
     fn polling_audit_detects_suppressed_native_events() -> Result<(), String> {
         let environment_lock = ENVIRONMENT_LOCK
@@ -852,5 +745,134 @@ mod tests {
         drop(xdg_config_home);
         drop(environment_lock);
         Ok(())
+    }
+
+    /// Keymap paths reached through a symlink. These tests create it with
+    /// `std::os::unix::fs::symlink`, which Windows does not have.
+    #[cfg(unix)]
+    mod symlink {
+        use std::fs;
+
+        use super::DEBOUNCE_INTERVAL;
+        use super::ENVIRONMENT_LOCK;
+        use super::RETRY_INTERVAL;
+        use super::TestDirectory;
+        use super::WatchMode;
+        use super::WorkerTimings;
+        use super::XdgConfigHome;
+        use super::isolated_paths;
+        use super::native_watch_is_observable;
+        use super::runtime;
+        use super::start_worker;
+        use super::wait_for_snapshot;
+        use super::wait_for_watcher;
+
+        const MISSING_SYMLINK_TARGET: &str = "missing-keymap-target/user-keymap.jsonc";
+
+        /// A symlinked keymap file whose target directory is missing fails the same way on every
+        /// watcher recreation, and `recreate_watcher` clears the reported watch error before it
+        /// reports that failure. The report must still be compared against what was reported last.
+        #[test]
+        fn a_repeated_symlink_parent_failure_is_reported_once() -> Result<(), String> {
+            let environment_lock = ENVIRONMENT_LOCK
+                .lock()
+                .expect("environment lock is available");
+            let temporary_directory =
+                TestDirectory::new("symlink-parent-failure").expect("temporary directory exists");
+            let xdg_config_home = XdgConfigHome::set(temporary_directory.path());
+            let paths = isolated_paths(&temporary_directory)?;
+            fs::create_dir_all(paths.config_directory())
+                .map_err(|error| format!("configuration directory creation failed: {error}"))?;
+            std::os::unix::fs::symlink(
+                temporary_directory.path().join(MISSING_SYMLINK_TARGET),
+                paths.user_keymap(),
+            )
+            .map_err(|error| format!("user keymap symlink creation failed: {error}"))?;
+
+            let (mut disk_worker, slot) = runtime::watch_test_worker(&paths);
+            disk_worker.recreate_watcher(&paths);
+            disk_worker.recreate_watcher(&paths);
+
+            let symlink_failures = slot
+                .take()
+                .ok_or_else(|| {
+                    String::from("the symlinked keymap target did not produce a watch diagnostic")
+                })?
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.message.contains("symlink"))
+                .count();
+            assert_eq!(symlink_failures, 1);
+
+            drop(xdg_config_home);
+            drop(environment_lock);
+            Ok(())
+        }
+
+        /// A dotfile manager links one tracked file into an otherwise untracked directory, so the
+        /// keymap path is a symlink to a file the configuration directory does not contain. An
+        /// editor then saves by renaming a temporary file over that target, which replaces
+        /// the file a file-only watch was placed on.
+        #[test]
+        fn a_native_watch_carries_edits_to_a_symlinked_keymap_file() -> Result<(), String> {
+            if !native_watch_is_observable(
+                "a_native_watch_carries_edits_to_a_symlinked_keymap_file",
+            ) {
+                return Ok(());
+            }
+
+            let environment_lock = ENVIRONMENT_LOCK
+                .lock()
+                .expect("environment lock is available");
+            let temporary_directory =
+                TestDirectory::new("symlinked-keymap").expect("temporary directory exists");
+            let xdg_config_home = XdgConfigHome::set(temporary_directory.path());
+            let paths = isolated_paths(&temporary_directory)?;
+            let keymap_store = temporary_directory.path().join("keymap-store");
+            let linked_keymap = keymap_store.join("tracked-keymap.jsonc");
+
+            fs::create_dir_all(paths.config_directory())
+                .map_err(|error| format!("configuration directory setup failed: {error}"))?;
+            fs::create_dir_all(&keymap_store)
+                .map_err(|error| format!("keymap store setup failed: {error}"))?;
+            fs::write(&linked_keymap, runtime::USER_KEYMAP_STUB)
+                .map_err(|error| format!("linked keymap setup failed: {error}"))?;
+            std::os::unix::fs::symlink(&linked_keymap, paths.user_keymap())
+                .map_err(|error| format!("keymap symlink setup failed: {error}"))?;
+
+            let worker_timings = WorkerTimings {
+                debounce: DEBOUNCE_INTERVAL,
+                poll:     None,
+                retry:    RETRY_INTERVAL,
+            };
+            let mut worker = start_worker(worker_timings, WatchMode::Native);
+
+            wait_for_snapshot(
+                &worker,
+                paths.user_keymap(),
+                Some(runtime::USER_KEYMAP_STUB),
+            );
+            wait_for_watcher(&worker, true);
+
+            // Both saves assert delivery and nothing about how quickly it arrived, for the reason
+            // given on the direct-edit test above.
+            let edited_contents = b"{\"bindings\": [{\"bindings\": {}}]}";
+            fs::write(paths.user_keymap(), edited_contents)
+                .map_err(|error| format!("symlinked keymap write failed: {error}"))?;
+            wait_for_snapshot(&worker, paths.user_keymap(), Some(edited_contents));
+
+            let renamed_contents = b"{\"bindings\": [{\"context\": \"resting\"}]}";
+            let staged_keymap = keymap_store.join("tracked-keymap.jsonc.tmp");
+            fs::write(&staged_keymap, renamed_contents)
+                .map_err(|error| format!("staged keymap write failed: {error}"))?;
+            fs::rename(&staged_keymap, &linked_keymap)
+                .map_err(|error| format!("rename-over-target save failed: {error}"))?;
+            wait_for_snapshot(&worker, paths.user_keymap(), Some(renamed_contents));
+
+            worker.shutdown();
+            drop(xdg_config_home);
+            drop(environment_lock);
+            Ok(())
+        }
     }
 }

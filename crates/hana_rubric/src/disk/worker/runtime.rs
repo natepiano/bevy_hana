@@ -127,7 +127,7 @@ pub(super) fn start_disk_worker_with(
 
 /// Builds a worker whose thread never starts, so a test can drive one method directly, paired
 /// with the [`CoalescingSlot`] its diagnostics publish into.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn watch_test_worker(paths: &KeymapPaths) -> (DiskWorker, CoalescingSlot) {
     let slot = CoalescingSlot::new();
     let (_, control_receiver) = mpsc::channel();

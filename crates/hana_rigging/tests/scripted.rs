@@ -107,6 +107,7 @@ use hana_rigging::prelude::IdentityQuestionLookup;
 use hana_rigging::prelude::IdentityQuestionRaised;
 use hana_rigging::prelude::IdentityQuestionState;
 use hana_rigging::prelude::IdentityVerdict;
+use hana_rigging::prelude::KernelRolePresentation;
 use hana_rigging::prelude::KeyAvailability;
 use hana_rigging::prelude::LastKnownGoodConfigurationAccessError;
 use hana_rigging::prelude::LiveRoleChange;
@@ -143,8 +144,10 @@ use hana_rigging::prelude::RiggingRevision;
 use hana_rigging::prelude::RiggingSystems;
 use hana_rigging::prelude::RoleEndpoint;
 use hana_rigging::prelude::RoleKey;
+use hana_rigging::prelude::RolePresentationView;
 use hana_rigging::prelude::RoleStatus;
 use hana_rigging::prelude::RoleStatusView;
+use hana_rigging::prelude::RoleUnavailableCause;
 use hana_rigging::prelude::SchemeName;
 use hana_rigging::prelude::SessionDatumArrivalEvidence;
 use hana_rigging::prelude::SessionLease;
@@ -1045,6 +1048,74 @@ fn role_component<'app>(
 
 fn role_lifecycle(app: &App, role: &RoleKey) -> Result<ObservedRoleLifecycle, Box<dyn Error>> {
     Ok(observed_role_lifecycle(role_component(app, role)?.view()))
+}
+
+fn role_presentation<'app>(
+    app: &'app App,
+    role: &RoleKey,
+) -> Result<&'app RolePresentationView<RoleUnavailableCause>, Box<dyn Error>> {
+    let binding = app.world().resource::<Bindings>().role_entity(role)?;
+    app.world()
+        .get::<KernelRolePresentation>(binding)
+        .map(KernelRolePresentation::view)
+        .ok_or_else(|| format!("role `{role}` has no kernel presentation").into())
+}
+
+/// Fail unless the role waits on an unsupported reporter wait naming `reporter` and presents as
+/// unsupported.
+fn assert_unsupported_reporter_wait(
+    app: &App,
+    role: &RoleKey,
+    reporter: ReporterId,
+) -> Result<(), Box<dyn Error>> {
+    let reporter_ref = reporter_health_for(app, reporter)?.identity().reporter_ref;
+    let status = role_component(app, role)?.view();
+    let RoleStatusView::Waiting(WaitingStatusView::ReporterUnsupported { reporters, .. }) = status
+    else {
+        return Err(
+            format!("role `{role}` is not waiting on unsupported discovery: {status:?}").into(),
+        );
+    };
+    if !reporters.as_slice().contains(&reporter_ref) {
+        return Err(
+            format!("role `{role}` waits on {reporters:?}, not on {reporter_ref:?}").into(),
+        );
+    }
+    let presentation = role_presentation(app, role)?;
+    if presentation != &RolePresentationView::Unavailable(RoleUnavailableCause::Unsupported) {
+        return Err(format!("role `{role}` presents {presentation:?}").into());
+    }
+    Ok(())
+}
+
+/// Request a rerun of an unsupported reporter and step one frame at a time until the kernel accepts
+/// it, failing on any frame where the role leaves its unsupported wait.
+///
+/// The request moves the reporter's run state back to idle at once, so this is the window where a
+/// wait read from the run state would fall back to a first-report wait.
+fn rerun_holding_unsupported_wait(
+    app: &mut App,
+    role: &RoleKey,
+    reporter: ReporterId,
+) -> Result<(), Box<dyn Error>> {
+    let completed_before = reporter_health_for(app, reporter)?.completed_runs();
+    app.world_mut()
+        .resource_mut::<DiscoveryControl>()
+        .request(reporter)?;
+    let mut observed_rerun = false;
+    while reporter_health_for(app, reporter)?.completed_runs() <= completed_before {
+        app.update();
+        observed_rerun |= !matches!(
+            reporter_health_for(app, reporter)?.activity(),
+            ReporterActivityView::Stopped { .. }
+        );
+        assert_unsupported_reporter_wait(app, role, reporter)?;
+    }
+    if !observed_rerun {
+        return Err("no frame observed the requested rerun in flight".into());
+    }
+    app.update();
+    assert_unsupported_reporter_wait(app, role, reporter)
 }
 
 fn role_hardware_wait(app: &App, role: &RoleKey) -> Result<HardwareWait, Box<dyn Error>> {
@@ -5302,6 +5373,78 @@ fn supported_reporters_continue_while_another_is_unsupported() -> Result<(), Box
     assert!(reporter_health_for(&app, supported)?.completed_runs() > 1);
 
     Ok(())
+}
+
+/// A role on a key that only an unsupported reporter could report must wait as unsupported, not
+/// as awaiting a first report that no scan will deliver.
+#[test]
+fn a_key_covered_only_by_unsupported_discovery_waits_as_unsupported() -> Result<(), Box<dyn Error>>
+{
+    let (mut app, reporter) = scripted_app(vec![ScriptedScan::Unsupported {
+        detail: UNSUPPORTED_DISCOVERY_DETAIL.to_owned(),
+    }])?;
+    let role = RoleKey::new("unsupported-discovery-panel")?;
+    register_role(
+        &mut app,
+        &role,
+        panel_key("unsupported-discovery-panel")?,
+        RecoveryPolicy::default(),
+        RetryOn::NewRevision,
+        ApplyDeadline::ProcessDefault,
+    )?;
+
+    advance_reporter(&mut app, reporter)?;
+    app.update();
+
+    assert_unsupported_reporter_wait(&app, &role, reporter)
+}
+
+/// A driver target deferred on an evidence-only reporter whose discovery is unsupported must wait
+/// as unsupported, even while another reporter proves the key present.
+#[test]
+fn a_target_deferred_on_unsupported_discovery_waits_as_unsupported() -> Result<(), Box<dyn Error>> {
+    let key = panel_key("unsupported-capability-panel")?;
+    let (mut app, presence_reporter) =
+        scripted_app(vec![scan![ScriptedDevice::present(key.clone())]])?;
+    let capability_reporter = add_matching_scripted_reporter(
+        &mut app,
+        vec![ScriptedScan::Unsupported {
+            detail: UNSUPPORTED_DISCOVERY_DETAIL.to_owned(),
+        }],
+    );
+    let role = RoleKey::new("unsupported-capability-panel")?;
+    register_capability_role::<ScanRateCapability>(&mut app, capability_reporter, &role, key)?;
+
+    advance_reporter(&mut app, presence_reporter)?;
+    advance_reporter(&mut app, capability_reporter)?;
+    app.update();
+
+    assert_unsupported_reporter_wait(&app, &role, capability_reporter)?;
+    rerun_holding_unsupported_wait(&mut app, &role, capability_reporter)
+}
+
+/// An explicit request reruns an unsupported reporter, and the role must hold its unsupported wait
+/// on every frame of that rerun.
+#[test]
+fn rerunning_unsupported_discovery_holds_the_unsupported_wait_on_every_frame()
+-> Result<(), Box<dyn Error>> {
+    let (mut app, reporter) = scripted_app(vec![ScriptedScan::Unsupported {
+        detail: UNSUPPORTED_DISCOVERY_DETAIL.to_owned(),
+    }])?;
+    let role = RoleKey::new("rerun-unsupported-panel")?;
+    register_role(
+        &mut app,
+        &role,
+        panel_key("rerun-unsupported-panel")?,
+        RecoveryPolicy::default(),
+        RetryOn::NewRevision,
+        ApplyDeadline::ProcessDefault,
+    )?;
+    advance_reporter(&mut app, reporter)?;
+    app.update();
+    assert_unsupported_reporter_wait(&app, &role, reporter)?;
+
+    rerun_holding_unsupported_wait(&mut app, &role, reporter)
 }
 
 /// An authored device the application marked offline must still report its connectivity, and no

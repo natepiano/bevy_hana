@@ -72,7 +72,7 @@ pub(crate) enum FullscreenRestoreState {
 
 /// Last native fullscreen transition that the platform confirmed as complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum NativeFullscreenState {
+pub(crate) enum NativeFullscreenState {
     Unavailable,
     Windowed,
     Fullscreen,

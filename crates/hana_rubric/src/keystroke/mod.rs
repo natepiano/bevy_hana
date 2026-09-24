@@ -21,6 +21,8 @@ pub use sequence_matcher::MatchOutcome;
 pub use sequence_matcher::SequenceMatcher;
 pub use sequence_matcher::TimeoutOutcome;
 
+use crate::platform_shortcut_mode::PlatformShortcutMode;
+
 bitflags! {
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
     struct ModifierFlags: u8 {
@@ -77,6 +79,16 @@ impl Modifiers {
         Self(ModifierFlags::from_bits_retain(
             self.0.bits() | ModifierFlags::PLATFORM.bits(),
         ))
+    }
+
+    /// Returns this set with the platform's shortcut modifier enabled, the one the `secondary`
+    /// alias names: physical Super on macOS and Control elsewhere.
+    #[must_use]
+    pub const fn with_secondary(self) -> Self {
+        match PlatformShortcutMode::current() {
+            PlatformShortcutMode::Command => self.with_platform(),
+            PlatformShortcutMode::Control => self.with_control(),
+        }
     }
 
     /// Reports whether control is enabled.
@@ -164,12 +176,9 @@ impl ModifierFamily {
             // Rendered under the running OS's own name for the physical Super key. `cmd`,
             // `super`, `win`, and `platform` all parse back to this family, so the round trip
             // holds on either platform.
-            Self::Platform => {
-                if cfg!(target_os = "macos") {
-                    "cmd"
-                } else {
-                    "super"
-                }
+            Self::Platform => match PlatformShortcutMode::current() {
+                PlatformShortcutMode::Command => "cmd",
+                PlatformShortcutMode::Control => "super",
             },
         }
     }
@@ -357,6 +366,18 @@ impl Keystroke {
     #[must_use]
     pub const fn primary_trigger(self) -> PrimaryTrigger { self.primary_trigger }
 
+    /// Returns this keystroke as on-screen hint text: each part of its `Display` form capitalized
+    /// and joined by `+`, so `secondary-p` reads `Cmd+P` on macOS and `Ctrl+P` elsewhere.
+    #[must_use]
+    pub fn label(self) -> String {
+        // No modifier or key name contains `-`, so it only separates the parts `Display` writes.
+        self.to_string()
+            .split('-')
+            .map(capitalized)
+            .collect::<Vec<_>>()
+            .join("+")
+    }
+
     /// Compares keystrokes by their platform-independent binding representation.
     fn structural_cmp(self, other: Self) -> Ordering {
         let (modifier_count, modifier_bits) = self.modifiers.structural_order();
@@ -487,10 +508,9 @@ fn parse_modifier(token: &str) -> Option<Modifier> {
         "alt" | "opt" | "option" | "altleft" | "altright" | "optleft" | "optright"
         | "optionleft" | "optionright" => Some(Modifier::Alt),
         "shift" | "shiftleft" | "shiftright" => Some(Modifier::Shift),
-        "secondary" => Some(if cfg!(target_os = "macos") {
-            Modifier::Platform
-        } else {
-            Modifier::Control
+        "secondary" => Some(match PlatformShortcutMode::current() {
+            PlatformShortcutMode::Command => Modifier::Platform,
+            PlatformShortcutMode::Control => Modifier::Control,
         }),
         "cmd" | "command" | "super" | "win" | "platform" | "cmdleft" | "cmdright"
         | "commandleft" | "commandright" | "superleft" | "superright" | "winleft" | "winright"
@@ -504,10 +524,9 @@ fn parse_modifier_family_primary(token: &str) -> Option<ModifierFamily> {
         "ctrl" | "control" => Some(ModifierFamily::Control),
         "alt" | "opt" | "option" => Some(ModifierFamily::Alt),
         "shift" => Some(ModifierFamily::Shift),
-        "secondary" => Some(if cfg!(target_os = "macos") {
-            ModifierFamily::Platform
-        } else {
-            ModifierFamily::Control
+        "secondary" => Some(match PlatformShortcutMode::current() {
+            PlatformShortcutMode::Command => ModifierFamily::Platform,
+            PlatformShortcutMode::Control => ModifierFamily::Control,
         }),
         "cmd" | "command" | "super" | "win" | "platform" => Some(ModifierFamily::Platform),
         _ => None,
@@ -675,6 +694,13 @@ fn parse_ordinary_key(token: &str) -> Option<OrdinaryKey> {
     None
 }
 
+fn capitalized(word: &str) -> String {
+    let mut characters = word.chars();
+    characters.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(characters).collect()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
@@ -689,6 +715,7 @@ mod tests {
     use super::ModifierFamily;
     use super::Modifiers;
     use super::OrdinaryKey;
+    use super::PlatformShortcutMode;
     use super::PrimaryTrigger;
 
     fn parsed(input: &str) -> Result<Keystroke, KeystrokeParseError> { input.parse() }
@@ -724,6 +751,16 @@ mod tests {
         assert_eq!(canonical, parsed("shift-super-p")?);
         assert_eq!(canonical, parsed("shift-win-p")?);
         assert_eq!(canonical, parsed("shift-platform-p")?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn label_capitalizes_each_part_and_joins_them_with_plus() -> Result<(), KeystrokeParseError> {
+        assert_eq!(parsed("shift-ctrl-r")?.label(), "Ctrl+Shift+R");
+        assert_eq!(parsed("alt-minus")?.label(), "Alt+Minus");
+        assert_eq!(parsed("f12")?.label(), "F12");
+        assert_eq!(parsed("shift")?.label(), "Shift");
 
         Ok(())
     }
@@ -818,21 +855,17 @@ mod tests {
 
     #[test]
     fn secondary_g_matches_the_platform_shortcut_modifier() -> Result<(), Box<dyn Error>> {
-        let keys = if cfg!(target_os = "macos") {
-            pressed(&[KeyCode::SuperLeft, KeyCode::KeyG])
-        } else {
-            pressed(&[KeyCode::ControlLeft, KeyCode::KeyG])
+        let (shortcut_key, expected_display) = match PlatformShortcutMode::current() {
+            PlatformShortcutMode::Command => (KeyCode::SuperLeft, "cmd-g"),
+            PlatformShortcutMode::Control => (KeyCode::ControlLeft, "ctrl-g"),
         };
+        let keys = pressed(&[shortcut_key, KeyCode::KeyG]);
         let physical = ordinary_keystroke(Modifiers::from_pressed(&keys), KeyCode::KeyG)?;
         let secondary = parsed("secondary-g")?;
         let display = secondary.to_string();
 
         assert_eq!(physical, secondary);
-        if cfg!(target_os = "macos") {
-            assert_eq!(display, "cmd-g");
-        } else {
-            assert_eq!(display, "ctrl-g");
-        }
+        assert_eq!(display, expected_display);
         assert!(!display.contains("secondary-"));
         assert_eq!(secondary, parsed(&display)?);
 
@@ -1005,20 +1038,12 @@ mod tests {
         assert_eq!(parsed("shift")?.to_string(), "shift");
         assert_eq!(parsed("ctrl")?.to_string(), "ctrl");
         assert_eq!(parsed("alt")?.to_string(), "alt");
-        assert_eq!(
-            parsed("secondary")?.to_string(),
-            if cfg!(target_os = "macos") {
-                "cmd"
-            } else {
-                "ctrl"
-            }
-        );
-
-        let platform_name = if cfg!(target_os = "macos") {
-            "cmd"
-        } else {
-            "super"
+        let (secondary_name, platform_name) = match PlatformShortcutMode::current() {
+            PlatformShortcutMode::Command => ("cmd", "cmd"),
+            PlatformShortcutMode::Control => ("ctrl", "super"),
         };
+        assert_eq!(parsed("secondary")?.to_string(), secondary_name);
+
         for alias in ["cmd", "super", "win", "platform"] {
             let rendered = parsed(alias)?.to_string();
             assert_eq!(rendered, platform_name);
@@ -1036,27 +1061,17 @@ mod tests {
             OrdinaryKey::try_from(KeyCode::KeyP)?,
         );
         let rendered = platform_p.to_string();
+        let (expected_platform, expected_secondary) = match PlatformShortcutMode::current() {
+            PlatformShortcutMode::Command => ("cmd-p", "cmd-p"),
+            PlatformShortcutMode::Control => ("super-p", "ctrl-p"),
+        };
 
-        assert_eq!(
-            rendered,
-            if cfg!(target_os = "macos") {
-                "cmd-p"
-            } else {
-                "super-p"
-            }
-        );
+        assert_eq!(rendered, expected_platform);
         assert_eq!(parsed(&rendered)?, platform_p);
 
         let secondary_p = parsed("secondary-p")?;
         let secondary_rendered = secondary_p.to_string();
-        assert_eq!(
-            secondary_rendered,
-            if cfg!(target_os = "macos") {
-                "cmd-p"
-            } else {
-                "ctrl-p"
-            }
-        );
+        assert_eq!(secondary_rendered, expected_secondary);
         assert_eq!(parsed(&secondary_rendered)?, secondary_p);
 
         Ok(())

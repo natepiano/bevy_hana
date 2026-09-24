@@ -125,6 +125,7 @@ objc2-core-media = { version = "0.3.2", default-features = false, features = [
   "CMTime",
   "objc2",
 ] }
+opener = { version = "0.8.5", features = ["reveal"] }
 parley = { version = "0.9.0", default-features = false, features = ["std"] }
 pipewire = "0.10.1"
 proc-macro2 = "1.0.107"

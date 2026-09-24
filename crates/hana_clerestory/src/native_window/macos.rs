@@ -15,6 +15,9 @@
 //! system sees the new window. It is kept on secondary windows to also block
 //! MANUAL tabbing (dragging a window onto another's tab bar, "Merge All
 //! Windows").
+//!
+//! [`NativeFullscreenObservations`] reports the native fullscreen transitions `AppKit` confirms
+//! complete, which the fullscreen restore waits on.
 
 use std::collections::HashMap;
 use std::ptr::NonNull;
@@ -24,11 +27,11 @@ use std::sync::atomic::Ordering;
 
 use bevy::ecs::system::NonSendMarker;
 use bevy::prelude::Added;
+use bevy::prelude::App;
 use bevy::prelude::Entity;
-use bevy::prelude::NonSendMut;
-use bevy::prelude::On;
+use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::Query;
-use bevy::prelude::Remove;
+use bevy::prelude::Update;
 use bevy::prelude::Without;
 use bevy::prelude::debug;
 use bevy::prelude::warn;
@@ -50,22 +53,23 @@ use objc2_foundation::NSNotificationCenter;
 use raw_window_handle::HasWindowHandle;
 use raw_window_handle::RawWindowHandle;
 
-use super::ManagedWindow;
-use crate::restore::TargetPosition;
+use crate::ManagedWindow;
+use crate::constants::NATIVE_FULLSCREEN;
+use crate::constants::NATIVE_WINDOWED;
+use crate::restore;
+use crate::restore::NativeFullscreenState;
 
-/// Native fullscreen transition this module observed complete for one window.
-///
-/// Declared here rather than reusing `restore`'s `NativeFullscreenState` so the restore enum
-/// stays inside `crate::restore`; `application` maps this into it at the call site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NativeFullscreenObserved {
-    Unavailable,
-    Windowed,
-    Fullscreen,
+/// Opt out of automatic tabbing app-wide before winit creates any OS window, then opt each new
+/// managed secondary window out of manual tabbing. See the module docs. Also holds the native
+/// fullscreen observations the restore reads.
+pub(crate) fn register(app: &mut App) {
+    disable_automatic_tabbing();
+    app.insert_non_send(NativeFullscreenObservations::default())
+        .add_systems(
+            Update,
+            disable_tabbing_on_managed.before(restore::place_window_at_saved_geometry),
+        );
 }
-
-const NATIVE_WINDOWED: u8 = 0;
-const NATIVE_FULLSCREEN: u8 = 1;
 
 struct NativeFullscreenObservation {
     center:         Retained<NSNotificationCenter>,
@@ -122,10 +126,10 @@ impl NativeFullscreenObservation {
         }
     }
 
-    fn state(&self) -> NativeFullscreenObserved {
+    fn state(&self) -> NativeFullscreenState {
         match self.state.load(Ordering::Acquire) {
-            NATIVE_FULLSCREEN => NativeFullscreenObserved::Fullscreen,
-            _ => NativeFullscreenObserved::Windowed,
+            NATIVE_FULLSCREEN => NativeFullscreenState::Fullscreen,
+            _ => NativeFullscreenState::Windowed,
         }
     }
 }
@@ -150,12 +154,12 @@ pub(crate) struct NativeFullscreenObservations {
 impl NativeFullscreenObservations {
     /// Start observing before Clerestory asks `AppKit` to change fullscreen state,
     /// then return the last transition that `AppKit` confirmed as complete.
-    pub(crate) fn observe(&mut self, entity: Entity) -> NativeFullscreenObserved {
+    pub(crate) fn observe(&mut self, entity: Entity) -> NativeFullscreenState {
         if let Some(observation) = self.entries.get(&entity) {
             return observation.state();
         }
         let Some(window) = get_ns_window(entity) else {
-            return NativeFullscreenObserved::Unavailable;
+            return NativeFullscreenState::Unavailable;
         };
         let observation = NativeFullscreenObservation::new(&window);
         let state = observation.state();
@@ -172,13 +176,13 @@ impl NativeFullscreenObservations {
 /// process-wide switch, not per-window state. It must be set before any OS
 /// window exists; plugin `build()` runs during `add_plugins`, ahead of winit's
 /// window creation at event-loop start.
-pub(crate) fn disable_automatic_tabbing() {
+fn disable_automatic_tabbing() {
     let Some(main_thread) = MainThreadMarker::new() else {
-        warn!("[macos_tabbing_fix] Not on the main thread; automatic tabbing stays enabled");
+        warn!("[native_window] Not on the main thread; automatic tabbing stays enabled");
         return;
     };
     NSWindow::setAllowsAutomaticWindowTabbing(false, main_thread);
-    debug!("[macos_tabbing_fix] Disabled automatic window tabbing app-wide");
+    debug!("[native_window] Disabled automatic window tabbing app-wide");
 }
 
 /// Get the `NSWindow` for a Bevy window entity.
@@ -200,37 +204,29 @@ fn get_ns_window(entity: Entity) -> Option<Retained<NSWindow>> {
 /// its runtime fullscreen request has reached `AppKit`.
 pub(crate) fn activate_fullscreen_window(entity: Entity) {
     let Some(window) = get_ns_window(entity) else {
-        debug!("[macos_tabbing_fix] Could not activate fullscreen window {entity:?}");
+        debug!("[native_window] Could not activate fullscreen window {entity:?}");
         return;
     };
     let was_key = window.isKeyWindow();
     window.makeKeyAndOrderFront(None);
     debug!(
-        "[macos_tabbing_fix] Made fullscreen window {entity:?} key (was_key={was_key}, is_key={})",
+        "[native_window] Made fullscreen window {entity:?} key (was_key={was_key}, is_key={})",
         window.isKeyWindow()
     );
 }
 
 /// Disable manual tabbing on each newly managed secondary window.
-pub(crate) fn disable_tabbing_on_managed(
+fn disable_tabbing_on_managed(
     new_windows: Query<Entity, (Added<ManagedWindow>, Without<PrimaryWindow>)>,
     _: NonSendMarker,
 ) {
     for entity in &new_windows {
         let Some(ns_window) = get_ns_window(entity) else {
-            debug!("[macos_tabbing_fix] Could not get NSWindow for managed window {entity:?}");
+            debug!("[native_window] Could not get NSWindow for managed window {entity:?}");
             continue;
         };
 
         ns_window.setTabbingMode(NSWindowTabbingMode::Disallowed);
-        debug!("[macos_tabbing_fix] Disabled tabbing on managed window {entity:?}");
+        debug!("[native_window] Disabled tabbing on managed window {entity:?}");
     }
-}
-
-/// Stop observing if a restore is cancelled before normal completion.
-pub(crate) fn clear_fullscreen_observation(
-    removed: On<Remove, TargetPosition>,
-    mut observations: NonSendMut<NativeFullscreenObservations>,
-) {
-    observations.stop(removed.entity);
 }

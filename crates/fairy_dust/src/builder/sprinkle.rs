@@ -52,7 +52,6 @@ use crate::lighting::StudioLightingConfig;
 use crate::orbit_cam;
 use crate::orbit_cam::OrbitCamPose;
 use crate::primitive::PrimitiveConfig;
-use crate::restart;
 use crate::restart_camera;
 use crate::save_window_position;
 use crate::screen_panels;
@@ -416,14 +415,12 @@ impl<S, Baseline> SprinkleBuilder<S, Baseline> {
 
     /// Run the configured app. Mirror of [`App::run`], except that Fairy Dust's
     /// `Ctrl+Shift+R` restart command replaces this process with
-    /// `cargo run --example <name>` on Unix, or spawns it and exits on Windows,
+    /// `cargo run --example <name>` on Unix, or spawns it and exits elsewhere,
     /// so `run` does not return in that case.
     pub fn run(self) -> AppExit {
         let mut builder = self.into_installed();
         keymap::install(&mut builder.app);
-        let exit = builder.app.run();
-        restart::perform_restart_if_requested();
-        exit
+        builder.app.run()
     }
 }
 

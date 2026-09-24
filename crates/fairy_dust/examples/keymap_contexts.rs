@@ -310,16 +310,12 @@ fn with_context_state_controls<S>(builder: SprinkleBuilder<S>) -> SprinkleBuilde
 fn title_bar() -> TitleBar {
     TitleBar::new()
         .with_title("Keymap contexts")
-        .controls([palette_control()])
+        .control(palette_control())
 }
 
 /// The palette recovery chord remains application-owned and available outside authored routing.
-const fn palette_control() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "Cmd+P Palette"
-    } else {
-        "Ctrl+P Palette"
-    }
+fn palette_control() -> String {
+    format!("{} Palette", command_palette_recovery_keystroke().label())
 }
 
 fn configure_camera(orbit_cam: &mut OrbitCam) { CONTEXT_CAMERA_POSE.apply_to(orbit_cam); }
@@ -1161,7 +1157,7 @@ mod tests {
         assert!(status.contains("2: running"));
         assert!(status.contains("3: resting"));
         assert!(status.contains("4: dimension lock"));
-        assert!(status.contains(super::palette_control()));
+        assert!(status.contains(&super::palette_control()));
         assert!(status.contains("scene: global route"));
         assert!(status.contains("1 invocation(s); last example::show_global_route"));
         assert_eq!(

@@ -8,7 +8,7 @@
 //! `AppExit` is bypassed because on macOS the winit run loop can fail to honor
 //! `AppExit::Success` cleanly, leaving the old window stuck. Unix builds
 //! use `exec`, so the current Bevy process is replaced by cargo without running
-//! Bevy shutdown. Windows keeps a spawn-and-exit path.
+//! Bevy shutdown. Other targets spawn cargo and exit.
 //!
 //! The example name is derived from `current_exe()`: cargo writes example
 //! binaries to `<target>/<profile>/examples/<name>`. The manifest path is
@@ -16,12 +16,15 @@
 //! restart keeps working when a developer uses a shared or foreign
 //! `CARGO_TARGET_DIR`.
 
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
+mod constants;
+#[cfg_attr(unix, path = "process_unix.rs")]
+#[cfg_attr(not(unix), path = "process_spawn.rs")]
+mod process;
+
 use std::path::Path;
 use std::path::PathBuf;
-use std::process;
 use std::process::Command;
+use std::process::exit;
 
 use bevy::prelude::App;
 use bevy::prelude::Event;
@@ -38,15 +41,13 @@ use hana_lagrange::OrbitCam;
 use hana_rubric::ReflectKeymapCommand;
 use hana_rubric::command;
 
-use crate::constants::CARGO_BIN;
-use crate::constants::CARGO_EXAMPLE_FLAG;
-use crate::constants::CARGO_EXAMPLES_DIR;
-use crate::constants::CARGO_MANIFEST_PATH_FLAG;
-use crate::constants::CARGO_RELEASE_FLAG;
-use crate::constants::CARGO_RUN_SUBCOMMAND;
-use crate::constants::EXIT_STATUS_FAILURE;
-#[cfg(windows)]
-use crate::constants::EXIT_STATUS_SUCCESS;
+use self::constants::CARGO_BIN;
+use self::constants::CARGO_EXAMPLE_FLAG;
+use self::constants::CARGO_EXAMPLES_DIR;
+use self::constants::CARGO_MANIFEST_PATH_FLAG;
+use self::constants::CARGO_RELEASE_FLAG;
+use self::constants::CARGO_RUN_SUBCOMMAND;
+use self::constants::EXIT_STATUS_FAILURE;
 use crate::ensure_plugin;
 use crate::orbit_cam::FairyDustOrbitCam;
 use crate::restart_camera;
@@ -75,40 +76,19 @@ fn request_restart(
     do_restart(encoded_pose);
 }
 
-/// Does nothing: restart leaves the current process from the input handler.
-/// Kept so [`crate::SprinkleBuilder::run`] needs no cfg branch.
-pub(crate) const fn perform_restart_if_requested() {}
-
-#[cfg(unix)]
 fn do_restart(encoded_pose: Option<String>) {
     let mut command = restart_command(encoded_pose);
-    let err = command.exec();
-    eprintln!("fairy_dust: failed to exec `cargo run`: {err}");
-    process::exit(EXIT_STATUS_FAILURE);
+    let err = process::hand_off(&mut command);
+    eprintln!("fairy_dust: failed to start `cargo run`: {err}");
+    exit(EXIT_STATUS_FAILURE);
 }
 
-#[cfg(windows)]
-fn do_restart(encoded_pose: Option<String>) {
-    let mut command = restart_command(encoded_pose);
-    match command.spawn() {
-        Ok(child) => {
-            info!("fairy_dust restart: cargo spawned as pid {}", child.id());
-            process::exit(EXIT_STATUS_SUCCESS);
-        },
-        Err(err) => {
-            eprintln!("fairy_dust: failed to spawn `cargo run`: {err}");
-            process::exit(EXIT_STATUS_FAILURE);
-        },
-    }
-}
-
-#[cfg(any(unix, windows))]
 fn restart_command(encoded_pose: Option<String>) -> Command {
     let exe = match std::env::current_exe() {
         Ok(path) => path,
         Err(err) => {
             eprintln!("fairy_dust: current_exe failed: {err}");
-            process::exit(EXIT_STATUS_FAILURE);
+            exit(EXIT_STATUS_FAILURE);
         },
     };
     let Some(example_name) = derive_example_name(&exe) else {
@@ -118,14 +98,14 @@ fn restart_command(encoded_pose: Option<String>) -> Command {
              <target>/<profile>/examples/<name>",
             exe.display(),
         );
-        process::exit(EXIT_STATUS_FAILURE);
+        exit(EXIT_STATUS_FAILURE);
     };
     let Some(manifest_path) = source_workspace_manifest() else {
         eprintln!(
             "fairy_dust: could not derive source workspace Cargo.toml from {}",
             env!("CARGO_MANIFEST_DIR"),
         );
-        process::exit(EXIT_STATUS_FAILURE);
+        exit(EXIT_STATUS_FAILURE);
     };
     let manifest_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
     // Re-launch in the profile the running binary was built with: a release
@@ -157,16 +137,10 @@ fn restart_command(encoded_pose: Option<String>) -> Command {
     command
 }
 
-#[cfg(not(any(unix, windows)))]
-fn do_restart(_: Option<String>) {
-    eprintln!("fairy_dust: restart not supported on this platform");
-}
-
 /// Recovers the example name from the running binary's path.
 ///
 /// Returns `None` unless the path has the layout cargo produces for examples:
 /// `<target>/<profile>/examples/<name>`.
-#[cfg(any(unix, windows))]
 fn derive_example_name(exe: &Path) -> Option<String> {
     let name = exe.file_name()?.to_str()?.to_string();
     let examples_dir = exe.parent()?;
@@ -178,7 +152,6 @@ fn derive_example_name(exe: &Path) -> Option<String> {
     Some(name)
 }
 
-#[cfg(any(unix, windows))]
 fn source_workspace_manifest() -> Option<PathBuf> {
     let package_manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = package_manifest.parent()?.parent()?;

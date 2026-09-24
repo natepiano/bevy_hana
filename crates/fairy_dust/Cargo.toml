@@ -48,6 +48,7 @@ hana_diegetic = { workspace = true }
 hana_lagrange = { workspace = true }
 hana_rubric = { workspace = true }
 hana_valence = { workspace = true }
+opener = { workspace = true }
 
 [dev-dependencies]
 strum.workspace = true

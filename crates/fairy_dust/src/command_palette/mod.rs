@@ -17,7 +17,6 @@ mod panel;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::path::Path;
-use std::process::Command;
 
 use bevy::ecs::change_detection::DetectChanges;
 use bevy::input::ButtonInput;
@@ -55,6 +54,7 @@ use hana_diegetic::DiegeticPanel;
 use hana_diegetic::ImeAcceptCommit;
 use hana_diegetic::ImeAppOwnedFieldSpec;
 use hana_diegetic::ImeAppliedResult;
+use hana_diegetic::ImeCancelCause;
 use hana_diegetic::ImeCanceled;
 use hana_diegetic::ImeCommitAuthority;
 use hana_diegetic::ImeCommitCause;
@@ -67,6 +67,8 @@ use hana_diegetic::ImeRejection;
 use hana_diegetic::ImeReplacePanelTree;
 use hana_diegetic::ImeTarget;
 use hana_diegetic::ImeTextChanged;
+use hana_diegetic::ImeVerticalArrow;
+use hana_diegetic::ImeVerticalArrowPressed;
 use hana_diegetic::LayoutTree;
 use hana_diegetic::PanelPicking;
 use hana_diegetic::PanelSystems;
@@ -88,6 +90,8 @@ use hana_rubric::KeymapPathAvailability;
 use hana_rubric::KeymapSystems;
 use hana_rubric::KeystrokeRouting;
 use hana_rubric::PaletteBinding;
+use hana_rubric::PaletteRowCursor;
+use hana_rubric::PaletteRowStep;
 use hana_rubric::PaletteSelectionOutcome;
 use hana_rubric::ReflectKeymapCommand;
 use hana_rubric::command;
@@ -97,6 +101,7 @@ use self::constants::FIELD_ID;
 use self::failure_row::KeymapFailureAction;
 use self::failure_row::keymap_failure_rows;
 use self::panel::FailureActionRow;
+use self::panel::command_row_list;
 use self::panel::failure_action_row_index;
 use self::panel::palette_panel_origin;
 use self::panel::palette_panel_width;
@@ -142,10 +147,12 @@ impl Plugin for CommandPalettePlugin {
                 open_palette_ime_after_panel_layout
                     .after(PanelSystems::ComputeLayout)
                     .after(PanelSystems::PositionScreenSpace),
+                resume_palette_after_window_focus,
             ),
         );
         app.add_observer(toggle_command_palette)
             .add_observer(update_query)
+            .add_observer(step_palette_highlight)
             .add_observer(dispatch_selected_command)
             .add_observer(close_on_cancel)
             .add_observer(run_failure_action);
@@ -383,6 +390,7 @@ fn toggle_command_palette(
         &active_context,
         &effective_keymap_status,
         "",
+        PaletteRowCursor::default(),
         palette_panel_width(window),
     );
     let origin = palette_panel_origin(window);
@@ -406,6 +414,7 @@ fn toggle_command_palette(
         CommandPalettePanel,
         PaletteImeSessionWindow(window_entity),
         PaletteCommittedQuery(String::new()),
+        PaletteRowCursor::default(),
         PaletteFailureActions(presentation.keymap_failure_actions),
         panel,
         Transform::default(),
@@ -418,14 +427,19 @@ fn open_palette_ime_after_panel_layout(
     mut commands: Commands,
 ) {
     for (panel, session_window) in &added_panels {
-        commands.trigger(ImeOpenSession {
-            target:       palette_ime_target(panel),
-            window:       session_window.0,
-            initial_text: String::new(),
-            field_spec:   ImeEditableFieldSpec::AppOwned(ImeAppOwnedFieldSpec::new(FIELD_ID)),
-            anchor:       None,
-        });
+        open_palette_session(panel, session_window.0, String::new(), &mut commands);
     }
+}
+
+/// Opens the IME session that edits `panel`'s query field, starting from `query`.
+fn open_palette_session(panel: Entity, window: Entity, query: String, commands: &mut Commands) {
+    commands.trigger(ImeOpenSession {
+        target: palette_ime_target(panel),
+        window,
+        initial_text: query,
+        field_spec: ImeEditableFieldSpec::AppOwned(ImeAppOwnedFieldSpec::new(FIELD_ID)),
+        anchor: None,
+    });
 }
 
 /// Selects the palette's inline field in applications and a stable app-owned
@@ -451,7 +465,10 @@ fn palette_ime_target(panel: Entity) -> ImeTarget {
 fn update_query(
     changed: On<ImeTextChanged>,
     windows: Query<&Window, With<PrimaryWindow>>,
-    panels: Query<Entity, With<CommandPalettePanel>>,
+    panels: Query<
+        (Entity, &PaletteCommittedQuery, Option<&PaletteRowCursor>),
+        With<CommandPalettePanel>,
+    >,
     keymap_load_failures: Res<KeymapLoadFailures>,
     keymap_path_availability: Res<KeymapPathAvailability>,
     keymap_bindings: Res<KeymapBindings>,
@@ -460,7 +477,7 @@ fn update_query(
     command_registry: Option<Res<CommandRegistry>>,
     mut commands: Commands,
 ) {
-    let Ok(panel) = panels.single() else {
+    let Ok((panel, palette_query, row_cursor)) = panels.single() else {
         return;
     };
     let open_palette_panel = OpenPalettePanel(panel);
@@ -469,6 +486,15 @@ fn update_query(
     {
         return;
     }
+    // A caret move or a resumed session reports the same text; only new text
+    // changes the rows the highlight indexed.
+    let row_cursor = match row_cursor {
+        Some(row_cursor) if palette_query.0 == changed.snapshot.committed_text => *row_cursor,
+        Some(_) | None => {
+            commands.entity(panel).insert(PaletteRowCursor::default());
+            PaletteRowCursor::default()
+        },
+    };
     let registry_assembly = palette_registry_assembly(command_registry.as_deref());
     rebuild_palette(
         &windows,
@@ -480,6 +506,7 @@ fn update_query(
         &effective_keymap_status,
         registry_assembly,
         &changed.snapshot.committed_text,
+        row_cursor,
         &mut commands,
     );
     commands.entity(panel).insert(PaletteCommittedQuery(
@@ -487,12 +514,14 @@ fn update_query(
     ));
 }
 
-/// Rebuilds an open palette after Rubric commits new context, binding, or
-/// diagnostics resources. `Update` runs after Rubric's `PreUpdate` lifecycle,
-/// so this reads the committed public snapshots rather than matcher internals.
-fn refresh_open_palette_after_keymap_changes(
+/// Moves the palette's highlighted row for each Up or Down press in its query field.
+fn step_palette_highlight(
+    pressed: On<ImeVerticalArrowPressed>,
     windows: Query<&Window, With<PrimaryWindow>>,
-    panels: Query<(Entity, &PaletteCommittedQuery), With<CommandPalettePanel>>,
+    mut panels: Query<
+        (Entity, &PaletteCommittedQuery, &mut PaletteRowCursor),
+        With<CommandPalettePanel>,
+    >,
     keymap_load_failures: Res<KeymapLoadFailures>,
     keymap_path_availability: Res<KeymapPathAvailability>,
     keymap_bindings: Res<KeymapBindings>,
@@ -501,7 +530,66 @@ fn refresh_open_palette_after_keymap_changes(
     command_registry: Option<Res<CommandRegistry>>,
     mut commands: Commands,
 ) {
-    let Ok((panel, palette_query)) = panels.single() else {
+    let Ok((panel, palette_query, mut row_cursor)) = panels.single_mut() else {
+        return;
+    };
+    if OpenPalettePanel(panel).ime_target_ownership(&pressed.target)
+        != PaletteImeTargetOwnership::OwnedByOpenPanel
+    {
+        return;
+    }
+    let registry_assembly = palette_registry_assembly(command_registry.as_deref());
+    let PaletteRegistryAssembly::Assembled(assembled_registry) = registry_assembly else {
+        return;
+    };
+    let query_result = query_command_palette(
+        assembled_registry,
+        &active_context,
+        &effective_keymap_status,
+        &keymap_bindings,
+        &palette_query.0,
+    );
+    let step = match pressed.arrow {
+        ImeVerticalArrow::Up => PaletteRowStep::Previous,
+        ImeVerticalArrow::Down => PaletteRowStep::Next,
+    };
+    row_cursor.step(
+        step,
+        command_row_list(query_result.selection(), query_result.rows().len()),
+    );
+    rebuild_palette(
+        &windows,
+        panel,
+        &keymap_load_failures,
+        &keymap_path_availability,
+        &keymap_bindings,
+        &active_context,
+        &effective_keymap_status,
+        registry_assembly,
+        &palette_query.0,
+        *row_cursor,
+        &mut commands,
+    );
+}
+
+/// Rebuilds an open palette after Rubric commits new context, binding, or
+/// diagnostics resources. `Update` runs after Rubric's `PreUpdate` lifecycle,
+/// so this reads the committed public snapshots rather than matcher internals.
+fn refresh_open_palette_after_keymap_changes(
+    windows: Query<&Window, With<PrimaryWindow>>,
+    panels: Query<
+        (Entity, &PaletteCommittedQuery, Option<&PaletteRowCursor>),
+        With<CommandPalettePanel>,
+    >,
+    keymap_load_failures: Res<KeymapLoadFailures>,
+    keymap_path_availability: Res<KeymapPathAvailability>,
+    keymap_bindings: Res<KeymapBindings>,
+    active_context: Res<ActiveKeymapContext>,
+    effective_keymap_status: Res<EffectiveKeymapStatus>,
+    command_registry: Option<Res<CommandRegistry>>,
+    mut commands: Commands,
+) {
+    let Ok((panel, palette_query, row_cursor)) = panels.single() else {
         return;
     };
     if !keymap_bindings.is_changed()
@@ -523,6 +611,7 @@ fn refresh_open_palette_after_keymap_changes(
         &effective_keymap_status,
         registry_assembly,
         &palette_query.0,
+        row_cursor.copied().unwrap_or_default(),
         &mut commands,
     );
 }
@@ -531,7 +620,7 @@ fn refresh_open_palette_after_keymap_changes(
 fn dispatch_selected_command(
     commit: On<ImeCommitRequested>,
     authority: Res<ImeCommitAuthority>,
-    panels: Query<Entity, With<CommandPalettePanel>>,
+    panels: Query<(Entity, Option<&PaletteRowCursor>), With<CommandPalettePanel>>,
     keymap_bindings: Res<KeymapBindings>,
     active_context: Res<ActiveKeymapContext>,
     effective_keymap_status: Res<EffectiveKeymapStatus>,
@@ -539,7 +628,7 @@ fn dispatch_selected_command(
     mut commands: Commands,
 ) {
     let commit = commit.event();
-    let Ok(panel) = panels.single() else {
+    let Ok((panel, row_cursor)) = panels.single() else {
         return;
     };
     let open_palette_panel = OpenPalettePanel(panel);
@@ -555,7 +644,7 @@ fn dispatch_selected_command(
         return;
     }
     let registry_assembly = palette_registry_assembly(command_registry.as_deref());
-    let selection = match registry_assembly {
+    let query_result = match registry_assembly {
         PaletteRegistryAssembly::AwaitingAssembly => {
             commands.trigger(ImeRejectCommit {
                 session_id: commit.session_id,
@@ -572,24 +661,22 @@ fn dispatch_selected_command(
             &effective_keymap_status,
             &keymap_bindings,
             &commit.text,
-        )
-        .selection(),
+        ),
     };
-    let command_id = match selection {
-        PaletteSelectionOutcome::Selected(command) => command.id().clone(),
-        PaletteSelectionOutcome::EmptyQuery
-        | PaletteSelectionOutcome::NoMatch
-        | PaletteSelectionOutcome::NotPaletteInvocable => {
-            commands.trigger(ImeRejectCommit {
-                session_id: commit.session_id,
-                attempt_id: commit.attempt_id,
-                reason:     ImeRejection::AppOwned(
-                    selection_rejection_reason(selection).to_owned(),
-                ),
-            });
-            return;
-        },
+    let selection = query_result.selection();
+    let highlighted_row = row_cursor
+        .copied()
+        .unwrap_or_default()
+        .highlighted_row(command_row_list(selection, query_result.rows().len()));
+    let Some(command_row) = highlighted_row.and_then(|row| query_result.rows().get(row)) else {
+        commands.trigger(ImeRejectCommit {
+            session_id: commit.session_id,
+            attempt_id: commit.attempt_id,
+            reason:     ImeRejection::AppOwned(selection_rejection_reason(selection).to_owned()),
+        });
+        return;
     };
+    let command_id = command_row.command().id().clone();
 
     accept_palette_commit(commit, &mut commands);
     commands.entity(panel).despawn();
@@ -621,6 +708,9 @@ const fn selection_rejection_reason(selection: PaletteSelectionOutcome<'_>) -> &
 }
 
 /// Closes the palette when the IME session is canceled, which is what Escape does.
+///
+/// A session that ended because the window lost focus keeps the palette open
+/// instead, and resumes once the window has focus again.
 fn close_on_cancel(
     canceled: On<ImeCanceled>,
     panels: Query<Entity, With<CommandPalettePanel>>,
@@ -631,9 +721,45 @@ fn close_on_cancel(
     };
     let open_palette_panel = OpenPalettePanel(panel);
     if open_palette_panel.ime_target_ownership(&canceled.target)
-        == PaletteImeTargetOwnership::OwnedByOpenPanel
+        != PaletteImeTargetOwnership::OwnedByOpenPanel
     {
+        return;
+    }
+    if canceled.cause == ImeCancelCause::FocusLost {
+        commands.entity(panel).insert(PaletteAwaitingWindowFocus);
+    } else {
         commands.entity(panel).despawn();
+    }
+}
+
+/// Marks a palette whose query session ended because its window lost focus.
+#[derive(Component)]
+struct PaletteAwaitingWindowFocus;
+
+/// Resumes the query session of a palette that stayed open while its window lost focus.
+fn resume_palette_after_window_focus(
+    windows: Query<&Window>,
+    palettes: Query<
+        (Entity, &PaletteImeSessionWindow, &PaletteCommittedQuery),
+        With<PaletteAwaitingWindowFocus>,
+    >,
+    mut commands: Commands,
+) {
+    for (panel, session_window, palette_query) in &palettes {
+        if windows
+            .get(session_window.0)
+            .is_ok_and(|window| window.focused)
+        {
+            commands
+                .entity(panel)
+                .remove::<PaletteAwaitingWindowFocus>();
+            open_palette_session(
+                panel,
+                session_window.0,
+                palette_query.0.clone(),
+                &mut commands,
+            );
+        }
     }
 }
 
@@ -665,26 +791,12 @@ enum RevealInParent {
 
 /// Hands `path` to the platform's file handler.
 fn open_path(path: &Path, reveal_in_parent: RevealInParent) {
-    #[cfg(target_os = "macos")]
-    let mut opener = {
-        let mut opener = Command::new("open");
-        if reveal_in_parent == RevealInParent::Yes {
-            opener.arg("-R");
-        }
-        opener
-    };
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let mut opener = {
-        let _ = reveal_in_parent;
-        Command::new("xdg-open")
-    };
-    #[cfg(windows)]
-    let mut opener = {
-        let _ = reveal_in_parent;
-        Command::new("explorer")
+    let opened = match reveal_in_parent {
+        RevealInParent::Yes => opener::reveal(path),
+        RevealInParent::No => opener::open(path),
     };
 
-    if let Err(error) = opener.arg(path).spawn() {
+    if let Err(error) = opened {
         error!(
             "fairy_dust: the command palette could not open {}: {error}",
             path.display()
@@ -702,6 +814,7 @@ fn rebuild_palette(
     effective_keymap_status: &EffectiveKeymapStatus,
     registry_assembly: PaletteRegistryAssembly<'_>,
     palette_query: &str,
+    row_cursor: PaletteRowCursor,
     commands: &mut Commands,
 ) {
     let Ok(window) = windows.single() else {
@@ -717,6 +830,7 @@ fn rebuild_palette(
         active_context,
         effective_keymap_status,
         palette_query,
+        row_cursor,
         panel_width,
     );
     commands
@@ -756,6 +870,7 @@ fn build_palette_presentation(
     active_context: &ActiveKeymapContext,
     effective_keymap_status: &EffectiveKeymapStatus,
     palette_query: &str,
+    row_cursor: PaletteRowCursor,
     panel_width: f32,
 ) -> PaletteTreePresentation {
     let keymap_failures = keymap_failure_rows(keymap_load_failures, keymap_path_availability);
@@ -775,7 +890,13 @@ fn build_palette_presentation(
                 keymap_bindings,
                 palette_query,
             );
-            palette_tree_for_query(palette_query, &query_result, &keymap_failures, panel_width)
+            palette_tree_for_query(
+                palette_query,
+                &query_result,
+                row_cursor,
+                &keymap_failures,
+                panel_width,
+            )
         },
     };
 
@@ -972,6 +1093,7 @@ mod tests {
     use bevy::state::app::StatesPlugin;
     use bevy::window::Ime;
     use bevy::window::PrimaryWindow;
+    use bevy::window::WindowFocused;
     use hana_diegetic::DiegeticPanel;
     use hana_diegetic::DiegeticTextMeasurer;
     use hana_diegetic::HeadlessDiegeticUiPlugin;
@@ -1000,6 +1122,7 @@ mod tests {
     use self::test_support::HELD_COMMAND_ID;
     use self::test_support::OPEN_COMMAND_ID;
     use self::test_support::PaletteTestDispatchEvent;
+    use self::test_support::PaletteTestRecoverEvent;
     use self::test_support::command_id;
     use self::test_support::palette_test_app;
     use super::*;
@@ -1289,7 +1412,10 @@ mod tests {
     }
 
     fn recovery_modifier() -> KeyCode {
-        if cfg!(target_os = "macos") {
+        if crate::command_palette_recovery_keystroke()
+            .modifiers()
+            .has_platform()
+        {
             KeyCode::SuperLeft
         } else {
             KeyCode::ControlLeft
@@ -1787,6 +1913,119 @@ mod tests {
         assert_eq!(outcomes.rejected, 0);
         assert_eq!(app.world().resource::<DispatchedCommands>().0, 0);
         assert_eq!(palette_panel_count(&mut app), 0);
+    }
+
+    /// Counts which of the two `Palette Test` rows Enter ran.
+    #[derive(Default, Resource)]
+    struct PaletteTestRowRuns {
+        dispatch: usize,
+        recover:  usize,
+    }
+
+    /// A runtime palette that counts runs of both invocable `Palette Test` rows.
+    fn palette_test_row_app() -> App {
+        let mut app = palette_runtime_app();
+        app.init_resource::<PaletteTestRowRuns>()
+            .add_observer(
+                |_: On<PaletteTestDispatchEvent>, mut runs: ResMut<PaletteTestRowRuns>| {
+                    runs.dispatch += 1;
+                },
+            )
+            .add_observer(
+                |_: On<PaletteTestRecoverEvent>, mut runs: ResMut<PaletteTestRowRuns>| {
+                    runs.recover += 1;
+                },
+            );
+        app
+    }
+
+    fn press_arrow_down(app: &mut App) {
+        press_keys(app, [KeyCode::ArrowDown]);
+        app.update();
+        release_key(app, KeyCode::ArrowDown);
+        app.update();
+    }
+
+    fn set_window_focus(app: &mut App, focused: bool) {
+        let window = primary_window(app);
+        if let Some(mut window_component) = app.world_mut().get_mut::<Window>(window) {
+            window_component.focused = focused;
+        }
+        app.world_mut()
+            .write_message(WindowFocused { window, focused });
+        app.update();
+    }
+
+    #[test]
+    fn down_then_enter_runs_the_second_row() {
+        let mut app = palette_test_row_app();
+
+        press_recovery_keystroke(&mut app);
+        commit_ime_text(&mut app, "Palette Test");
+        press_arrow_down(&mut app);
+        request_palette_ime_commit(&mut app, ImeCommitCause::Request);
+
+        let runs = app.world().resource::<PaletteTestRowRuns>();
+        assert_eq!((runs.dispatch, runs.recover), (0, 1));
+    }
+
+    #[test]
+    fn down_from_an_empty_query_highlights_the_first_row() {
+        let mut app = palette_runtime_app();
+        press_recovery_keystroke(&mut app);
+        let panel = palette_panel(&mut app);
+        let highlighted_row = |app: &App| {
+            let query_result = query_command_palette(
+                app.world().resource(),
+                app.world().resource(),
+                app.world().resource(),
+                app.world().resource(),
+                "",
+            );
+            app.world()
+                .get::<PaletteRowCursor>(panel)
+                .expect("an open palette carries a row cursor")
+                .highlighted_row(command_row_list(
+                    query_result.selection(),
+                    query_result.rows().len(),
+                ))
+        };
+        assert_eq!(highlighted_row(&app), None);
+
+        press_arrow_down(&mut app);
+
+        assert_eq!(highlighted_row(&app), Some(0));
+    }
+
+    #[test]
+    fn focus_loss_keeps_the_palette_and_focus_return_resumes_its_query() {
+        let mut app = palette_test_row_app();
+        press_recovery_keystroke(&mut app);
+        commit_ime_text(&mut app, DISPATCH_COMMAND_TITLE);
+
+        set_window_focus(&mut app, false);
+        app.update();
+
+        assert_eq!(
+            palette_panel_count(&mut app),
+            1,
+            "losing focus keeps the palette open"
+        );
+        assert_eq!(app.world().resource::<PaletteImeSessions>().0.len(), 1);
+
+        set_window_focus(&mut app, true);
+
+        assert_eq!(
+            app.world().resource::<PaletteImeSessions>().0.len(),
+            2,
+            "focus coming back opens a new query session"
+        );
+        request_palette_ime_commit(&mut app, ImeCommitCause::Request);
+        assert_eq!(
+            app.world().resource::<PaletteTestRowRuns>().dispatch,
+            1,
+            "the resumed session carries the query typed before focus left"
+        );
     }
 
     #[test]

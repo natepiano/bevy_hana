@@ -8,29 +8,27 @@
 //! `CAMetalDrawable.addPresentedHandler` is the per-frame signal to replace this poll with when a
 //! hook into the surface becomes available.
 //!
-//! The poll exists on macOS and in tests. On other production platforms the confirmation source
-//! still exists, but declares its signal absent, so every output window explicitly carries
-//! `OutputProof::NoSignalAvailable` instead of an unconfirmed proof that promises evidence which
-//! can never arrive.
+//! The poll runs wherever the signal is provided: on macOS, whose `native` backend reads `AppKit`,
+//! and in tests, which script the reading. On other production platforms the `native` backend
+//! declares the signal absent, so the poll is never installed and every output window explicitly
+//! carries `OutputProof::NoSignalAvailable` instead of an unconfirmed proof that promises evidence
+//! which can never arrive.
+
+#[cfg_attr(target_os = "macos", path = "macos.rs")]
+#[cfg_attr(not(target_os = "macos"), path = "unsupported.rs")]
+mod native;
 
 #[cfg(test)]
 use std::collections::HashMap;
 use std::time::Duration;
 
 use bevy::app::App;
-#[cfg(any(target_os = "macos", test))]
 use bevy::app::PostUpdate;
-#[cfg(any(target_os = "macos", test))]
 use bevy::ecs::system::Local;
-#[cfg(any(target_os = "macos", test))]
 use bevy::ecs::system::NonSendMarker;
-#[cfg(any(target_os = "macos", test))]
 use bevy::prelude::Entity;
-#[cfg(any(target_os = "macos", test))]
 use bevy::prelude::IntoScheduleConfigs;
-#[cfg(any(target_os = "macos", test))]
 use bevy::prelude::Query;
-#[cfg(any(target_os = "macos", test))]
 use bevy::prelude::Res;
 #[cfg(test)]
 use bevy::prelude::ResMut;
@@ -38,23 +36,11 @@ use bevy::prelude::ResMut;
 use bevy::prelude::Resource;
 use bevy::time::Time;
 use bevy::time::Virtual;
-#[cfg(target_os = "macos")]
-use bevy::winit::WINIT_WINDOWS;
 use hana_rigging::prelude::ConfirmationSignal;
 use hana_rigging::prelude::OutputConfirmation;
-#[cfg(any(target_os = "macos", test))]
 use hana_rigging::prelude::OutputConfirmationSource;
 use hana_rigging::prelude::OutputProofPlugin;
-#[cfg(any(target_os = "macos", test))]
 use hana_rigging::prelude::OutputProofSystems;
-#[cfg(target_os = "macos")]
-use objc2_app_kit::NSView;
-#[cfg(target_os = "macos")]
-use objc2_app_kit::NSWindowOcclusionState;
-#[cfg(target_os = "macos")]
-use raw_window_handle::HasWindowHandle;
-#[cfg(target_os = "macos")]
-use raw_window_handle::RawWindowHandle;
 
 #[cfg(test)]
 use crate::restore::InjectedWinitWindows;
@@ -76,10 +62,10 @@ use crate::restore::InjectedWinitWindows;
 pub(crate) struct OnScreenConfirmation;
 
 impl OutputConfirmation for OnScreenConfirmation {
-    const SIGNAL: ConfirmationSignal = if cfg!(any(target_os = "macos", test)) {
+    const SIGNAL: ConfirmationSignal = if cfg!(test) {
         ConfirmationSignal::Provided
     } else {
-        ConfirmationSignal::Absent
+        native::SIGNAL
     };
 
     fn cadence(&self) -> Duration { Duration::from_secs(1) }
@@ -97,11 +83,12 @@ pub(crate) fn register_window_output_proof(app: &mut App) {
     app.add_plugins(OutputProofPlugin::<OnScreenConfirmation>::new());
     #[cfg(test)]
     app.init_resource::<ScriptedWindowOnScreenReadings>();
-    #[cfg(any(target_os = "macos", test))]
-    app.add_systems(
-        PostUpdate,
-        poll_windows_on_screen.before(OutputProofSystems::Age),
-    );
+    if matches!(OnScreenConfirmation::SIGNAL, ConfirmationSignal::Provided) {
+        app.add_systems(
+            PostUpdate,
+            poll_windows_on_screen.before(OutputProofSystems::Age),
+        );
+    }
 }
 
 /// What `AppKit` reported about one native window's relationship to the visible desktop.
@@ -142,13 +129,6 @@ enum WindowOnScreenObservation {
     /// The OS, or the test double standing in for it, produced this reading.
     Reading(WindowOnScreenReading),
     /// Winit has not created the native window for this entity yet.
-    #[cfg_attr(
-        not(target_os = "macos"),
-        allow(
-            dead_code,
-            reason = "only the native macOS poll observes a window before winit creates it"
-        )
-    )]
     NoNativeWindowYet,
     /// The test double has no reading scripted for this entity.
     #[cfg_attr(
@@ -163,11 +143,9 @@ enum WindowOnScreenObservation {
 /// Starting at zero deliberately makes a newly installed poll read immediately. Every completed
 /// poll moves the deadline by half the source cadence, which detects a stopped report in time for
 /// the proof to demote within one full cadence without asking `AppKit` on every frame.
-#[cfg(any(target_os = "macos", test))]
 #[derive(Default)]
 struct NextWindowOnScreenReadingAt(Duration);
 
-#[cfg(any(target_os = "macos", test))]
 impl NextWindowOnScreenReadingAt {
     fn is_due(&self, now: Duration) -> bool { now >= self.0 }
 
@@ -213,7 +191,6 @@ impl ScriptedWindowOnScreenReadings {
 /// The query is over confirmation sources rather than general windows: a
 /// `WindowRiggingRole` requires this source for exactly its managed lifetime, so the component is
 /// the presenter's declaration that this operating-system reading belongs to it.
-#[cfg(any(target_os = "macos", test))]
 fn poll_windows_on_screen(
     time: Res<Time<Virtual>>,
     mut next_reading_at: Local<NextWindowOnScreenReadingAt>,
@@ -229,13 +206,17 @@ fn poll_windows_on_screen(
     next_reading_at.postpone_from(now, OnScreenConfirmation.cadence() / 2);
 
     for (window, mut confirmation) in &mut output_windows {
-        let observation = observe_window_on_screen(
-            window,
-            #[cfg(test)]
-            injected_windows.as_deref(),
-            #[cfg(test)]
-            &mut scripted_readings,
-        );
+        // An injected winit resource declares a headless test boundary. Its presence stands native
+        // lookup down wholesale; whether evidence exists for this particular entity belongs to the
+        // scripted reading and becomes `NoScriptedReading`, never `OnNoScreen`.
+        #[cfg(test)]
+        let observation = if injected_windows.is_some() {
+            scripted_readings.observe(window)
+        } else {
+            native::observe_native_window_on_screen(window)
+        };
+        #[cfg(not(test))]
+        let observation = native::observe_native_window_on_screen(window);
         if matches!(
             observation,
             WindowOnScreenObservation::Reading(WindowOnScreenReading::ReportedVisible)
@@ -243,68 +224,4 @@ fn poll_windows_on_screen(
             confirmation.confirm(&time);
         }
     }
-}
-
-/// Take one named observation at the boundary where scripted or native window evidence arrives.
-#[cfg(any(target_os = "macos", test))]
-fn observe_window_on_screen(
-    window: Entity,
-    #[cfg(test)] injected_windows: Option<&InjectedWinitWindows>,
-    #[cfg(test)] scripted_readings: &mut ScriptedWindowOnScreenReadings,
-) -> WindowOnScreenObservation {
-    // An injected winit resource declares a headless test boundary. Its presence stands native
-    // lookup down wholesale; whether evidence exists for this particular entity belongs to the
-    // scripted reading and becomes `NoScriptedReading`, never `OnNoScreen`.
-    #[cfg(test)]
-    {
-        match injected_windows {
-            Some(_) => scripted_readings.observe(window),
-            None => {
-                #[cfg(target_os = "macos")]
-                {
-                    observe_native_window_on_screen(window)
-                }
-                // A non-macOS test has no native branch to fall through to, but still exercises
-                // the same poll and decision over its scripted observation.
-                #[cfg(not(target_os = "macos"))]
-                scripted_readings.observe(window)
-            },
-        }
-    }
-
-    #[cfg(all(target_os = "macos", not(test)))]
-    observe_native_window_on_screen(window)
-}
-
-/// Read `AppKit`'s screen association and occlusion state for one exact Bevy window entity.
-#[cfg(target_os = "macos")]
-fn observe_native_window_on_screen(window: Entity) -> WindowOnScreenObservation {
-    WINIT_WINDOWS.with(|winit_windows| {
-        let winit_windows = winit_windows.borrow();
-        let Some(winit_window) = winit_windows.get_window(window) else {
-            return WindowOnScreenObservation::NoNativeWindowYet;
-        };
-        let Ok(handle) = winit_window.window_handle() else {
-            return WindowOnScreenObservation::NoNativeWindowYet;
-        };
-        let RawWindowHandle::AppKit(appkit_handle) = handle.as_raw() else {
-            return WindowOnScreenObservation::NoNativeWindowYet;
-        };
-        // SAFETY: `ns_view` is a valid `NSView` pointer from winit's window handle.
-        let ns_view: &NSView = unsafe { appkit_handle.ns_view.cast().as_ref() };
-        let Some(ns_window) = ns_view.window() else {
-            return WindowOnScreenObservation::NoNativeWindowYet;
-        };
-        let reading = if ns_window.screen().is_none() {
-            WindowOnScreenReading::OnNoScreen
-        } else if ns_window
-            .occlusionState()
-            .contains(NSWindowOcclusionState::Visible)
-        {
-            WindowOnScreenReading::ReportedVisible
-        } else {
-            WindowOnScreenReading::ReportedOccluded
-        };
-        WindowOnScreenObservation::Reading(reading)
-    })
 }

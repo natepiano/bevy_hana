@@ -61,17 +61,6 @@ pub(crate) const POSE_FIELD_COUNT: usize = 6;
 pub(crate) const POSE_FIELD_SEPARATOR: char = ',';
 pub(crate) const RESTART_CAMERA_RESTORE_DURATION: Duration = Duration::from_secs(2);
 
-// cargo restart
-pub(crate) const CARGO_BIN: &str = "cargo";
-pub(crate) const CARGO_EXAMPLES_DIR: &str = "examples";
-pub(crate) const CARGO_EXAMPLE_FLAG: &str = "--example";
-pub(crate) const CARGO_MANIFEST_PATH_FLAG: &str = "--manifest-path";
-pub(crate) const CARGO_RELEASE_FLAG: &str = "--release";
-pub(crate) const CARGO_RUN_SUBCOMMAND: &str = "run";
-pub(crate) const EXIT_STATUS_FAILURE: i32 = 1;
-#[cfg(windows)]
-pub(crate) const EXIT_STATUS_SUCCESS: i32 = 0;
-
 // cascade shadow
 // An orthographic `OrbitCam` parks at a fixed `(near + far) / 2` distance that a
 // small scene's radius-based fit can't reach, so the cascade also extends to

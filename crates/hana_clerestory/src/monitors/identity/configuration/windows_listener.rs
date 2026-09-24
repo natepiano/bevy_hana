@@ -10,6 +10,7 @@ use bevy::log::error;
 
 use super::MonitorConfigurationGenerationTracker;
 use super::constants::WINDOWS_NOTIFICATION_WAIT_MILLISECONDS;
+use crate::monitors::identity::ConfigurationNotificationError;
 use crate::monitors::identity::MonitorIdentificationError;
 use crate::monitors::identity::OperatingSystemQueryError;
 
@@ -34,7 +35,7 @@ impl WindowsListenerOwner {
         let (sender, receiver) = sync_channel(1);
         let thread = thread::Builder::new()
             .spawn(move || notification_thread(backend, tracker, thread_control, sender))
-            .map_err(|_| OperatingSystemQueryError::ConfigurationNotificationRegistration)?;
+            .map_err(|_| ConfigurationNotificationError::Registration)?;
 
         match receiver.recv() {
             Ok(Ok(())) => Ok(Self {
@@ -48,7 +49,7 @@ impl WindowsListenerOwner {
             },
             Err(_) => {
                 let _ = thread.join();
-                Err(OperatingSystemQueryError::ConfigurationNotificationRegistration)
+                Err(ConfigurationNotificationError::Registration.into())
             },
         }
     }
@@ -61,7 +62,7 @@ impl WindowsListenerOwner {
         };
         thread
             .join()
-            .map_err(|_| OperatingSystemQueryError::ConfigurationNotificationRemoval)
+            .map_err(|_| ConfigurationNotificationError::Removal.into())
     }
 }
 
@@ -95,9 +96,7 @@ fn notification_thread<B>(
 
     while control.is_listening() {
         match resources.wait_for_event(WINDOWS_NOTIFICATION_WAIT_MILLISECONDS) {
-            #[cfg(target_os = "windows")]
-            Ok(ListenerWait::Events) => {},
-            Ok(ListenerWait::Timeout) => {},
+            Ok(ListenerWait::Events | ListenerWait::Timeout) => {},
             Ok(ListenerWait::Exit | ListenerWait::Stop) => break,
             Err(()) => {
                 resources.fail_notification_stream();
@@ -184,11 +183,11 @@ where
         let tracker = self
             .tracker
             .as_ref()
-            .ok_or(OperatingSystemQueryError::ConfigurationNotificationRegistration)?;
+            .ok_or(ConfigurationNotificationError::Registration)?;
         let backend = self
             .backend
             .as_mut()
-            .ok_or(OperatingSystemQueryError::ConfigurationNotificationRegistration)?;
+            .ok_or(ConfigurationNotificationError::Registration)?;
         backend.register_window_class(tracker)?;
         self.stage = ListenerSetupStage::ClassRegistered;
 
@@ -292,7 +291,6 @@ enum ListenerSetupStage {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ListenerWait {
-    #[cfg(target_os = "windows")]
     Events,
     Timeout,
     Exit,
@@ -337,9 +335,7 @@ impl WindowsListenerStatus {
 }
 
 pub(super) fn log_removal_error() {
-    let error = MonitorIdentificationError::from(
-        OperatingSystemQueryError::ConfigurationNotificationRemoval,
-    );
+    let error = MonitorIdentificationError::from(ConfigurationNotificationError::Removal);
     error!("[MonitorConfiguration] {error}");
 }
 
@@ -395,7 +391,7 @@ mod tests {
 
         assert_eq!(
             result,
-            Err(OperatingSystemQueryError::ConfigurationNotificationRegistration)
+            Err(ConfigurationNotificationError::Registration.into())
         );
         let state = state
             .lock()
@@ -451,9 +447,25 @@ mod tests {
                 .as_deref()
                 .expect("test should retain its tracker owner")
                 .state(),
-            MonitorConfigurationState::Unavailable(
-                OperatingSystemQueryError::ConfigurationNotificationStream.into()
-            )
+            MonitorConfigurationState::Unavailable(ConfigurationNotificationError::Stream.into())
+        );
+        assert_eq!(listener.shutdown(SignalResult::Delivered), Ok(()));
+        listener.assert_full_cleanup();
+    }
+
+    #[test]
+    fn delivered_events_keep_the_listener_waiting() {
+        let mut listener =
+            FakeListener::start(VecDeque::from([FakeWait::Events, FakeWait::StreamFailure]));
+        listener.wait_until_complete();
+        // Only a second wait can fail the stream, so the loop continued past the events.
+        assert_eq!(
+            listener
+                .tracker
+                .as_deref()
+                .expect("test should retain its tracker owner")
+                .state(),
+            MonitorConfigurationState::Unavailable(ConfigurationNotificationError::Stream.into())
         );
         assert_eq!(listener.shutdown(SignalResult::Delivered), Ok(()));
         listener.assert_full_cleanup();
@@ -466,7 +478,7 @@ mod tests {
 
         assert_eq!(
             listener.shutdown(SignalResult::Delivered),
-            Err(OperatingSystemQueryError::ConfigurationNotificationRemoval)
+            Err(ConfigurationNotificationError::Removal.into())
         );
         listener.assert_full_cleanup();
     }
@@ -730,7 +742,7 @@ mod tests {
                 .failure
                 == Some(operation)
             {
-                Err(OperatingSystemQueryError::ConfigurationNotificationRegistration)
+                Err(ConfigurationNotificationError::Registration.into())
             } else {
                 Ok(())
             }
@@ -810,6 +822,7 @@ mod tests {
                 let _ = wait_started.send(());
             }
             match wait {
+                Some(FakeWait::Events) => Ok(ListenerWait::Events),
                 Some(FakeWait::Exit) => Ok(ListenerWait::Exit),
                 Some(FakeWait::Panic) => panic!("fake listener worker panic"),
                 Some(FakeWait::StreamFailure) => Err(()),
@@ -957,6 +970,7 @@ mod tests {
 
     #[derive(Clone, Copy)]
     enum FakeWait {
+        Events,
         Exit,
         Panic,
         StreamFailure,

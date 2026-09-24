@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::str;
 
 use hana_rigging::prelude::AttachmentPath;
+use hana_rigging::prelude::PlatformDeviceHandle;
 use hana_rigging::prelude::ReportedId;
+use hana_rigging::prelude::ReportedSerial;
 use winit::monitor::MonitorHandle;
 use winit::platform::x11::MonitorHandleExtX11;
 use x11rb::NONE;
@@ -21,20 +23,22 @@ use crate::Platform;
 use crate::constants::DRM_CLASS_DIRECTORY;
 use crate::constants::DRM_CONNECTOR_EDID_FILE;
 use crate::constants::DRM_CONNECTOR_NAME_SEPARATOR;
-use crate::constants::DRM_INTERNAL_CONNECTOR_EVIDENCE_TAG;
-use crate::constants::DRM_INTERNAL_CONNECTOR_PREFIXES;
 use crate::constants::X11_EDID_PROPERTY_NAME;
+use crate::monitors::DisplayProductName;
+#[cfg(any(test, feature = "test"))]
+use crate::monitors::identity;
+use crate::monitors::identity::DisplayFingerprint;
+use crate::monitors::identity::DisplayIdentityEvidence;
 use crate::monitors::identity::MonitorIdentificationError;
 use crate::monitors::identity::OperatingSystemQueryError;
 use crate::monitors::identity::edid::EdidEvidence;
 use crate::monitors::identity::edid::EdidIdentityEvidence;
+use crate::monitors::identity::internal_connector::InternalConnector;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(in crate::monitors) enum QualifiedEvidence {
     InternalConnector(InternalConnector),
     LinuxEdid(EdidIdentityEvidence),
-    #[cfg(test)]
-    WindowsEdid(EdidIdentityEvidence),
     #[cfg(any(test, feature = "test"))]
     Synthetic(Vec<u8>),
 }
@@ -45,35 +49,30 @@ impl QualifiedEvidence {
         match self {
             Self::InternalConnector(connector) => connector.as_bytes(),
             Self::LinuxEdid(edid) => edid.stable_bytes(),
-            #[cfg(test)]
-            Self::WindowsEdid(edid) => edid.stable_bytes(),
             #[cfg(any(test, feature = "test"))]
             Self::Synthetic(bytes) => bytes,
         }
     }
-}
 
-/// The DRM connector name of a display built into the machine, tagged with
-/// [`DRM_INTERNAL_CONNECTOR_EVIDENCE_TAG`].
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(in crate::monitors) struct InternalConnector(Vec<u8>);
-
-impl InternalConnector {
-    /// The evidence for `connector_name`, or `None` when that connector accepts a replaceable
-    /// display.
-    fn identify(connector_name: &str) -> Option<Self> {
-        DRM_INTERNAL_CONNECTOR_PREFIXES
-            .iter()
-            .any(|prefix| connector_name.starts_with(prefix))
-            .then(|| {
-                let mut evidence = DRM_INTERNAL_CONNECTOR_EVIDENCE_TAG.to_vec();
-                evidence.extend_from_slice(connector_name.as_bytes());
-                Self(evidence)
-            })
+    /// Reporter evidence for this observation, given the `fingerprint` of its stable bytes.
+    pub(in crate::monitors::identity) fn identity_evidence(
+        &self,
+        fingerprint: DisplayFingerprint,
+    ) -> DisplayIdentityEvidence {
+        match self {
+            Self::InternalConnector(_) => DisplayIdentityEvidence::Synthesized {
+                display_fingerprint: fingerprint,
+                serial:              ReportedSerial::PlatformCannotReport,
+            },
+            Self::LinuxEdid(edid) => edid.identity_evidence(fingerprint),
+            #[cfg(any(test, feature = "test"))]
+            Self::Synthetic(_) => identity::synthesized_without_serial(fingerprint),
+        }
     }
-
-    fn as_bytes(&self) -> &[u8] { &self.0 }
 }
+
+/// Report no active-display detail: this backend has no display count apart from winit's.
+pub(crate) const fn active_display_detail(_: usize) -> Option<String> { None }
 
 pub(in crate::monitors) fn monitor_evidence(
     handle: &MonitorHandle,
@@ -93,6 +92,28 @@ pub(in crate::monitors) fn monitor_evidence(
             attachment: attachment_path_when_unreported(platform),
         },
     }
+}
+
+/// Join capture evidence using the compositor's exact connector name.
+/// The durable device identity still comes from the display's EDID evidence.
+pub(in crate::monitors) fn platform_device_handle(
+    monitor_handle: Option<&MonitorHandle>,
+) -> PlatformDeviceHandle {
+    let Some(name) = monitor_handle
+        .and_then(MonitorHandle::name)
+        .filter(|name| !name.is_empty())
+    else {
+        return PlatformDeviceHandle::PlatformReportedNothing;
+    };
+    ReportedId::new(format!("linux-output:{name}")).map_or(
+        PlatformDeviceHandle::PlatformReportedNothing,
+        PlatformDeviceHandle::Reported,
+    )
+}
+
+/// Report no `AppKit` product name: this backend has no `AppKit` screen list to read one from.
+pub(in crate::monitors) const fn product_name(_: Option<&MonitorHandle>) -> DisplayProductName {
+    DisplayProductName::NotReported
 }
 
 /// Return identity evidence for a Wayland output from the DRM connector that shares its name.
@@ -294,42 +315,10 @@ mod tests {
     }
 
     #[test]
-    fn every_internal_connector_prefix_names_its_display() {
-        for prefix in DRM_INTERNAL_CONNECTOR_PREFIXES {
-            let connector_name = format!("{prefix}1");
-
-            assert!(InternalConnector::identify(&connector_name).is_some());
-        }
-    }
-
-    #[test]
-    fn connectors_that_accept_any_display_name_no_display() {
-        for connector_name in ["DP-1", "DVI-D-1", "HDMI-A-1", "VGA-1", "Virtual-1"] {
-            assert!(InternalConnector::identify(connector_name).is_none());
-        }
-    }
-
-    #[test]
-    fn internal_connector_evidence_is_tagged_and_distinct_per_connector() {
-        let first = InternalConnector::identify("eDP-1").expect("eDP-1 is internal");
-        let second = InternalConnector::identify("eDP-2").expect("eDP-2 is internal");
-        let qualified = QualifiedEvidence::InternalConnector(first.clone());
-
-        assert!(
-            qualified
-                .stable_bytes()
-                .starts_with(DRM_INTERNAL_CONNECTOR_EVIDENCE_TAG)
-        );
-        assert_ne!(first.as_bytes(), second.as_bytes());
-    }
-
-    #[test]
     fn qualified_edid_variants_retain_the_extracted_serial_tier() {
         let identity = qualify_edid(Ok(serial_edid())).expect("fixture EDID should qualify");
-        let windows = QualifiedEvidence::WindowsEdid(identity.clone());
         let linux = QualifiedEvidence::LinuxEdid(identity);
 
-        assert_eq!(windows.stable_bytes(), b"42");
         assert_eq!(linux.stable_bytes(), b"42");
     }
 

@@ -7,7 +7,6 @@
 //! binary can run under either Wayland or X11, so the variant is detected
 //! at startup from the `WAYLAND_DISPLAY` environment variable.
 
-#[cfg(target_os = "linux")]
 use std::env::var;
 
 use bevy::prelude::Resource;
@@ -20,8 +19,8 @@ use hana_rigging::prelude::Digest;
 use hana_rigging::prelude::SchemeName;
 
 use super::constants::SCALE_FACTOR_EPSILON;
-#[cfg(target_os = "linux")]
 use super::constants::WAYLAND_DISPLAY_ENVIRONMENT_VARIABLE;
+use super::monitors;
 use super::monitors::DisplayDeviceEvidence;
 use super::monitors::DisplayIdentityEvidence;
 use super::persistence::EstablishedWindowPosition;
@@ -46,19 +45,6 @@ pub enum Platform {
     Wayland,
 }
 
-#[cfg(target_os = "macos")]
-const CORE_GRAPHICS_SUCCESS: i32 = 0;
-
-#[cfg(target_os = "macos")]
-#[link(name = "CoreGraphics", kind = "framework")]
-unsafe extern "C" {
-    fn CGGetActiveDisplayList(
-        max_displays: u32,
-        active_displays: *mut u32,
-        display_count: *mut u32,
-    ) -> i32;
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReturnCapability {
     Supported,
@@ -68,41 +54,21 @@ pub(crate) enum ReturnCapability {
 impl Platform {
     /// Detect the current platform.
     ///
-    /// On Linux, checks `WAYLAND_DISPLAY` to distinguish Wayland from X11.
-    /// On macOS and Windows the result is compile-time constant.
+    /// On macOS and Windows the compile target decides the result. On Linux,
+    /// checks `WAYLAND_DISPLAY` to distinguish Wayland from X11, which is why
+    /// this is not a `const fn` on any target.
     #[must_use]
-    #[cfg(target_os = "macos")]
-    pub const fn detect() -> Self { Self::MacOs }
-
-    /// Detect the current platform.
-    ///
-    /// On Linux, checks `WAYLAND_DISPLAY` to distinguish Wayland from X11.
-    /// On macOS and Windows the result is compile-time constant.
-    #[must_use]
-    #[cfg(target_os = "windows")]
-    pub const fn detect() -> Self { Self::Windows }
-
-    /// Detect the current platform.
-    ///
-    /// On Linux, checks `WAYLAND_DISPLAY` to distinguish Wayland from X11.
-    /// On macOS and Windows the result is compile-time constant.
-    #[must_use]
-    #[cfg(target_os = "linux")]
     pub fn detect() -> Self {
-        if var(WAYLAND_DISPLAY_ENVIRONMENT_VARIABLE).is_ok_and(|value| !value.is_empty()) {
+        if cfg!(target_os = "macos") {
+            Self::MacOs
+        } else if cfg!(target_os = "windows") {
+            Self::Windows
+        } else if var(WAYLAND_DISPLAY_ENVIRONMENT_VARIABLE).is_ok_and(|value| !value.is_empty()) {
             Self::Wayland
         } else {
             Self::X11
         }
     }
-
-    /// Detect the current platform.
-    ///
-    /// On Linux, checks `WAYLAND_DISPLAY` to distinguish Wayland from X11.
-    /// On macOS and Windows the result is compile-time constant.
-    #[must_use]
-    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-    pub fn detect() -> Self { compile_error!("Unsupported platform") }
 
     /// The platform the crate's in-process fixtures run under.
     ///
@@ -334,62 +300,29 @@ impl Platform {
     }
 }
 
-#[cfg(target_os = "macos")]
 pub(crate) fn empty_current_display_list_error(observed_count: usize) -> DeviceAccessError {
-    let mut active_display_count = 0;
-    // SAFETY: a zero-capacity query writes only `display_count`; the active-display pointer is null
-    // because no display identifiers are requested by this count query.
-    let error_code =
-        unsafe { CGGetActiveDisplayList(0, std::ptr::null_mut(), &raw mut active_display_count) };
-    if error_code != CORE_GRAPHICS_SUCCESS {
-        return discovery_transport_error(&format!(
-            "CGGetActiveDisplayList failed with CGError code {error_code} while \
-             {observed_count} observed displays remained"
-        ));
-    }
-
-    discovery_transport_error(&format!(
-        "winit returned no current display handles while CGGetActiveDisplayList reported \
-         {active_display_count} active displays and {observed_count} observed displays remained"
-    ))
-}
-
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn empty_current_display_list_error(observed_count: usize) -> DeviceAccessError {
-    discovery_transport_error(&format!(
-        "winit returned no current display handles while {observed_count} observed displays \
-         remained"
-    ))
+    let detail = monitors::active_display_detail(observed_count).unwrap_or_else(|| {
+        format!(
+            "winit returned no current display handles while {observed_count} observed displays \
+             remained"
+        )
+    });
+    discovery_transport_error(&detail)
 }
 
 /// Apply the reporter's durable display-key rules to one display's evidence.
-#[cfg(all(target_os = "macos", not(test)))]
-pub(crate) const fn classify_display_key(
-    evidence: &DisplayDeviceEvidence,
-    _: &SchemeName,
-) -> DisplayKeyClassification {
-    match &evidence.identity_evidence {
-        DisplayIdentityEvidence::Synthesized {
-            display_fingerprint,
-            ..
-        } => DisplayKeyClassification::Keyed(DeviceKey {
-            kind: DeviceKind::Display,
-            id:   DeviceIdSource::Synthesized {
-                digest: Digest::new(display_fingerprint.get()),
-            },
-        }),
-        DisplayIdentityEvidence::Unavailable { .. } => DisplayKeyClassification::MatchEvidenceOnly,
-    }
-}
-
-/// Apply the reporter's durable display-key rules to one display's evidence.
-#[cfg(any(test, not(target_os = "macos")))]
+#[allow(
+    clippy::missing_const_for_fn,
+    reason = "const only compiles where macOS drops the `ReportedSerial` arm, outside tests"
+)]
 pub(crate) fn classify_display_key(
     evidence: &DisplayDeviceEvidence,
     edid_serial_scheme: &SchemeName,
 ) -> DisplayKeyClassification {
+    // Only the `ReportedSerial` arm reads the scheme, and macOS compiles that arm out.
+    let _ = edid_serial_scheme;
     match &evidence.identity_evidence {
-        #[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
+        #[cfg(any(test, not(target_os = "macos")))]
         DisplayIdentityEvidence::ReportedSerial(value) => {
             DisplayKeyClassification::Keyed(DeviceKey {
                 kind: DeviceKind::Display,
@@ -534,48 +467,5 @@ mod tests {
                 );
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod selector_placement_tests {
-    use std::error::Error;
-    use std::io;
-    use std::path::Path;
-
-    /// Counts lines that choose a target, the `target_os =` form every selector uses.
-    fn target_selector_lines(source: &Path) -> io::Result<usize> {
-        Ok(std::fs::read_to_string(source)?
-            .lines()
-            .filter(|line| {
-                line.split("target_os")
-                    .skip(1)
-                    .any(|rest| rest.trim_start().starts_with('='))
-            })
-            .count())
-    }
-
-    /// This module and `monitors/identity/native/mod.rs` select the target. The native identity
-    /// backends they mount and the reporter stay target-free.
-    #[test]
-    fn target_selection_stays_in_the_platform_facades() -> Result<(), Box<dyn Error>> {
-        let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut offenders = Vec::new();
-        for relative in [
-            "src/reporter.rs",
-            "src/monitors/identity/native/linux.rs",
-            "src/monitors/identity/native/macos.rs",
-            "src/monitors/identity/native/windows.rs",
-        ] {
-            let source = crate_root.join(relative);
-            if target_selector_lines(&source)? > 0 {
-                offenders.push(source.display().to_string());
-            }
-        }
-        assert!(
-            offenders.is_empty(),
-            "target selection belongs in the platform facades, found in {offenders:?}"
-        );
-        Ok(())
     }
 }

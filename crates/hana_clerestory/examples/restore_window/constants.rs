@@ -51,9 +51,7 @@ pub(crate) const SIZE_PHYSICAL_LABEL: &str = "Size (physical):";
 pub(crate) const UNKNOWN_MANAGED_WINDOW_NAME: &str = "unknown";
 pub(crate) const UNSELECTED_VIDEO_MODE_MARKER: &str = " ";
 pub(crate) const VIDEO_MODES_HEADER: &str = "\nVideo Modes (Up/Down to select):\n";
-#[cfg(target_os = "linux")]
 pub(crate) const WAYLAND_PLATFORM_SUFFIX: &str = " (Wayland)";
-#[cfg(target_os = "linux")]
 pub(crate) const X11_PLATFORM_SUFFIX: &str = " (X11)";
 
 // managed windows

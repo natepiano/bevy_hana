@@ -42,10 +42,9 @@ mod driver;
 #[cfg(test)]
 mod driver_conformance_tests;
 mod events;
-#[cfg(target_os = "macos")]
-mod macos_tabbing_fix;
 mod managed;
 mod monitors;
+mod native_window;
 mod output_proof;
 #[cfg(test)]
 mod output_proof_tests;
@@ -70,8 +69,6 @@ use bevy::camera::CameraUpdateSystems;
 use bevy::prelude::Add;
 use bevy::prelude::Added;
 use bevy::prelude::App;
-#[cfg(all(target_os = "linux", feature = "workaround-winit-4445"))]
-use bevy::prelude::ApplyDeferred;
 use bevy::prelude::Commands;
 use bevy::prelude::Component;
 use bevy::prelude::Entity;
@@ -83,10 +80,6 @@ use bevy::prelude::PreStartup;
 use bevy::prelude::Query;
 use bevy::prelude::Reflect;
 use bevy::prelude::ReflectComponent;
-#[cfg(all(target_os = "linux", feature = "workaround-winit-4445"))]
-use bevy::prelude::Res;
-#[cfg(all(target_os = "windows", feature = "workaround-winit-4341"))]
-use bevy::prelude::Startup;
 use bevy::prelude::SystemSet;
 use bevy::prelude::Update;
 use bevy::prelude::Window;
@@ -384,23 +377,7 @@ fn configured_platform(app: &App) -> Platform {
 
 /// The platform this plugin build configures for.
 #[cfg(not(any(test, feature = "test")))]
-#[allow(
-    clippy::missing_const_for_fn,
-    reason = "`Platform::detect` is only `const` on macOS and Windows; on Linux it reads the               environment, so a `const fn` here would not compile there"
-)]
 fn configured_platform(_: &App) -> Platform { Platform::detect() }
-
-#[cfg(target_os = "macos")]
-fn install_macos_window_tabbing_fix(app: &mut App) {
-    // App-wide opt-out of automatic window tabbing, before winit creates any OS window. See
-    // `macos_tabbing_fix` module docs.
-    macos_tabbing_fix::disable_automatic_tabbing();
-    app.add_systems(
-        Update,
-        macos_tabbing_fix::disable_tabbing_on_managed
-            .before(restore::place_window_at_saved_geometry),
-    );
-}
 
 impl Plugin for ConfiguredWindowManagerPlugin {
     fn build(&self, app: &mut App) {
@@ -414,14 +391,9 @@ impl Plugin for ConfiguredWindowManagerPlugin {
         let platform = configured_platform(app);
         app.insert_resource(platform);
         hide_startup_window(app, platform);
-        #[cfg(target_os = "macos")]
-        install_macos_window_tabbing_fix(app);
-
+        native_window::register(app);
         #[cfg(all(target_os = "windows", feature = "workaround-winit-4341"))]
-        {
-            app.add_systems(Startup, windows_dpi_fix::install_dpi_fix);
-            app.add_systems(Update, windows_dpi_fix::install_dpi_fix_on_managed);
-        }
+        windows_dpi_fix::register(app);
 
         app.configure_sets(
             PreStartup,
@@ -488,30 +460,6 @@ impl Plugin for ConfiguredWindowManagerPlugin {
         app.add_systems(
             PostUpdate,
             resize_announcement::announce_unpublished_resizes.before(CameraUpdateSystems),
-        );
-
-        // X11 frame extent compensation (W6 workaround, winit #4445).
-        #[cfg(all(target_os = "linux", feature = "workaround-winit-4445"))]
-        app.add_systems(
-            Update,
-            (
-                restore::compensate_target_position
-                    .after(restore::prepare_driver_restore_targets)
-                    .before(restore::place_window_at_saved_geometry)
-                    .in_set(ClerestoryWindowDriverSet::TargetPreparation),
-                ApplyDeferred
-                    .after(restore::compensate_target_position)
-                    .in_set(ClerestoryWindowDriverSet::TargetPreparation),
-                // Re-apply the compensated position once the window is mapped: bevy 0.19
-                // can ignore the first `set_outer_position` request while the X11 window is
-                // unmapped, while a mapped window's `Window.position` readback matches the
-                // requested compensated position plus `X11FrameTop`.
-                restore::reapply_compensated_position
-                    .after(restore::place_window_at_saved_geometry)
-                    .before(restore::check_restore_settling)
-                    .in_set(ClerestoryWindowDriverSet::TargetPreparation),
-            )
-                .run_if(|p: Res<Platform>| p.is_x11()),
         );
     }
 }

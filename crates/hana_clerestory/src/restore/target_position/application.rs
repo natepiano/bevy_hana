@@ -7,9 +7,10 @@ use bevy::prelude::Entity;
 use bevy::prelude::Has;
 use bevy::prelude::IVec2;
 use bevy::prelude::MessageReader;
-#[cfg(target_os = "macos")]
 use bevy::prelude::NonSendMut;
+use bevy::prelude::On;
 use bevy::prelude::Query;
+use bevy::prelude::Remove;
 use bevy::prelude::Res;
 use bevy::prelude::ResMut;
 use bevy::prelude::Resource;
@@ -50,14 +51,10 @@ use crate::constants::SETTLE_TIMEOUT_SECS;
 use crate::deadline::OperatingSystemWorkDeadline;
 use crate::deadline::OperatingSystemWorkDeadlineStatus;
 use crate::events::ExpectedPhysicalPosition;
-#[cfg(target_os = "macos")]
-use crate::macos_tabbing_fix;
-#[cfg(target_os = "macos")]
-use crate::macos_tabbing_fix::NativeFullscreenObservations;
-#[cfg(target_os = "macos")]
-use crate::macos_tabbing_fix::NativeFullscreenObserved;
 use crate::monitors::CurrentMonitor;
 use crate::monitors::CurrentMonitorIndex;
+use crate::native_window;
+use crate::native_window::NativeFullscreenObservations;
 use crate::persistence::SavedWindowMode;
 use crate::recovery::WindowFallbackRecoveryState;
 use crate::restore::RestorePreparationSource;
@@ -321,8 +318,7 @@ fn begin_cross_dpi_restore(
 }
 
 fn advance_fullscreen_restore(
-    #[cfg(target_os = "macos")] entity: Entity,
-    #[cfg(not(target_os = "macos"))] _entity: Entity,
+    entity: Entity,
     target_position: &mut TargetPosition,
     window: &mut Window,
     current_monitor: Option<&CurrentMonitor>,
@@ -408,8 +404,7 @@ fn advance_fullscreen_restore(
             FullscreenRestoreProgress::Completed,
         ),
         FullscreenRestoreState::ActivateWindow => {
-            #[cfg(target_os = "macos")]
-            macos_tabbing_fix::activate_fullscreen_window(entity);
+            native_window::activate_fullscreen_window(entity);
             debug!(
                 "[place_window_at_saved_geometry] macOS fullscreen: activated window after mode request"
             );
@@ -533,9 +528,7 @@ pub(crate) fn place_window_at_saved_geometry(
     >,
     mut commands: Commands,
     _: NonSendMarker,
-    #[cfg(target_os = "macos")] mut fullscreen_observations: NonSendMut<
-        NativeFullscreenObservations,
-    >,
+    mut fullscreen_observations: NonSendMut<NativeFullscreenObservations>,
     platform: Res<Platform>,
     scale_inputs: Res<ObservedScaleInputs>,
     time: Option<Res<Time>>,
@@ -557,21 +550,14 @@ pub(crate) fn place_window_at_saved_geometry(
             #[cfg(any(test, feature = "test"))]
             injected_windows.as_deref(),
         );
-        #[cfg(target_os = "macos")]
         let native_fullscreen = if native_window_exists
             && *platform == Platform::MacOs
             && target_position.saved_window_mode.is_fullscreen()
         {
-            match fullscreen_observations.observe(entity) {
-                NativeFullscreenObserved::Fullscreen => NativeFullscreenState::Fullscreen,
-                NativeFullscreenObserved::Windowed => NativeFullscreenState::Windowed,
-                NativeFullscreenObserved::Unavailable => NativeFullscreenState::Unavailable,
-            }
+            fullscreen_observations.observe(entity)
         } else {
             NativeFullscreenState::Unavailable
         };
-        #[cfg(not(target_os = "macos"))]
-        let native_fullscreen = NativeFullscreenState::Unavailable;
         let restore_status = restore_window(
             entity,
             restore_preparation,
@@ -597,15 +583,17 @@ pub(crate) fn place_window_at_saved_geometry(
             WindowSettleProgress::Settling(_)
         ) {
             fallback.mark_settling(restore_preparation.role().clone());
-        }
-        #[cfg(target_os = "macos")]
-        if matches!(
-            &target_position.window_settle_progress,
-            WindowSettleProgress::Settling(_)
-        ) {
             fullscreen_observations.stop(entity);
         }
     }
+}
+
+/// Stop observing native fullscreen if a restore is cancelled before it settles.
+pub(crate) fn clear_fullscreen_observation(
+    removed: On<Remove, TargetPosition>,
+    mut observations: NonSendMut<NativeFullscreenObservations>,
+) {
+    observations.stop(removed.entity);
 }
 
 /// Advance a cross-DPI restore out of `WaitingForScaleChange`.
@@ -1117,7 +1105,7 @@ mod scale_change_wait_tests {
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 #[allow(
     clippy::expect_used,
     reason = "tests should panic on unexpected values"

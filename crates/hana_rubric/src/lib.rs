@@ -13,6 +13,7 @@ mod keymap;
 mod keymap_plugin;
 mod keystroke;
 mod palette;
+mod palette_cursor;
 mod platform_shortcut_mode;
 /// Convenience re-exports for common keymap callers.
 pub mod prelude;
@@ -100,3 +101,6 @@ pub use palette::CommandPaletteRow;
 pub use palette::PaletteBinding;
 pub use palette::PaletteSelectionOutcome;
 pub use palette::query_command_palette;
+pub use palette_cursor::PaletteRowCursor;
+pub use palette_cursor::PaletteRowList;
+pub use palette_cursor::PaletteRowStep;

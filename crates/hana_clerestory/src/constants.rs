@@ -14,6 +14,16 @@ use std::time::Duration;
 /// monitor index itself at that point — so the window becomes visible instead of waiting forever.
 pub(crate) const FULLSCREEN_MONITOR_MOVE_TIMEOUT_SECS: f32 = SETTLE_TIMEOUT_SECS;
 
+// macos core graphics
+#[cfg(target_os = "macos")]
+pub(crate) const CORE_GRAPHICS_SUCCESS: i32 = 0;
+
+// macos native fullscreen
+#[cfg(target_os = "macos")]
+pub(crate) const NATIVE_FULLSCREEN: u8 = 1;
+#[cfg(target_os = "macos")]
+pub(crate) const NATIVE_WINDOWED: u8 = 0;
+
 // managed window names
 /// First numeric suffix appended to deduplicate a managed window name (e.g. `name-2`).
 pub(crate) const FIRST_DUPLICATE_SUFFIX: u32 = 2;
@@ -70,7 +80,7 @@ pub(crate) const FNV_1A_PRIME: u64 = 0x0000_0100_0000_01b3;
 #[cfg(target_os = "macos")]
 pub(crate) const MACOS_DISPLAY_UUID_BYTES: usize = 16;
 /// `RandR` output property carrying a display's EDID block.
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(target_os = "linux")]
 pub(crate) const X11_EDID_PROPERTY_NAME: &[u8] = b"EDID";
 
 // monitor lookup
@@ -96,7 +106,6 @@ pub(crate) const RON_HEADER: &str = "\
 pub(crate) const STATE_FILE: &str = "windows.ron";
 
 // platform detection
-#[cfg(target_os = "linux")]
 pub(crate) const WAYLAND_DISPLAY_ENVIRONMENT_VARIABLE: &str = "WAYLAND_DISPLAY";
 
 // restore strategies
@@ -140,15 +149,6 @@ pub(crate) const MILLIS_PER_SECOND: f32 = 1000.0;
 /// revealed, leaving the persisted target untouched so a normal restore can still move it once
 /// that display returns.
 pub(crate) const EXACT_DISPLAY_WAIT_TIMEOUT_SECS: f32 = SETTLE_TIMEOUT_SECS;
-
-/// How often (in seconds) a window still hidden past [`EXACT_DISPLAY_WAIT_TIMEOUT_SECS`] restates
-/// why it is waiting.
-///
-/// Two placement decisions keep waiting after that deadline expires: the kernel is mid-apply, and
-/// a saved configuration whose display is live so placement is still expected to arrive. Neither
-/// is bounded, so a placement that never arrives leaves the window hidden for the whole session
-/// with nothing written to say so. The first overdue frame reports immediately and later ones
-/// report on this cadence, which keeps a permanent wait visible without writing a line per frame.
 
 // windows display-config acquisition
 #[cfg(target_os = "windows")]

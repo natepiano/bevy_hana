@@ -59,14 +59,18 @@ use super::windows_listener::WindowUserDataWrite;
 use super::windows_listener::WindowsListenerBackend;
 use super::windows_listener::WindowsListenerOwner;
 use super::windows_listener::WindowsListenerShutdownEvent;
+use crate::Platform;
+use crate::monitors::identity::ConfigurationNotificationError;
 use crate::monitors::identity::MonitorIdentificationError;
 use crate::monitors::identity::OperatingSystemQueryError;
 
-pub(super) struct WindowsConfigurationNotification {
+pub(super) struct ConfigurationNotification {
     listener: WindowsListenerOwner,
 }
 
-impl WindowsConfigurationNotification {
+impl ConfigurationNotification {
+    pub(super) const PLATFORM: Platform = Platform::Windows;
+
     pub(super) fn register(
         tracker: Arc<MonitorConfigurationGenerationTracker>,
     ) -> Result<Self, MonitorIdentificationError> {
@@ -289,7 +293,9 @@ fn dispatch_pending_messages() -> ListenerWait {
 }
 
 const fn registration_error() -> OperatingSystemQueryError {
-    OperatingSystemQueryError::ConfigurationNotificationRegistration
+    OperatingSystemQueryError::ConfigurationNotification(
+        ConfigurationNotificationError::Registration,
+    )
 }
 
 const fn handle_from_address(address: usize) -> HANDLE {

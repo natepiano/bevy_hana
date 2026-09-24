@@ -6,10 +6,11 @@ use std::sync::OnceLock;
 use bevy::log::error;
 
 use super::MonitorConfigurationGenerationTracker;
-use super::constants::CORE_GRAPHICS_SUCCESS;
 use super::constants::MACOS_BEGIN_CONFIGURATION_FLAG;
+use crate::Platform;
+use crate::constants::CORE_GRAPHICS_SUCCESS;
+use crate::monitors::identity::ConfigurationNotificationError;
 use crate::monitors::identity::MonitorIdentificationError;
-use crate::monitors::identity::OperatingSystemQueryError;
 
 type CoreGraphicsDisplayReconfigurationCallback =
     Option<unsafe extern "C-unwind" fn(u32, u32, *mut c_void)>;
@@ -26,11 +27,13 @@ unsafe extern "C-unwind" {
     ) -> i32;
 }
 
-pub(super) struct MacOsConfigurationNotification {
+pub(super) struct ConfigurationNotification {
     registration: DisplayReconfigurationRegistration<NativeCoreGraphics>,
 }
 
-impl MacOsConfigurationNotification {
+impl ConfigurationNotification {
+    pub(super) const PLATFORM: Platform = Platform::MacOs;
+
     pub(super) fn register(
         tracker: Arc<MonitorConfigurationGenerationTracker>,
     ) -> Result<Self, MonitorIdentificationError> {
@@ -98,7 +101,7 @@ where
         let context = DisplayReconfigurationContext(tracker);
         let result = api.register(Some(display_reconfigured), context.user_info());
         if result != CORE_GRAPHICS_SUCCESS {
-            return Err(OperatingSystemQueryError::ConfigurationNotificationRegistration.into());
+            return Err(ConfigurationNotificationError::Registration.into());
         }
         Ok(Self {
             api,
@@ -117,7 +120,7 @@ where
             return Ok(());
         }
         display_reconfiguration_quarantine().retain(context);
-        Err(OperatingSystemQueryError::ConfigurationNotificationRemoval.into())
+        Err(ConfigurationNotificationError::Removal.into())
     }
 }
 
@@ -262,10 +265,7 @@ mod tests {
             .unregister()
             .expect_err("scripted removal should fail");
 
-        assert_eq!(
-            error,
-            OperatingSystemQueryError::ConfigurationNotificationRemoval.into()
-        );
+        assert_eq!(error, ConfigurationNotificationError::Removal.into());
         assert!(tracker_weak.upgrade().is_some());
         assert!(
             display_reconfiguration_quarantine()

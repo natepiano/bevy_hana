@@ -1,14 +1,12 @@
 mod constants;
-#[cfg(target_os = "macos")]
-mod macos;
-#[cfg(target_os = "windows")]
-mod windows;
+#[cfg_attr(target_os = "linux", path = "x11.rs")]
+#[cfg_attr(target_os = "macos", path = "macos.rs")]
+#[cfg_attr(target_os = "windows", path = "windows.rs")]
+mod native;
 #[cfg(target_os = "windows")]
 mod windows_device_notification;
 #[cfg(any(test, target_os = "windows"))]
 mod windows_listener;
-#[cfg(all(unix, not(target_os = "macos")))]
-mod x11;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
@@ -17,16 +15,10 @@ use std::sync::atomic::Ordering;
 
 use bevy::prelude::Resource;
 use bevy::prelude::error;
+use native::ConfigurationNotification;
 
-#[cfg(target_os = "macos")]
-use self::macos::MacOsConfigurationNotification;
-#[cfg(target_os = "windows")]
-use self::windows::WindowsConfigurationNotification;
-#[cfg(all(unix, not(target_os = "macos")))]
-use self::x11::X11ConfigurationNotification;
+use super::ConfigurationNotificationError;
 use super::MonitorIdentificationError;
-#[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
-use super::OperatingSystemQueryError;
 use crate::Platform;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,7 +79,7 @@ impl MonitorConfigurationGenerationTracker {
         }
     }
 
-    #[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
+    #[cfg(any(test, not(target_os = "macos")))]
     pub(super) fn fail_notification_stream(&self) {
         let _ = self.status.compare_exchange(
             ConfigurationTrackerStatus::Ready.to_raw(),
@@ -104,10 +96,9 @@ impl MonitorConfigurationGenerationTracker {
                     MonitorIdentificationError::ConfigurationGenerationExhausted,
                 )
             },
-            #[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
             ConfigurationTrackerStatus::NotificationFailed => {
                 MonitorConfigurationState::Unavailable(
-                    OperatingSystemQueryError::ConfigurationNotificationStream.into(),
+                    ConfigurationNotificationError::Stream.into(),
                 )
             },
             ConfigurationTrackerStatus::Ready => {
@@ -121,20 +112,17 @@ impl MonitorConfigurationGenerationTracker {
 enum ConfigurationTrackerStatus {
     Ready,
     GenerationExhausted,
-    #[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
     NotificationFailed,
 }
 
 impl ConfigurationTrackerStatus {
     const GENERATION_EXHAUSTED: u8 = 1;
-    #[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
     const NOTIFICATION_FAILED: u8 = 2;
     const READY: u8 = 0;
 
     const fn from_raw(raw: u8) -> Self {
         match raw {
             Self::GENERATION_EXHAUSTED => Self::GenerationExhausted,
-            #[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
             Self::NOTIFICATION_FAILED => Self::NotificationFailed,
             _ => Self::Ready,
         }
@@ -144,7 +132,6 @@ impl ConfigurationTrackerStatus {
         match self {
             Self::Ready => Self::READY,
             Self::GenerationExhausted => Self::GENERATION_EXHAUSTED,
-            #[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
             Self::NotificationFailed => Self::NOTIFICATION_FAILED,
         }
     }
@@ -178,12 +165,7 @@ impl MonitorConfiguration {
 }
 
 enum ConfigurationNotificationRegistration {
-    #[cfg(target_os = "macos")]
-    MacOs(MacOsConfigurationNotification),
-    #[cfg(target_os = "windows")]
-    Windows(WindowsConfigurationNotification),
-    #[cfg(all(unix, not(target_os = "macos")))]
-    X11(X11ConfigurationNotification),
+    Native(ConfigurationNotification),
     Wayland,
 }
 
@@ -193,19 +175,10 @@ impl ConfigurationNotificationRegistration {
         tracker: &Arc<MonitorConfigurationGenerationTracker>,
     ) -> Result<Self, MonitorIdentificationError> {
         match platform {
-            #[cfg(target_os = "macos")]
-            Platform::MacOs => {
-                MacOsConfigurationNotification::register(Arc::clone(tracker)).map(Self::MacOs)
-            },
-            #[cfg(target_os = "windows")]
-            Platform::Windows => {
-                WindowsConfigurationNotification::register(Arc::clone(tracker)).map(Self::Windows)
-            },
-            #[cfg(all(unix, not(target_os = "macos")))]
-            Platform::X11 => {
-                X11ConfigurationNotification::register(Arc::clone(tracker)).map(Self::X11)
-            },
             Platform::Wayland => Ok(Self::Wayland),
+            native::ConfigurationNotification::PLATFORM => {
+                native::ConfigurationNotification::register(Arc::clone(tracker)).map(Self::Native)
+            },
             _ => Err(MonitorIdentificationError::StablePhysicalIdentityUnavailable),
         }
     }
@@ -214,12 +187,7 @@ impl ConfigurationNotificationRegistration {
 impl Drop for ConfigurationNotificationRegistration {
     fn drop(&mut self) {
         match self {
-            #[cfg(target_os = "macos")]
-            Self::MacOs(notification) => notification.unregister(),
-            #[cfg(target_os = "windows")]
-            Self::Windows(notification) => notification.unregister(),
-            #[cfg(all(unix, not(target_os = "macos")))]
-            Self::X11(notification) => notification.unregister(),
+            Self::Native(notification) => notification.unregister(),
             Self::Wayland => {},
         }
     }

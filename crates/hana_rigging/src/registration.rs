@@ -314,6 +314,13 @@ impl Reporters {
                 cadence:                  reporter_entry.registration.cadence(),
                 first_complete_set_bound: reporter_entry.registration.first_complete_set_bound(),
                 coverage:                 reporter_entry.registration.coverage(),
+                discovery_support:        match reporter_entry.health.outcome() {
+                    ReporterOutcomeHealth::Unsupported { .. } => DiscoverySupport::Unsupported,
+                    ReporterOutcomeHealth::NotCompleted
+                    | ReporterOutcomeHealth::Deferred { .. }
+                    | ReporterOutcomeHealth::Succeeded { .. }
+                    | ReporterOutcomeHealth::Failing { .. } => DiscoverySupport::Supported,
+                },
                 contribution:             match &reporter_entry.latest_set {
                     RetainedDeviceSet::NotCompleted => {
                         ReporterContribution::AwaitingFirstCompleteSet
@@ -935,7 +942,36 @@ pub(crate) struct RegisteredReporter<'a> {
     /// What this reporter's omission of a durable key is worth, which decides whether a complete
     /// set without an authored unit proves the unit is gone or proves nothing at all.
     pub(crate) coverage:                 &'a ReporterCoverage,
+    /// Whether the reporter's latest accepted outcome says its discovery is unsupported here.
+    pub(crate) discovery_support:        DiscoverySupport,
     pub(crate) contribution:             ReporterContribution<'a>,
+}
+
+impl RegisteredReporter<'_> {
+    /// Whether this reporter has never completed a set and its latest accepted outcome says its
+    /// discovery is unsupported, so no scan will ever end a wait on it.
+    ///
+    /// The accepted outcome, not the run state, decides this: an explicit discovery request moves
+    /// the run state back to idle at once, while the outcome stays unsupported until the rerun is
+    /// accepted.
+    pub(crate) const fn stopped_unsupported(&self) -> bool {
+        matches!(
+            (&self.contribution, self.discovery_support),
+            (
+                ReporterContribution::AwaitingFirstCompleteSet,
+                DiscoverySupport::Unsupported
+            )
+        )
+    }
+}
+
+/// Whether a reporter's latest accepted discovery outcome says its discovery is unsupported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DiscoverySupport {
+    /// No accepted outcome says discovery is unsupported.
+    Supported,
+    /// The latest accepted outcome stopped the reporter as unsupported.
+    Unsupported,
 }
 
 /// What one registered reporter offers the current reconcile pass.

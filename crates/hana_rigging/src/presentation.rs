@@ -150,7 +150,8 @@ pub enum RoleUnavailableCause {
     TargetNotAttached,
     /// Consecutive device-operation failures exhausted the automatic retry run.
     RepeatedFailures,
-    /// The driver reported that this operation is unsupported on this platform.
+    /// The driver reported that this operation is unsupported on this platform, or the discovery
+    /// its wait depends on is unsupported.
     Unsupported,
     /// Automatic recovery for this role was abandoned.
     RecoveryAbandoned,
@@ -208,10 +209,16 @@ const fn established_presentation(
 }
 
 /// Derive a waiting role's presentation, reading availability before the wait family.
+///
+/// An unsupported reporter wait is read first: no discovery will ever change the key's
+/// availability, so "scanning" would promise a report that never arrives.
 fn waiting_presentation(
     waiting: &WaitingStatusView,
     availability: KeyAvailability,
 ) -> RolePresentationView<RoleUnavailableCause> {
+    if matches!(waiting, WaitingStatusView::ReporterUnsupported { .. }) {
+        return RolePresentationView::Unavailable(RoleUnavailableCause::Unsupported);
+    }
     match availability {
         KeyAvailability::Absent { .. } | KeyAvailability::DepartureGrace { .. } => {
             RolePresentationView::Disconnected
@@ -255,6 +262,9 @@ const fn present_key_wait_presentation(
         },
         WaitingStatusView::ApplicationReporterEnable { .. } => {
             RolePresentationView::Unavailable(RoleUnavailableCause::ReporterNotEnabled)
+        },
+        WaitingStatusView::ReporterUnsupported { .. } => {
+            RolePresentationView::Unavailable(RoleUnavailableCause::Unsupported)
         },
         WaitingStatusView::ApplicationReporterRegistrationRequired { .. } => {
             RolePresentationView::Unavailable(RoleUnavailableCause::ReporterRegistrationRequired)
@@ -358,7 +368,7 @@ mod tests {
     ];
 
     /// Every wait family under a present key, with the presentation it must derive.
-    const PRESENT_KEY_WAIT_VERDICTS: [(&str, RolePresentationView<RoleUnavailableCause>); 15] = [
+    const PRESENT_KEY_WAIT_VERDICTS: [(&str, RolePresentationView<RoleUnavailableCause>); 16] = [
         ("Reporter", RolePresentationView::Connecting),
         ("KernelRetry", RolePresentationView::Connecting),
         ("NewRegistration", RolePresentationView::Connecting),
@@ -386,6 +396,10 @@ mod tests {
         (
             "ApplicationReporterEnable",
             RolePresentationView::Unavailable(RoleUnavailableCause::ReporterNotEnabled),
+        ),
+        (
+            "ReporterUnsupported",
+            RolePresentationView::Unavailable(RoleUnavailableCause::Unsupported),
         ),
         (
             "ApplicationReporterRegistrationRequired",
@@ -442,6 +456,7 @@ mod tests {
             },
             WaitingStatusView::ApplicationReapply { .. } => "ApplicationReapply",
             WaitingStatusView::ApplicationReporterEnable { .. } => "ApplicationReporterEnable",
+            WaitingStatusView::ReporterUnsupported { .. } => "ReporterUnsupported",
             WaitingStatusView::ApplicationReporterRegistrationRequired { .. } => {
                 "ApplicationReporterRegistrationRequired"
             },
@@ -576,6 +591,10 @@ mod tests {
                 timing: sample_timing(),
             },
             WaitingStatusView::ApplicationReporterEnable {
+                reporters: sample_reporters(),
+                timing:    sample_timing(),
+            },
+            WaitingStatusView::ReporterUnsupported {
                 reporters: sample_reporters(),
                 timing:    sample_timing(),
             },
@@ -802,6 +821,8 @@ mod tests {
         Ok(())
     }
 
+    /// An unsupported reporter wait is the one family read before availability, and
+    /// `an_unsupported_reporter_wait_presents_as_unsupported_under_every_availability` covers it.
     #[test]
     fn a_wait_reads_availability_before_its_family() -> Result<(), Box<dyn Error>> {
         for availability in every_availability()? {
@@ -810,7 +831,10 @@ mod tests {
                 continue;
             }
             let expected = verdict_for(label)?;
-            for waiting in every_wait_family()? {
+            for waiting in every_wait_family()?
+                .into_iter()
+                .filter(|waiting| !matches!(waiting, WaitingStatusView::ReporterUnsupported { .. }))
+            {
                 assert_eq!(
                     derive_role_presentation(
                         &RoleStatusView::Waiting(waiting.clone()),
@@ -821,6 +845,24 @@ mod tests {
                     wait_family_label(&waiting)
                 );
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_unsupported_reporter_wait_presents_as_unsupported_under_every_availability()
+    -> Result<(), Box<dyn Error>> {
+        let waiting = RoleStatusView::Waiting(WaitingStatusView::ReporterUnsupported {
+            reporters: sample_reporters(),
+            timing:    sample_timing(),
+        });
+        for availability in every_availability()? {
+            assert_eq!(
+                derive_role_presentation(&waiting, availability.clone()),
+                RolePresentationView::Unavailable(RoleUnavailableCause::Unsupported),
+                "unsupported reporter wait under `{}`",
+                availability_label(&availability)
+            );
         }
         Ok(())
     }

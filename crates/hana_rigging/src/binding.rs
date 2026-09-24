@@ -929,7 +929,7 @@ pub(crate) struct NonEmptyReporterIds {
 }
 
 impl NonEmptyReporterIds {
-    fn from_registered_reporters<'a>(
+    pub(crate) fn from_registered_reporters<'a>(
         first: &RegisteredReporter<'a>,
         rest: &[RegisteredReporter<'a>],
     ) -> Self {
@@ -1151,6 +1151,9 @@ pub(crate) enum WaitingCondition {
     ApplicationReporterEnable {
         reporters: NonEmptyReporterIds,
     },
+    ReporterUnsupported {
+        reporters: NonEmptyReporterIds,
+    },
     NewRegistration,
     OperatorDecision {
         role:      RoleKey,
@@ -1189,6 +1192,7 @@ impl WaitingCondition {
             Self::KernelRetry(RetryGate::AwaitingRevision(_))
             | Self::ApplicationReapply
             | Self::ApplicationReporterEnable { .. }
+            | Self::ReporterUnsupported { .. }
             | Self::NewRegistration
             | Self::OperatorDecision { .. }
             | Self::ClaimRelease { .. }
@@ -1224,6 +1228,10 @@ impl WaitingCondition {
             (
                 Self::ApplicationReporterEnable { reporters: left },
                 Self::ApplicationReporterEnable { reporters: right },
+            )
+            | (
+                Self::ReporterUnsupported { reporters: left },
+                Self::ReporterUnsupported { reporters: right },
             ) => left == right,
             (
                 Self::OperatorDecision {
@@ -3945,6 +3953,12 @@ fn project_waiting_status(
                 timing,
             }
         },
+        WaitingCondition::ReporterUnsupported { reporters } => {
+            WaitingStatusView::ReporterUnsupported {
+                reporters: reporters.reporter_refs(),
+                timing,
+            }
+        },
         WaitingCondition::NewRegistration => WaitingStatusView::NewRegistration { timing },
         WaitingCondition::OperatorDecision { role, candidate } => {
             WaitingStatusView::OperatorDecision {
@@ -4967,6 +4981,7 @@ mod tests {
     use crate::WaitTiming;
     use crate::WaitingStatusView;
     use crate::reconcile::FrameClockReading;
+    use crate::registration::DiscoverySupport;
     use crate::registration::DriverId;
     use crate::registration::RegisteredReporter;
     use crate::registration::ReporterContribution;
@@ -6910,6 +6925,7 @@ mod tests {
             cadence:                  &cadence,
             first_complete_set_bound: Duration::from_secs(11),
             coverage:                 &coverage,
+            discovery_support:        DiscoverySupport::Supported,
             contribution:             ReporterContribution::AwaitingFirstCompleteSet,
         };
         let key = display_endpoint("studio-display")?.device;

@@ -153,6 +153,8 @@ pub use ime::ImeTarget;
 pub use ime::ImeTextChanged;
 pub use ime::ImeValidationRejected;
 pub use ime::ImeValueRevision;
+pub use ime::ImeVerticalArrow;
+pub use ime::ImeVerticalArrowPressed;
 pub use ime::PanelElementId;
 pub use layout::AcceptsElement;
 pub use layout::AlignX;

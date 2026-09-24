@@ -36,11 +36,12 @@ hana_kana = { workspace = true }
 hana_rigging = { workspace = true }
 winit = { workspace = true }
 
-dirs      = { workspace = true }
-ron       = { workspace = true }
-serde     = { workspace = true }
-thiserror = { workspace = true }
-tracing   = { workspace = true, optional = true }
+dirs              = { workspace = true }
+raw-window-handle = "0.6"
+ron               = { workspace = true }
+serde             = { workspace = true }
+thiserror         = { workspace = true }
+tracing           = { workspace = true, optional = true }
 
 [dev-dependencies]
 bevy                  = { workspace = true, features = ["bevy_pbr", "bevy_ui", "default_font"] }
@@ -52,7 +53,6 @@ serde_json            = { workspace = true }
 tempfile              = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-raw-window-handle = "0.6"
 windows = { version = "0.62.2", features = [
   "Win32_Devices_DeviceAndDriverInstallation",
   "Win32_Devices_Display",
@@ -83,10 +83,8 @@ objc2-foundation = { version = "0.3.2", features = [
   "NSValue",
   "block2",
 ] }
-raw-window-handle = "0.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-raw-window-handle = "0.6"
 x11rb = { version = "0.13", default-features = false, features = [
   "dl-libxcb",
   "randr",

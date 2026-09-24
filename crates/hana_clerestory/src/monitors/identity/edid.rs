@@ -1,11 +1,11 @@
-#[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
 use hana_rigging::prelude::ReportedId;
 
-#[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
+use super::DisplayFingerprint;
+use super::DisplayIdentityEvidence;
 use super::MonitorIdentificationError;
+use super::synthesized_without_serial;
 
 /// Durable display identity carried by one structurally valid EDID.
-#[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(in crate::monitors) enum EdidIdentityEvidence {
     /// Serial value published by the display in either EDID serial field.
@@ -14,7 +14,6 @@ pub(in crate::monitors) enum EdidIdentityEvidence {
     Descriptor(Vec<u8>),
 }
 
-#[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
 impl EdidIdentityEvidence {
     pub(super) fn stable_bytes(&self) -> &[u8] {
         match self {
@@ -22,18 +21,29 @@ impl EdidIdentityEvidence {
             Self::Descriptor(edid) => edid,
         }
     }
+
+    /// Reporter evidence for this EDID: the serial the display published, or `fingerprint` when
+    /// it published none.
+    pub(super) fn identity_evidence(
+        &self,
+        fingerprint: DisplayFingerprint,
+    ) -> DisplayIdentityEvidence {
+        match self {
+            Self::ReportedSerial(reported_id) => {
+                DisplayIdentityEvidence::ReportedSerial(reported_id.clone())
+            },
+            Self::Descriptor(_) => synthesized_without_serial(fingerprint),
+        }
+    }
 }
 
-#[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
 enum EdidSerialState {
     Reported(ReportedId),
     NotExposed,
 }
 
-#[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
 pub(super) struct EdidEvidence;
 
-#[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
 impl EdidEvidence {
     pub(super) const BLOCK_SIZE: usize = 128;
     const DESCRIPTOR_END: usize = 126;
@@ -41,7 +51,7 @@ impl EdidEvidence {
     const DESCRIPTOR_START: usize = 54;
     const EXTENSION_COUNT_INDEX: usize = 126;
     pub(super) const HEADER: [u8; 8] = [0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00];
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(target_os = "linux")]
     pub(super) const PROPERTY_FORMAT: u8 = 8;
     const SERIAL_DESCRIPTOR_TAG: u8 = 0xff;
     pub(super) const SERIAL_END: usize = 16;
@@ -149,7 +159,6 @@ impl EdidEvidence {
     }
 }
 
-#[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
 fn normalized_placeholder_key(serial: &str) -> String {
     serial
         .bytes()
@@ -158,7 +167,6 @@ fn normalized_placeholder_key(serial: &str) -> String {
         .collect()
 }
 
-#[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
 fn trim_serial_padding(serial: &[u8]) -> &[u8] {
     let is_padding = |byte: &u8| matches!(byte, 0 | b' ' | b'\t' | b'\n' | b'\r');
     let Some(start) = serial.iter().position(|byte| !is_padding(byte)) else {
@@ -172,6 +180,8 @@ fn trim_serial_padding(serial: &[u8]) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
+    use hana_rigging::prelude::ReportedSerial;
+
     use super::*;
 
     const CHECKSUM_INDEX: usize = EdidEvidence::BLOCK_SIZE - 1;
@@ -335,5 +345,32 @@ mod tests {
                 Ok(EdidIdentityEvidence::ReportedSerial(_))
             ));
         }
+    }
+
+    #[test]
+    fn serial_tier_keeps_the_serial_and_descriptor_tier_keeps_the_fingerprint() {
+        let expected = ReportedId::new(NUMERIC_SERIAL.to_string());
+        assert!(expected.is_ok());
+        let Some(expected) = expected.ok() else {
+            return;
+        };
+        let serial = EdidIdentityEvidence::ReportedSerial(expected.clone());
+        let descriptor = EdidIdentityEvidence::Descriptor(synthetic_edid(0));
+        let serial_fingerprint = DisplayFingerprint::from_evidence_bytes(serial.stable_bytes());
+        let descriptor_fingerprint =
+            DisplayFingerprint::from_evidence_bytes(descriptor.stable_bytes());
+
+        assert_eq!(serial.stable_bytes(), NUMERIC_SERIAL.to_string().as_bytes());
+        assert_eq!(
+            serial.identity_evidence(serial_fingerprint),
+            DisplayIdentityEvidence::ReportedSerial(expected)
+        );
+        assert_eq!(
+            descriptor.identity_evidence(descriptor_fingerprint),
+            DisplayIdentityEvidence::Synthesized {
+                display_fingerprint: descriptor_fingerprint,
+                serial:              ReportedSerial::NotExposedByUnit,
+            }
+        );
     }
 }

@@ -514,12 +514,15 @@ pub(crate) fn roles_waiting_on(
 ) -> RolesWaitingOnReporter {
     let mut roles = bindings
         .registered_roles()
-        .filter(|role| {
-            matches!(
-                bindings.projected_status(role),
-                Ok(RoleStatusView::Waiting(WaitingStatusView::Reporter(wait)))
-                    if wait.names_reporter(reporter)
-            )
+        .filter(|role| match bindings.projected_status(role) {
+            Ok(RoleStatusView::Waiting(WaitingStatusView::Reporter(wait))) => {
+                wait.names_reporter(reporter)
+            },
+            Ok(RoleStatusView::Waiting(WaitingStatusView::ReporterUnsupported {
+                reporters,
+                ..
+            })) => reporters.contains(reporter),
+            _ => false,
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -1101,6 +1104,28 @@ pub enum DeviceAccessErrorView {
         /// Provider detail.
         detail: String,
     },
+}
+
+impl DeviceAccessErrorView {
+    /// Report the provider detail this failure carried out of the call that refused.
+    ///
+    /// Every class names its own condition, so every variant carries a detail worth printing. A
+    /// caller reads it through this accessor rather than matching the variants itself: the match
+    /// lives here, where a new variant cannot compile without answering for its detail, and a
+    /// downstream wildcard can never quietly drop one.
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::Cancelled { detail }
+            | Self::Contended { detail }
+            | Self::Blocked { detail }
+            | Self::Absent { detail }
+            | Self::Unresponsive { detail }
+            | Self::Releasing { detail }
+            | Self::Transport { detail }
+            | Self::Unsupported { detail } => detail,
+        }
+    }
 }
 
 impl Display for DeviceAccessErrorView {

@@ -1,19 +1,14 @@
-#[cfg(target_os = "linux")]
-mod linux;
-#[cfg(target_os = "macos")]
-mod macos;
-#[cfg(target_os = "windows")]
-mod windows;
+#[cfg_attr(target_os = "linux", path = "linux.rs")]
+#[cfg_attr(target_os = "macos", path = "macos.rs")]
+#[cfg_attr(target_os = "windows", path = "windows.rs")]
+mod selected;
 
 use hana_rigging::prelude::AttachmentPath;
-#[cfg(target_os = "linux")]
-use linux as selected;
-#[cfg(target_os = "macos")]
-use macos as selected;
 pub(in crate::monitors) use selected::QualifiedEvidence;
+pub(crate) use selected::active_display_detail;
 pub(in crate::monitors) use selected::monitor_evidence;
-#[cfg(target_os = "windows")]
-use windows as selected;
+pub(in crate::monitors) use selected::platform_device_handle;
+pub(in crate::monitors) use selected::product_name;
 
 use super::MonitorIdentificationError;
 use crate::Platform;

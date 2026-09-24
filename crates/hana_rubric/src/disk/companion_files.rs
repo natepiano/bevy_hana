@@ -169,19 +169,15 @@ fn companion_diagnostic(origin: DiagnosticOrigin, error: Error) -> Diagnostic {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[allow(
     clippy::expect_used,
     reason = "tests stop when their isolated companion-file setup fails"
 )]
 mod tests {
-    #[cfg(unix)]
     use std::fs;
-    #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
-    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
     use super::publish_companion_files;
@@ -195,7 +191,6 @@ mod tests {
     const SCHEMA_BYTES: &[u8] = b"{\"type\": \"object\"}\n";
     const TEST_APP_NAME: &str = "hana-rubric-companion-test";
 
-    #[cfg(unix)]
     #[test]
     fn replaces_an_existing_read_only_companion_file() {
         let environment_lock = ENVIRONMENT_LOCK
@@ -256,7 +251,6 @@ mod tests {
         drop(environment_lock);
     }
 
-    #[cfg(unix)]
     #[test]
     fn leaves_matching_regular_files_untouched() {
         let environment_lock = ENVIRONMENT_LOCK
@@ -291,7 +285,6 @@ mod tests {
         drop(environment_lock);
     }
 
-    #[cfg(unix)]
     #[test]
     fn reports_a_read_only_directory_without_failing_publication() {
         let environment_lock = ENVIRONMENT_LOCK
@@ -328,7 +321,6 @@ mod tests {
         drop(environment_lock);
     }
 
-    #[cfg(unix)]
     #[test]
     fn replaces_a_destination_symlink_without_following_it() {
         let environment_lock = ENVIRONMENT_LOCK

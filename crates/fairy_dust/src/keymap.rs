@@ -22,6 +22,8 @@ use hana_rubric::CommandId;
 use hana_rubric::KeymapConfigurationDirectory;
 use hana_rubric::KeymapPlugin;
 use hana_rubric::Keystroke;
+use hana_rubric::Modifiers;
+use hana_rubric::OrdinaryKey;
 
 use crate::command_palette;
 
@@ -40,16 +42,8 @@ pub(crate) const FAIRY_DUST_DEFAULT_KEYMAP: &str = include_str!("../assets/keyma
 /// [`KeymapPlugin::with_protected_command_binding`] so their configuration
 /// agrees with the direct recovery route.
 #[must_use]
-pub fn command_palette_recovery_keystroke() -> Keystroke {
-    match "secondary-p".parse() {
-        Ok(keystroke) => keystroke,
-        Err(error) => {
-            bevy::log::error!(
-                "fairy_dust: the built-in recovery keystroke could not be parsed: {error}"
-            );
-            std::process::abort();
-        },
-    }
+pub const fn command_palette_recovery_keystroke() -> Keystroke {
+    Keystroke::from_ordinary_key(Modifiers::none().with_secondary(), OrdinaryKey::KEY_P)
 }
 
 /// Returns the command id the application-owned recovery chord invokes.
@@ -66,42 +60,17 @@ pub fn command_palette_recovery_command_id() -> CommandId { command_palette::rec
 ///
 /// This reads physical input directly instead of going through Rubric's keymap
 /// routing: the chord must still open the repair palette when no validated
-/// bindings exist.
+/// bindings exist. The held modifiers must equal the recovery keystroke's
+/// exactly, so an extra modifier such as Shift turns the chord into a different
+/// authored binding.
 pub(crate) fn recovery_keystroke_pressed(keys: &ButtonInput<KeyCode>) -> bool {
-    keys.just_pressed(KeyCode::KeyP)
-        && recovery_has_secondary_modifier(keys)
-        && !recovery_has_extra_modifier(keys)
-}
-
-/// Reports whether either physical platform-secondary modifier is down.
-fn recovery_has_secondary_modifier(keys: &ButtonInput<KeyCode>) -> bool {
-    let secondary_modifiers = if cfg!(target_os = "macos") {
-        [KeyCode::SuperLeft, KeyCode::SuperRight]
-    } else {
-        [KeyCode::ControlLeft, KeyCode::ControlRight]
-    };
-    secondary_modifiers
-        .into_iter()
-        .any(|modifier| keys.pressed(modifier))
-}
-
-/// Reports whether a modifier is down that turns Command/Control+P into a
-/// different authored chord, such as secondary-shift-p.
-fn recovery_has_extra_modifier(keys: &ButtonInput<KeyCode>) -> bool {
-    let non_secondary_modifiers = if cfg!(target_os = "macos") {
-        [KeyCode::ControlLeft, KeyCode::ControlRight]
-    } else {
-        [KeyCode::SuperLeft, KeyCode::SuperRight]
-    };
-    [
-        KeyCode::ShiftLeft,
-        KeyCode::ShiftRight,
-        KeyCode::AltLeft,
-        KeyCode::AltRight,
-    ]
-    .into_iter()
-    .chain(non_secondary_modifiers)
-    .any(|modifier| keys.pressed(modifier))
+    let modifiers = Modifiers::from_pressed(keys);
+    keys.get_just_pressed().copied().any(|key_code| {
+        OrdinaryKey::try_from(key_code).is_ok_and(|ordinary_key| {
+            Keystroke::from_ordinary_key(modifiers, ordinary_key)
+                == command_palette_recovery_keystroke()
+        })
+    })
 }
 
 /// The keymap document Fairy Dust's `KeymapPlugin` is installed with, and
@@ -429,13 +398,22 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn recovery_input_accepts_each_platform_secondary_side_and_their_combination() {
-        let secondary_modifiers = if cfg!(target_os = "macos") {
+    /// The left and right physical keys that hold the recovery keystroke's one
+    /// modifier.
+    fn recovery_modifier_keys() -> [KeyCode; 2] {
+        if command_palette_recovery_keystroke()
+            .modifiers()
+            .has_platform()
+        {
             [KeyCode::SuperLeft, KeyCode::SuperRight]
         } else {
             [KeyCode::ControlLeft, KeyCode::ControlRight]
-        };
+        }
+    }
+
+    #[test]
+    fn recovery_input_accepts_each_platform_secondary_side_and_their_combination() {
+        let secondary_modifiers = recovery_modifier_keys();
 
         for modifier in secondary_modifiers {
             let mut keys = ButtonInput::<KeyCode>::default();
@@ -456,12 +434,8 @@ mod tests {
 
     #[test]
     fn recovery_input_rejects_every_extra_modifier() {
-        let secondary_modifier = if cfg!(target_os = "macos") {
-            KeyCode::SuperLeft
-        } else {
-            KeyCode::ControlLeft
-        };
-        let non_secondary_modifier = if cfg!(target_os = "macos") {
+        let [secondary_modifier, _] = recovery_modifier_keys();
+        let non_secondary_modifier = if secondary_modifier == KeyCode::SuperLeft {
             KeyCode::ControlLeft
         } else {
             KeyCode::SuperLeft

@@ -111,6 +111,13 @@ pub enum WaitingStatusView {
         /// Retained timing for this wait.
         timing:    WaitTiming,
     },
+    /// Every reporter that could end the wait stopped because its discovery is unsupported.
+    ReporterUnsupported {
+        /// Registered reporters whose unsupported discovery holds the wait.
+        reporters: NonEmptyReporterRefs,
+        /// Retained timing for this wait.
+        timing:    WaitTiming,
+    },
     /// Application code must register a replacement binding.
     NewRegistration {
         /// Retained timing for this wait.

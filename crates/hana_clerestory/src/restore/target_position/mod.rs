@@ -6,9 +6,11 @@ mod target;
 
 pub(crate) use application::ObservedScaleInputs;
 pub(crate) use application::capture_scale_inputs;
+pub(crate) use application::clear_fullscreen_observation;
 pub(crate) use application::place_window_at_saved_geometry;
 pub(crate) use strategy::FullscreenRestoreState;
 pub(crate) use strategy::MonitorScaleStrategy;
+pub(crate) use strategy::NativeFullscreenState;
 pub(crate) use strategy::WindowRestoreState;
 pub(crate) use target::PreparedPositionMeaning;
 pub(crate) use target::RestoreDiagnostics;

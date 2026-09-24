@@ -13,25 +13,28 @@ use x11rb::xcb_ffi::XCBConnection;
 
 use super::MonitorConfigurationGenerationTracker;
 use super::constants::X11_NOTIFICATION_POLL_INTERVAL;
+use crate::Platform;
+use crate::monitors::identity::ConfigurationNotificationError;
 use crate::monitors::identity::MonitorIdentificationError;
-use crate::monitors::identity::OperatingSystemQueryError;
 
-pub(super) struct X11ConfigurationNotification {
+pub(super) struct ConfigurationNotification {
     control: Arc<ListenerControl>,
     thread:  Option<JoinHandle<()>>,
 }
 
-impl X11ConfigurationNotification {
+impl ConfigurationNotification {
+    pub(super) const PLATFORM: Platform = Platform::X11;
+
     pub(super) fn register(
         tracker: Arc<MonitorConfigurationGenerationTracker>,
     ) -> Result<Self, MonitorIdentificationError> {
         let (connection, screen_number) = XCBConnection::connect(None)
-            .map_err(|_| OperatingSystemQueryError::ConfigurationNotificationRegistration)?;
+            .map_err(|_| ConfigurationNotificationError::Registration)?;
         let root = connection
             .setup()
             .roots
             .get(screen_number)
-            .ok_or(OperatingSystemQueryError::ConfigurationNotificationRegistration)?
+            .ok_or(ConfigurationNotificationError::Registration)?
             .root;
         let mask = NotifyMask::SCREEN_CHANGE
             | NotifyMask::CRTC_CHANGE
@@ -41,15 +44,15 @@ impl X11ConfigurationNotification {
             | NotifyMask::RESOURCE_CHANGE;
         connection
             .randr_select_input(root, mask)
-            .map_err(|_| OperatingSystemQueryError::ConfigurationNotificationRegistration)?
+            .map_err(|_| ConfigurationNotificationError::Registration)?
             .check()
-            .map_err(|_| OperatingSystemQueryError::ConfigurationNotificationRegistration)?;
+            .map_err(|_| ConfigurationNotificationError::Registration)?;
 
         let control = Arc::new(ListenerControl::default());
         let thread_control = Arc::clone(&control);
         let thread = thread::Builder::new()
             .spawn(move || listen(connection, tracker, thread_control))
-            .map_err(|_| OperatingSystemQueryError::ConfigurationNotificationRegistration)?;
+            .map_err(|_| ConfigurationNotificationError::Registration)?;
         Ok(Self {
             control,
             thread: Some(thread),
@@ -63,9 +66,7 @@ impl X11ConfigurationNotification {
         };
         thread.thread().unpark();
         if thread.join().is_err() {
-            let error = MonitorIdentificationError::from(
-                OperatingSystemQueryError::ConfigurationNotificationRemoval,
-            );
+            let error = MonitorIdentificationError::from(ConfigurationNotificationError::Removal);
             error!("[MonitorConfiguration] {error}");
         }
     }

@@ -171,6 +171,17 @@ impl KeymapPaths {
     }
 }
 
+/// The directory [`configuration_root`] uses when `XDG_CONFIG_HOME` is unset or empty.
+///
+/// [`configuration_directory`] picks the variant for the running OS, so [`configuration_root`]
+/// reads no platform state and both variants are tested on every OS.
+enum ConfigurationRootFallback {
+    /// `.config` under this home directory, the macOS fallback.
+    DotConfigUnderHome(Option<PathBuf>),
+    /// The directory `dirs::config_dir` reports, the fallback on every other OS.
+    PlatformDirectory(Option<PathBuf>),
+}
+
 fn valid_app_name(app_name: &str) -> Option<&Path> {
     let app_name = Path::new(app_name);
     let mut components = app_name.components();
@@ -182,26 +193,29 @@ fn valid_app_name(app_name: &str) -> Option<&Path> {
 }
 
 fn configuration_directory() -> Option<PathBuf> {
+    let configuration_root_fallback = if cfg!(target_os = "macos") {
+        ConfigurationRootFallback::DotConfigUnderHome(dirs::home_dir())
+    } else {
+        ConfigurationRootFallback::PlatformDirectory(dirs::config_dir())
+    };
+
     configuration_root(
         env::var_os(XDG_CONFIG_HOME).map(PathBuf::from),
-        dirs::config_dir(),
-        dirs::home_dir(),
+        configuration_root_fallback,
     )
 }
 
 fn configuration_root(
     xdg_config_home: Option<PathBuf>,
-    platform_config_directory: Option<PathBuf>,
-    home_directory: Option<PathBuf>,
+    configuration_root_fallback: ConfigurationRootFallback,
 ) -> Option<PathBuf> {
     xdg_config_home
         .filter(|path| !path.as_os_str().is_empty())
-        .or_else(|| {
-            if cfg!(target_os = "macos") {
+        .or_else(|| match configuration_root_fallback {
+            ConfigurationRootFallback::DotConfigUnderHome(home_directory) => {
                 home_directory.map(|home_directory| home_directory.join(".config"))
-            } else {
-                platform_config_directory
-            }
+            },
+            ConfigurationRootFallback::PlatformDirectory(platform_directory) => platform_directory,
         })
 }
 
@@ -277,12 +291,14 @@ impl Drop for XdgConfigHome {
     reason = "tests stop when their isolated configuration setup fails"
 )]
 mod tests {
+    use std::path::PathBuf;
+
+    use super::ConfigurationRootFallback;
     use super::ENVIRONMENT_LOCK;
     use super::KeymapPathAvailability;
     use super::KeymapPathFailure;
     use super::TestDirectory;
     use super::XdgConfigHome;
-    #[cfg(target_os = "macos")]
     use super::configuration_root;
 
     const TEST_APP_NAME: &str = "hana-rubric-paths-test";
@@ -329,24 +345,34 @@ mod tests {
         drop(environment_lock);
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn macos_without_xdg_uses_dot_config_under_home() {
-        let environment_lock = ENVIRONMENT_LOCK
-            .lock()
-            .expect("environment lock is available");
-        let temporary_directory =
-            TestDirectory::new("macos-fallback").expect("temporary directory exists");
-        let xdg_config_home = XdgConfigHome::set(temporary_directory.path());
-        let injected_home = temporary_directory.path().join("home");
+    fn without_xdg_the_home_fallback_uses_dot_config_under_home() {
+        let home_directory = PathBuf::from("injected-home");
 
-        assert_eq!(
-            configuration_root(None, None, Some(injected_home.clone())),
-            Some(injected_home.join(".config"))
-        );
+        for xdg_config_home in [None, Some(PathBuf::new())] {
+            assert_eq!(
+                configuration_root(
+                    xdg_config_home,
+                    ConfigurationRootFallback::DotConfigUnderHome(Some(home_directory.clone())),
+                ),
+                Some(home_directory.join(".config"))
+            );
+        }
+    }
 
-        drop(xdg_config_home);
-        drop(environment_lock);
+    #[test]
+    fn without_xdg_the_platform_fallback_uses_the_platform_directory() {
+        let platform_directory = PathBuf::from("injected-platform-directory");
+
+        for xdg_config_home in [None, Some(PathBuf::new())] {
+            assert_eq!(
+                configuration_root(
+                    xdg_config_home,
+                    ConfigurationRootFallback::PlatformDirectory(Some(platform_directory.clone())),
+                ),
+                Some(platform_directory.clone())
+            );
+        }
     }
 
     #[test]

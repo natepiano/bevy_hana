@@ -52,6 +52,8 @@ pub use events::ImeRejection;
 pub use events::ImeStarted;
 pub use events::ImeTextChanged;
 pub use events::ImeValidationRejected;
+pub use events::ImeVerticalArrow;
+pub use events::ImeVerticalArrowPressed;
 pub use field::ImeAppOwnedFieldSpec;
 pub use field::ImeBuiltInApplied;
 pub use field::ImeBuiltInFieldKind;

@@ -1294,6 +1294,17 @@ fn waiting_condition_for_target(
 ) -> WaitingCondition {
     match wait {
         TargetWait::Reporter { reporter, error } => {
+            if world
+                .resource::<Reporters>()
+                .registered_reporters()
+                .any(|registered| {
+                    registered.reporter == reporter && registered.stopped_unsupported()
+                })
+            {
+                return WaitingCondition::ReporterUnsupported {
+                    reporters: NonEmptyReporterIds::from_reporter_ids(reporter, &[]),
+                };
+            }
             let kind = target_reporter_wait_kind(world, reporter, &error);
             reporter_wait_for_ids(world, kind, &endpoint.device, &[reporter], now)
         },
@@ -1705,12 +1716,17 @@ fn unresolved_device_wait(
     let mut awaiting = Vec::new();
     let mut completed = Vec::new();
     let mut disabled = Vec::new();
+    let mut unsupported = Vec::new();
     for registered in reporters
         .registered_reporters()
         .filter(|reporter| reporter.coverage.establishes_absence_for(device_key))
     {
         if registered.activation == ReporterActivation::Disabled {
             disabled.push(registered.reporter);
+            continue;
+        }
+        if registered.stopped_unsupported() {
+            unsupported.push(registered.reporter);
             continue;
         }
         match &registered.contribution {
@@ -1731,6 +1747,13 @@ fn unresolved_device_wait(
         && let Some((first, rest)) = disabled.split_first()
     {
         return WaitingCondition::ApplicationReporterEnable {
+            reporters: NonEmptyReporterIds::from_reporter_ids(*first, rest),
+        };
+    }
+    if completed.is_empty()
+        && let Some((first, rest)) = unsupported.split_first()
+    {
+        return WaitingCondition::ReporterUnsupported {
             reporters: NonEmptyReporterIds::from_reporter_ids(*first, rest),
         };
     }
@@ -1950,22 +1973,25 @@ fn reporter_wait_for_refs(
         })
         .collect::<Vec<_>>();
     let registered = if kind == ReporterWaitKind::AwaitingFirstReport {
-        let registered_ids = registered
-            .iter()
-            .map(|reporter| reporter.reporter)
-            .collect::<Vec<_>>();
-        let enabled = registered
+        let (enabled, disabled): (Vec<_>, Vec<_>) = registered
             .into_iter()
-            .filter(|reporter| reporter.activation == ReporterActivation::Enabled)
-            .collect::<Vec<_>>();
-        if enabled.is_empty()
-            && let Some((first, rest)) = registered_ids.split_first()
-        {
-            return WaitingCondition::ApplicationReporterEnable {
-                reporters: NonEmptyReporterIds::from_reporter_ids(*first, rest),
-            };
+            .partition(|reporter| reporter.activation == ReporterActivation::Enabled);
+        let (unsupported, runnable): (Vec<_>, Vec<_>) = enabled
+            .into_iter()
+            .partition(RegisteredReporter::stopped_unsupported);
+        if runnable.is_empty() {
+            if let Some((first, rest)) = disabled.split_first() {
+                return WaitingCondition::ApplicationReporterEnable {
+                    reporters: NonEmptyReporterIds::from_registered_reporters(first, rest),
+                };
+            }
+            if let Some((first, rest)) = unsupported.split_first() {
+                return WaitingCondition::ReporterUnsupported {
+                    reporters: NonEmptyReporterIds::from_registered_reporters(first, rest),
+                };
+            }
         }
-        enabled
+        runnable
     } else {
         registered
     };

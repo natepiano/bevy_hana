@@ -16,11 +16,14 @@ use std::cell::Cell;
 
 use bevy::ecs::system::NonSendMarker;
 use bevy::prelude::Added;
+use bevy::prelude::App;
 use bevy::prelude::Commands;
 use bevy::prelude::Entity;
 use bevy::prelude::Query;
 use bevy::prelude::Resource;
 use bevy::prelude::Single;
+use bevy::prelude::Startup;
+use bevy::prelude::Update;
 use bevy::prelude::With;
 use bevy::prelude::Without;
 use bevy::prelude::debug;
@@ -47,6 +50,12 @@ use super::ManagedWindow;
 use super::constants::DPI_CHANGE_HANDLED_RESULT;
 use super::constants::SUBCLASS_ID;
 use super::constants::SUBCLASS_REFERENCE_DATA;
+
+/// Subclass the primary window at startup and each managed secondary window as it appears.
+pub(crate) fn register(app: &mut App) {
+    app.add_systems(Startup, install_dpi_fix);
+    app.add_systems(Update, install_dpi_fix_on_managed);
+}
 
 /// Wrapper around `HWND` that implements `Send` + `Sync`.
 ///
@@ -189,7 +198,7 @@ unsafe extern "system" fn subclass_proc(
 }
 
 /// Install the DPI fix subclass on the primary window.
-pub(crate) fn install_dpi_fix(
+fn install_dpi_fix(
     mut commands: Commands,
     window_entity: Single<Entity, With<PrimaryWindow>>,
     _: NonSendMarker,
@@ -221,7 +230,7 @@ pub(crate) fn install_dpi_fix(
 
 /// Install the DPI fix on each newly managed secondary window; `install_dpi_fix` covers the
 /// primary window.
-pub(crate) fn install_dpi_fix_on_managed(
+fn install_dpi_fix_on_managed(
     new_windows: Query<Entity, (Added<ManagedWindow>, Without<PrimaryWindow>)>,
     _: NonSendMarker,
 ) {

@@ -46,6 +46,7 @@ pub use identity::DisplayFingerprint;
 pub use identity::DisplayIdentity;
 pub(crate) use identity::DisplayIdentityEvidence;
 use identity::MonitorConfiguration;
+pub(crate) use identity::active_display_detail;
 pub use live_display_endpoint::LiveDisplayContradictionCount;
 pub use live_display_endpoint::LiveDisplayDevices;
 pub use live_display_endpoint::LiveDisplayEndpoint;
@@ -393,16 +394,25 @@ mod tests {
         }
     }
 
+    /// Check the real-`WinitPlugin` finish contract for `order`. On macOS the contract already ran
+    /// on the process main thread, selected by the test's name, so only its result is read here.
+    fn assert_finish_contract(order: WinitPluginOrder) {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = order;
+            macos_main_thread_finish::assert_succeeded();
+        }
+        #[cfg(not(target_os = "macos"))]
+        finish_with_real_winit_plugin(order);
+    }
+
     #[test]
     #[cfg_attr(
         not(target_os = "macos"),
         ignore = "builds a real winit event loop, which needs a display server"
     )]
     fn monitor_plugin_before_real_winit_plugin_finishes() {
-        #[cfg(target_os = "macos")]
-        macos_main_thread_finish::assert_succeeded();
-        #[cfg(not(target_os = "macos"))]
-        finish_with_real_winit_plugin(WinitPluginOrder::MonitorFirst);
+        assert_finish_contract(WinitPluginOrder::MonitorFirst);
     }
 
     #[test]
@@ -411,10 +421,7 @@ mod tests {
         ignore = "builds a real winit event loop, which needs a display server"
     )]
     fn real_winit_plugin_before_monitor_plugin_finishes() {
-        #[cfg(target_os = "macos")]
-        macos_main_thread_finish::assert_succeeded();
-        #[cfg(not(target_os = "macos"))]
-        finish_with_real_winit_plugin(WinitPluginOrder::WinitFirst);
+        assert_finish_contract(WinitPluginOrder::WinitFirst);
     }
 
     #[test]

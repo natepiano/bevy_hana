@@ -23,7 +23,6 @@ use dirs::config_dir;
 use hana_clerestory::CurrentMonitor;
 use hana_clerestory::CurrentMonitorIndex;
 use hana_clerestory::ManagedWindowName;
-#[cfg(target_os = "linux")]
 use hana_clerestory::Platform;
 
 use super::constants::ACTIVE_VIDEO_MODE_SUFFIX;
@@ -45,9 +44,7 @@ use super::constants::STATE_FILE;
 use super::constants::UNSELECTED_VIDEO_MODE_MARKER;
 use super::constants::VIDEO_MODE_CENTER_PADDING;
 use super::constants::VISIBLE_VIDEO_MODE_COUNT;
-#[cfg(target_os = "linux")]
 use super::constants::WAYLAND_PLATFORM_SUFFIX;
-#[cfg(target_os = "linux")]
 use super::constants::X11_PLATFORM_SUFFIX;
 use super::events::ClearStateAndQuit;
 use super::events::QuitApp;
@@ -261,17 +258,13 @@ pub(crate) fn sync_selected_to_active(
     }
 }
 
-#[cfg(target_os = "linux")]
 fn platform_suffix() -> &'static str {
-    if Platform::detect().is_wayland() {
-        WAYLAND_PLATFORM_SUFFIX
-    } else {
-        X11_PLATFORM_SUFFIX
+    match Platform::detect() {
+        Platform::Wayland => WAYLAND_PLATFORM_SUFFIX,
+        Platform::X11 => X11_PLATFORM_SUFFIX,
+        Platform::MacOs | Platform::Windows => "",
     }
 }
-
-#[cfg(not(target_os = "linux"))]
-const fn platform_suffix() -> &'static str { "" }
 
 pub(crate) fn format_monitor_row(
     current_monitor: &CurrentMonitor,

@@ -35,12 +35,8 @@ use hana_kana::ToI32;
 use hana_kana::ToU32;
 use hana_rigging::prelude::AttachmentPath;
 use hana_rigging::prelude::PlatformDeviceHandle;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-use hana_rigging::prelude::ReportedId;
 use hana_rigging::prelude::ReportedSerial;
 use winit::monitor::MonitorHandle;
-#[cfg(target_os = "macos")]
-use winit::platform::macos::MonitorHandleExtMacOS;
 
 use super::DisplayProductName;
 use super::MonitorDiscoveryRequestCoverage;
@@ -408,14 +404,14 @@ impl DisplayDeviceEvidence {
     #[cfg(any(test, feature = "test"))]
     #[allow(
         clippy::missing_const_for_fn,
-        reason = "`platform_device_handle` is a `const fn` only on non-macOS targets"
+        reason = "`platform_device_handle` is a `const fn` only on Windows"
     )]
     fn unavailable() -> Self {
         Self {
             identity_evidence:      DisplayIdentityEvidence::Unavailable {
                 serial: ReportedSerial::PlatformCannotReport,
             },
-            platform_device_handle: platform_device_handle(None),
+            platform_device_handle: identity::platform_device_handle(None),
             attachment:             AttachmentPath::PlatformHasNoConcept,
         }
     }
@@ -706,7 +702,7 @@ fn display_evidence(
                 identity_evidence: DisplayIdentityEvidence::Unavailable {
                     serial: ReportedSerial::PlatformCannotReport,
                 },
-                platform_device_handle: platform_device_handle(monitor.handle.as_ref()),
+                platform_device_handle: identity::platform_device_handle(monitor.handle.as_ref()),
                 attachment,
             },
             DisplayIdentity::Anonymous,
@@ -722,7 +718,7 @@ fn display_evidence(
             .device_handles
             .get(&monitor.entity)
             .cloned()
-            .unwrap_or_else(|| platform_device_handle(monitor.handle.as_ref()));
+            .unwrap_or_else(|| identity::platform_device_handle(monitor.handle.as_ref()));
         let scripted_unavailable = |attachment| {
             (
                 DisplayDeviceEvidence {
@@ -794,47 +790,15 @@ fn display_evidence(
             (
                 DisplayDeviceEvidence {
                     identity_evidence,
-                    platform_device_handle: platform_device_handle(monitor.handle.as_ref()),
+                    platform_device_handle: identity::platform_device_handle(
+                        monitor.handle.as_ref(),
+                    ),
                     attachment: attachment.clone(),
                 },
                 legacy_identity,
             )
         },
     )
-}
-
-/// Retain the exact window-server handle attached to this topology entry.
-#[cfg(target_os = "macos")]
-fn platform_device_handle(monitor_handle: Option<&MonitorHandle>) -> PlatformDeviceHandle {
-    let Some(monitor_handle) = monitor_handle else {
-        return PlatformDeviceHandle::PlatformReportedNothing;
-    };
-    ReportedId::new(monitor_handle.native_id().to_string()).map_or(
-        PlatformDeviceHandle::PlatformReportedNothing,
-        PlatformDeviceHandle::Reported,
-    )
-}
-
-/// Join capture evidence using the compositor's exact connector name.
-/// The durable device identity still comes from the display's EDID evidence.
-#[cfg(target_os = "linux")]
-fn platform_device_handle(monitor_handle: Option<&MonitorHandle>) -> PlatformDeviceHandle {
-    let Some(name) = monitor_handle
-        .and_then(MonitorHandle::name)
-        .filter(|name| !name.is_empty())
-    else {
-        return PlatformDeviceHandle::PlatformReportedNothing;
-    };
-    ReportedId::new(format!("linux-output:{name}")).map_or(
-        PlatformDeviceHandle::PlatformReportedNothing,
-        PlatformDeviceHandle::Reported,
-    )
-}
-
-/// Report that this platform supplies no handle shared with another display reporter.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-const fn platform_device_handle(_: Option<&MonitorHandle>) -> PlatformDeviceHandle {
-    PlatformDeviceHandle::PlatformHasNoConcept
 }
 
 fn display_product_name(

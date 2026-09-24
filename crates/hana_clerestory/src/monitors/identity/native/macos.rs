@@ -1,33 +1,30 @@
 use std::ffi::c_void;
 
+use hana_rigging::prelude::PlatformDeviceHandle;
+use hana_rigging::prelude::ReportedId;
+use hana_rigging::prelude::ReportedSerial;
+use objc2::MainThreadMarker;
+use objc2_app_kit::NSScreen;
+use objc2_foundation::NSNumber;
+use objc2_foundation::NSString;
 use winit::monitor::MonitorHandle;
 use winit::platform::macos::MonitorHandleExtMacOS;
 
 use super::MonitorEvidenceObservation;
 use super::attachment_path_when_unreported;
 use crate::Platform;
-#[cfg(test)]
-use crate::constants::DRM_INTERNAL_CONNECTOR_EVIDENCE_TAG;
-#[cfg(test)]
-use crate::constants::DRM_INTERNAL_CONNECTOR_PREFIXES;
+use crate::constants::CORE_GRAPHICS_SUCCESS;
 use crate::constants::MACOS_DISPLAY_UUID_BYTES;
+use crate::monitors::DisplayProductName;
+#[cfg(any(test, feature = "test"))]
+use crate::monitors::identity;
+use crate::monitors::identity::DisplayFingerprint;
+use crate::monitors::identity::DisplayIdentityEvidence;
 use crate::monitors::identity::MonitorIdentificationError;
-#[cfg(test)]
-use crate::monitors::identity::OperatingSystemQueryError;
-#[cfg(test)]
-use crate::monitors::identity::edid::EdidEvidence;
-#[cfg(test)]
-use crate::monitors::identity::edid::EdidIdentityEvidence;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(in crate::monitors) enum QualifiedEvidence {
     MacOsDisplayUuid(MacOsDisplayUuid),
-    #[cfg(test)]
-    InternalConnector(InternalConnector),
-    #[cfg(test)]
-    WindowsEdid(EdidIdentityEvidence),
-    #[cfg(test)]
-    LinuxEdid(EdidIdentityEvidence),
     #[cfg(any(test, feature = "test"))]
     Synthetic(Vec<u8>),
 }
@@ -36,38 +33,29 @@ impl QualifiedEvidence {
     /// Bytes that identify the physical display and nothing about this process or this boot.
     #[allow(
         clippy::missing_const_for_fn,
-        reason = "const only compiles where the macOS arm is the sole arm; the Vec arms are not"
+        reason = "const only compiles where the macOS arm is the sole arm; the `Synthetic` arm is not"
     )]
     pub(in crate::monitors::identity) fn stable_bytes(&self) -> &[u8] {
         match self {
             Self::MacOsDisplayUuid(uuid) => uuid.as_bytes(),
-            #[cfg(test)]
-            Self::InternalConnector(connector) => connector.as_bytes(),
-            #[cfg(test)]
-            Self::WindowsEdid(edid) | Self::LinuxEdid(edid) => edid.stable_bytes(),
             #[cfg(any(test, feature = "test"))]
             Self::Synthetic(bytes) => bytes,
         }
     }
-}
 
-#[cfg(test)]
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(in crate::monitors) struct InternalConnector(Vec<u8>);
-
-#[cfg(test)]
-impl InternalConnector {
-    fn as_bytes(&self) -> &[u8] { &self.0 }
-
-    fn identify(connector_name: &str) -> Option<Self> {
-        DRM_INTERNAL_CONNECTOR_PREFIXES
-            .iter()
-            .any(|prefix| connector_name.starts_with(prefix))
-            .then(|| {
-                let mut evidence = DRM_INTERNAL_CONNECTOR_EVIDENCE_TAG.to_vec();
-                evidence.extend_from_slice(connector_name.as_bytes());
-                Self(evidence)
-            })
+    /// Reporter evidence for this observation, given the `fingerprint` of its stable bytes.
+    pub(in crate::monitors::identity) const fn identity_evidence(
+        &self,
+        fingerprint: DisplayFingerprint,
+    ) -> DisplayIdentityEvidence {
+        match self {
+            Self::MacOsDisplayUuid(_) => DisplayIdentityEvidence::Synthesized {
+                display_fingerprint: fingerprint,
+                serial:              ReportedSerial::PlatformCannotReport,
+            },
+            #[cfg(any(test, feature = "test"))]
+            Self::Synthetic(_) => identity::synthesized_without_serial(fingerprint),
+        }
     }
 }
 
@@ -97,6 +85,39 @@ unsafe extern "C" {
 unsafe extern "C" {
     fn CFUUIDGetUUIDBytes(uuid: *const c_void) -> CoreFoundationUuidBytes;
     fn CFRelease(reference: *const c_void);
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGGetActiveDisplayList(
+        max_displays: u32,
+        active_displays: *mut u32,
+        display_count: *mut u32,
+    ) -> i32;
+}
+
+/// Describe an empty winit display list with the active-display count `CoreGraphics` reports.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the Linux and Windows backends share this signature and return `None`"
+)]
+pub(crate) fn active_display_detail(observed_count: usize) -> Option<String> {
+    let mut active_display_count = 0;
+    // SAFETY: a zero-capacity query writes only `display_count`; the active-display pointer is null
+    // because no display identifiers are requested by this count query.
+    let error_code =
+        unsafe { CGGetActiveDisplayList(0, std::ptr::null_mut(), &raw mut active_display_count) };
+    if error_code != CORE_GRAPHICS_SUCCESS {
+        return Some(format!(
+            "CGGetActiveDisplayList failed with CGError code {error_code} while \
+             {observed_count} observed displays remained"
+        ));
+    }
+
+    Some(format!(
+        "winit returned no current display handles while CGGetActiveDisplayList reported \
+         {active_display_count} active displays and {observed_count} observed displays remained"
+    ))
 }
 
 /// Read the `ColorSync` UUID for a monitor, or report that no stable identity is available.
@@ -134,61 +155,44 @@ pub(in crate::monitors) fn monitor_evidence(
     }
 }
 
-#[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    reason = "tests should panic on unexpected values"
-)]
-mod tests {
-    use super::*;
+/// Retain the exact window-server handle attached to this topology entry.
+pub(in crate::monitors) fn platform_device_handle(
+    monitor_handle: Option<&MonitorHandle>,
+) -> PlatformDeviceHandle {
+    let Some(monitor_handle) = monitor_handle else {
+        return PlatformDeviceHandle::PlatformReportedNothing;
+    };
+    ReportedId::new(monitor_handle.native_id().to_string()).map_or(
+        PlatformDeviceHandle::PlatformReportedNothing,
+        PlatformDeviceHandle::Reported,
+    )
+}
 
-    #[test]
-    fn test_only_edid_evidence_keeps_serial_tiers_and_query_errors_distinct() {
-        let query_error =
-            qualify_edid(Err(OperatingSystemQueryError::StableIdentityProperty.into()));
-        assert_eq!(
-            query_error,
-            Err(MonitorIdentificationError::OperatingSystemQuery(
-                OperatingSystemQueryError::StableIdentityProperty
-            ))
-        );
-
-        let identity = qualify_edid(Ok(serial_edid())).expect("fixture EDID should qualify");
-        let windows = QualifiedEvidence::WindowsEdid(identity.clone());
-        let linux = QualifiedEvidence::LinuxEdid(identity);
-
-        assert_eq!(windows.stable_bytes(), b"42");
-        assert_eq!(linux.stable_bytes(), b"42");
-    }
-
-    #[test]
-    fn internal_connector_test_evidence_uses_the_linux_tag() {
-        let connector = InternalConnector::identify("eDP-1").expect("eDP-1 is internal");
-        let qualified = QualifiedEvidence::InternalConnector(connector);
-
-        assert!(
-            qualified
-                .stable_bytes()
-                .starts_with(DRM_INTERNAL_CONNECTOR_EVIDENCE_TAG)
-        );
-    }
-
-    fn qualify_edid(
-        query: Result<Vec<u8>, MonitorIdentificationError>,
-    ) -> Result<EdidIdentityEvidence, MonitorIdentificationError> {
-        EdidEvidence::qualify(query?)
-    }
-
-    fn serial_edid() -> Vec<u8> {
-        let mut edid = vec![0_u8; EdidEvidence::BLOCK_SIZE];
-        edid[..EdidEvidence::HEADER.len()].copy_from_slice(&EdidEvidence::HEADER);
-        edid[EdidEvidence::SERIAL_START..EdidEvidence::SERIAL_END]
-            .copy_from_slice(&42_u32.to_le_bytes());
-        let checksum_index = EdidEvidence::BLOCK_SIZE - 1;
-        let checksum = edid[..checksum_index]
-            .iter()
-            .fold(0_u8, |sum, byte| sum.wrapping_add(*byte));
-        edid[checksum_index] = 0_u8.wrapping_sub(checksum);
-        edid
-    }
+/// Resolve one winit monitor's product name from the matching `AppKit` screen.
+pub(in crate::monitors) fn product_name(
+    monitor_handle: Option<&MonitorHandle>,
+) -> DisplayProductName {
+    let Some(monitor_handle) = monitor_handle else {
+        return DisplayProductName::NotReported;
+    };
+    let Some(main_thread) = MainThreadMarker::new() else {
+        return DisplayProductName::NotReported;
+    };
+    let screen_number_key = NSString::from_str("NSScreenNumber");
+    let display_id = monitor_handle.native_id();
+    NSScreen::screens(main_thread)
+        .iter()
+        .find(|screen| {
+            screen
+                .deviceDescription()
+                .objectForKey(&screen_number_key)
+                .is_some_and(|screen_number| {
+                    screen_number
+                        .downcast_ref::<NSNumber>()
+                        .is_some_and(|screen_number| screen_number.unsignedIntValue() == display_id)
+                })
+        })
+        .map_or(DisplayProductName::NotReported, |screen| {
+            DisplayProductName::Reported(screen.localizedName().to_string())
+        })
 }

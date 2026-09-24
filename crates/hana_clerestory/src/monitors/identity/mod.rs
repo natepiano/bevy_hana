@@ -1,18 +1,22 @@
 mod configuration;
+#[cfg(any(test, not(target_os = "macos")))]
 mod edid;
+#[cfg(any(test, target_os = "linux"))]
+mod internal_connector;
 mod native;
 
 use bevy::prelude::Reflect;
 pub(super) use configuration::MonitorConfiguration;
 pub(super) use configuration::MonitorConfigurationState;
-#[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
-use edid::EdidIdentityEvidence;
-#[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
+#[cfg(any(test, not(target_os = "macos")))]
 use hana_rigging::prelude::ReportedId;
 use hana_rigging::prelude::ReportedSerial;
 #[cfg(any(test, feature = "test"))]
 pub(super) use native::QualifiedEvidence;
+pub(crate) use native::active_display_detail;
 pub(super) use native::monitor_evidence;
+pub(super) use native::platform_device_handle;
+pub(super) use native::product_name;
 use serde::Deserialize;
 use serde::Serialize;
 use thiserror::Error;
@@ -89,7 +93,7 @@ pub enum DisplayIdentity {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DisplayIdentityEvidence {
     /// Serial value the display published in its EDID.
-    #[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
+    #[cfg(any(test, not(target_os = "macos")))]
     ReportedSerial(ReportedId),
     /// Stable descriptor material that identifies only a restore target.
     Synthesized {
@@ -108,7 +112,7 @@ pub(crate) enum DisplayIdentityEvidence {
 impl DisplayIdentityEvidence {
     pub(crate) fn reported_serial(&self) -> ReportedSerial {
         match self {
-            #[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
+            #[cfg(any(test, not(target_os = "macos")))]
             Self::ReportedSerial(reported_id) => ReportedSerial::Provided(reported_id.clone()),
             Self::Synthesized { serial, .. } | Self::Unavailable { serial } => serial.clone(),
         }
@@ -125,7 +129,7 @@ pub(super) enum MonitorIdentificationError {
     #[error("operating-system monitor query failed: {0}")]
     OperatingSystemQuery(#[from] OperatingSystemQueryError),
     /// The platform returned identity data that failed its format or placeholder checks.
-    #[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
+    #[cfg(any(test, not(target_os = "macos")))]
     #[error(
         "stable physical monitor identity data is missing, incomplete, malformed, or a placeholder"
     )]
@@ -142,27 +146,43 @@ pub(super) enum MonitorIdentificationError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub(super) enum OperatingSystemQueryError {
     /// The platform display-configuration query failed.
-    #[cfg(any(target_os = "windows", all(unix, not(target_os = "macos"))))]
+    #[cfg(not(target_os = "macos"))]
     #[error("display-configuration query failed")]
     DisplayConfiguration,
-    /// Registration for display-configuration notifications failed.
-    #[error("monitor configuration-notification registration failed")]
-    ConfigurationNotificationRegistration,
-    /// The registered display-configuration notification stream failed.
-    #[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
-    #[error("monitor configuration-notification stream failed")]
-    ConfigurationNotificationStream,
-    /// Removing a display-configuration notification registration failed.
-    #[error("monitor configuration-notification removal failed")]
-    ConfigurationNotificationRemoval,
+    /// A display-configuration notification operation failed.
+    #[error(transparent)]
+    ConfigurationNotification(#[from] ConfigurationNotificationError),
     /// Windows could not enumerate a display's device interface.
     #[cfg(target_os = "windows")]
     #[error("monitor device-interface query failed")]
     MonitorDeviceInterface,
     /// The platform property used for durable display evidence could not be read.
-    #[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
+    #[cfg(not(target_os = "macos"))]
     #[error("stable monitor identity-property query failed")]
     StableIdentityProperty,
+}
+
+/// Display-configuration notification operation that failed.
+///
+/// Nested under [`OperatingSystemQueryError::ConfigurationNotification`] so the three operations
+/// share no variant-name prefix on a target, such as macOS, where they are the only query errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub(super) enum ConfigurationNotificationError {
+    /// Registration for display-configuration notifications failed.
+    #[error("monitor configuration-notification registration failed")]
+    Registration,
+    /// The registered display-configuration notification stream failed.
+    #[error("monitor configuration-notification stream failed")]
+    Stream,
+    /// Removing a display-configuration notification registration failed.
+    #[error("monitor configuration-notification removal failed")]
+    Removal,
+}
+
+impl From<ConfigurationNotificationError> for MonitorIdentificationError {
+    fn from(error: ConfigurationNotificationError) -> Self {
+        Self::OperatingSystemQuery(error.into())
+    }
 }
 
 /// Convert one fresh platform observation into reporter evidence and the legacy persistence
@@ -176,45 +196,10 @@ pub(super) fn classify_display_evidence(
 ) -> (DisplayIdentityEvidence, DisplayIdentity) {
     let fingerprint = DisplayFingerprint::from_evidence_bytes(evidence.stable_bytes());
     let legacy = DisplayIdentity::Fingerprinted(fingerprint);
-    let reported = match evidence {
-        #[cfg(any(test, target_os = "windows"))]
-        native::QualifiedEvidence::WindowsEdid(EdidIdentityEvidence::ReportedSerial(serial)) => {
-            DisplayIdentityEvidence::ReportedSerial(serial.clone())
-        },
-        #[cfg(any(test, target_os = "windows"))]
-        native::QualifiedEvidence::WindowsEdid(EdidIdentityEvidence::Descriptor(_)) => {
-            synthesized_without_serial(fingerprint)
-        },
-        #[cfg(any(test, all(unix, not(target_os = "macos"))))]
-        native::QualifiedEvidence::LinuxEdid(EdidIdentityEvidence::ReportedSerial(serial)) => {
-            DisplayIdentityEvidence::ReportedSerial(serial.clone())
-        },
-        #[cfg(any(test, all(unix, not(target_os = "macos"))))]
-        native::QualifiedEvidence::LinuxEdid(EdidIdentityEvidence::Descriptor(_)) => {
-            synthesized_without_serial(fingerprint)
-        },
-        #[cfg(any(test, target_os = "linux"))]
-        native::QualifiedEvidence::InternalConnector(_) => DisplayIdentityEvidence::Synthesized {
-            display_fingerprint: fingerprint,
-            serial:              ReportedSerial::PlatformCannotReport,
-        },
-        #[cfg(target_os = "macos")]
-        native::QualifiedEvidence::MacOsDisplayUuid(_) => DisplayIdentityEvidence::Synthesized {
-            display_fingerprint: fingerprint,
-            serial:              ReportedSerial::PlatformCannotReport,
-        },
-        #[cfg(any(test, feature = "test"))]
-        QualifiedEvidence::Synthetic(_) => synthesized_without_serial(fingerprint),
-    };
-    (reported, legacy)
+    (evidence.identity_evidence(fingerprint), legacy)
 }
 
-#[cfg(any(
-    test,
-    feature = "test",
-    target_os = "windows",
-    all(unix, not(target_os = "macos"))
-))]
+#[cfg(any(test, feature = "test", not(target_os = "macos")))]
 const fn synthesized_without_serial(fingerprint: DisplayFingerprint) -> DisplayIdentityEvidence {
     DisplayIdentityEvidence::Synthesized {
         display_fingerprint: fingerprint,

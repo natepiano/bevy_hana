@@ -12,12 +12,13 @@ use windows::Win32::UI::WindowsAndMessaging::WM_DEVICECHANGE;
 use windows::Win32::UI::WindowsAndMessaging::WM_DISPLAYCHANGE;
 
 use super::MonitorConfigurationGenerationTracker;
+use crate::monitors::identity::ConfigurationNotificationError;
 use crate::monitors::identity::OperatingSystemQueryError;
 
 pub(super) fn monitor_device_notification_filter()
 -> Result<DEV_BROADCAST_DEVICEINTERFACE_W, OperatingSystemQueryError> {
     let dbcc_size = u32::try_from(size_of::<DEV_BROADCAST_DEVICEINTERFACE_W>())
-        .map_err(|_| OperatingSystemQueryError::ConfigurationNotificationRegistration)?;
+        .map_err(|_| ConfigurationNotificationError::Registration)?;
     Ok(DEV_BROADCAST_DEVICEINTERFACE_W {
         dbcc_size,
         dbcc_devicetype: DBT_DEVTYP_DEVICEINTERFACE.0,

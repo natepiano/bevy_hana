@@ -9,11 +9,16 @@
 //! See: <https://github.com/rust-windowing/winit/issues/4445>
 
 use bevy::ecs::system::NonSendMarker;
+use bevy::prelude::App;
+use bevy::prelude::ApplyDeferred;
 use bevy::prelude::Commands;
 use bevy::prelude::Component;
 use bevy::prelude::Entity;
 use bevy::prelude::IVec2;
+use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::Query;
+use bevy::prelude::Res;
+use bevy::prelude::Update;
 use bevy::prelude::Window;
 use bevy::prelude::With;
 use bevy::prelude::Without;
@@ -31,15 +36,46 @@ use x11rb::protocol::xproto::ConnectionExt;
 use x11rb::xcb_ffi::XCBConnection;
 
 use super::MonitorScaleStrategy;
-use super::TargetPosition;
 use super::WindowRestoreAttempt;
-use super::X11FrameCompensated;
+use super::check_restore_settling;
+use super::place_window_at_saved_geometry;
+use super::prepare_driver_restore_targets;
+use super::target_position::TargetPosition;
 use super::target_position::WindowSettleProgress;
+use super::winit_info::X11FrameCompensated;
+use crate::ClerestoryWindowDriverSet;
+use crate::Platform;
 use crate::constants::FRAME_EXTENT_COUNT;
 use crate::constants::FRAME_EXTENT_PROPERTY_OFFSET;
 use crate::constants::FRAME_EXTENT_TOP_INDEX;
 use crate::constants::FRAME_EXTENTS_ATOM_NAME;
 use crate::events::ExpectedPhysicalPosition;
+
+/// Compensate each restore target for the X11 frame before placement, then re-apply it once the
+/// window is mapped. Runs only on X11.
+pub(super) fn register(app: &mut App) {
+    app.add_systems(
+        Update,
+        (
+            compensate_target_position
+                .after(prepare_driver_restore_targets)
+                .before(place_window_at_saved_geometry)
+                .in_set(ClerestoryWindowDriverSet::TargetPreparation),
+            ApplyDeferred
+                .after(compensate_target_position)
+                .in_set(ClerestoryWindowDriverSet::TargetPreparation),
+            // Re-apply the compensated position once the window is mapped: bevy 0.19
+            // can ignore the first `set_outer_position` request while the X11 window is
+            // unmapped, while a mapped window's `Window.position` readback matches the
+            // requested compensated position plus `X11FrameTop`.
+            reapply_compensated_position
+                .after(place_window_at_saved_geometry)
+                .before(check_restore_settling)
+                .in_set(ClerestoryWindowDriverSet::TargetPreparation),
+        )
+            .run_if(|p: Res<Platform>| p.is_x11()),
+    );
+}
 
 /// The `_NET_FRAME_EXTENTS` top (physical pixels) queried during W6 compensation.
 ///
@@ -47,14 +83,14 @@ use crate::events::ExpectedPhysicalPosition;
 /// compares against (`compensated_position + frame_top`) without re-opening an X11 connection
 /// every frame. Present only on windows whose position was compensated.
 #[derive(Component)]
-pub(crate) struct X11FrameTop(i32);
+struct X11FrameTop(i32);
 
 /// Subtract the X11 title bar height from `TargetPosition::placement_decision`.
 ///
 /// Inserts `X11FrameCompensated` once frame extents are available; this gates
 /// `place_window_at_saved_geometry`. If `_NET_FRAME_EXTENTS` is not yet set by the WM, returns
 /// silently and retries next frame.
-pub(crate) fn compensate_target_position(
+fn compensate_target_position(
     mut commands: Commands,
     mut windows: Query<
         (Entity, &mut TargetPosition),
@@ -100,7 +136,7 @@ pub(crate) fn compensate_target_position(
 ///
 /// Same-scale (`ApplyUnchanged`) windowed restores only — cross-DPI strategies drive
 /// position through their own multi-phase move and tolerate the W6 offset.
-pub(crate) fn reapply_compensated_position(
+fn reapply_compensated_position(
     mut windows: Query<(&TargetPosition, &X11FrameTop, &mut Window), With<WindowRestoreAttempt>>,
 ) {
     for (target_position, physical_frame_top, mut window) in &mut windows {

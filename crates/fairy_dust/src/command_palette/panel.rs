@@ -24,6 +24,8 @@ use hana_rubric::CommandPaletteQueryResult;
 use hana_rubric::CommandPaletteRow;
 use hana_rubric::DiagnosticSeverity;
 use hana_rubric::PaletteBinding;
+use hana_rubric::PaletteRowCursor;
+use hana_rubric::PaletteRowList;
 use hana_rubric::PaletteSelectionOutcome;
 
 use super::constants::COMMAND_KEYSTROKE_COLOR;
@@ -82,8 +84,11 @@ pub(super) enum PalettePresentationInput<'view, 'registry, 'keymap, 'context> {
     AwaitingRegistryAssembly,
     /// One borrowed query result from the live registry and its complete context observation.
     AssembledQuery {
-        /// What the query resolved to, which determines the highlighted row and the status line.
+        /// What the query resolved to, which sets the row the query highlights and the status
+        /// line.
         selection_outcome: PaletteSelectionOutcome<'registry>,
+        /// Which row the arrow keys have highlighted, and how far the list has scrolled.
+        row_cursor:        PaletteRowCursor,
         /// The command rows matching the query, in registry order.
         command_rows:      &'view [CommandPaletteRow<'registry, 'keymap, 'context>],
         /// The complete active state snapshot the shared query observed.
@@ -117,6 +122,7 @@ pub(super) enum SelectionStatus {
 pub(super) fn palette_tree_for_query(
     query: &str,
     query_result: &CommandPaletteQueryResult<'_, '_, '_, '_>,
+    row_cursor: PaletteRowCursor,
     keymap_failures: &[KeymapFailureRow],
     panel_width: f32,
 ) -> LayoutTree {
@@ -124,8 +130,9 @@ pub(super) fn palette_tree_for_query(
         query,
         presentation_input: PalettePresentationInput::AssembledQuery {
             selection_outcome: query_result.selection(),
-            command_rows:      query_result.rows(),
-            active_context:    query_result.active_context(),
+            row_cursor,
+            command_rows: query_result.rows(),
+            active_context: query_result.active_context(),
         },
         keymap_failure_rows: keymap_failures,
         panel_width,
@@ -133,6 +140,25 @@ pub(super) fn palette_tree_for_query(
 }
 
 /// Builds the distinct panel state used only before command-registry assembly.
+/// The command rows a [`PaletteRowCursor`] steps through for one query.
+///
+/// A query that selects a command selects the first row.
+pub(super) const fn command_row_list(
+    selection_outcome: PaletteSelectionOutcome<'_>,
+    command_rows: usize,
+) -> PaletteRowList {
+    PaletteRowList {
+        len:         command_rows,
+        query_row:   match selection_outcome {
+            PaletteSelectionOutcome::Selected(_) => Some(0),
+            PaletteSelectionOutcome::EmptyQuery
+            | PaletteSelectionOutcome::NoMatch
+            | PaletteSelectionOutcome::NotPaletteInvocable => None,
+        },
+        visible_len: MAX_VISIBLE_COMMAND_ROWS,
+    }
+}
+
 pub(super) fn palette_tree_awaiting_assembly(
     query: &str,
     keymap_failures: &[KeymapFailureRow],
@@ -358,6 +384,7 @@ fn build_command_rows(builder: &mut LayoutBuilder, view: &PaletteView<'_, '_, '_
             ),
             PalettePresentationInput::AssembledQuery {
                 selection_outcome,
+                row_cursor,
                 command_rows,
                 active_context,
             } => {
@@ -369,14 +396,21 @@ fn build_command_rows(builder: &mut LayoutBuilder, view: &PaletteView<'_, '_, '_
                 if let SelectionStatus::Message(status) = selection_status(*selection_outcome) {
                     build_note_row(builder, status.to_owned(), FAILURE_ADVISORY_COLOR);
                 }
-                for command_row in command_rows.iter().take(MAX_VISIBLE_COMMAND_ROWS) {
-                    build_command_row(builder, command_row, *selection_outcome);
+                let row_list = command_row_list(*selection_outcome, command_rows.len());
+                let highlighted_row = row_cursor.highlighted_row(row_list);
+                let visible_rows = row_cursor.visible_rows(row_list);
+                for (row, command_row) in command_rows.iter().enumerate() {
+                    if visible_rows.contains(&row) {
+                        build_command_row(builder, command_row, highlighted_row == Some(row));
+                    }
                 }
-                let hidden = command_rows.len().saturating_sub(MAX_VISIBLE_COMMAND_ROWS);
+                let hidden = command_rows.len() - visible_rows.len();
                 if hidden > 0 {
                     build_note_row(
                         builder,
-                        format!("{hidden} more — keep typing to narrow the list"),
+                        format!(
+                            "{hidden} more — arrow keys scroll, or keep typing to narrow the list"
+                        ),
                         HIDDEN_ROW_COLOR,
                     );
                 }
@@ -403,17 +437,15 @@ fn build_note_row(builder: &mut LayoutBuilder, note: String, color: Color) {
 fn build_command_row(
     builder: &mut LayoutBuilder,
     command_row: &CommandPaletteRow<'_, '_, '_>,
-    selection: PaletteSelectionOutcome<'_>,
+    highlighted: bool,
 ) {
     let command = command_row.command();
-    let is_selected = matches!(selection, PaletteSelectionOutcome::Selected(selected)
-        if selected.id() == command.id());
     let mut row = El::row()
         .width(Sizing::GROW)
         .height(Sizing::fixed(COMMAND_ROW_HEIGHT))
         .gap(PANEL_COLUMN_GAP)
         .align_y(AlignY::Center);
-    let title_color = if is_selected {
+    let title_color = if highlighted {
         row = row
             .background(SELECTED_COMMAND_BACKGROUND)
             .corner_radius(CornerRadius::all(FIELD_CORNER_RADIUS));
@@ -523,6 +555,7 @@ mod tests {
     use hana_rubric::KeymapBindings;
     use hana_rubric::KeymapPlugin;
     use hana_rubric::PaletteBinding;
+    use hana_rubric::PaletteRowCursor;
     use hana_rubric::PaletteSelectionOutcome;
     use hana_rubric::query_command_palette;
     use strum::AsRefStr;
@@ -760,7 +793,13 @@ mod tests {
             keymap_bindings,
             query,
         );
-        palette_tree_for_query(query, &query_result, &[], PANEL_MAX_WIDTH)
+        palette_tree_for_query(
+            query,
+            &query_result,
+            PaletteRowCursor::default(),
+            &[],
+            PANEL_MAX_WIDTH,
+        )
     }
 
     fn awaiting_context() -> ActiveKeymapContext {
@@ -904,8 +943,13 @@ mod tests {
             app.world().resource(),
             "Open Command Palette",
         );
-        let awaiting =
-            palette_tree_for_query("Open Command Palette", &query_result, &[], PANEL_MAX_WIDTH);
+        let awaiting = palette_tree_for_query(
+            "Open Command Palette",
+            &query_result,
+            PaletteRowCursor::default(),
+            &[],
+            PANEL_MAX_WIDTH,
+        );
         let unbound = shared_tree(
             "Open Command Palette",
             app.world().resource::<KeymapBindings>(),
@@ -936,6 +980,7 @@ mod tests {
         let unavailable_tree = palette_tree_for_query(
             DISPATCH_COMMAND_TITLE,
             &unavailable_query,
+            PaletteRowCursor::default(),
             &[],
             PANEL_MAX_WIDTH,
         );
@@ -960,7 +1005,13 @@ mod tests {
         );
         let presentation = format!(
             "{:?}",
-            palette_tree_for_query(DISPATCH_COMMAND_TITLE, &query_result, &[], PANEL_MAX_WIDTH,)
+            palette_tree_for_query(
+                DISPATCH_COMMAND_TITLE,
+                &query_result,
+                PaletteRowCursor::default(),
+                &[],
+                PANEL_MAX_WIDTH,
+            )
         );
 
         assert!(matches!(
@@ -984,7 +1035,13 @@ mod tests {
         );
         let presentation = format!(
             "{:?}",
-            palette_tree_for_query("Open Command Palette", &query_result, &[], PANEL_MAX_WIDTH,)
+            palette_tree_for_query(
+                "Open Command Palette",
+                &query_result,
+                PaletteRowCursor::default(),
+                &[],
+                PANEL_MAX_WIDTH,
+            )
         );
 
         assert!(presentation.contains("Context: global"));
@@ -1004,7 +1061,13 @@ mod tests {
         );
         let presentation = format!(
             "{:?}",
-            palette_tree_for_query(DISPATCH_COMMAND_TITLE, &query_result, &[], PANEL_MAX_WIDTH,)
+            palette_tree_for_query(
+                DISPATCH_COMMAND_TITLE,
+                &query_result,
+                PaletteRowCursor::default(),
+                &[],
+                PANEL_MAX_WIDTH,
+            )
         );
 
         assert!(presentation.contains("Context: application=ready, interaction=editing"));

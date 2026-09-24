@@ -26,36 +26,23 @@ pub(crate) use restore_attempt::resolve_legacy_coordinate_monitor;
 pub(crate) use settle_state::check_restore_settling;
 pub(crate) use target_position::FullscreenRestoreState;
 pub(crate) use target_position::MonitorScaleStrategy;
+pub(crate) use target_position::NativeFullscreenState;
 use target_position::ObservedScaleInputs;
-#[cfg(any(
-    test,
-    target_os = "macos",
-    all(target_os = "linux", feature = "workaround-winit-4445")
-))]
+#[cfg(test)]
 pub(crate) use target_position::TargetPosition;
 pub(crate) use target_position::WindowRestoreState;
 pub(crate) use target_position::place_window_at_saved_geometry;
 pub(crate) use target_position::rebase_legacy_position;
 #[cfg(test)]
 pub(crate) use winit_info::InjectedWinitWindows;
-#[cfg(all(target_os = "linux", feature = "workaround-winit-4445"))]
-pub(crate) use winit_info::X11FrameCompensated;
-#[cfg(all(target_os = "linux", feature = "workaround-winit-4445"))]
-pub(crate) use x11_position_fix::compensate_target_position;
-#[cfg(all(target_os = "linux", feature = "workaround-winit-4445"))]
-pub(crate) use x11_position_fix::reapply_compensated_position;
 
 use crate::ClerestoryUpdateSet;
 use crate::ClerestoryWindowDriverSet;
-#[cfg(target_os = "macos")]
-use crate::macos_tabbing_fix;
 pub(crate) struct RestorePlugin;
 
 impl Plugin for RestorePlugin {
     fn build(&self, app: &mut App) {
-        #[cfg(target_os = "macos")]
-        app.insert_non_send(crate::macos_tabbing_fix::NativeFullscreenObservations::default())
-            .add_observer(macos_tabbing_fix::clear_fullscreen_observation);
+        app.add_observer(target_position::clear_fullscreen_observation);
 
         app.configure_sets(
             Update,
@@ -86,5 +73,8 @@ impl Plugin for RestorePlugin {
             )
                 .in_set(ClerestoryWindowDriverSet::TargetPreparation),
         );
+
+        #[cfg(all(target_os = "linux", feature = "workaround-winit-4445"))]
+        x11_position_fix::register(app);
     }
 }

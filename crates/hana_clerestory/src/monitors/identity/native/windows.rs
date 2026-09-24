@@ -1,5 +1,6 @@
 use std::mem::size_of;
 
+use hana_rigging::prelude::PlatformDeviceHandle;
 use windows::Win32::Devices::DeviceAndDriverInstallation::DICS_FLAG_GLOBAL;
 use windows::Win32::Devices::DeviceAndDriverInstallation::DIGCF_DEVICEINTERFACE;
 use windows::Win32::Devices::DeviceAndDriverInstallation::DIGCF_PRESENT;
@@ -46,10 +47,11 @@ use super::MonitorEvidenceObservation;
 use super::attachment_path_when_unreported;
 use crate::Platform;
 use crate::constants::DISPLAY_CONFIG_ACQUISITION_ATTEMPTS;
-#[cfg(test)]
-use crate::constants::DRM_INTERNAL_CONNECTOR_EVIDENCE_TAG;
-#[cfg(test)]
-use crate::constants::DRM_INTERNAL_CONNECTOR_PREFIXES;
+use crate::monitors::DisplayProductName;
+#[cfg(any(test, feature = "test"))]
+use crate::monitors::identity;
+use crate::monitors::identity::DisplayFingerprint;
+use crate::monitors::identity::DisplayIdentityEvidence;
 use crate::monitors::identity::MonitorIdentificationError;
 use crate::monitors::identity::OperatingSystemQueryError;
 use crate::monitors::identity::edid::EdidEvidence;
@@ -58,10 +60,6 @@ use crate::monitors::identity::edid::EdidIdentityEvidence;
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(in crate::monitors) enum QualifiedEvidence {
     WindowsEdid(EdidIdentityEvidence),
-    #[cfg(test)]
-    InternalConnector(InternalConnector),
-    #[cfg(test)]
-    LinuxEdid(EdidIdentityEvidence),
     #[cfg(any(test, feature = "test"))]
     Synthetic(Vec<u8>),
 }
@@ -71,35 +69,26 @@ impl QualifiedEvidence {
     pub(in crate::monitors::identity) fn stable_bytes(&self) -> &[u8] {
         match self {
             Self::WindowsEdid(edid) => edid.stable_bytes(),
-            #[cfg(test)]
-            Self::InternalConnector(connector) => connector.as_bytes(),
-            #[cfg(test)]
-            Self::LinuxEdid(edid) => edid.stable_bytes(),
             #[cfg(any(test, feature = "test"))]
             Self::Synthetic(bytes) => bytes,
         }
     }
-}
 
-#[cfg(test)]
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(in crate::monitors) struct InternalConnector(Vec<u8>);
-
-#[cfg(test)]
-impl InternalConnector {
-    fn as_bytes(&self) -> &[u8] { &self.0 }
-
-    fn identify(connector_name: &str) -> Option<Self> {
-        DRM_INTERNAL_CONNECTOR_PREFIXES
-            .iter()
-            .any(|prefix| connector_name.starts_with(prefix))
-            .then(|| {
-                let mut evidence = DRM_INTERNAL_CONNECTOR_EVIDENCE_TAG.to_vec();
-                evidence.extend_from_slice(connector_name.as_bytes());
-                Self(evidence)
-            })
+    /// Reporter evidence for this observation, given the `fingerprint` of its stable bytes.
+    pub(in crate::monitors::identity) fn identity_evidence(
+        &self,
+        fingerprint: DisplayFingerprint,
+    ) -> DisplayIdentityEvidence {
+        match self {
+            Self::WindowsEdid(edid) => edid.identity_evidence(fingerprint),
+            #[cfg(any(test, feature = "test"))]
+            Self::Synthetic(_) => identity::synthesized_without_serial(fingerprint),
+        }
     }
 }
+
+/// Report no active-display detail: this backend has no display count apart from winit's.
+pub(crate) const fn active_display_detail(_: usize) -> Option<String> { None }
 
 pub(in crate::monitors) fn monitor_evidence(
     handle: &MonitorHandle,
@@ -115,6 +104,18 @@ pub(in crate::monitors) fn monitor_evidence(
             attachment: attachment_path_when_unreported(platform),
         },
     }
+}
+
+/// Report that this platform supplies no handle shared with another display reporter.
+pub(in crate::monitors) const fn platform_device_handle(
+    _: Option<&MonitorHandle>,
+) -> PlatformDeviceHandle {
+    PlatformDeviceHandle::PlatformHasNoConcept
+}
+
+/// Report no `AppKit` product name: this backend has no `AppKit` screen list to read one from.
+pub(in crate::monitors) const fn product_name(_: Option<&MonitorHandle>) -> DisplayProductName {
+    DisplayProductName::NotReported
 }
 
 fn windows_display_evidence(
@@ -455,23 +456,9 @@ mod tests {
     #[test]
     fn qualified_edid_variants_retain_the_extracted_serial_tier() {
         let identity = qualify_edid(Ok(serial_edid())).expect("fixture EDID should qualify");
-        let windows = QualifiedEvidence::WindowsEdid(identity.clone());
-        let linux = QualifiedEvidence::LinuxEdid(identity);
+        let windows = QualifiedEvidence::WindowsEdid(identity);
 
         assert_eq!(windows.stable_bytes(), b"42");
-        assert_eq!(linux.stable_bytes(), b"42");
-    }
-
-    #[test]
-    fn internal_connector_test_evidence_uses_the_linux_tag() {
-        let connector = InternalConnector::identify("eDP-1").expect("eDP-1 is internal");
-        let qualified = QualifiedEvidence::InternalConnector(connector);
-
-        assert!(
-            qualified
-                .stable_bytes()
-                .starts_with(DRM_INTERNAL_CONNECTOR_EVIDENCE_TAG)
-        );
     }
 
     fn serial_edid() -> Vec<u8> {

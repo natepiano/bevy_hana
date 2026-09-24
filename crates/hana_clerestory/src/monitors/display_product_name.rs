@@ -1,18 +1,9 @@
 //! Operating-system display product names.
 
 use bevy::prelude::Reflect;
-#[cfg(target_os = "macos")]
-use objc2::MainThreadMarker;
-#[cfg(target_os = "macos")]
-use objc2_app_kit::NSScreen;
-#[cfg(target_os = "macos")]
-use objc2_foundation::NSNumber;
-#[cfg(target_os = "macos")]
-use objc2_foundation::NSString;
 use winit::monitor::MonitorHandle;
-#[cfg(target_os = "macos")]
-use winit::platform::macos::MonitorHandleExtMacOS;
 
+use super::identity;
 use crate::Platform;
 
 /// The product name the operating system shows the user for a display.
@@ -41,58 +32,19 @@ impl DisplayProductName {
     }
 }
 
-#[cfg(target_os = "macos")]
 pub(super) fn from_platform(
     monitor_handle: Option<&MonitorHandle>,
     winit_name: Option<&str>,
     platform: Platform,
 ) -> DisplayProductName {
-    let _ = (winit_name, platform);
-    macos_product_name(monitor_handle)
-}
-
-#[cfg(not(target_os = "macos"))]
-pub(super) fn from_platform(
-    monitor_handle: Option<&MonitorHandle>,
-    winit_name: Option<&str>,
-    platform: Platform,
-) -> DisplayProductName {
-    let _ = monitor_handle;
     match platform {
+        Platform::MacOs => identity::product_name(monitor_handle),
         Platform::Windows | Platform::X11 => winit_name.map_or_else(
             || DisplayProductName::NotReported,
             |name| DisplayProductName::Reported(name.to_owned()),
         ),
-        Platform::MacOs | Platform::Wayland => DisplayProductName::PlatformHasNoConcept,
+        Platform::Wayland => DisplayProductName::PlatformHasNoConcept,
     }
-}
-
-/// Resolve one winit monitor's product name from the matching `AppKit` screen.
-#[cfg(target_os = "macos")]
-fn macos_product_name(monitor_handle: Option<&MonitorHandle>) -> DisplayProductName {
-    let Some(monitor_handle) = monitor_handle else {
-        return DisplayProductName::NotReported;
-    };
-    let Some(main_thread) = MainThreadMarker::new() else {
-        return DisplayProductName::NotReported;
-    };
-    let screen_number_key = NSString::from_str("NSScreenNumber");
-    let display_id = monitor_handle.native_id();
-    NSScreen::screens(main_thread)
-        .iter()
-        .find(|screen| {
-            screen
-                .deviceDescription()
-                .objectForKey(&screen_number_key)
-                .is_some_and(|screen_number| {
-                    screen_number
-                        .downcast_ref::<NSNumber>()
-                        .is_some_and(|screen_number| screen_number.unsignedIntValue() == display_id)
-                })
-        })
-        .map_or(DisplayProductName::NotReported, |screen| {
-            DisplayProductName::Reported(screen.localizedName().to_string())
-        })
 }
 
 #[cfg(test)]
