@@ -12,10 +12,9 @@ use crate::render::draw_order::DrawZIndexRank;
 /// build panel-local glyph meshes.
 #[derive(Component, Clone, Debug)]
 pub struct PanelTextLayout {
-    /// Panel-local id of the source text run, plus the line ordinal within that
-    /// run (`0` for an unwrapped run). Together they form the reification reuse
-    /// key, and because neither depends on position in the command stream, a
-    /// named run survives a sibling reorder.
+    /// Panel-local id of the source text run. Named text access uses this with
+    /// [`line_index`](Self::line_index); reification keeps its own private
+    /// identity so icon runs do not share the text-id namespace.
     pub id:               PanelElementId,
     /// Line ordinal of this command within its run (`0`-based), so a wrapped
     /// multi-line run reuses each line stably.
@@ -30,8 +29,8 @@ pub struct PanelTextLayout {
     /// Distinct from the batch material's `StandardMaterial::depth_bias`, which
     /// text batch materials derive from `PanelTextDrawZIndexRank`.
     pub clip_depth_nudge: f32,
-    /// OIT `position.z` offset projected from the run's `DrawOrderIndex`.
-    pub oit_depth_offset: f32,
+    /// Normalized panel-local OIT paint order; physical depth stays unchanged.
+    pub oit_paint_order:  f32,
     /// Layout-computed position and size in layout coordinates.
     pub bounds:           BoundingBox,
     /// X scale: points to meters.
@@ -58,29 +57,30 @@ impl PanelTextLayout {
     /// Bit-equality over the layout fields a panel-text glyph mesh depends on,
     /// used to gate per-run rebuilds.
     ///
-    /// Compares `bounds`, ordering fields, `scale_x`, `scale_y`, `anchor_x`,
-    /// `anchor_y`, and `clip_rect` via exact equality or `to_bits`. Excludes
-    /// the reuse-identity fields (`id`/`line_index`/`element_idx`).
+    /// Compares `element_idx`, `bounds`, ordering fields, `scale_x`, `scale_y`,
+    /// `anchor_x`, `anchor_y`, and `clip_rect` via exact equality or `to_bits`.
+    /// Excludes the text-access fields (`id`/`line_index`).
     pub(super) fn gating_eq(&self, other: &Self) -> bool {
         let Self {
             bounds,
             draw_ordinal,
             clip_depth_nudge,
-            oit_depth_offset,
+            oit_paint_order,
             scale_x,
             scale_y,
             anchor_x,
             anchor_y,
             clip_rect,
+            element_idx,
             id: _,
             line_index: _,
-            element_idx: _,
         } = self;
 
-        bbox_bits(bounds) == bbox_bits(&other.bounds)
+        *element_idx == other.element_idx
+            && bbox_bits(bounds) == bbox_bits(&other.bounds)
             && *draw_ordinal == other.draw_ordinal
             && clip_depth_nudge.to_bits() == other.clip_depth_nudge.to_bits()
-            && oit_depth_offset.to_bits() == other.oit_depth_offset.to_bits()
+            && oit_paint_order.to_bits() == other.oit_paint_order.to_bits()
             && scale_x.to_bits() == other.scale_x.to_bits()
             && scale_y.to_bits() == other.scale_y.to_bits()
             && anchor_x.to_bits() == other.anchor_x.to_bits()
@@ -119,7 +119,7 @@ mod tests {
             element_idx:      0,
             draw_ordinal:     0,
             clip_depth_nudge: 0.0,
-            oit_depth_offset: 0.0,
+            oit_paint_order:  0.0,
             bounds:           bbox(1.0, 2.0, 30.0, 12.0),
             scale_x:          0.5,
             scale_y:          0.5,
@@ -147,8 +147,17 @@ mod tests {
     fn gating_eq_ignores_reuse_key() {
         let base = sample_layout();
         let mut rekeyed = sample_layout();
-        rekeyed.element_idx = 7;
+        rekeyed.id = PanelElementId::named("other");
+        rekeyed.line_index = 2;
         assert!(base.gating_eq(&rekeyed));
+    }
+
+    #[test]
+    fn gating_eq_detects_source_element_change() {
+        let base = sample_layout();
+        let mut moved = sample_layout();
+        moved.element_idx = 7;
+        assert!(!base.gating_eq(&moved));
     }
 
     #[test]
@@ -157,7 +166,7 @@ mod tests {
         let mut reordered = sample_layout();
         reordered.draw_ordinal = 3;
         reordered.clip_depth_nudge = 3.0;
-        reordered.oit_depth_offset = 0.000_001;
+        reordered.oit_paint_order = 0.000_001;
         assert!(!base.gating_eq(&reordered));
     }
 

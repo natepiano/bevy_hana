@@ -7,6 +7,7 @@
 mod constants;
 mod loader;
 mod measurer;
+mod outline;
 mod registry;
 
 use std::sync::Arc;
@@ -17,11 +18,24 @@ pub(crate) use constants::DEFAULT_FAMILY;
 use constants::MONOSPACE_ADVANCE_SAMPLE;
 pub(super) use loader::FontLoader;
 pub use measurer::DiegeticTextMeasurer;
+pub(crate) use measurer::RichTextMeasurer;
+pub(crate) use measurer::create_cap_height_measurer;
 pub use measurer::create_parley_measurer;
+pub(crate) use measurer::create_parley_rich_measurer;
+pub use outline::GlyphOutline;
+pub use outline::TextOutline;
+pub use outline::TextOutlineError;
+pub use outline::TextOutlineMeasurement;
+pub use registry::EmbeddedFace;
+pub use registry::FontFailureSource;
 pub use registry::FontId;
+pub use registry::FontLoadError;
 pub use registry::FontLoadFailed;
+pub use registry::FontLookupError;
 pub use registry::FontRegistered;
+pub use registry::FontRegistrationError;
 pub use registry::FontRegistry;
+pub use registry::FontRegistryError;
 pub use registry::FontSource;
 use ttf_parser::Face;
 use ttf_parser::GlyphId;
@@ -46,21 +60,63 @@ use crate::layout::Unit;
 /// [`FontRegistered`](crate::FontRegistered) event.
 #[derive(Asset, TypePath)]
 pub struct Font {
-    name:                    String,
-    units_per_em:            u16,
-    monospace_advance:       MonospaceAdvance,
-    raw_ascent:              i16,
-    raw_descent:             i16,
-    raw_line_gap:            i16,
-    raw_cap_height:          i16,
-    raw_x_height:            i16,
-    raw_italic_angle:        f32,
-    raw_underline_position:  Option<i16>,
-    raw_underline_thickness: Option<i16>,
-    raw_strikeout_position:  Option<i16>,
-    raw_strikeout_thickness: Option<i16>,
+    name:              String,
+    units_per_em:      u16,
+    monospace_advance: MonospaceAdvance,
+    raw_ascent:        i16,
+    raw_descent:       i16,
+    raw_line_gap:      i16,
+    raw_cap_height:    i16,
+    raw_x_height:      i16,
+    raw_italic_angle:  f32,
+    /// Underline placement in design units.
+    raw_underline:     DecorationLineMetrics,
+    /// Strikeout placement in design units.
+    raw_strikeout:     DecorationLineMetrics,
     /// Raw font bytes, retained for slug curve extraction and per-glyph queries.
-    data:                    Arc<[u8]>,
+    data:              Arc<[u8]>,
+}
+
+/// Why [`Font::from_bytes`] could not build a font.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum FontParseError {
+    /// The bytes do not parse as a TTF or OTF face.
+    #[error("font {name:?} is unreadable")]
+    Unreadable {
+        /// The family name the font was offered under.
+        name: String,
+    },
+}
+
+/// Placement of a decoration line (underline or strikeout) as the font
+/// specifies it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DecorationLineMetrics {
+    /// The font's table gives the line's placement.
+    Specified {
+        /// Underline: distance below the baseline. Strikeout: distance above it.
+        position:  f32,
+        /// Stroke thickness.
+        thickness: f32,
+    },
+    /// The font's table gives no placement for this line, and there is no
+    /// meaningful fallback.
+    NotSpecified,
+}
+
+impl DecorationLineMetrics {
+    fn scaled(self, scale: f32) -> Self {
+        match self {
+            Self::Specified {
+                position,
+                thickness,
+            } => Self::Specified {
+                position:  position * scale,
+                thickness: thickness * scale,
+            },
+            Self::NotSpecified => Self::NotSpecified,
+        }
+    }
 }
 
 /// Why [`Font::nearest_integral_advance_size`] could not resolve a point size.
@@ -109,47 +165,86 @@ pub struct FontMetrics {
     /// Distance from the baseline to the ascender line. This is the font's
     /// full ascender — it includes room for accented characters like `Â` and
     /// `É`, so it is always >= [`cap_height`](Self::cap_height).
-    pub ascent:              f32,
+    pub ascent:       f32,
     /// Distance from the baseline to the descender line (positive = below
     /// baseline). Covers the lowest descenders like `p`, `g`, `y`.
-    pub descent:             f32,
+    pub descent:      f32,
     /// Font-recommended inter-line spacing, also called "leading" in
     /// traditional typography. In parley's half-leading model this value
     /// is split in half and absorbed into the `top` and `bottom` of
     /// each line box — see `ShapedLineMetrics`.
-    pub line_gap:            f32,
+    pub line_gap:     f32,
     /// Total line height: `ascent + descent + line_gap`.
-    pub line_height:         f32,
+    pub line_height:  f32,
     /// Height of lowercase letters like `x` (baseline to mean line).
-    pub x_height:            f32,
+    pub x_height:     f32,
     /// Height of uppercase letters like `H` (baseline to cap line).
     /// Always <= [`ascent`](Self::ascent) because ascent includes room
     /// for diacritics above capitals.
-    pub cap_height:          f32,
+    pub cap_height:   f32,
     /// Italic angle in degrees from vertical. `0.0` for upright fonts.
-    pub italic_angle:        f32,
-    /// Distance below the baseline for underline placement. `None` if the
-    /// font's post table does not specify underline metrics — there is no
-    /// meaningful fallback.
-    pub underline_position:  Option<f32>,
-    /// Underline stroke thickness. `None` if the font's post table does not
-    /// specify underline metrics.
-    pub underline_thickness: Option<f32>,
-    /// Distance above the baseline for strikeout placement. `None` if the
-    /// font's OS/2 table does not specify strikeout metrics — there is no
-    /// meaningful fallback.
-    pub strikeout_position:  Option<f32>,
-    /// Strikeout stroke thickness. `None` if the font's OS/2 table does not
-    /// specify strikeout metrics.
-    pub strikeout_thickness: Option<f32>,
+    pub italic_angle: f32,
+    /// Underline placement: its position is the distance below the baseline.
+    /// [`NotSpecified`](DecorationLineMetrics::NotSpecified) when the font's
+    /// post table gives none.
+    pub underline:    DecorationLineMetrics,
+    /// Strikeout placement: its position is the distance above the baseline.
+    /// [`NotSpecified`](DecorationLineMetrics::NotSpecified) when the font's
+    /// OS/2 table gives none.
+    pub strikeout:    DecorationLineMetrics,
     /// The font size these metrics were computed for.
-    pub font_size:           f32,
+    pub font_size:    f32,
     /// Number of design units per em in the original font.
-    pub units_per_em:        u16,
+    pub units_per_em: u16,
+}
+
+/// Line-box trimming that leaves the shaped cap-to-baseline span.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShapedLineCapBoxTrims {
+    top:    f32,
+    bottom: f32,
+}
+
+impl ShapedLineCapBoxTrims {
+    /// Distance to trim above the shaped cap line.
+    #[must_use]
+    pub const fn top(self) -> f32 { self.top }
+
+    /// Distance to trim below the shaped alphabetic baseline.
+    #[must_use]
+    pub const fn bottom(self) -> f32 { self.bottom }
+}
+
+impl FontMetrics {
+    /// Returns the trims from the production-shaped line box to the cap line and baseline.
+    ///
+    /// Parley's production `quantize = true` path rounds ascent and descent independently, then
+    /// splits the resulting leading around the line. Mirroring that placement here keeps
+    /// metric-based layout aligned with the baseline the glyph run actually uses.
+    #[must_use]
+    pub fn shaped_line_cap_box_trims(&self) -> ShapedLineCapBoxTrims {
+        let ascent = self.ascent.round();
+        let descent = self.descent.round();
+        let leading = self.line_height - ascent - descent;
+        let leading_above = (leading * 0.5).floor();
+        let baseline = ascent + leading_above;
+        ShapedLineCapBoxTrims {
+            top:    baseline - self.cap_height,
+            bottom: self.line_height - baseline,
+        }
+    }
+
+    /// Returns a box height that centres the shaped cap span and contains the full line box.
+    #[must_use]
+    pub fn shaped_line_cap_centered_height(&self) -> f32 {
+        let trims = self.shaped_line_cap_box_trims();
+        2.0f32.mul_add(trims.top.max(trims.bottom), self.cap_height)
+    }
 }
 
 /// Bounding rectangle for a single glyph, in scaled layout units.
 #[cfg(feature = "typography_overlay")]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GlyphBounds {
     /// Left edge of the glyph bounding box.
     pub min_x: f32,
@@ -167,6 +262,7 @@ pub struct GlyphBounds {
 /// persistently. Only available when the `typography_overlay` feature
 /// is enabled.
 #[cfg(feature = "typography_overlay")]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GlyphTypographyMetrics {
     /// Horizontal advance width (Apple's "Advancement").
     pub advance_width: f32,
@@ -180,6 +276,35 @@ pub struct GlyphTypographyMetrics {
     pub bearing_y:     f32,
 }
 
+/// What a glyph draws, measured by [`Font::glyph_metrics`] and
+/// [`Font::glyph_metrics_by_id`].
+#[cfg(feature = "typography_overlay")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GlyphInkMeasurement {
+    /// The glyph exists but has no outline, so it draws no ink (a space).
+    NoVisibleInk,
+    /// The glyph draws ink with these metrics.
+    Visible(GlyphTypographyMetrics),
+}
+
+/// Why a glyph could not be measured.
+#[cfg(feature = "typography_overlay")]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum GlyphMetricsError {
+    /// The font's stored bytes do not parse as a face.
+    #[error("font {name:?} is unreadable")]
+    Unreadable {
+        /// The font's family name.
+        name: String,
+    },
+    /// The font has no glyph for this character.
+    #[error("font has no glyph for {0:?}")]
+    MissingGlyph(char),
+    /// The glyph ID is at or past the face's glyph count.
+    #[error("glyph ID {0} is past the font's glyph count")]
+    UnknownGlyphId(u16),
+}
+
 impl Font {
     /// Parses font-level metrics from raw TTF/OTF bytes.
     ///
@@ -188,10 +313,14 @@ impl Font {
     /// metrics. When `cap_height` or `x_height` are not in the OS/2 table,
     /// they are derived from the bounding box of the `H` or `x` glyph.
     ///
-    /// Returns `None` if the font data cannot be parsed.
-    #[must_use]
-    pub fn from_bytes(name: &str, data: &[u8]) -> Option<Self> {
-        let face = Face::parse(data, 0).ok()?;
+    /// # Errors
+    ///
+    /// Returns [`FontParseError::Unreadable`] when `data` does not parse as a
+    /// font face.
+    pub fn from_bytes(name: &str, data: &[u8]) -> Result<Self, FontParseError> {
+        let face = Face::parse(data, 0).map_err(|_| FontParseError::Unreadable {
+            name: name.to_string(),
+        })?;
         let units_per_em = face.units_per_em();
         let monospace_advance = monospace_advance(&face);
 
@@ -213,16 +342,25 @@ impl Font {
 
         let raw_italic_angle = face.italic_angle();
 
-        let (raw_underline_position, raw_underline_thickness) =
-            face.underline_metrics().map_or((None, None), |m| {
-                (Some(m.position.abs()), Some(m.thickness))
-            });
+        let raw_underline =
+            face.underline_metrics()
+                .map_or(DecorationLineMetrics::NotSpecified, |m| {
+                    DecorationLineMetrics::Specified {
+                        position:  f32::from(m.position.abs()),
+                        thickness: f32::from(m.thickness),
+                    }
+                });
 
-        let (raw_strikeout_position, raw_strikeout_thickness) = face
-            .strikeout_metrics()
-            .map_or((None, None), |m| (Some(m.position), Some(m.thickness)));
+        let raw_strikeout =
+            face.strikeout_metrics()
+                .map_or(DecorationLineMetrics::NotSpecified, |m| {
+                    DecorationLineMetrics::Specified {
+                        position:  f32::from(m.position),
+                        thickness: f32::from(m.thickness),
+                    }
+                });
 
-        Some(Self {
+        Ok(Self {
             name: (*name).to_string(),
             units_per_em,
             monospace_advance,
@@ -232,10 +370,8 @@ impl Font {
             raw_cap_height,
             raw_x_height,
             raw_italic_angle,
-            raw_underline_position,
-            raw_underline_thickness,
-            raw_strikeout_position,
-            raw_strikeout_thickness,
+            raw_underline,
+            raw_strikeout,
             data: Arc::from(data),
         })
     }
@@ -247,6 +383,12 @@ impl Font {
     /// Returns the raw TTF/OTF font bytes.
     #[must_use]
     pub fn data(&self) -> &[u8] { &self.data }
+
+    #[cfg(test)]
+    pub(super) fn with_unreadable_data_for_test(mut self) -> Self {
+        self.data = Arc::from(&b"not a font"[..]);
+        self
+    }
 
     /// Returns font-level metrics scaled to `size` layout units.
     ///
@@ -268,10 +410,8 @@ impl Font {
             x_height: f32::from(self.raw_x_height) * scale,
             cap_height: f32::from(self.raw_cap_height) * scale,
             italic_angle: self.raw_italic_angle,
-            underline_position: self.raw_underline_position.map(|v| f32::from(v) * scale),
-            underline_thickness: self.raw_underline_thickness.map(|v| f32::from(v) * scale),
-            strikeout_position: self.raw_strikeout_position.map(|v| f32::from(v) * scale),
-            strikeout_thickness: self.raw_strikeout_thickness.map(|v| f32::from(v) * scale),
+            underline: self.raw_underline.scaled(scale),
+            strikeout: self.raw_strikeout.scaled(scale),
             font_size: size,
             units_per_em: self.units_per_em,
         }
@@ -342,36 +482,25 @@ impl Font {
 
     /// Returns per-glyph typographic metrics for `ch` at `size`.
     ///
-    /// Parses the glyph on demand from stored font data. Returns `None`
-    /// if the character has no glyph in this font.
+    /// Parses the glyph on demand from stored font data. A glyph with no
+    /// outline (a space) measures [`GlyphInkMeasurement::NoVisibleInk`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GlyphMetricsError::Unreadable`] when the stored font data
+    /// does not parse, or [`GlyphMetricsError::MissingGlyph`] when the font has
+    /// no glyph for `ch`.
     #[cfg(feature = "typography_overlay")]
-    #[must_use]
-    pub fn glyph_metrics(&self, ch: char, size: f32) -> Option<GlyphTypographyMetrics> {
-        let face = Face::parse(&self.data, 0).ok()?;
-        let glyph_id = face.glyph_index(ch)?;
-        let ink = glyph_ink_extents(&face, glyph_id.0)?;
-        let scale = size / ink.units_per_em;
-
-        let advance_width = face
-            .glyph_hor_advance(glyph_id)
-            .map_or(0.0, |a| f32::from(a) * scale);
-
-        let bounds = GlyphBounds {
-            min_x: ink.min_x * scale,
-            min_y: ink.min_y * scale,
-            max_x: ink.max_x * scale,
-            max_y: ink.max_y * scale,
-        };
-
-        let bearing_x = bounds.min_x;
-        let bearing_y = bounds.max_y;
-
-        Some(GlyphTypographyMetrics {
-            advance_width,
-            bounds,
-            bearing_x,
-            bearing_y,
-        })
+    pub fn glyph_metrics(
+        &self,
+        ch: char,
+        size: f32,
+    ) -> Result<GlyphInkMeasurement, GlyphMetricsError> {
+        let face = self.glyph_face()?;
+        let glyph_id = face
+            .glyph_index(ch)
+            .ok_or(GlyphMetricsError::MissingGlyph(ch))?;
+        Ok(measure_glyph_ink(&face, glyph_id, size))
     }
 
     /// Returns per-glyph typographic metrics by glyph ID at `size`.
@@ -379,34 +508,63 @@ impl Font {
     /// Like [`glyph_metrics`](Self::glyph_metrics) but takes a glyph index
     /// directly (as stored in `ShapedGlyph`)
     /// rather than a character.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GlyphMetricsError::Unreadable`] when the stored font data
+    /// does not parse, or [`GlyphMetricsError::UnknownGlyphId`] when
+    /// `glyph_id` is at or past the face's glyph count.
     #[cfg(feature = "typography_overlay")]
-    #[must_use]
-    pub fn glyph_metrics_by_id(&self, glyph_id: u16, size: f32) -> Option<GlyphTypographyMetrics> {
-        let face = Face::parse(&self.data, 0).ok()?;
-        let ink = glyph_ink_extents(&face, glyph_id)?;
-        let scale = size / ink.units_per_em;
+    pub fn glyph_metrics_by_id(
+        &self,
+        glyph_id: u16,
+        size: f32,
+    ) -> Result<GlyphInkMeasurement, GlyphMetricsError> {
+        let face = self.glyph_face()?;
+        // Checked first: the outline read gives no ink both for an absent ID
+        // and for a glyph without an outline.
+        if glyph_id >= face.number_of_glyphs() {
+            return Err(GlyphMetricsError::UnknownGlyphId(glyph_id));
+        }
+        Ok(measure_glyph_ink(&face, GlyphId(glyph_id), size))
+    }
 
-        let advance_width = face
-            .glyph_hor_advance(GlyphId(glyph_id))
-            .map_or(0.0, |a| f32::from(a) * scale);
-
-        let bounds = GlyphBounds {
-            min_x: ink.min_x * scale,
-            min_y: ink.min_y * scale,
-            max_x: ink.max_x * scale,
-            max_y: ink.max_y * scale,
-        };
-
-        let bearing_x = bounds.min_x;
-        let bearing_y = bounds.max_y;
-
-        Some(GlyphTypographyMetrics {
-            advance_width,
-            bounds,
-            bearing_x,
-            bearing_y,
+    #[cfg(feature = "typography_overlay")]
+    fn glyph_face(&self) -> Result<Face<'_>, GlyphMetricsError> {
+        Face::parse(&self.data, 0).map_err(|_| GlyphMetricsError::Unreadable {
+            name: self.name.clone(),
         })
     }
+}
+
+/// Measures the ink of a glyph known to exist in `face`.
+#[cfg(feature = "typography_overlay")]
+fn measure_glyph_ink(face: &Face<'_>, glyph_id: GlyphId, size: f32) -> GlyphInkMeasurement {
+    let Some(ink) = glyph_ink_extents(face, glyph_id.0) else {
+        return GlyphInkMeasurement::NoVisibleInk;
+    };
+    let scale = size / ink.units_per_em;
+
+    let advance_width = face
+        .glyph_hor_advance(glyph_id)
+        .map_or(0.0, |a| f32::from(a) * scale);
+
+    let bounds = GlyphBounds {
+        min_x: ink.min_x * scale,
+        min_y: ink.min_y * scale,
+        max_x: ink.max_x * scale,
+        max_y: ink.max_y * scale,
+    };
+
+    let bearing_x = bounds.min_x;
+    let bearing_y = bounds.max_y;
+
+    GlyphInkMeasurement::Visible(GlyphTypographyMetrics {
+        advance_width,
+        bounds,
+        bearing_x,
+        bearing_y,
+    })
 }
 
 /// A glyph's ink bounding box in font design units, paired with the font's
@@ -466,13 +624,55 @@ fn monospace_advance(face: &Face<'_>) -> MonospaceAdvance {
     reason = "tests use unwrap for clearer failure messages"
 )]
 mod tests {
+    use std::sync::PoisonError;
+
+    use parley::Layout;
+    use parley::LayoutContext;
+    use parley::style::FontFamily;
+    use parley::style::StyleProperty;
+
+    use super::DEFAULT_FAMILY;
     use super::Font;
+    use super::FontId;
+    use super::FontRegistry;
     use super::IntegralAdvanceSizeError;
     use crate::Pt;
 
     const JETBRAINS_MONO_DATA: &[u8] =
         include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf");
     const NOTO_SANS_DATA: &[u8] = include_bytes!("../../../assets/fonts/NotoSans-Regular.ttf");
+
+    #[test]
+    fn shaped_line_cap_box_trims_follow_production_baselines() {
+        let registry = FontRegistry::new().unwrap();
+        let font = registry.font(FontId::MONOSPACE).unwrap();
+
+        for size in [12.0, 17.0] {
+            let metrics = font.metrics(size);
+            let trims = metrics.shaped_line_cap_box_trims();
+            let line = {
+                let font_context = registry.font_context();
+                let mut font_context = font_context.lock().unwrap_or_else(PoisonError::into_inner);
+                let mut layout_context = LayoutContext::default();
+                let mut layout: Layout<()> = Layout::new();
+                let mut builder =
+                    layout_context.ranged_builder(&mut font_context, "Cap", 1.0, true);
+                builder.push_default(StyleProperty::FontSize(size));
+                builder.push_default(StyleProperty::FontFamily(FontFamily::named(DEFAULT_FAMILY)));
+                builder.build_into(&mut layout, "Cap");
+                drop(font_context);
+                layout.break_all_lines(None);
+                *layout.lines().next().unwrap().metrics()
+            };
+
+            assert!((trims.top() - (line.baseline - metrics.cap_height)).abs() < f32::EPSILON);
+            assert!((trims.bottom() - (line.line_height - line.baseline)).abs() < f32::EPSILON);
+            assert_eq!(
+                metrics.shaped_line_cap_centered_height(),
+                2.0f32.mul_add(trims.top().max(trims.bottom), metrics.cap_height)
+            );
+        }
+    }
 
     #[test]
     fn nearest_integral_advance_selects_eleven_and_one_quarter_points() {

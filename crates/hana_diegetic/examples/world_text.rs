@@ -17,6 +17,7 @@
 //!   - **ROTATION ANIMATION** at the end is decorative scaffolding.
 
 use bevy::light::NotShadowCaster;
+use bevy::prelude::Alpha;
 use bevy::prelude::AlphaMode;
 use bevy::prelude::Assets;
 use bevy::prelude::Color;
@@ -49,6 +50,10 @@ use fairy_dust::Face;
 use fairy_dust::TitleBar;
 use hana_diegetic::Anchor;
 use hana_diegetic::DiegeticText;
+use hana_diegetic::DiegeticTextMeasurer;
+use hana_diegetic::ShadowCasting;
+use hana_diegetic::TextStyle;
+use hana_diegetic::Unit;
 use hana_lagrange::OrbitCamPreset;
 
 // Camera home pose.
@@ -76,9 +81,44 @@ const GROUND_TEXT_SIZE: f32 = 0.48;
 const GROUND_TEXT_TRANSLATION: Vec3 = Vec3::new(0.0, 0.001, 1.35);
 
 // Translucent backdrop behind the anchor demo labels.
-const ANCHOR_FRAME_COLOR: Color = Color::srgba(0.08, 0.08, 0.08, 0.18);
-const ANCHOR_FRAME_SIZE: Vec3 = Vec3::new(3.6, 2.0, 0.18);
-const ANCHOR_FRAME_LOCAL_OFFSET: Vec3 = Vec3::new(0.0, -0.2, -0.1);
+const ANCHOR_FRAME_COLOR: Color = Color::srgba(0.08, 0.08, 0.08, 0.97);
+const ANCHOR_FRAME_TURN_ALPHA: f32 = 0.18;
+const ANCHOR_FRAME_FADE_SECS: f32 = 0.15;
+const ANCHOR_FRAME_FACE_GAP: f32 = 0.005;
+const ANCHOR_DEMO_CENTER: Vec3 = Vec3::new(2.0, 2.45, -0.5);
+const ANCHOR_LABEL_SIZE: f32 = 0.125;
+const ANCHOR_COLUMN_GAP: f32 = 0.22;
+const ANCHOR_FRAME_MARGIN: f32 = 0.4;
+const ANCHOR_FRAME_HEIGHT: f32 = 2.2;
+const ANCHOR_FRAME_DEPTH: f32 = 0.18;
+const ANCHOR_ROWS: [([(&str, Anchor); 3], f32); 3] = [
+    (
+        [
+            ("TopLeft", Anchor::TopLeft),
+            ("TopCenter", Anchor::TopCenter),
+            ("TopRight", Anchor::TopRight),
+        ],
+        0.5,
+    ),
+    (
+        [
+            ("CenterLeft", Anchor::CenterLeft),
+            ("Center", Anchor::Center),
+            ("CenterRight", Anchor::CenterRight),
+        ],
+        -0.2,
+    ),
+    (
+        [
+            ("BottomLeft", Anchor::BottomLeft),
+            ("BottomCenter", Anchor::BottomCenter),
+            ("BottomRight", Anchor::BottomRight),
+        ],
+        -0.9,
+    ),
+];
+const ANCHOR_FRAME_LOCAL_OFFSET_Y: f32 = -0.2;
+const ANCHOR_LABEL_Z: f32 = 0.01;
 
 fn main() {
     // `hana_diegetic::DiegeticUiPlugin` is registered automatically by
@@ -177,8 +217,9 @@ fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    text_measurer: Res<DiegeticTextMeasurer>,
 ) {
-    spawn_anchor_demo(&mut commands, &mut meshes, &mut materials);
+    spawn_anchor_demo(&mut commands, &mut meshes, &mut materials, &text_measurer);
     spawn_ground_text(&mut commands);
 }
 
@@ -189,18 +230,20 @@ fn spawn_anchor_demo(
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<Mesh>>,
     materials: &mut ResMut<Assets<StandardMaterial>>,
+    text_measurer: &DiegeticTextMeasurer,
 ) {
-    let demo_center = Vec3::new(2.0, 1.5, -0.5);
+    let demo_center = ANCHOR_DEMO_CENTER;
+    let layout = anchor_demo_layout(text_measurer);
     let demo_rotation = Quat::from_rotation_y(-15.0_f32.to_radians());
 
-    // Backdrop frame plane — sits behind the anchor labels in the demo's
-    // local Z, slightly transparent, ground-plane color.
+    let frame_offset = anchor_frame_offset();
     commands.spawn((
         CameraHomeTarget,
+        AnchorFrame,
         Mesh3d(meshes.add(Cuboid::new(
-            ANCHOR_FRAME_SIZE.x,
-            ANCHOR_FRAME_SIZE.y,
-            ANCHOR_FRAME_SIZE.z,
+            layout.frame_width,
+            ANCHOR_FRAME_HEIGHT,
+            ANCHOR_FRAME_DEPTH,
         ))),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: ANCHOR_FRAME_COLOR,
@@ -209,7 +252,7 @@ fn spawn_anchor_demo(
             cull_mode: None,
             ..default()
         })),
-        Transform::from_translation(demo_center + demo_rotation * ANCHOR_FRAME_LOCAL_OFFSET)
+        Transform::from_translation(demo_center + demo_rotation * frame_offset)
             .with_rotation(demo_rotation),
         NotShadowCaster,
     ));
@@ -222,27 +265,27 @@ fn spawn_anchor_demo(
     });
 
     // Title.
-    commands.spawn(
+    commands.spawn((
         DiegeticText::world("Text Anchors")
-            .size(0.16)
-            .color(Color::srgb(0.7, 0.8, 1.0))
+            .style(anchor_text_style(0.16, Color::srgb(0.7, 0.8, 1.0)))
             .anchor(Anchor::TopCenter)
             .transform(
                 Transform::from_translation(demo_center + demo_rotation * Vec3::new(0.0, 1.4, 0.0))
                     .with_rotation(demo_rotation),
             )
             .build(),
-    );
+        NotShadowCaster,
+    ));
 
     commands.spawn((
         Mesh3d(sphere_mesh.clone()),
         MeshMaterial3d(sphere_material.clone()),
         Transform::from_translation(demo_center + demo_rotation * Vec3::new(-0.60, 1.10, 0.01)),
+        NotShadowCaster,
     ));
-    commands.spawn(
+    commands.spawn((
         DiegeticText::world(" = Transform translation")
-            .size(0.10)
-            .color(Color::WHITE)
+            .style(anchor_text_style(0.10, Color::WHITE))
             .anchor(Anchor::TopLeft)
             .transform(
                 Transform::from_translation(
@@ -251,22 +294,20 @@ fn spawn_anchor_demo(
                 .with_rotation(demo_rotation),
             )
             .build(),
-    );
+        NotShadowCaster,
+    ));
 
-    let anchor_demo = [
-        (Anchor::TopLeft, "TopLeft", -1.3, 0.5),
-        (Anchor::TopCenter, "TopCenter", 0.0, 0.5),
-        (Anchor::TopRight, "TopRight", 1.3, 0.5),
-        (Anchor::CenterLeft, "CenterLeft", -1.3, -0.2),
-        (Anchor::Center, "Center", 0.0, -0.2),
-        (Anchor::CenterRight, "CenterRight", 1.3, -0.2),
-        (Anchor::BottomLeft, "BottomLeft", -1.3, -0.9),
-        (Anchor::BottomCenter, "BottomCenter", 0.0, -0.9),
-        (Anchor::BottomRight, "BottomRight", 1.3, -0.9),
-    ];
+    let anchor_demo = ANCHOR_ROWS.into_iter().flat_map(|(labels, y)| {
+        let columns = layout.columns;
+        [
+            (labels[0].1, labels[0].0, columns.left, y),
+            (labels[1].1, labels[1].0, columns.center, y),
+            (labels[2].1, labels[2].0, columns.right, y),
+        ]
+    });
 
     for (anchor, text, local_x, local_y) in anchor_demo {
-        let local_offset = Vec3::new(local_x, local_y, 0.01);
+        let local_offset = Vec3::new(local_x, local_y, ANCHOR_LABEL_Z);
         let world_pos = demo_center + demo_rotation * local_offset;
 
         // Sphere at the anchor origin.
@@ -274,13 +315,13 @@ fn spawn_anchor_demo(
             Mesh3d(sphere_mesh.clone()),
             MeshMaterial3d(sphere_material.clone()),
             Transform::from_translation(world_pos),
+            NotShadowCaster,
         ));
 
         // Text with the given anchor.
         commands.spawn((
             DiegeticText::world(text)
-                .size(0.125)
-                .color(Color::WHITE)
+                .style(anchor_text_style(ANCHOR_LABEL_SIZE, Color::WHITE))
                 .anchor(anchor)
                 .transform(Transform::from_translation(world_pos).with_rotation(demo_rotation))
                 .build(),
@@ -288,7 +329,57 @@ fn spawn_anchor_demo(
                 position:      world_pos,
                 base_rotation: demo_rotation,
             },
+            NotShadowCaster,
         ));
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AnchorColumns {
+    left:   f32,
+    center: f32,
+    right:  f32,
+}
+
+struct AnchorDemoLayout {
+    columns:     AnchorColumns,
+    frame_width: f32,
+}
+
+fn anchor_text_style(size: f32, color: Color) -> TextStyle {
+    TextStyle::new(size)
+        .with_color(color)
+        .with_shadow_casting(ShadowCasting::Off)
+}
+
+fn anchor_frame_offset() -> Vec3 {
+    Vec3::new(
+        0.0,
+        ANCHOR_FRAME_LOCAL_OFFSET_Y,
+        ANCHOR_LABEL_Z - ANCHOR_FRAME_FACE_GAP - ANCHOR_FRAME_DEPTH / 2.0,
+    )
+}
+
+fn anchor_demo_layout(text_measurer: &DiegeticTextMeasurer) -> AnchorDemoLayout {
+    let points_per_meter = Unit::Meters.to_points();
+    let measure = TextStyle::new(ANCHOR_LABEL_SIZE * points_per_meter).as_measure();
+    let width = |text: &str| (text_measurer.measure_fn)(text, &measure).width / points_per_meter;
+    let distance = ANCHOR_ROWS
+        .iter()
+        .map(|(labels, _)| {
+            width(labels[1].0) / 2.0
+                + width(labels[0].0).max(width(labels[2].0))
+                + ANCHOR_COLUMN_GAP
+        })
+        .fold(0.0, f32::max);
+    let columns = AnchorColumns {
+        left:   -distance,
+        center: 0.0,
+        right:  distance,
+    };
+    AnchorDemoLayout {
+        columns,
+        frame_width: 2.0 * (distance + ANCHOR_FRAME_MARGIN),
     }
 }
 
@@ -336,15 +427,38 @@ struct AnchorDemoText {
     base_rotation: Quat,
 }
 
+#[derive(Component)]
+struct AnchorFrame;
+
+#[derive(Default)]
+enum AnchorRotationState {
+    #[default]
+    Idle,
+    Rotating {
+        axis:  Vec3,
+        angle: f32,
+    },
+    RestoringFrame,
+}
+
+#[derive(Default)]
+enum RotationRequest {
+    #[default]
+    Absent,
+    Pending(Vec3),
+}
+
 #[derive(Resource, Default)]
 struct AnchorRotation {
-    /// Current rotation angle in radians (0..TAU). `None` = not rotating.
-    angle:     Option<f32>,
-    /// Which local axis to rotate around.
-    axis:      Vec3,
-    /// Axis a shortcut asked to rotate around, consumed by `rotate_anchor_demo`
-    /// on the next frame it is idle.
-    requested: Option<Vec3>,
+    state:     AnchorRotationState,
+    requested: RotationRequest,
+}
+
+#[derive(Default)]
+enum CubeBaseRotation {
+    #[default]
+    Uncaptured,
+    Captured(Quat),
 }
 
 /// Marker for the cube entity so the rotation system can find it.
@@ -354,11 +468,17 @@ struct DemoCube;
 /// `X` / `Y` / `Z` request a full rotation around that local axis through Fairy
 /// Dust's shortcut binding; `rotate_anchor_demo` starts it on the next idle
 /// frame. Each fires only when no modifier is held.
-fn rotate_x(mut state: ResMut<AnchorRotation>) { state.requested = Some(Vec3::X); }
+fn rotate_x(mut state: ResMut<AnchorRotation>) {
+    state.requested = RotationRequest::Pending(Vec3::X);
+}
 
-fn rotate_y(mut state: ResMut<AnchorRotation>) { state.requested = Some(Vec3::Y); }
+fn rotate_y(mut state: ResMut<AnchorRotation>) {
+    state.requested = RotationRequest::Pending(Vec3::Y);
+}
 
-fn rotate_z(mut state: ResMut<AnchorRotation>) { state.requested = Some(Vec3::Z); }
+fn rotate_z(mut state: ResMut<AnchorRotation>) {
+    state.requested = RotationRequest::Pending(Vec3::Z);
+}
 
 /// Starts a full rotation around the requested local axis, then drives it each
 /// frame. `Anchor` demo texts rotate around their anchor point (red dot stays
@@ -371,39 +491,71 @@ fn rotate_anchor_demo(
     mut state: ResMut<AnchorRotation>,
     mut texts: Query<(&AnchorDemoText, &mut Transform), Without<DemoCube>>,
     mut cube: Query<&mut Transform, With<DemoCube>>,
-    mut cube_base_rotation: Local<Option<Quat>>,
+    frame: Query<&MeshMaterial3d<StandardMaterial>, With<AnchorFrame>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut cube_base_rotation: Local<CubeBaseRotation>,
 ) {
-    let requested = state.requested.take();
-    if state.angle.is_none()
-        && let Some(axis) = requested
+    let requested = std::mem::take(&mut state.requested);
+    if matches!(&state.state, AnchorRotationState::Idle)
+        && let RotationRequest::Pending(axis) = requested
     {
-        state.angle = Some(0.0);
-        state.axis = axis;
+        state.state = AnchorRotationState::Rotating { axis, angle: 0.0 };
         if let Ok(cube_t) = cube.single() {
-            *cube_base_rotation = Some(cube_t.rotation);
+            *cube_base_rotation = CubeBaseRotation::Captured(cube_t.rotation);
         }
         commands.trigger(RotationBegin { axis });
     }
 
-    let Some(angle) = state.angle.as_mut() else {
+    if matches!(state.state, AnchorRotationState::RestoringFrame) {
+        fade_anchor_frame(
+            &frame,
+            &mut materials,
+            ANCHOR_FRAME_COLOR.to_srgba().alpha,
+            time.delta_secs(),
+        );
+        if frame_alpha(&frame, &materials) >= ANCHOR_FRAME_COLOR.to_srgba().alpha - 0.000_01 {
+            state.state = AnchorRotationState::Idle;
+        }
+        return;
+    }
+
+    let AnchorRotationState::Rotating { axis, angle } = &mut state.state else {
         return;
     };
 
+    fade_anchor_frame(
+        &frame,
+        &mut materials,
+        ANCHOR_FRAME_TURN_ALPHA,
+        time.delta_secs(),
+    );
+
     *angle = time.delta_secs().mul_add(ROTATION_SPEED, *angle);
     let current_angle = *angle;
-    let axis = state.axis;
+    let axis = *axis;
 
     if current_angle >= std::f32::consts::TAU {
         for (demo, mut transform) in &mut texts {
             *transform =
                 Transform::from_translation(demo.position).with_rotation(demo.base_rotation);
         }
-        if let (Ok(mut cube_t), Some(base)) = (cube.single_mut(), *cube_base_rotation) {
-            cube_t.rotation = base;
+        if let (Ok(mut cube_t), CubeBaseRotation::Captured(base)) =
+            (cube.single_mut(), &*cube_base_rotation)
+        {
+            cube_t.rotation = *base;
         }
-        state.angle = None;
-        *cube_base_rotation = None;
+        state.state = AnchorRotationState::RestoringFrame;
+        *cube_base_rotation = CubeBaseRotation::Uncaptured;
         commands.trigger(RotationEnd { axis });
+        fade_anchor_frame(
+            &frame,
+            &mut materials,
+            ANCHOR_FRAME_COLOR.to_srgba().alpha,
+            time.delta_secs(),
+        );
+        if frame_alpha(&frame, &materials) >= ANCHOR_FRAME_COLOR.to_srgba().alpha - 0.000_01 {
+            state.state = AnchorRotationState::Idle;
+        }
         return;
     }
 
@@ -413,7 +565,44 @@ fn rotate_anchor_demo(
         transform.rotation = demo.base_rotation * rot;
     }
 
-    if let (Ok(mut cube_t), Some(base)) = (cube.single_mut(), *cube_base_rotation) {
-        cube_t.rotation = base * rot;
+    if let (Ok(mut cube_t), CubeBaseRotation::Captured(base)) =
+        (cube.single_mut(), &*cube_base_rotation)
+    {
+        cube_t.rotation = *base * rot;
     }
+}
+
+fn frame_alpha(
+    frame: &Query<&MeshMaterial3d<StandardMaterial>, With<AnchorFrame>>,
+    materials: &Assets<StandardMaterial>,
+) -> f32 {
+    frame
+        .single()
+        .ok()
+        .and_then(|handle| materials.get(&handle.0))
+        .map_or_else(
+            || ANCHOR_FRAME_COLOR.to_srgba().alpha,
+            |material| material.base_color.to_srgba().alpha,
+        )
+}
+
+fn fade_anchor_frame(
+    frame: &Query<&MeshMaterial3d<StandardMaterial>, With<AnchorFrame>>,
+    materials: &mut Assets<StandardMaterial>,
+    target: f32,
+    delta: f32,
+) {
+    let Ok(handle) = frame.single() else { return };
+    let Some(mut material) = materials.get_mut(&handle.0) else {
+        return;
+    };
+    let current = material.base_color.to_srgba().alpha;
+    let step = (ANCHOR_FRAME_COLOR.to_srgba().alpha - ANCHOR_FRAME_TURN_ALPHA) * delta
+        / ANCHOR_FRAME_FADE_SECS;
+    let alpha = if current < target {
+        (current + step).min(target)
+    } else {
+        (current - step).max(target)
+    };
+    material.base_color = material.base_color.with_alpha(alpha);
 }

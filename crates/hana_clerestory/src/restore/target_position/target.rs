@@ -27,6 +27,30 @@ use crate::persistence::UnrebasedDesktopPosition;
 use crate::persistence::WindowPlacementConfiguration;
 use crate::restore::settle_state::SettleState;
 
+/// Physical desktop coordinate reported by the native window backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NativeWindowReadbackPosition(IVec2);
+
+impl NativeWindowReadbackPosition {
+    pub(crate) const fn from_physical_pixels(position: IVec2) -> Self { Self(position) }
+
+    pub(crate) const fn physical_pixels(self) -> IVec2 { self.0 }
+
+    #[cfg(all(target_os = "linux", feature = "workaround-winit-4445"))]
+    pub(crate) const fn x11_frame_request(self, physical_top: i32) -> X11FramePositionRequest {
+        X11FramePositionRequest(IVec2::new(self.0.x, self.0.y - physical_top))
+    }
+}
+
+/// Physical frame coordinate sent to X11 after subtracting its reported frame top.
+#[cfg(all(target_os = "linux", feature = "workaround-winit-4445"))]
+pub(crate) struct X11FramePositionRequest(IVec2);
+
+#[cfg(all(target_os = "linux", feature = "workaround-winit-4445"))]
+impl X11FramePositionRequest {
+    pub(in crate::restore) const fn physical_pixels(self) -> IVec2 { self.0 }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Reflect)]
 pub(crate) enum SavedWindowPlacementDecision {
     #[cfg(test)]
@@ -284,14 +308,16 @@ pub(crate) enum FullscreenRestoreProgress {
     Advancing(FullscreenRestoreState),
     /// The fullscreen step finished and normal geometry application may continue.
     Completed,
+    /// A compositor state did not arrive before its deadline.
+    Failed,
 }
 
-/// Whether the windowed move has been requested yet, and if so what bounds it.
+/// Deadline for one fullscreen restore step that waits on the operating system.
 #[derive(Clone, Debug, PartialEq, Eq, Reflect)]
-pub(crate) enum FullscreenMoveDeadline {
-    /// The move has not been requested yet, so nothing is being waited on.
+pub(crate) enum FullscreenRestoreDeadline {
+    /// The windowed monitor move has not been requested yet.
     NotRequested,
-    /// The move was requested; this bounds how long the operating system gets.
+    /// The current native state or monitor move must arrive before this expires.
     Awaiting(OperatingSystemWorkDeadline),
 }
 
@@ -304,6 +330,19 @@ pub(crate) enum WindowSettleProgress {
 }
 
 impl TargetPosition {
+    /// Preserve exact native pixels before any platform frame compensation is applied.
+    pub(crate) const fn retain_physical_windowed_position(
+        &mut self,
+        position: NativeWindowReadbackPosition,
+    ) {
+        if let SavedWindowPlacementDecision::Restorable {
+            physical_position, ..
+        } = &mut self.placement_decision
+        {
+            *physical_position = position.physical_pixels();
+        }
+    }
+
     /// Scale ratio between starting and target monitors.
     #[must_use]
     pub(super) const fn ratio(&self) -> f64 { self.starting_scale / self.target_scale }
@@ -382,11 +421,21 @@ impl TargetPosition {
         match &mut self.placement_decision {
             SavedWindowPlacementDecision::Restorable {
                 physical_position, ..
-            } => physical_position.y -= physical_frame_top,
+            } => {
+                *physical_position =
+                    NativeWindowReadbackPosition::from_physical_pixels(*physical_position)
+                        .x11_frame_request(physical_frame_top)
+                        .physical_pixels();
+            },
             #[cfg(test)]
             SavedWindowPlacementDecision::PersistedOffset {
                 physical_position, ..
-            } => physical_position.y -= physical_frame_top,
+            } => {
+                *physical_position =
+                    NativeWindowReadbackPosition::from_physical_pixels(*physical_position)
+                        .x11_frame_request(physical_frame_top)
+                        .physical_pixels();
+            },
             SavedWindowPlacementDecision::CompositorControlled => {},
             #[cfg(test)]
             SavedWindowPlacementDecision::NotSaved
@@ -489,7 +538,11 @@ fn compute_target_position(
         monitor_scale_strategy: platform.scale_strategy(starting_scale, target_scale),
         saved_window_mode: saved_window_mode.clone(),
         monitor_index: target_info.index,
-        fullscreen_restore_progress: if saved_window_mode.is_fullscreen() {
+        fullscreen_restore_progress: if platform == Platform::MacOs
+            && matches!(saved_window_mode, SavedWindowMode::BorderlessFullscreen)
+        {
+            FullscreenRestoreProgress::Advancing(FullscreenRestoreState::ApplyMode)
+        } else if saved_window_mode.is_fullscreen() {
             FullscreenRestoreProgress::Advancing(platform.fullscreen_restore_state())
         } else {
             FullscreenRestoreProgress::ReadyForGeometry

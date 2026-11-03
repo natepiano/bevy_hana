@@ -10,6 +10,7 @@ use bevy::prelude::ReflectEvent;
 use bevy::prelude::Res;
 use bevy::prelude::ResMut;
 use bevy::prelude::Resource;
+use bevy::prelude::World;
 use bevy_enhanced_input::prelude::EnhancedInputPlugin;
 use bevy_enhanced_input::prelude::InputAction;
 use hana_lagrange::FreeCamInputMode;
@@ -19,6 +20,7 @@ use hana_lagrange::ResolvedCameraInputRoute;
 use hana_rubric::ReflectKeymapCommand;
 use hana_rubric::command;
 
+use super::BoundCamera;
 use super::CameraGuidancePanel;
 use crate::ensure_plugin;
 
@@ -42,8 +44,26 @@ command! {
     action:      ToggleFreeCamLookPitch,
     event:       ToggleFreeCamLookPitchEvent,
     id:          "fairy_dust::toggle_free_cam_look_pitch",
-    title:       "Toggle Free Camera Look Pitch",
+    title:       "Toggle free camera look pitch",
     description: "Swap the free camera between inverted and standard mouse pitch.",
+    toggle_state: free_camera_pitch_is_inverted,
+}
+
+fn free_camera_pitch_is_inverted(world: &World) -> bool {
+    let camera = world
+        .get_resource::<ResolvedCameraInputRoute>()
+        .and_then(ResolvedCameraInputRoute::routed_camera)
+        .or_else(|| {
+            let mut panels = world.try_query::<&CameraGuidancePanel>()?;
+            match panels.single(world).ok()?.bound_camera {
+                BoundCamera::Showing(camera) => Some(camera),
+                BoundCamera::AwaitingCamera => None,
+            }
+        });
+    camera
+        .and_then(|camera| world.get::<FreeCamInputMode>(camera))
+        .and_then(mode_look_pitch)
+        .is_some_and(|pitch| pitch == FreeCamLookPitch::Inverted)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,7 +119,10 @@ fn active_camera(
 ) -> Option<Entity> {
     route
         .routed_camera()
-        .or_else(|| panels.single().ok()?.bound_camera)
+        .or_else(|| match panels.single().ok()?.bound_camera {
+            BoundCamera::Showing(camera) => Some(camera),
+            BoundCamera::AwaitingCamera => None,
+        })
 }
 
 const fn mode_look_pitch(mode: &FreeCamInputMode) -> Option<FreeCamLookPitch> {
@@ -126,11 +149,54 @@ fn set_look_pitch(mode: &mut FreeCamInputMode, look_pitch: FreeCamLookPitch) -> 
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn command_palette_toggle_pitch_reads_the_bound_camera_instead_of_saved_preference()
+    -> Result<(), &'static str> {
+        let mut app = crate::test_app();
+        app.init_resource::<FreeCamLookPitchPreference>()
+            .insert_resource(ResolvedCameraInputRoute::default())
+            .add_observer(toggle_look_pitch);
+        let camera = app
+            .world_mut()
+            .spawn(FreeCamInputMode::with_preset(
+                FreeCamPreset::keyboard_mouse(),
+            ))
+            .id();
+        app.world_mut().spawn(CameraGuidancePanel {
+            bound_camera: BoundCamera::Showing(camera),
+            owner_shown:  true,
+            home_hint:    HomeHintLocation::CameraPanel,
+        });
+        assert_eq!(
+            app.world()
+                .resource::<FreeCamLookPitchPreference>()
+                .look_pitch(),
+            FreeCamLookPitch::Inverted
+        );
+        assert!(!free_camera_pitch_is_inverted(app.world()));
+        app.world_mut().trigger(ToggleFreeCamLookPitchEvent);
+        assert!(free_camera_pitch_is_inverted(app.world()));
+        app.world_mut().trigger(ToggleFreeCamLookPitchEvent);
+        assert!(!free_camera_pitch_is_inverted(app.world()));
+        *app.world_mut()
+            .get_mut::<FreeCamInputMode>(camera)
+            .ok_or("bound camera mode")? = FreeCamInputMode::Manual;
+        assert!(
+            !free_camera_pitch_is_inverted(app.world()),
+            "manual mode has no enabled pitch inversion"
+        );
+        app.world_mut().despawn(camera);
+        assert!(!free_camera_pitch_is_inverted(app.world()));
+        Ok(())
+    }
+
     use hana_lagrange::BindingsError;
     use hana_lagrange::FreeCamBindings;
     use hana_lagrange::FreeCamPreset;
 
     use super::*;
+    use crate::camera_control_panel::HomeHintLocation;
 
     #[test]
     fn preference_defaults_to_inverted() {

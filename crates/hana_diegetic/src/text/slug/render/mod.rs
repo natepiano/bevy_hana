@@ -9,6 +9,6 @@ use crate::render;
 use crate::render::PathExtendedMaterial;
 
 #[cfg(test)]
-pub(super) const fn text_material_oit_depth_offset(material: &PathExtendedMaterial) -> f32 {
-    render::path_material_oit_depth_offset(material)
+pub(super) const fn text_material_oit_paint_order(material: &PathExtendedMaterial) -> f32 {
+    render::path_material_oit_paint_order(material)
 }

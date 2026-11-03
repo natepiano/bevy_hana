@@ -5,11 +5,12 @@
 //!
 //! - the real glyph **packer** (`build_packed_glyph`, the band/curve records, `DEFAULT_BAND_COUNT`)
 //!   — production code; if it changes, these numbers move,
-//! - a Rust **debugging model of the `analytic_path.wgsl` coverage math** (`Probe`) — both the
+//! - a Rust **debugging model of the `analytic_path.wesl` coverage math** (`Probe`) — both the
 //!   `aa_band` path (`signed_distance` / `band_coverage`, inside-negative) and the Off/Supersample
-//!   `distance_coverage` path (inside-positive smoothstep), including per-curve hairline dilation
-//!   and the hairline fade factor. The `distance_coverage` model covers the Off/Supersample sign
-//!   convention, which an `aa_band`-only model would miss,
+//!   `distance_terms_coverage` path (inside-positive smoothstep), including per-curve hairline
+//!   dilation and the hairline fade factor. The `distance_terms_coverage` model covers the
+//!   Off/Supersample sign convention, which an `aa_band`-only model would miss, plus the analytic
+//!   band floor and the size-dependent band floor,
 //! - an independent brute-force **ground truth** (`GroundTruth`) that counts inside/outside over
 //!   the footprint with no bands at all.
 //!
@@ -35,7 +36,7 @@
     clippy::cast_sign_loss,
     clippy::suboptimal_flops,
     clippy::imprecise_flops,
-    reason = "line-for-line CPU mirror of the analytic_path.wgsl coverage math: the int/f32/u32 casts \
+    reason = "line-for-line CPU mirror of the analytic_path.wesl coverage math: the int/f32/u32 casts \
               reproduce the shader's f32()/u32() conversions, and mul_add/cbrt are deliberately \
               avoided so the Rust results match the shader's operation order exactly"
 )]
@@ -43,25 +44,38 @@
 use bevy::math::Vec2;
 use bevy::math::Vec4;
 
+use super::outline;
 use super::outline::Contour;
 use super::outline::Glyph;
 use crate::render::BandRecord;
 use crate::render::Bounds;
+use crate::render::ContourRole;
 use crate::render::CurveRecord;
 use crate::render::DEFAULT_BAND_COUNT;
 use crate::render::PackedPath;
 use crate::render::PackedPathRecord;
+use crate::render::PathQuadRecord;
 use crate::render::QuadraticSegment;
+use crate::render::TextFitMode;
+use crate::text;
+use crate::text::slug::runtime;
+use crate::text::slug::runtime::FontKey;
+use crate::text::slug::runtime::GlyphInstance;
+use crate::text::slug::runtime::GlyphKey;
+
+type TestResult = Result<(), &'static str>;
 
 const ROOT_EPSILON: f32 = 0.000_01;
 const EDGE_FILTER_WIDTH: f32 = 1.2;
 const SQRT_3_OVER_2: f32 = 0.866_025_4;
+const ISLAND_FADE_START_PX: f32 = 1.08;
+const ISLAND_FADE_END_PX: f32 = 1.20;
 
 // Test configuration: a ~40px-tall glyph viewed at a fixed extreme anisotropy.
 const PX: f32 = 700.0 / 40.0;
 const ANISO: f32 = 12.0;
 const GT_SAMPLES: u32 = 24;
-// Mirror the shader caps in analytic_path.wgsl: the line/circle path
+// Mirror the shader caps in analytic_path.wesl: the line/circle path
 // (corner_wing_reach) and the text band path (aniso_shader_fix) move with their
 // shader counterparts.
 const MAX_ANISO_SAMPLES: u32 = 16;
@@ -86,9 +100,17 @@ const CORNER_WING_MAX_REACH: f32 = 1.5;
 // ---- shader-math debugging model -------------------------------------------
 
 struct Probe {
-    record: PackedPathRecord,
-    curves: Vec<CurveRecord>,
-    bands:  Vec<BandRecord>,
+    record:           PackedPathRecord,
+    curves:           Vec<CurveRecord>,
+    bands:            Vec<BandRecord>,
+    neighbor_witness: NeighborWitness,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum NeighborWitness {
+    #[default]
+    NearestCurve,
+    FilterWidth,
 }
 
 fn xy(v: Vec4) -> Vec2 { Vec2::new(v.x, v.y) }
@@ -132,7 +154,7 @@ impl Probe {
         for offset in 0..band.count {
             let curve = self.curves[(band.start + offset) as usize];
             let value = curve_winding(curve, point);
-            if curve.fade_exponent > 0.0 {
+            if curve.fade_exponent > 0.0 || curve.island_extent_xy != 0 {
                 winding.1 += value;
             } else {
                 winding.0 += value;
@@ -141,7 +163,12 @@ impl Probe {
         winding
     }
 
-    /// Mirrors the shader's `lanes_any_outside_neighbor` (`.0` = exempt lane,
+    fn winding_at(&self, point: Vec2) -> i32 {
+        let (exempt, faded) = self.lane_winding_at(point);
+        exempt + faded
+    }
+
+    /// Mirrors the non-text neighbor probes in the shader's `sample_terms` (`.0` = exempt lane,
     /// `.1` = whole-path union; the lane windings sum to the union's).
     fn lanes_any_outside_neighbor(&self, point: Vec2, edge_width: f32) -> (bool, bool) {
         let right = self.lane_winding_at(point + Vec2::new(edge_width, 0.0));
@@ -157,7 +184,7 @@ impl Probe {
         )
     }
 
-    /// Mirrors the shader's `lanes_no_outside_neighbor` (`.0` = exempt lane,
+    /// Mirrors the interior-edge flags of the shader's `sample_terms` (`.0` = exempt lane,
     /// `.1` = whole-path union).
     fn lanes_no_outside_neighbor(
         &self,
@@ -166,6 +193,35 @@ impl Probe {
         point: Vec2,
         edge_width: f32,
     ) -> (bool, bool) {
+        if self.record.text_em_size > 0.0 && self.neighbor_witness == NeighborWitness::NearestCurve
+        {
+            let exempt_needs = lane_needs_neighbor_test(&terms.exempt, edge_width);
+            let union_needs = lane_needs_neighbor_test(union_terms, edge_width);
+            if !exempt_needs && !union_needs {
+                return (false, false);
+            }
+            let primary = if union_needs {
+                union_terms
+            } else {
+                &terms.exempt
+            };
+            let reach = (primary.adjusted * 1.5).max(edge_width * 0.01);
+            let winding = self.lane_winding_at(point - primary.normal * reach);
+            let exempt_winding = if exempt_needs
+                && union_needs
+                && ((terms.exempt.adjusted - union_terms.adjusted).abs() > ROOT_EPSILON
+                    || terms.exempt.normal.distance(union_terms.normal) > ROOT_EPSILON)
+            {
+                let reach = (terms.exempt.adjusted * 1.5).max(edge_width * 0.01);
+                self.lane_winding_at(point - terms.exempt.normal * reach)
+            } else {
+                winding
+            };
+            return (
+                exempt_needs && exempt_winding.0 != 0,
+                union_needs && winding.0 + winding.1 != 0,
+            );
+        }
         if lane_needs_neighbor_test(&terms.exempt, edge_width)
             || lane_needs_neighbor_test(union_terms, edge_width)
         {
@@ -194,7 +250,7 @@ impl Probe {
             let curve = self.curves[(hband.start + offset) as usize];
             if include_winding {
                 let value = curve_winding(curve, point);
-                if curve.fade_exponent > 0.0 {
+                if curve.fade_exponent > 0.0 || curve.island_extent_xy != 0 {
                     terms.faded.winding += value;
                 } else {
                     terms.exempt.winding += value;
@@ -216,35 +272,39 @@ impl Probe {
         terms
     }
 
-    /// Verbatim port of `signed_distance_sample` (the `aa_band` feeder):
-    /// signed distances (`.x` exempt lane, `.y` whole-path union) plus the
-    /// faded lane's winning dilation and fade exponent.
+    /// Verbatim port of `sample_terms` + `signed_distance_terms` (the `aa_band` feeder):
+    /// signed distances (`.x` exempt lane, `.y` whole-path union), the faded
+    /// lane's winning dilation and fade exponent, and both winning normals.
     fn signed_distance_sample(
         &self,
         point: Vec2,
         scan_width_sq: f32,
         hairline_target: f32,
-    ) -> (Vec2, f32, f32) {
+    ) -> SignedDistanceSample {
         let scan_width = scan_width_sq.sqrt();
         let terms = self.coverage_terms(point, scan_width_sq, hairline_target);
         let union_terms = union_lane(&terms);
         let no_outside = self.lanes_no_outside_neighbor(&terms, &union_terms, point, scan_width);
-        (
-            Vec2::new(
+        SignedDistanceSample {
+            sd:               Vec2::new(
                 lane_signed_distance(&terms.exempt, scan_width, no_outside.0),
                 lane_signed_distance(&union_terms, scan_width, no_outside.1),
             ),
-            terms.faded.dilation,
-            terms.fade_exponent,
-        )
+            dilation:         terms.faded.dilation,
+            fade_exponent:    terms.fade_exponent,
+            island_extent_em: terms.island_extent_em,
+            exempt_normal:    terms.exempt.normal,
+            union_normal:     union_terms.normal,
+            counter_edges:    Vec2::new(terms.exempt.counter_edge, union_terms.counter_edge),
+        }
     }
 
     fn signed_distance(&self, point: Vec2, scan_width_sq: f32, hairline_target: f32) -> Vec2 {
         self.signed_distance_sample(point, scan_width_sq, hairline_target)
-            .0
+            .sd
     }
 
-    /// Verbatim port of `distance_coverage` (the Off/Supersample path):
+    /// Verbatim port of `sample_terms` + `distance_terms_coverage` (the Off/Supersample path):
     /// inside-POSITIVE smoothstep ramps with per-curve dilation, combined as
     /// mix(exempt, union, fade factor) — at factor 1 the path renders as the
     /// unfaded single-winding union, at factor 0 only the exempt
@@ -265,7 +325,16 @@ impl Probe {
 
         let exempt = lane_coverage(&terms.exempt, edge_width, no_outside.0);
         let union_coverage = lane_coverage(&union_terms, edge_width, no_outside.1);
-        let fade = hairline_fade_factor(terms.faded.dilation, hairline_target, terms.fade_exponent);
+        let axis_pixels_per_em =
+            Vec2::splat(self.record.text_em_size) / pixel.max(Vec2::splat(ROOT_EPSILON));
+        let fade = contour_fade_factor(
+            terms.faded.dilation,
+            hairline_target,
+            terms.fade_exponent,
+            terms.island_extent_em,
+            axis_pixels_per_em,
+            self.record.has_island,
+        );
         exempt + (union_coverage - exempt) * fade
     }
 
@@ -274,21 +343,50 @@ impl Probe {
     /// distances combine per sample as mix(exempt, union, fade); these probes
     /// carry no fade exponent on their curves, so the fade factor is 1.
     fn aa_band_coverage(&self, point: Vec2, dx: Vec2, dy: Vec2) -> (f32, f32) {
+        self.aa_band_coverage_with_floor(point, dx, dy, 0.0, true)
+    }
+
+    fn aa_band_coverage_with_floor(
+        &self,
+        point: Vec2,
+        dx: Vec2,
+        dy: Vec2,
+        em_size: f32,
+        analytic_floor: bool,
+    ) -> (f32, f32) {
         let pixel = Vec2::new(
             (dx.x.abs() + dy.x.abs()).max(ROOT_EPSILON),
             (dx.y.abs() + dy.y.abs()).max(ROOT_EPSILON),
         );
         let edge_width = (pixel.x.max(pixel.y) * EDGE_FILTER_WIDTH).max(ROOT_EPSILON);
-        let edge_width_sq = edge_width * edge_width;
+        let scan_width_sq = edge_width.powi(2);
 
-        // band = fwidth(signed_distance) modeled as forward differences across
-        // the 2x2 quad, per lane.
-        let sd_center = self.signed_distance(point, edge_width_sq, 0.0);
-        let band = ((self.signed_distance(point + dx, edge_width_sq, 0.0) - sd_center).abs()
-            + (self.signed_distance(point + dy, edge_width_sq, 0.0) - sd_center).abs())
-        .max(Vec2::splat(ROOT_EPSILON));
+        // Model fwidth(signed_distance) with forward differences across the
+        // 2x2 quad, floored by the nearest curve's analytic gradient.
+        let center = self.signed_distance_sample(point, scan_width_sq, 0.0);
+        let differences = (self.signed_distance(point + dx, scan_width_sq, 0.0) - center.sd).abs()
+            + (self.signed_distance(point + dy, scan_width_sq, 0.0) - center.sd).abs();
+        let floor_strength = if analytic_floor {
+            text_small_size_strength(em_size, dx, dy)
+        } else {
+            0.0
+        };
+        let analytic = Vec2::new(
+            analytic_band(center.exempt_normal, dx, dy),
+            analytic_band(center.union_normal, dx, dy),
+        );
+        let band = (differences
+            + (analytic - differences).max(Vec2::ZERO)
+                * floor_strength
+                * (Vec2::ONE - center.counter_edges))
+            .max(Vec2::splat(ROOT_EPSILON));
 
-        let single = lanes_band_coverage(sd_center, band);
+        let axis_pixels_per_em = if self.record.has_island != 0 {
+            projected_axis_pixels_per_em(dx, dy, self.record.text_em_size)
+        } else {
+            Vec2::ZERO
+        };
+        let single = lanes_band_coverage(&center, band, axis_pixels_per_em, self.record.has_island);
 
         let mut sum = 0.0;
         for (a, b) in [
@@ -297,74 +395,277 @@ impl Probe {
             (-0.375, -0.125),
             (0.125, -0.375),
         ] {
-            sum += lanes_band_coverage(
-                self.signed_distance(point + a * dx + b * dy, edge_width_sq, 0.0),
-                band,
-            );
+            let sample = self.signed_distance_sample(point + a * dx + b * dy, scan_width_sq, 0.0);
+            sum += lanes_band_coverage(&sample, band, axis_pixels_per_em, self.record.has_island);
         }
         (single, sum * 0.25)
     }
 
     /// Mirrors the shader's anisotropic stride: stride N samples along the longer
-    /// footprint axis, `per_band = d_minor + d_major/N`. The Lipschitz clamp on
-    /// the finite differences removes the spike when a sample crosses into a band
-    /// where a horizontal/vertical edge isn't visible (returns a far curve).
+    /// footprint axis, `per_band = d_minor + d_major/N`, floored by the
+    /// nearest curve's analytic gradient at the strided pixel size. The
+    /// Lipschitz clamp on finite differences removes the spike when a sample
+    /// crosses into a band where an edge isn't visible.
     fn aniso_shader_fix(&self, point: Vec2, dx: Vec2, dy: Vec2, max_n: u32) -> f32 {
+        self.aniso_shader_fix_with_floor(point, dx, dy, max_n, 0.0, true)
+    }
+
+    fn aniso_shader_fix_with_floor(
+        &self,
+        point: Vec2,
+        dx: Vec2,
+        dy: Vec2,
+        max_n: u32,
+        em_size: f32,
+        analytic_floor: bool,
+    ) -> f32 {
+        let strength = if analytic_floor {
+            text_small_size_strength(em_size, dx, dy)
+        } else {
+            0.0
+        };
+        let coverage = self.aniso_shader_fix_with_floor_strength(point, dx, dy, max_n, strength);
+        if self.record.text_em_size <= 0.0 {
+            return coverage;
+        }
+        let pixels_per_em = em_size / dx.length().max(dy.length()).max(ROOT_EPSILON);
+        let fit_strength = small_text_fit_strength(pixels_per_em);
+        let (exempt_winding, union_winding) = self.lane_winding_at(point);
+        let bounds_min = self.bounds_min();
+        let bounds_max = bounds_min + self.bounds_size();
+        if fit_strength == 0.0
+            || exempt_winding + union_winding != 0
+            || point.x < bounds_min.x
+            || point.x > bounds_max.x
+            || point.y < bounds_min.y
+            || point.y > bounds_max.y
+        {
+            return coverage;
+        }
+        let mut inside = 0;
+        for (x, y) in [(-0.25, -0.25), (0.25, -0.25), (-0.25, 0.25), (0.25, 0.25)] {
+            let winding = self.lane_winding_at(point + x * dx + y * dy);
+            inside += i32::from(winding.0 + winding.1 != 0);
+        }
+        let mut counter_cap = (inside as f32 * 0.25 + 0.05).clamp(0.08, 1.0);
+        if counter_cap > 0.08 && coverage > 0.08 {
+            let pixel = Vec2::new(
+                (dx.x.abs() + dy.x.abs()).max(ROOT_EPSILON),
+                (dx.y.abs() + dy.y.abs()).max(ROOT_EPSILON),
+            );
+            let edge_width = (pixel.x.max(pixel.y) * EDGE_FILTER_WIDTH).max(ROOT_EPSILON);
+            let sample = self.signed_distance_sample(point, edge_width * edge_width, 0.0);
+            if sample.counter_edges.y > 0.5 {
+                counter_cap = 0.08;
+            }
+        }
+        let cap = 1.0 + (counter_cap - 1.0) * fit_strength;
+        coverage.min(cap)
+    }
+
+    fn aniso_shader_fix_with_floor_strength(
+        &self,
+        point: Vec2,
+        dx: Vec2,
+        dy: Vec2,
+        max_n: u32,
+        floor_strength: f32,
+    ) -> f32 {
         let pixel = Vec2::new(
             (dx.x.abs() + dy.x.abs()).max(ROOT_EPSILON),
             (dx.y.abs() + dy.y.abs()).max(ROOT_EPSILON),
         );
         let edge_width = (pixel.x.max(pixel.y) * EDGE_FILTER_WIDTH).max(ROOT_EPSILON);
-        let edge_width_sq = edge_width * edge_width;
-        let sd_c = self.signed_distance(point, edge_width_sq, 0.0);
+        let scan_width_sq = edge_width.powi(2);
+        let center = self.signed_distance_sample(point, scan_width_sq, 0.0);
 
-        let (major, minor, major_len, minor_len) = if dx.length() >= dy.length() {
+        let major_is_x = dx.length() >= dy.length();
+        let (major, minor, major_len, minor_len) = if major_is_x {
             (dx, dy, dx.length(), dy.length())
         } else {
             (dy, dx, dy.length(), dx.length())
         };
-        let n = ((major_len / minor_len.max(ROOT_EPSILON)).ceil() as u32).clamp(1, max_n);
+        let n = ((major_len / minor_len.max(ROOT_EPSILON) - ANISO_RATIO_TOLERANCE).ceil() as u32)
+            .clamp(1, max_n);
+        let pixels_per_em = self.record.text_em_size / major_len.max(ROOT_EPSILON);
+        let island_pixels_per_em = if self.record.has_island != 0 {
+            projected_axis_pixels_per_em(dx, dy, self.record.text_em_size)
+        } else {
+            Vec2::ZERO
+        };
+        let smooth = |start: f32, end: f32| {
+            let t = ((pixels_per_em - start) / (end - start)).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        };
+        let cross_strength = smooth(2.9, 4.0) * (1.0 - smooth(9.0, 10.0));
+        let major_x_scale = if major_is_x { 1.0 / 3.0 } else { 1.0 };
+        let minor_x_scale = if major_is_x { 1.0 } else { 1.0 / 3.0 };
         // sd is 1-Lipschitz, so |Δsd| over a step can't exceed the step length.
-        let d_major = (self.signed_distance(point + major, edge_width_sq, 0.0) - sd_c)
+        let d_major = (self.signed_distance(point + major, scan_width_sq, 0.0) - center.sd)
             .abs()
             .min(Vec2::splat(major_len));
-        let d_minor = (self.signed_distance(point + minor, edge_width_sq, 0.0) - sd_c)
+        let d_minor = (self.signed_distance(point + minor, scan_width_sq, 0.0) - center.sd)
             .abs()
             .min(Vec2::splat(minor_len));
-        let per_band = (d_minor + d_major / n as f32).max(Vec2::splat(ROOT_EPSILON));
+        let differences = d_minor * minor_x_scale + d_major * major_x_scale / n as f32;
+        let analytic = Vec2::new(
+            analytic_band(
+                center.exempt_normal,
+                minor * minor_x_scale,
+                major * major_x_scale / n as f32,
+            ),
+            analytic_band(
+                center.union_normal,
+                minor * minor_x_scale,
+                major * major_x_scale / n as f32,
+            ),
+        );
+        let per_band =
+            floored_band_widths(differences, analytic, floor_strength, center.counter_edges);
+        let single_band = if cross_strength < 1.0 {
+            let single_differences = d_minor + d_major / n as f32;
+            let single_analytic = Vec2::new(
+                analytic_band(center.exempt_normal, minor, major / n as f32),
+                analytic_band(center.union_normal, minor, major / n as f32),
+            );
+            floored_band_widths(
+                single_differences,
+                single_analytic,
+                floor_strength,
+                center.counter_edges,
+            )
+        } else {
+            per_band
+        };
 
         let mut sum = 0.0;
         for i in 0..n {
             let s = (i as f32 + 0.5) / n as f32 - 0.5;
-            sum += lanes_band_coverage(
-                self.signed_distance(point + s * major, edge_width_sq, 0.0),
-                per_band,
-            );
+            if cross_strength <= 0.0 {
+                let sample = self.signed_distance_sample(point + s * major, scan_width_sq, 0.0);
+                sum += lanes_band_coverage(
+                    &sample,
+                    single_band,
+                    island_pixels_per_em,
+                    self.record.has_island,
+                );
+                continue;
+            }
+            let mut single_coverage = 0.0;
+            let mut cross_coverage = 0.0;
+            for cross in [-1.0_f32 / 3.0, 0.0, 1.0 / 3.0] {
+                let sample =
+                    self.signed_distance_sample(point + s * major + cross * dx, scan_width_sq, 0.0);
+                cross_coverage += lanes_band_coverage(
+                    &sample,
+                    per_band,
+                    island_pixels_per_em,
+                    self.record.has_island,
+                ) / 3.0;
+                if cross == 0.0 && cross_strength < 1.0 {
+                    single_coverage = lanes_band_coverage(
+                        &sample,
+                        single_band,
+                        island_pixels_per_em,
+                        self.record.has_island,
+                    );
+                }
+            }
+            sum += single_coverage + (cross_coverage - single_coverage) * cross_strength;
         }
         sum / n as f32
     }
 }
 
+/// Raises each finite-difference band width toward its analytic width by
+/// `floor_strength`, except across a counter edge, and keeps it above zero.
+fn floored_band_widths(
+    differences: Vec2,
+    analytic: Vec2,
+    floor_strength: f32,
+    counter_edges: Vec2,
+) -> Vec2 {
+    (differences
+        + (analytic - differences).max(Vec2::ZERO) * floor_strength * (Vec2::ONE - counter_edges))
+        .max(Vec2::splat(ROOT_EPSILON))
+}
+
 fn band_coverage(sd: f32, band: f32) -> f32 { (0.5 - sd / band).clamp(0.0, 1.0) }
 
-/// The shader's mix(exempt, union, fade) band combine at fade factor 1 —
-/// these probes carry no fade exponent, so the result is the union band
-/// coverage (`sd.y`).
-fn lanes_band_coverage(sd: Vec2, band: Vec2) -> f32 { band_coverage(sd.y, band.y) }
+fn analytic_band(normal: Vec2, dx: Vec2, dy: Vec2) -> f32 {
+    Vec2::new(normal.dot(dx), normal.dot(dy))
+        .length()
+        .max(ROOT_EPSILON)
+}
+
+const TEXT_LOW_FULL_PX_PER_EM: f32 = 4.9;
+const ANISO_RATIO_TOLERANCE: f32 = 0.001;
+const TEXT_LOW_END_PX_PER_EM: f32 = 2.9;
+const TEXT_LOW_FADE_SPAN_PX_PER_EM: f32 = TEXT_LOW_FULL_PX_PER_EM - TEXT_LOW_END_PX_PER_EM;
+
+fn small_text_fit_strength(pixels_per_em: f32) -> f32 {
+    let smooth = |start: f32, end: f32| {
+        let t = ((pixels_per_em - start) / (end - start)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    smooth(5.0, 5.5) * (1.0 - smooth(8.0, 9.0))
+}
+
+fn text_small_size_strength(em_size: f32, dx: Vec2, dy: Vec2) -> f32 {
+    if em_size <= 0.0 {
+        return 1.0;
+    }
+    let pixels_per_em = em_size / dx.length().max(dy.length()).max(ROOT_EPSILON);
+    ((pixels_per_em - TEXT_LOW_END_PX_PER_EM) / TEXT_LOW_FADE_SPAN_PX_PER_EM).clamp(0.0, 1.0)
+}
+
+/// Combine exempt and whole-path lanes with the winning contour's fade.
+fn lanes_band_coverage(
+    sample: &SignedDistanceSample,
+    band: Vec2,
+    axis_pixels_per_em: Vec2,
+    has_island: u32,
+) -> f32 {
+    let exempt = band_coverage(sample.sd.x, band.x);
+    let union = band_coverage(sample.sd.y, band.y);
+    let fade = contour_fade_factor(
+        sample.dilation,
+        0.0,
+        sample.fade_exponent,
+        sample.island_extent_em,
+        axis_pixels_per_em,
+        has_island,
+    );
+    exempt + (union - exempt) * fade
+}
+
+struct SignedDistanceSample {
+    sd:               Vec2,
+    dilation:         f32,
+    fade_exponent:    f32,
+    island_extent_em: Vec2,
+    exempt_normal:    Vec2,
+    union_normal:     Vec2,
+    counter_edges:    Vec2,
+}
 
 /// Mirror of the shader's `LaneTerms`.
 struct LaneTerms {
-    winding:  i32,
-    adjusted: f32,
-    dilation: f32,
+    winding:      i32,
+    adjusted:     f32,
+    dilation:     f32,
+    normal:       Vec2,
+    counter_edge: f32,
 }
 
 impl Default for LaneTerms {
     fn default() -> Self {
         Self {
-            winding:  0,
-            adjusted: 1_000_000.0,
-            dilation: 0.0,
+            winding:      0,
+            adjusted:     1_000_000.0,
+            dilation:     0.0,
+            normal:       Vec2::X,
+            counter_edge: 0.0,
         }
     }
 }
@@ -373,9 +674,10 @@ impl Default for LaneTerms {
 /// `fade_exponent == 0` curves, faded lane = `fade_exponent > 0` curves.
 #[derive(Default)]
 struct CoverageTerms {
-    exempt:        LaneTerms,
-    faded:         LaneTerms,
-    fade_exponent: f32,
+    exempt:           LaneTerms,
+    faded:            LaneTerms,
+    fade_exponent:    f32,
+    island_extent_em: Vec2,
 }
 
 /// Mirror of the shader's `lane_needs_neighbor_test`.
@@ -390,12 +692,22 @@ fn lane_needs_neighbor_test(lane: &LaneTerms, edge_width: f32) -> bool {
 fn union_lane(terms: &CoverageTerms) -> LaneTerms {
     let faded_wins = terms.faded.adjusted < terms.exempt.adjusted;
     LaneTerms {
-        winding:  terms.exempt.winding + terms.faded.winding,
-        adjusted: terms.exempt.adjusted.min(terms.faded.adjusted),
-        dilation: if faded_wins {
+        winding:      terms.exempt.winding + terms.faded.winding,
+        adjusted:     terms.exempt.adjusted.min(terms.faded.adjusted),
+        dilation:     if faded_wins {
             terms.faded.dilation
         } else {
             terms.exempt.dilation
+        },
+        normal:       if faded_wins {
+            terms.faded.normal
+        } else {
+            terms.exempt.normal
+        },
+        counter_edge: if faded_wins {
+            terms.faded.counter_edge
+        } else {
+            terms.exempt.counter_edge
         },
     }
 }
@@ -449,16 +761,29 @@ fn accumulate_nearest(
     hairline_target: f32,
 ) {
     let dilation = curve_dilation(curve, hairline_target);
-    let adjusted = curve_distance_sq(point, curve).sqrt() - dilation;
-    if curve.fade_exponent > 0.0 {
+    let (distance_sq, closest) = curve_distance(point, curve);
+    let adjusted = distance_sq.sqrt() - dilation;
+    let to_point = point - closest;
+    let to_point_len = to_point.length();
+    let normal = if to_point_len > ROOT_EPSILON {
+        to_point / to_point_len
+    } else {
+        Vec2::X
+    };
+    if curve.fade_exponent > 0.0 || curve.island_extent_xy != 0 {
         if adjusted < terms.faded.adjusted {
             terms.faded.adjusted = adjusted;
             terms.faded.dilation = dilation;
+            terms.faded.normal = normal;
+            terms.faded.counter_edge = f32::from(curve.edge_normal.length_squared() > 2.0);
             terms.fade_exponent = curve.fade_exponent;
+            terms.island_extent_em = unpack_island_extent(curve.island_extent_xy);
         }
     } else if adjusted < terms.exempt.adjusted {
         terms.exempt.adjusted = adjusted;
         terms.exempt.dilation = dilation;
+        terms.exempt.normal = normal;
+        terms.exempt.counter_edge = f32::from(curve.edge_normal.length_squared() > 2.0);
     }
 }
 
@@ -471,14 +796,42 @@ fn hairline_fade_factor(dilation: f32, hairline_target: f32, fade_exponent: f32)
     (natural / hairline_target).powf(fade_exponent)
 }
 
+fn contour_fade_factor(
+    dilation: f32,
+    hairline_target: f32,
+    fade_exponent: f32,
+    island_extent_em: Vec2,
+    axis_pixels_per_em: Vec2,
+    has_island: u32,
+) -> f32 {
+    if has_island != 0 && island_extent_em.max_element() > 0.0 {
+        let extent_px = (island_extent_em * axis_pixels_per_em).max_element();
+        return ((extent_px - ISLAND_FADE_START_PX) / (ISLAND_FADE_END_PX - ISLAND_FADE_START_PX))
+            .clamp(0.0, 1.0);
+    }
+    hairline_fade_factor(dilation, hairline_target, fade_exponent)
+}
+
+fn unpack_island_extent(packed: u32) -> Vec2 {
+    Vec2::new((packed & 65_535) as f32, (packed >> 16) as f32) / 32_767.5
+}
+
+fn projected_axis_pixels_per_em(dx: Vec2, dy: Vec2, em: f32) -> Vec2 {
+    let area = (dx.x * dy.y - dx.y * dy.x).abs().max(ROOT_EPSILON);
+    em * Vec2::new(
+        Vec2::new(dy.y, dx.y).length(),
+        Vec2::new(dy.x, dx.x).length(),
+    ) / area
+}
+
 /// WGSL `smoothstep`.
 fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
     let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
 
-fn curve_distance_sq(point: Vec2, curve: CurveRecord) -> f32 {
-    exact_quadratic_distance_sq(
+fn curve_distance(point: Vec2, curve: CurveRecord) -> (f32, Vec2) {
+    exact_quadratic_distance(
         curve,
         point,
         xy(curve.start_delta),
@@ -493,24 +846,29 @@ fn curve_bounds_distance_sq(point: Vec2, curve: CurveRecord) -> f32 {
     (point - nearest).length_squared()
 }
 
-fn point_line_distance_sq(point: Vec2, start: Vec2, end: Vec2) -> f32 {
+fn point_line_closest(point: Vec2, start: Vec2, end: Vec2) -> Vec2 {
     let edge = end - start;
     let len_sq = edge.length_squared().max(ROOT_EPSILON);
     let t = ((point - start).dot(edge) / len_sq).clamp(0.0, 1.0);
-    (point - (start + edge * t)).length_squared()
+    start + edge * t
 }
 
-fn exact_quadratic_distance_sq(
+fn exact_quadratic_distance(
     curve: CurveRecord,
     point: Vec2,
     start: Vec2,
     control_delta: Vec2,
     curve_delta: Vec2,
     end: Vec2,
-) -> f32 {
+) -> (f32, Vec2) {
     let pv = point - start;
     let mut best_sq = pv.length_squared();
-    best_sq = best_sq.min((end - point).length_squared());
+    let mut best_closest = start;
+    let end_sq = (end - point).length_squared();
+    if end_sq < best_sq {
+        best_sq = end_sq;
+        best_closest = end;
+    }
 
     let inv = curve.solver.z;
     if inv > 0.0 {
@@ -522,13 +880,22 @@ fn exact_quadratic_distance_sq(
         for &t in &roots {
             if (0.0..=1.0).contains(&t) {
                 let closest = start + control_delta * (2.0 * t) + curve_delta * (t * t);
-                best_sq = best_sq.min((closest - point).length_squared());
+                let dist_sq = (closest - point).length_squared();
+                if dist_sq < best_sq {
+                    best_sq = dist_sq;
+                    best_closest = closest;
+                }
             }
         }
-        best_sq
     } else {
-        best_sq.min(point_line_distance_sq(point, start, end))
+        let closest = point_line_closest(point, start, end);
+        let dist_sq = (closest - point).length_squared();
+        if dist_sq < best_sq {
+            best_sq = dist_sq;
+            best_closest = closest;
+        }
     }
+    (best_sq, best_closest)
 }
 
 fn cbrt_signed(x: f32) -> f32 {
@@ -710,6 +1077,7 @@ fn sharp_corner_glyph() -> (Glyph, Vec<QuadraticSegment>) {
             segments:             segments.clone(),
             minimum_feature_size: 0.0,
             fade_exponent:        0.0,
+            role:                 ContourRole::Ink,
         }],
     };
     (glyph, segments)
@@ -731,9 +1099,17 @@ fn build() -> (Probe, GroundTruth) {
     let packed = super::build_packed_glyph(glyph, DEFAULT_BAND_COUNT);
     let band_count = (packed.bands().len() / 2) as u32;
     let probe = Probe {
-        record: PackedPathRecord::new(packed.bounds(), 0, band_count, band_count, band_count, 0.0),
-        curves: packed.curves().to_vec(),
-        bands:  packed.bands().to_vec(),
+        record:           PackedPathRecord::new(
+            packed.bounds(),
+            0,
+            band_count,
+            band_count,
+            band_count,
+            0.0,
+        ),
+        curves:           packed.curves().to_vec(),
+        bands:            packed.bands().to_vec(),
+        neighbor_witness: NeighborWitness::NearestCurve,
     };
     let gt = GroundTruth { segments };
     (probe, gt)
@@ -979,20 +1355,46 @@ fn center_dilation_bounds_corner_wing() {
     }
 }
 
-/// Tripwire: hashes `analytic_path.wgsl` and fails when it changes. The [`Probe`]
+/// Tripwire: hashes `analytic_path.wesl` and fails when it changes. The [`Probe`]
 /// above mirrors the shader's coverage math by hand; this flags that the shader
 /// changed so the mirror gets re-checked. It cannot tell whether the change was
 /// correct — the shader runs on the GPU. On failure, re-verify [`Probe`], then
 /// set `EXPECTED_SHADER_FNV1A` to the printed value.
 #[test]
-fn shader_mirror_matches_wgsl() {
-    const SHADER: &str = include_str!("../../../render/analytic_paths/analytic_path.wgsl");
-    const EXPECTED_SHADER_FNV1A: u64 = 0xb7a2_b3f0_8884_b007;
+fn shader_mirror_matches_wesl() {
+    const SHADER: &str = include_str!("../../../render/analytic_paths/analytic_path.wesl");
+    // Incoming OIT paint/plane plumbing changed; coverage functions match the prior mirror.
+    const EXPECTED_SHADER_FNV1A: u64 = 0x7c85_26f6_e074_01b8;
     let actual = fnv1a_64(SHADER.as_bytes());
     assert_eq!(
-        actual, EXPECTED_SHADER_FNV1A,
-        "shader has changed, make sure to update this test to match the new logic (new hash {actual:#018x})",
+        actual,
+        EXPECTED_SHADER_FNV1A,
+        "shader has changed, make sure to update this test to match the new logic (new hash 0x{:04x}_{:04x}_{:04x}_{:04x})",
+        actual >> 48,
+        (actual >> 32) & 0xffff,
+        (actual >> 16) & 0xffff,
+        actual & 0xffff,
     );
+}
+
+#[test]
+fn shadow_prepass_discards_small_zero_island_and_keeps_large_dot() -> TestResult {
+    let shader = include_str!("../../../render/analytic_paths/analytic_path.wesl");
+    let (_, prepass) = shader
+        .split_once("@if(PREPASS_PIPELINE) {\n@fragment")
+        .ok_or("analytic WESL keeps a prepass fragment")?;
+    let (prepass, _) = prepass
+        .split_once("@if(!PREPASS_PIPELINE) {\n@fragment")
+        .ok_or("the forward fragment follows the prepass fragment")?;
+    assert!(prepass.contains("let fade = contour_fade_factor("));
+    assert!(prepass.contains("if fade <= threshold {\n            discard;"));
+
+    let dot = Vec2::splat(0.12);
+    let small = contour_fade_factor(0.0, 0.0, 0.0, dot, Vec2::splat(6.0), 1);
+    let large = contour_fade_factor(0.0, 0.0, 0.0, dot, Vec2::splat(12.0), 1);
+    assert_eq!(small, 0.0, "six-pixel dot cannot enter a shadow texel");
+    assert_eq!(large, 1.0, "twelve-pixel dot fills its shadow texel");
+    Ok(())
 }
 
 fn fnv1a_64(bytes: &[u8]) -> u64 {
@@ -1039,7 +1441,7 @@ fn rectangle_probe_with_fade(
     let packed = super::build_packed_glyph(glyph, band_count);
     let band_count = (packed.bands().len() / 2) as u32;
     Probe {
-        record: PackedPathRecord::new(
+        record:           PackedPathRecord::new(
             packed.bounds(),
             0,
             band_count,
@@ -1047,9 +1449,550 @@ fn rectangle_probe_with_fade(
             band_count,
             minimum_feature_size,
         ),
-        curves: packed.curves().to_vec(),
-        bands:  packed.bands().to_vec(),
+        curves:           packed.curves().to_vec(),
+        bands:            packed.bands().to_vec(),
+        neighbor_witness: NeighborWitness::NearestCurve,
     }
+}
+
+#[allow(clippy::expect_used, reason = "the embedded H test fixture must exist")]
+fn embedded_h_probe() -> Probe {
+    const FONT: &[u8] = include_bytes!("../../../../assets/fonts/JetBrainsMono-Regular.ttf");
+    let face = ttf_parser::Face::parse(FONT, 0).expect("embedded mono face");
+    let glyph_id = face.glyph_index('H').expect("embedded H glyph");
+    let glyph =
+        outline::load_glyph_by_id_from_face(FONT, 0, glyph_id.0, 'H').expect("embedded H outline");
+    let packed = super::build_packed_glyph(glyph, DEFAULT_BAND_COUNT);
+    let band_count = (packed.bands().len() / 2) as u32;
+    Probe {
+        record:           PackedPathRecord::new(
+            packed.bounds(),
+            0,
+            band_count,
+            band_count,
+            band_count,
+            0.0,
+        ),
+        curves:           packed.curves().to_vec(),
+        bands:            packed.bands().to_vec(),
+        neighbor_witness: NeighborWitness::NearestCurve,
+    }
+}
+
+struct PositionedProbe {
+    probe:             Probe,
+    old_x_bands_probe: Probe,
+    origin_x:          f32,
+    bounds:            Bounds,
+    quad:              PathQuadRecord,
+}
+
+struct GlyphRunProbe {
+    glyphs:    Vec<PositionedProbe>,
+    word_gaps: Vec<(f32, f32)>,
+    width:     f32,
+    em:        f32,
+}
+
+#[allow(clippy::expect_used, reason = "the embedded run fixture must exist")]
+fn embedded_run_probe(text: &str) -> GlyphRunProbe {
+    const FONT: &[u8] = include_bytes!("../../../../assets/fonts/JetBrainsMono-Regular.ttf");
+    embedded_run_probe_from_font(FONT, text)
+}
+
+#[test]
+fn jetbrains_mono_figure_eight_crossbar_mid_is_382_design_units() {
+    const FONT: &[u8] = include_bytes!("../../../../assets/fonts/JetBrainsMono-Regular.ttf");
+    let mid = runtime::font_figure_crossbar_mid(FONT, 0, 1000.0);
+    assert_eq!(mid, 382.0, "figure eight crossbar midpoint: {mid}");
+}
+
+#[test]
+#[allow(clippy::expect_used, reason = "the embedded mono fixture must exist")]
+fn zero_dot_is_an_island_with_small_size_fade_thresholds() {
+    const FONT: &[u8] = include_bytes!("../../../../assets/fonts/JetBrainsMono-Regular.ttf");
+    let face = ttf_parser::Face::parse(FONT, 0).expect("embedded mono face");
+    let id = face.glyph_index('0').expect("zero glyph");
+    let glyph = outline::load_glyph_by_id_from_face(FONT, 0, id.0, '0').expect("zero outline");
+    assert_eq!(glyph.contours.len(), 3);
+    let islands: Vec<_> = glyph
+        .contours
+        .iter()
+        .filter_map(|contour| match contour.role {
+            ContourRole::Ink => None,
+            ContourRole::Island { extent_em } => Some((contour, extent_em)),
+        })
+        .collect();
+    assert_eq!(islands.len(), 1, "zero needs one isolated dot");
+    let (dot, extent_em) = islands[0];
+    assert!(
+        extent_em.max_element() * 8.0 <= 0.961,
+        "dot at 8 px/em is {:.3}px",
+        extent_em.max_element() * 8.0
+    );
+    assert!(
+        extent_em.max_element() * 12.0 >= 1.20,
+        "dot at 12 px/em is {:.3}px",
+        extent_em.max_element() * 12.0
+    );
+
+    let (min, max) = dot.segments.iter().fold(
+        (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY)),
+        |(min, max), segment| {
+            (
+                min.min(segment.start).min(segment.control).min(segment.end),
+                max.max(segment.start).max(segment.control).max(segment.end),
+            )
+        },
+    );
+    let centre = min.midpoint(max);
+    let run = embedded_run_probe("0");
+    assert_eq!(run.glyphs[0].probe.record.has_island, 1);
+    for (size, should_draw) in [
+        (6.0_f32, false),
+        (8.0, false),
+        (8.5, false),
+        (9.0, false),
+        (10.0, true),
+        (12.0, true),
+    ] {
+        let pixel = run.em / size;
+        let coverage = run.glyphs[0].probe.aniso_shader_fix_with_floor(
+            centre,
+            Vec2::new(pixel, 0.0),
+            Vec2::new(0.0, pixel),
+            MAX_ANISO_SAMPLES_TEXT,
+            run.em,
+            true,
+        );
+        if should_draw {
+            assert!(coverage > 0.5, "zero dot at {size} px/em: {coverage:.3}");
+        } else {
+            assert!(
+                coverage < 0.26,
+                "zero counter at {size} px/em: {coverage:.3}"
+            );
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::expect_used, reason = "the embedded mono fixture must exist")]
+fn large_counter_islands_keep_their_ink() {
+    const FONT: &[u8] = include_bytes!("../../../../assets/fonts/JetBrainsMono-Regular.ttf");
+    let face = ttf_parser::Face::parse(FONT, 0).expect("embedded mono face");
+    let theta = face.glyph_index('Θ').expect("theta glyph");
+    let theta = outline::load_glyph_by_id_from_face(FONT, 0, theta.0, 'Θ').expect("theta outline");
+    let islands: Vec<_> = theta
+        .contours
+        .iter()
+        .filter_map(|contour| match contour.role {
+            ContourRole::Ink => None,
+            ContourRole::Island { extent_em } => Some(extent_em),
+        })
+        .collect();
+    assert_eq!(islands.len(), 1, "theta bar is one isolated ink contour");
+    assert!(
+        islands[0].max_element() * 6.67 >= 1.2,
+        "theta bar is only {:.2} px at 6.67 px/em",
+        islands[0].max_element() * 6.67
+    );
+
+    // The @ inner a joins the outer stroke: its two contours contain no island.
+    let at = face.glyph_index('@').expect("at-sign glyph");
+    let at = outline::load_glyph_by_id_from_face(FONT, 0, at.0, '@').expect("at-sign outline");
+    assert_eq!(at.contours.len(), 2);
+    for contour in &at.contours {
+        assert_eq!(contour.role, ContourRole::Ink);
+    }
+}
+
+#[test]
+fn narrow_island_fades_by_its_larger_projected_dimension() {
+    let extent_em = Vec2::new(0.18, 0.06);
+    let em = 1000.0;
+    let foreshortened_x =
+        projected_axis_pixels_per_em(Vec2::new(em / 4.0, 0.0), Vec2::new(0.0, em / 12.0), em);
+    assert_eq!(foreshortened_x, Vec2::new(4.0, 12.0));
+    assert_eq!(
+        contour_fade_factor(0.0, 0.0, 0.0, extent_em, foreshortened_x, 1),
+        0.0,
+    );
+    let resolved_x =
+        projected_axis_pixels_per_em(Vec2::new(em / 8.0, 0.0), Vec2::new(0.0, em / 12.0), em);
+    assert_eq!(
+        contour_fade_factor(0.0, 0.0, 0.0, extent_em, resolved_x, 1),
+        1.0,
+    );
+}
+
+#[test]
+fn eight_top_bar_has_inside_winding_and_upper_counter_has_outside_winding() {
+    let run = embedded_run_probe("8");
+    let probe = &run.glyphs[0].probe;
+    let top_bar = probe.lane_winding_at(Vec2::new(300.0, 695.0));
+    let hole = probe.lane_winding_at(Vec2::new(300.0, 540.0));
+    assert_ne!(top_bar.0 + top_bar.1, 0);
+    assert_eq!(hole.0 + hole.1, 0);
+}
+
+#[test]
+fn six_pixel_eight_counter_centres_have_low_coverage_below_fitted_crossbar() {
+    let run = embedded_run_probe("8");
+    let probe = &run.glyphs[0].probe;
+    let pixel = run.em / 6.0;
+    let dx = Vec2::new(pixel, 0.0);
+    let dy = Vec2::new(0.0, pixel);
+    for y in [0.382 * run.em + pixel, 0.382 * run.em - pixel] {
+        let point = Vec2::new(0.3 * run.em, y);
+        let coverage =
+            probe.aniso_shader_fix_with_floor(point, dx, dy, MAX_ANISO_SAMPLES_TEXT, run.em, true);
+        assert!(
+            coverage < 0.10,
+            "counter at y={y} has {coverage:.3} coverage"
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::expect_used, reason = "the embedded mono fixture must exist")]
+fn six_pixel_eights_keep_both_counter_pixels_light_at_column_edges() {
+    const FONT: &[u8] = include_bytes!("../../../../assets/fonts/JetBrainsMono-Regular.ttf");
+    let run = embedded_run_probe("8");
+    let glyph = &run.glyphs[0];
+    let face = ttf_parser::Face::parse(FONT, 0).expect("embedded mono face");
+    let id = face.glyph_index('8').expect("eight glyph");
+    let outline = outline::load_glyph_by_id_from_face(FONT, 0, id.0, '8').expect("eight outline");
+    let centre_x = outline
+        .contours
+        .iter()
+        .map(|contour| {
+            let (min, max) = contour.segments.iter().fold(
+                (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY)),
+                |(min, max), segment| {
+                    (
+                        min.min(segment.start).min(segment.control).min(segment.end),
+                        max.max(segment.start).max(segment.control).max(segment.end),
+                    )
+                },
+            );
+            (min.midpoint(max).y, min.midpoint(max).x)
+        })
+        .max_by(|left, right| left.0.total_cmp(&right.0))
+        .expect("upper counter")
+        .1;
+    let mut failures = Vec::new();
+    for pixels_per_em in [6.0_f32, 6.02] {
+        for pitch in [0.0_f32, 0.18] {
+            for tilt in [0.0_f32, 3.0] {
+                let pixel = run.em / pixels_per_em;
+                let dx = Vec2::new(pixel / tilt.to_radians().cos(), 0.0);
+                let dy = Vec2::new(0.0, pixel / pitch.cos());
+                for phase in [0.90_f32, 0.95, 0.99, 0.00, 0.05] {
+                    let origin_phase = (centre_x / dx.x - phase).rem_euclid(1.0);
+                    for y_phase in [0.0_f32, 0.25, 0.5, 0.75] {
+                        let feature_y = glyph.probe.record.figure_crossbar_mid;
+                        let shift_px = 0.5 - (feature_y / dy.y - y_phase).fract();
+                        let mut lightest_pair = 1.0_f32;
+                        let mut best = (0.0_f32, [1.0_f32; 2], Vec2::ZERO);
+                        for column in -1..7 {
+                            let x = (column as f32 + 0.5 + origin_phase) * dx.x;
+                            if !(180.0..=430.0).contains(&x) {
+                                continue;
+                            }
+                            let mut holes = [1.0_f32; 2];
+                            let mut upper_point = Vec2::ZERO;
+                            for row in -1..8 {
+                                let point =
+                                    Vec2::new(x, (row as f32 + 0.5 + y_phase - shift_px) * dy.y);
+                                let hole = if (500.0..=580.0).contains(&point.y) {
+                                    0
+                                } else if (180.0..=260.0).contains(&point.y) {
+                                    1
+                                } else {
+                                    continue;
+                                };
+                                let coverage = glyph.probe.aniso_shader_fix_with_floor(
+                                    point,
+                                    dx,
+                                    dy,
+                                    MAX_ANISO_SAMPLES_TEXT,
+                                    run.em,
+                                    true,
+                                );
+                                if hole == 0 && coverage < holes[0] {
+                                    upper_point = point;
+                                }
+                                holes[hole] = holes[hole].min(coverage);
+                            }
+                            let pair = holes[0].max(holes[1]);
+                            if pair < lightest_pair {
+                                lightest_pair = pair;
+                                best = (x, holes, upper_point);
+                            }
+                        }
+                        // The fixture blends linear colors before sRGB output. With its
+                        // dark fill and light ink, the displayed color midpoint is near
+                        // 0.26 geometric coverage, not 0.5.
+                        if lightest_pair >= 0.26 {
+                            let left_edge = best.2 - 0.5 * dx;
+                            let right_edge = best.2 + 0.5 * dx;
+                            let edge_width = dx.length().max(dy.length()) * EDGE_FILTER_WIDTH;
+                            let sample = glyph.probe.signed_distance_sample(
+                                best.2,
+                                edge_width * edge_width,
+                                0.0,
+                            );
+                            let quarter_ink =
+                                [(-0.25, -0.25), (0.25, -0.25), (-0.25, 0.25), (0.25, 0.25)]
+                                    .into_iter()
+                                    .filter(|(x, y)| {
+                                        glyph.probe.winding_at(best.2 + *x * dx + *y * dy) != 0
+                                    })
+                                    .count();
+                            failures.push(format!("{pixels_per_em} px/em pitch {pitch} tilt {tilt} centre x {centre_x:.1} x phase {phase} y phase {y_phase}: x {:.1} upper {:.3} lower {:.3}, point {:?}, winding {} edge L/R {}/{}, quarter ink {}, counter edge {}, outside {}", best.0, best.1[0], best.1[1], best.2, glyph.probe.winding_at(best.2), glyph.probe.winding_at(left_edge), glyph.probe.winding_at(right_edge), quarter_ink, sample.counter_edges.y, glyph.probe.outside_bounds(best.2)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "paired counter failures: {failures:?}");
+}
+
+#[allow(clippy::expect_used, reason = "the embedded run fixture must exist")]
+fn embedded_run_probe_from_font(font: &[u8], text: &str) -> GlyphRunProbe {
+    let face = ttf_parser::Face::parse(font, 0).expect("embedded face");
+    let mut glyphs = Vec::new();
+    let mut word_gaps = Vec::new();
+    let mut origin_x = 0.0;
+    for character in text.chars() {
+        let glyph_id = face.glyph_index(character).expect("embedded run glyph");
+        let advance = f32::from(face.glyph_hor_advance(glyph_id).expect("glyph advance"));
+        if character == ' ' {
+            word_gaps.push((origin_x, origin_x + advance));
+        } else {
+            let glyph = outline::load_glyph_by_id_from_face(font, 0, glyph_id.0, character)
+                .expect("embedded run outline");
+            let bounds = glyph.bounds;
+            let packed = super::build_packed_glyph(glyph, DEFAULT_BAND_COUNT);
+            let band_count = (packed.bands().len() / 2) as u32;
+            let probe = Probe {
+                record:           PackedPathRecord::new(
+                    packed.bounds(),
+                    0,
+                    band_count,
+                    band_count,
+                    band_count,
+                    0.0,
+                )
+                .with_text_em_size(f32::from(face.units_per_em()))
+                .with_figure_crossbar_mid(runtime::font_figure_crossbar_mid(
+                    font,
+                    0,
+                    f32::from(face.units_per_em()),
+                ))
+                .with_has_island(
+                    packed
+                        .curves()
+                        .iter()
+                        .any(|curve| curve.island_extent_xy != 0),
+                ),
+                curves:           packed.curves().to_vec(),
+                bands:            packed.bands().to_vec(),
+                neighbor_witness: NeighborWitness::NearestCurve,
+            };
+            let layout_scale = 0.05 / f32::from(face.units_per_em());
+            let instance = GlyphInstance::new_non_uniform(
+                GlyphKey::with_preprocess_version(FontKey::new(1), glyph_id.0, 0),
+                Vec2::new(origin_x * layout_scale, 0.0),
+                bounds,
+                Vec2::splat(layout_scale),
+            );
+            let extents = text::glyph_quad_extents(instance, 1.0, None)
+                .expect("visible glyph should produce a quad");
+            let quad = PathQuadRecord {
+                rect_min:           Vec2::new(extents.left, extents.bottom),
+                rect_size:          Vec2::new(
+                    extents.right - extents.left,
+                    extents.top - extents.bottom,
+                ),
+                uv_min:             Vec2::new(extents.uv_left, extents.uv_top),
+                uv_size:            Vec2::new(
+                    extents.uv_right - extents.uv_left,
+                    extents.uv_bottom - extents.uv_top,
+                ),
+                box_uv_min:         Vec2::ZERO,
+                box_uv_size:        Vec2::ONE,
+                packed_path_index:  0,
+                render_index:       0,
+                box_uv_flip_x:      0,
+                clip_edges:         extents.clip_edges,
+                text_fit_mode:      TextFitMode::SmallGlyph.shader_value(),
+                padding_before_fit: 0,
+                text_fit_offset:    Vec2::ZERO,
+            };
+            let old_x_bands_probe = vertical_only_x_band_baseline_probe(&probe);
+            glyphs.push(PositionedProbe {
+                probe,
+                old_x_bands_probe,
+                origin_x,
+                bounds,
+                quad,
+            });
+        }
+        origin_x += advance;
+    }
+    GlyphRunProbe {
+        glyphs,
+        word_gaps,
+        width: origin_x,
+        em: f32::from(face.units_per_em()),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RunCoveragePolicy {
+    margin_px:        f32,
+    analytic_floor:   bool,
+    all_x_band_edges: bool,
+    fixed_margin:     bool,
+}
+
+impl RunCoveragePolicy {
+    const CURRENT: Self = Self {
+        margin_px:        0.5,
+        analytic_floor:   true,
+        all_x_band_edges: true,
+        fixed_margin:     false,
+    };
+    const BEFORE_PHASE: Self = Self {
+        margin_px:        0.0,
+        analytic_floor:   false,
+        all_x_band_edges: false,
+        fixed_margin:     false,
+    };
+    const BUGGY_VERTEX_UNITS: Self = Self {
+        margin_px:        0.5,
+        analytic_floor:   true,
+        all_x_band_edges: true,
+        fixed_margin:     true,
+    };
+}
+
+#[derive(Default)]
+struct RunCoverage {
+    mean:                     f32,
+    gap:                      f32,
+    row_means:                Vec<f32>,
+    punch_out_colored_pixels: usize,
+}
+
+fn vertical_only_x_band_baseline_probe(probe: &Probe) -> Probe {
+    let mut curves = Vec::new();
+    let mut bands = Vec::new();
+    for (index, band) in probe.bands.iter().enumerate() {
+        let start = curves.len() as u32;
+        for offset in 0..band.count {
+            let curve = probe.curves[(band.start + offset) as usize];
+            let vertical = curve.bounds.w - curve.bounds.y > curve.bounds.z - curve.bounds.x;
+            if index < probe.record.band_range.z as usize || vertical {
+                curves.push(curve);
+            }
+        }
+        bands.push(BandRecord {
+            start,
+            count: curves.len() as u32 - start,
+            ..*band
+        });
+    }
+    Probe {
+        // This probe represents the renderer before small-text fitting and
+        // before the island and x-tap coverage changes.
+        record: PackedPathRecord {
+            text_em_size: 0.0,
+            has_island: 0,
+            ..probe.record
+        },
+        curves,
+        bands,
+        neighbor_witness: NeighborWitness::FilterWidth,
+    }
+}
+
+fn run_coverage(run: &GlyphRunProbe, pixels_per_em: f32, policy: RunCoveragePolicy) -> RunCoverage {
+    let units_per_pixel = run.em / pixels_per_em;
+    let dx = Vec2::new(units_per_pixel, 0.0);
+    let dy = Vec2::new(0.0, units_per_pixel);
+    let columns = (run.width / units_per_pixel).ceil() as usize;
+    let rows = (run.em / units_per_pixel).ceil() as usize + 1;
+    let mut result = RunCoverage::default();
+    let mut gap_sum = 0.0;
+    let mut gap_count = 0;
+    for row in 0..rows {
+        let mut row_sum = 0.0;
+        for column in 0..columns {
+            let point = Vec2::new(
+                (column as f32 + 0.5) * units_per_pixel,
+                (row as f32 + 0.5) * units_per_pixel - run.em * 0.2,
+            );
+            let mut clear = 1.0;
+            let mut punch_out_alpha = 0.0_f32;
+            for glyph in &run.glyphs {
+                let projected_units_per_pixel = Vec2::splat(0.05 / pixels_per_em);
+                let vertex = glyph
+                    .quad
+                    .vertex_text_margin(glyph.probe.record, projected_units_per_pixel);
+                let margin_px = if policy.margin_px == 0.0 {
+                    0.0
+                } else if policy.fixed_margin {
+                    policy.margin_px
+                } else {
+                    vertex.margin_px
+                };
+                let margin = margin_px * units_per_pixel;
+                let local = point - Vec2::new(glyph.origin_x, 0.0);
+                // glyph_quad_extents uses 16 design units of padding at unit scale.
+                let rect_min = glyph.bounds.min - Vec2::splat(16.0 + margin);
+                let rect_max = glyph.bounds.max + Vec2::splat(16.0 + margin);
+                if local.cmpge(rect_min).all() && local.cmple(rect_max).all() {
+                    let probe = if policy.all_x_band_edges
+                        && text_small_size_strength(run.em, dx, dy) > 0.0
+                    {
+                        &glyph.probe
+                    } else {
+                        &glyph.old_x_bands_probe
+                    };
+                    let coverage = probe.aniso_shader_fix_with_floor(
+                        local,
+                        dx,
+                        dy,
+                        MAX_ANISO_SAMPLES_TEXT,
+                        run.em,
+                        policy.analytic_floor,
+                    );
+                    clear *= 1.0 - coverage;
+                    punch_out_alpha = punch_out_alpha.max(1.0 - coverage);
+                }
+            }
+            result.punch_out_colored_pixels += usize::from(punch_out_alpha > 0.01);
+            let coverage = 1.0 - clear;
+            row_sum += coverage;
+            if run
+                .word_gaps
+                .iter()
+                .any(|&(start, end)| point.x >= start && point.x < end)
+            {
+                gap_sum += coverage;
+                gap_count += 1;
+            }
+        }
+        result.row_means.push(row_sum / columns as f32);
+        result.mean += row_sum;
+    }
+    result.mean /= (rows * columns) as f32;
+    result.gap = gap_sum / gap_count.max(1) as f32;
+    result
 }
 
 /// An axis-aligned rectangle contour from `min` to `min + size` with the
@@ -1076,6 +2019,7 @@ fn rectangle_contour(
             .collect(),
         minimum_feature_size,
         fade_exponent,
+        role: ContourRole::Ink,
     }
 }
 
@@ -1115,6 +2059,459 @@ fn run_tick_scan(probe: Probe, size: Vec2, band_count: usize) {
         distinct.iter().any(|&value| value > 100 && value < 900),
         "coverage across the edge should pass through intermediate values, got {distinct:?}"
     );
+}
+
+/// A horizontal crossbar split between two pixel rows must give both rows
+/// their box-filtered share, even when forward signed-distance differences
+/// collapse across the thin interior.
+#[test]
+fn subpixel_horizontal_bar_tracks_box_filter_in_both_band_paths() {
+    let probe = rectangle_probe(Vec2::new(8.0, 0.4), DEFAULT_BAND_COUNT, 0.0);
+    let dx = Vec2::new(2.0, 0.0);
+    let dy = Vec2::Y;
+    for phase_step in 1..=4 {
+        let phase = phase_step as f32 * 0.1;
+        for row in 0..=1 {
+            let center_y = row as f32;
+            let pixel_bottom = center_y - 0.5;
+            let pixel_top = center_y + 0.5;
+            let expected = (pixel_top.min(phase + 0.4) - pixel_bottom.max(phase)).max(0.0);
+            let point = Vec2::new(4.0, center_y - phase);
+            let (single, _) = probe.aa_band_coverage(point, dx, dy);
+            let strided = probe.aniso_shader_fix(point, dx, dy, MAX_ANISO_SAMPLES_TEXT);
+            for (path, actual) in [("single", single), ("strided", strided)] {
+                assert!(
+                    (actual - expected).abs() <= 0.08,
+                    "{path} band at phase {phase:.1}, row {row}: {actual:.3} vs box {expected:.3}",
+                );
+                if expected >= 0.1 {
+                    assert!(
+                        actual > 0.05,
+                        "{path} band dropped a crossbar row at phase {phase:.1}, row {row}",
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn text_size_ramp_preserves_small_run_and_full_six_pixel_strokes() {
+    let run = embedded_run_probe("H");
+    let glyph = &run.glyphs[0];
+    let dx = Vec2::new(2.0, 0.0);
+    let dy = Vec2::Y;
+    for (pixels_per_em, expected) in [
+        (2.0, 0.0),
+        (2.6, 0.0),
+        (2.9, 0.0),
+        (4.0, 0.55),
+        (4.9, 1.0),
+        (6.0, 1.0),
+        (12.0, 1.0),
+    ] {
+        assert!((text_small_size_strength(pixels_per_em * 2.0, dx, dy) - expected).abs() < 1.0e-6);
+        let vertex = glyph
+            .quad
+            .vertex_text_margin(glyph.probe.record, Vec2::splat(0.05 / pixels_per_em));
+        assert!((vertex.pixels_per_em - pixels_per_em).abs() < 1.0e-5);
+        assert!((vertex.margin_px - 0.5 * expected).abs() < 1.0e-5);
+    }
+}
+
+/// With the band floor and quad margin off, the `info  load scene ok` run's
+/// mean/space coverage is 0.0887/0.0000 at 2.6 px/em and 0.1106/0.0000 at
+/// 4 px/em. Each current measure may rise by at most 0.03.
+#[test]
+fn tiny_real_glyph_run_preserves_light_word_gaps() {
+    let run = embedded_run_probe("info  load scene ok");
+    for (pixels_per_em, expected_mean, expected_gap) in [(2.6, 0.0887, 0.0), (4.0, 0.1106, 0.0)] {
+        let baseline = run_coverage(&run, pixels_per_em, RunCoveragePolicy::BEFORE_PHASE);
+        let current = run_coverage(&run, pixels_per_em, RunCoveragePolicy::CURRENT);
+        assert!((baseline.mean - expected_mean).abs() < 0.001);
+        assert!((baseline.gap - expected_gap).abs() < 0.001);
+        if pixels_per_em < TEXT_LOW_END_PX_PER_EM {
+            assert_eq!(current.mean, baseline.mean);
+            assert_eq!(current.row_means, baseline.row_means);
+        }
+        assert!(
+            current.mean <= baseline.mean + 0.03,
+            "{pixels_per_em} mean {:.4} vs {:.4}",
+            current.mean,
+            baseline.mean
+        );
+        assert!(
+            current.gap <= baseline.gap + 0.03,
+            "{pixels_per_em} gap {:.4} vs {:.4}",
+            current.gap,
+            baseline.gap
+        );
+    }
+    let punch_out = embedded_run_probe("PunchOut");
+    let before_phase = run_coverage(&punch_out, 1.5, RunCoveragePolicy::BEFORE_PHASE);
+    let before_repair = run_coverage(&punch_out, 1.5, RunCoveragePolicy::BUGGY_VERTEX_UNITS);
+    let repaired = run_coverage(&punch_out, 1.5, RunCoveragePolicy::CURRENT);
+    println!(
+        "PunchOut mirror at 1.5 px/em (>0.01 inverted coverage): pre-phase {}, before repair {}, after repair {} coloured pixels",
+        before_phase.punch_out_colored_pixels,
+        before_repair.punch_out_colored_pixels,
+        repaired.punch_out_colored_pixels,
+    );
+}
+
+/// At 6 px/em, real `JetBrains Mono` e, o, and 0 each keep a central pixel
+/// within 0.08 coverage of the floor-off open patch (0.000 for each glyph).
+/// Four quarter-pixel phases exercise the openings between aligned rows.
+#[test]
+fn real_glyph_counters_remain_open_at_six_pixels_per_em() {
+    let run = embedded_run_probe("eo0");
+    let units_per_pixel = run.em / 6.0;
+    let dx = Vec2::new(units_per_pixel, 0.0);
+    let dy = Vec2::new(0.0, units_per_pixel);
+    for (glyph, character) in run.glyphs.iter().zip("eo0".chars()) {
+        let size = glyph.bounds.max - glyph.bounds.min;
+        for phase in [
+            Vec2::ZERO,
+            Vec2::new(0.25, 0.0),
+            Vec2::new(0.0, 0.25),
+            Vec2::splat(0.25),
+        ] {
+            let mut lightest_current = 1.0_f32;
+            let mut matched_baseline = 1.0_f32;
+            for y in 2..=6 {
+                for x in 2..=6 {
+                    let point = glyph.bounds.min
+                        + size * Vec2::new(x as f32 / 8.0, y as f32 / 8.0)
+                        + phase * units_per_pixel;
+                    let baseline = glyph.old_x_bands_probe.aniso_shader_fix_with_floor(
+                        point,
+                        dx,
+                        dy,
+                        MAX_ANISO_SAMPLES_TEXT,
+                        run.em,
+                        false,
+                    );
+                    let current = glyph.probe.aniso_shader_fix_with_floor(
+                        point,
+                        dx,
+                        dy,
+                        MAX_ANISO_SAMPLES_TEXT,
+                        run.em,
+                        true,
+                    );
+                    if current < lightest_current {
+                        lightest_current = current;
+                        matched_baseline = baseline;
+                    }
+                }
+            }
+            assert!(
+                matched_baseline < 0.5,
+                "{character} has no open central patch"
+            );
+            assert!(
+                lightest_current <= matched_baseline + 0.08,
+                "{character} counter at phase {phase:?}: {lightest_current:.3} vs {matched_baseline:.3}",
+            );
+            assert!(
+                lightest_current < 0.8,
+                "{character} counter approaches stem coverage"
+            );
+        }
+    }
+}
+
+fn glyph_pixel_is_in_expanded_quad(
+    glyph: &PositionedProbe,
+    em: f32,
+    pixels_per_em: f32,
+    point: Vec2,
+) -> bool {
+    let margin_px = glyph
+        .quad
+        .vertex_text_margin(glyph.probe.record, Vec2::splat(0.05 / pixels_per_em))
+        .margin_px;
+    let padding = 16.0 + margin_px * em / pixels_per_em;
+    let min = glyph.bounds.min - Vec2::splat(padding);
+    let max = glyph.bounds.max + Vec2::splat(padding);
+    point.cmpge(min).all() && point.cmple(max).all()
+}
+
+#[test]
+fn six_pixel_eights_keep_analytic_counter_samples_open_after_vertical_fit() {
+    for text in ["283", "8888", "806"] {
+        let run = embedded_run_probe(text);
+        for tilt_degrees in [0.0_f32, 3.0] {
+            let pixel = run.em / 6.0;
+            let dx = Vec2::new(pixel / tilt_degrees.to_radians().cos(), 0.0);
+            let dy = Vec2::new(0.0, pixel);
+            for x_phase in 0..8 {
+                for y_phase in 0..8 {
+                    for (index, glyph) in run.glyphs.iter().enumerate() {
+                        if text.as_bytes()[index] != b'8' {
+                            continue;
+                        }
+                        let x_phase = x_phase as f32 / 8.0;
+                        let y_phase = y_phase as f32 / 8.0;
+                        let local_x_phase = (x_phase - glyph.origin_x / dx.x).rem_euclid(1.0);
+                        let feature_y = glyph.probe.record.figure_crossbar_mid;
+                        let shift_px = 0.5 - (feature_y / pixel - y_phase).fract();
+                        let mut counter_coverage = [1.0_f32; 2];
+                        for row in -1..8 {
+                            for column in -1..7 {
+                                let point = Vec2::new(
+                                    (column as f32 + 0.5 + local_x_phase) * dx.x,
+                                    (row as f32 + 0.5 + y_phase - shift_px) * dy.y,
+                                );
+                                if !glyph_pixel_is_in_expanded_quad(glyph, run.em, 6.0, point)
+                                    || !(180.0..=430.0).contains(&point.x)
+                                {
+                                    continue;
+                                }
+                                let counter = if (430.0..650.0).contains(&point.y) {
+                                    Some(0)
+                                } else if (130.0..350.0).contains(&point.y) {
+                                    Some(1)
+                                } else {
+                                    None
+                                };
+                                if let Some(counter) = counter {
+                                    let coverage = glyph.probe.aniso_shader_fix_with_floor(
+                                        point,
+                                        dx,
+                                        dy,
+                                        MAX_ANISO_SAMPLES_TEXT,
+                                        run.em,
+                                        true,
+                                    );
+                                    counter_coverage[counter] =
+                                        counter_coverage[counter].min(coverage);
+                                }
+                            }
+                        }
+                        assert!(
+                            counter_coverage
+                                .into_iter()
+                                .all(|coverage| coverage <= 0.65),
+                            "{text} glyph {index} tilt {tilt_degrees} phase ({x_phase},{y_phase}): {counter_coverage:?}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn small_m_gap_does_not_become_a_solid_ink_pixel() {
+    let run = embedded_run_probe("m");
+    let glyph = &run.glyphs[0];
+    let pixel = run.em / 6.0;
+    let point = Vec2::splat(1.625 * pixel);
+    assert!(glyph_pixel_is_in_expanded_quad(glyph, run.em, 6.0, point));
+    let dx = Vec2::new(pixel, 0.0);
+    let dy = Vec2::new(0.0, pixel);
+    let coverage = glyph.probe.aniso_shader_fix_with_floor(
+        point,
+        dx,
+        dy,
+        MAX_ANISO_SAMPLES_TEXT,
+        run.em,
+        true,
+    );
+    assert!(coverage < 0.9, "m gap reached solid coverage {coverage:.3}");
+}
+
+#[allow(
+    clippy::expect_used,
+    reason = "the embedded glyph fixture must have all three outlines"
+)]
+fn embedded_glyph_truth(character: char) -> GroundTruth {
+    const FONT: &[u8] = include_bytes!("../../../../assets/fonts/JetBrainsMono-Regular.ttf");
+    let face = ttf_parser::Face::parse(FONT, 0).expect("embedded mono face");
+    let glyph_id = face.glyph_index(character).expect("embedded glyph");
+    let glyph = outline::load_glyph_by_id_from_face(FONT, 0, glyph_id.0, character)
+        .expect("embedded outline");
+    GroundTruth {
+        segments: glyph
+            .contours
+            .iter()
+            .flat_map(|contour| contour.segments.iter().copied())
+            .collect(),
+    }
+}
+
+#[test]
+fn small_dark_glyph_open_spaces_stay_close_to_pixel_area_reference() {
+    let mut checked_open_pixels = 0;
+    for character in ['m', '0', '4'] {
+        let run = embedded_run_probe(&character.to_string());
+        let glyph = &run.glyphs[0];
+        let truth = embedded_glyph_truth(character);
+        for pixels_per_em in 6..=9 {
+            let pixel = run.em / pixels_per_em as f32;
+            let dx = Vec2::new(pixel, 0.0);
+            let dy = Vec2::new(0.0, pixel);
+            for phase in [0.125, 0.75] {
+                for row in 0..8 {
+                    for col in 0..6 {
+                        let point = Vec2::new(
+                            (col as f32 + 0.5 + phase) * pixel,
+                            (row as f32 + 0.5 + phase) * pixel,
+                        );
+                        let reference = truth.coverage(point, dx, dy, 32);
+                        if !glyph_pixel_is_in_expanded_quad(
+                            glyph,
+                            run.em,
+                            pixels_per_em as f32,
+                            point,
+                        ) || reference >= 0.45
+                        {
+                            continue;
+                        }
+                        let coverage = glyph.probe.aniso_shader_fix_with_floor(
+                            point,
+                            dx,
+                            dy,
+                            MAX_ANISO_SAMPLES_TEXT,
+                            run.em,
+                            true,
+                        );
+                        let old = glyph.probe.aniso_shader_fix_with_floor_strength(
+                            point,
+                            dx,
+                            dy,
+                            MAX_ANISO_SAMPLES_TEXT,
+                            text_small_size_strength(run.em, dx, dy),
+                        );
+                        assert!(coverage <= old + 0.001);
+                        assert!(
+                            coverage <= reference + 0.18,
+                            "{character} at {pixels_per_em} px/em phase {phase}, point {point:?}: coverage {coverage:.3}, area {reference:.3}"
+                        );
+                        checked_open_pixels += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        checked_open_pixels > 0,
+        "sampled glyphs must contain open pixels"
+    );
+}
+
+/// With the band floor off, the 12 px/em H stem sums to 7.8586 over 49
+/// quarter-pixel samples. The band floor adds 0.0069; allow at most 0.02.
+#[test]
+fn ordinary_size_real_stem_keeps_baseline_weight() {
+    let probe = embedded_h_probe();
+    let em = 1000.0;
+    let pixel = em / 12.0;
+    let dx = Vec2::new(pixel, 0.0);
+    let dy = Vec2::new(0.0, pixel);
+    let mut baseline = 0.0;
+    let mut current = 0.0;
+    for x in 0..=48 {
+        let point = Vec2::new((x as f32 + 0.5) * pixel * 0.25, 700.0);
+        baseline +=
+            probe.aniso_shader_fix_with_floor(point, dx, dy, MAX_ANISO_SAMPLES_TEXT, em, false);
+        current +=
+            probe.aniso_shader_fix_with_floor(point, dx, dy, MAX_ANISO_SAMPLES_TEXT, em, true);
+    }
+    assert!(
+        current <= baseline + 0.02,
+        "12 px/em stem weight {current:.3} vs {baseline:.3}"
+    );
+}
+
+#[test]
+fn edge_on_text_has_no_stem_growth_in_either_band_path() {
+    let em = 1000.0;
+    let probe = rectangle_probe(Vec2::new(400.0, 82.0), DEFAULT_BAND_COUNT, 0.0);
+    let point = Vec2::new(200.0, 41.0);
+    let short = em / 6.0;
+    let long = 64.0 * short;
+    let diagonal = std::f32::consts::FRAC_1_SQRT_2;
+    for (dx, dy) in [
+        (Vec2::new(short, 0.0), Vec2::new(0.0, long)),
+        (
+            Vec2::new(short * diagonal, long * diagonal),
+            Vec2::new(-short * diagonal, long * diagonal),
+        ),
+    ] {
+        assert_eq!(text_small_size_strength(em, dx, dy), 0.0);
+        let (single, _) = probe.aa_band_coverage_with_floor(point, dx, dy, em, true);
+        let (baseline_single, _) = probe.aa_band_coverage_with_floor(point, dx, dy, em, false);
+        assert_eq!(single, baseline_single);
+        let strided =
+            probe.aniso_shader_fix_with_floor(point, dx, dy, MAX_ANISO_SAMPLES_TEXT, em, true);
+        let baseline_strided =
+            probe.aniso_shader_fix_with_floor(point, dx, dy, MAX_ANISO_SAMPLES_TEXT, em, false);
+        assert_eq!(strided, baseline_strided);
+    }
+}
+
+#[test]
+fn tiny_text_lines_keep_a_dark_pixel_row_between_them() {
+    let em = 1000.0;
+    let units_per_pixel = em / 2.5;
+    let stroke = rectangle_probe(Vec2::new(400.0, 82.0), DEFAULT_BAND_COUNT, 0.0);
+    let dx = Vec2::new(units_per_pixel, 0.0);
+    let dy = Vec2::new(0.0, units_per_pixel);
+    let line_center = Vec2::new(200.0, 41.0);
+    let gap_center = Vec2::new(200.0, 82.0 + units_per_pixel * 0.5);
+    let line =
+        stroke.aniso_shader_fix_with_floor(line_center, dx, dy, MAX_ANISO_SAMPLES_TEXT, em, true);
+    let gap =
+        stroke.aniso_shader_fix_with_floor(gap_center, dx, dy, MAX_ANISO_SAMPLES_TEXT, em, true);
+    assert!(gap * 2.0 < line * 0.5, "gap {gap:.3}, line {line:.3}");
+}
+
+#[test]
+fn split_crossbar_reaches_both_pixel_rows() {
+    let probe = rectangle_probe(Vec2::new(8.0, 0.4), DEFAULT_BAND_COUNT, 0.0);
+    let dx = Vec2::new(2.0, 0.0);
+    let dy = Vec2::Y;
+    let em_size = 12.0;
+    for row in 0..=1 {
+        let point = Vec2::new(4.0, row as f32 - 0.3);
+        let (single, _) = probe.aa_band_coverage_with_floor(point, dx, dy, em_size, true);
+        let strided =
+            probe.aniso_shader_fix_with_floor(point, dx, dy, MAX_ANISO_SAMPLES_TEXT, em_size, true);
+        for (path, actual) in [("single", single), ("strided", strided)] {
+            assert!(actual >= 0.18, "{path} band lost row {row}: {actual:.3}");
+        }
+    }
+}
+
+#[test]
+fn embedded_h_crossbar_keeps_coverage_across_pixel_phases() {
+    let probe = embedded_h_probe();
+    let em = 1000.0;
+    for pixels_per_em in [6.0, 16.0 + 2.0 / 3.0] {
+        let units_per_pixel = em / pixels_per_em;
+        let dx = Vec2::new(units_per_pixel, 0.0);
+        let dy = Vec2::new(0.0, units_per_pixel);
+        for phase_step in 0..=20 {
+            let phase = phase_step as f32 / 20.0;
+            let center = Vec2::new(300.0, 377.0 + phase * units_per_pixel);
+            let above =
+                probe.aniso_shader_fix_with_floor(center, dx, dy, MAX_ANISO_SAMPLES_TEXT, em, true);
+            let below = probe.aniso_shader_fix_with_floor(
+                center - dy,
+                dx,
+                dy,
+                MAX_ANISO_SAMPLES_TEXT,
+                em,
+                true,
+            );
+            assert!(
+                above.max(below) > 0.2,
+                "H bar at {pixels_per_em} px/em, phase {phase:.2}: {above:.3}, {below:.3}"
+            );
+        }
+    }
 }
 
 /// A ray exactly level with a rectangle's horizontal edge grazes both cap
@@ -1237,6 +2634,7 @@ fn atlas_packed_tall_spine_covers_full_length() {
                 segments,
                 minimum_feature_size: 0.0,
                 fade_exponent: 0.0,
+                role: ContourRole::Ink,
             }],
         };
         let packed: PackedPath = super::build_packed_glyph(glyph, 1);
@@ -1263,9 +2661,10 @@ fn atlas_packed_tall_spine_covers_full_length() {
             continue;
         }
         let probe = Probe {
-            record: records[index],
-            curves: curves.clone(),
-            bands:  bands.clone(),
+            record:           records[index],
+            curves:           curves.clone(),
+            bands:            bands.clone(),
+            neighbor_witness: NeighborWitness::NearestCurve,
         };
         let du_per_px = 49.0;
         let dx = Vec2::new(du_per_px, 0.0);
@@ -1372,7 +2771,7 @@ fn units_ruler_sizes_cover_at_screen_scale() {
     }
 }
 
-// ---- hairline dilation + fade probes (the distance_coverage mirror) --------
+// ---- hairline dilation + fade probes (the distance_terms_coverage mirror) --------
 
 /// Sub-floor stroke fixture: a 40 design-unit-wide tall stroke viewed at
 /// 50 du/px with a 1.5px hairline floor, so the floor is 75 du and each curve
@@ -1394,7 +2793,7 @@ fn subfloor_stroke_probe() -> Probe {
 /// The dilation contract, sign convention included: a sub-floor stroke
 /// dilated to the hairline floor must render exactly like a stroke whose
 /// natural width IS the floor, across the whole cross-axis profile, on the
-/// `distance_coverage` (AA Off) path. The failure mode this guards: the
+/// `distance_terms_coverage` (AA Off) path. The failure mode this guards: the
 /// inside-positive ramp applying the dilation with the inside-negative sign,
 /// eroding sub-floor strokes to hollow rims.
 #[test]
@@ -1430,7 +2829,7 @@ fn dilated_subfloor_stroke_matches_at_floor_stroke_profile() {
     }
 }
 
-/// `Fade { exponent }` scales every `distance_coverage` evaluation by
+/// `Fade { exponent }` scales every `distance_terms_coverage` evaluation by
 /// `(natural / floor)^exponent` from that evaluation's winning curve (its
 /// dilation and its contour's packed exponent) — nothing else about the
 /// profile changes.
@@ -1463,10 +2862,10 @@ fn fade_scales_subfloor_stroke_coverage_by_natural_ratio() {
     }
 }
 
-/// Text exemption is structural: a path packed with `minimum_feature_size = 0` (every
-/// text glyph) has zero dilation, so its fade factor is 1 under any exponent.
+/// Text paths never use dilation, so
+/// a text path's fade factor stays 1 under any exponent.
 #[test]
-fn text_paths_are_exempt_from_fade() {
+fn text_paths_ignore_fade_exponent_without_dilation() {
     let plain_probe = rectangle_probe(Vec2::new(STROKE_NATURAL_DU, STROKE_HEIGHT_DU), 1, 0.0);
     let faded_probe =
         rectangle_probe_with_fade(Vec2::new(STROKE_NATURAL_DU, STROKE_HEIGHT_DU), 1, 0.0, 4.0);
@@ -1475,8 +2874,8 @@ fn text_paths_are_exempt_from_fade() {
 
     for step in -40..=80 {
         let point = Vec2::new(STROKE_NATURAL_DU * 0.5 + (step as f32) * 2.0, y);
-        let plain = plain_probe.distance_coverage(point, pixel, 0.0, STROKE_TARGET_DU);
-        let faded = faded_probe.distance_coverage(point, pixel, 0.0, STROKE_TARGET_DU);
+        let plain = plain_probe.distance_coverage(point, pixel, 0.0, 0.0);
+        let faded = faded_probe.distance_coverage(point, pixel, 0.0, 0.0);
         assert!(
             (plain - faded).abs() < 1.0e-6,
             "x {:.1}: fade exponent changed an undilated path's coverage \
@@ -1512,25 +2911,28 @@ fn signed_distance_sample_tracks_winning_dilation() {
     let center_offset = (STROKE_TARGET_DU - STROKE_NATURAL_DU) * 0.5;
 
     let center = Vec2::new(STROKE_NATURAL_DU * 0.5, y);
-    let (sd, dilation, _) = dilated.signed_distance_sample(center, scan_width_sq, STROKE_TARGET_DU);
+    let sample = dilated.signed_distance_sample(center, scan_width_sq, STROKE_TARGET_DU);
     assert!(
-        (dilation - dilation_max).abs() < 1.0e-4,
-        "the stroke's own curves should win with dilation {dilation_max}, got {dilation}"
+        (sample.dilation - dilation_max).abs() < 1.0e-4,
+        "the stroke's own curves should win with dilation {dilation_max}, got {}",
+        sample.dilation,
     );
-    let (floor_sd, floor_dilation, _) = at_floor.signed_distance_sample(
+    assert_eq!(sample.fade_exponent, 1.0);
+    let floor_sample = at_floor.signed_distance_sample(
         center + Vec2::new(center_offset, 0.0),
         scan_width_sq,
         STROKE_TARGET_DU,
     );
     assert!(
-        (sd.y - floor_sd.y).abs() < 1.0e-3,
+        (sample.sd.y - floor_sample.sd.y).abs() < 1.0e-3,
         "dilated faded-lane signed distance {:.4} should match the at-floor stroke {:.4}",
-        sd.y,
-        floor_sd.y,
+        sample.sd.y,
+        floor_sample.sd.y,
     );
     assert!(
-        floor_dilation.abs() < 1.0e-6,
-        "an at-floor stroke needs no dilation, got {floor_dilation}"
+        floor_sample.dilation.abs() < 1.0e-6,
+        "an at-floor stroke needs no dilation, got {}",
+        floor_sample.dilation,
     );
 }
 
@@ -1567,7 +2969,7 @@ fn merged_mixed_fade_path_has_no_junction_dip() {
         let packed = super::build_packed_glyph(glyph, 1);
         let band_count = (packed.bands().len() / 2) as u32;
         Probe {
-            record: PackedPathRecord::new(
+            record:           PackedPathRecord::new(
                 packed.bounds(),
                 0,
                 band_count,
@@ -1575,8 +2977,9 @@ fn merged_mixed_fade_path_has_no_junction_dip() {
                 band_count,
                 STROKE_NATURAL_DU,
             ),
-            curves: packed.curves().to_vec(),
-            bands:  packed.bands().to_vec(),
+            curves:           packed.curves().to_vec(),
+            bands:            packed.bands().to_vec(),
+            neighbor_witness: NeighborWitness::NearestCurve,
         }
     };
     let mixed = merged_probe(0.0);

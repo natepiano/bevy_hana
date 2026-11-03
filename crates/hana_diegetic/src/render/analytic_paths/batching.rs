@@ -30,6 +30,7 @@ use hana_kana::ToUsize;
 use super::material::PathExtendedMaterial;
 use super::packing::PathQuadRecord;
 use super::packing::PathRenderRecord;
+use super::packing::TextFitMode;
 use crate::DrawZIndex;
 use crate::layout::DrawBatchFamily;
 use crate::layout::Lighting;
@@ -45,6 +46,7 @@ use crate::render::batch_store::BatchEntry;
 use crate::render::batch_store::BatchStore;
 use crate::render::draw_order::DrawOrderIndex;
 use crate::render::draw_order::DrawZIndexRank;
+use crate::render::material::PanelDisplayTarget;
 use crate::render::material_table::GpuMaterialSlotId;
 use crate::render::material_table::MaterialSlotCandidate;
 use crate::render::material_table::MaterialSlotId;
@@ -57,6 +59,8 @@ use crate::text::RunStorageKey;
 /// sort, pass, pipeline, and resource facts that must agree inside one draw.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct PathBatchKey {
+    /// Camera transform the panel reaches after fragment output.
+    pub display_target:         PanelDisplayTarget,
     /// Authored z-index splitter for this batch's command records.
     pub z_index:                DrawZIndex,
     /// Dense panel-local rank for `z_index`, used by the batch material
@@ -94,7 +98,7 @@ pub(crate) fn analytic_material_slot_candidate(
 /// Converts an absolute run record into the value uploaded for one batch.
 ///
 /// `ClipDepthNudge` is uploaded relative to the batch's first
-/// `DrawOrderIndex`; `OitDepthOffset` stays absolute to the panel because OIT
+/// `DrawOrderIndex`; `OitPaintOrder` stays absolute to the panel because OIT
 /// compares fragments across records.
 pub(crate) fn path_render_record_relative_to_first_draw_order_index(
     mut record: PathRenderRecord,
@@ -245,7 +249,7 @@ pub(crate) struct TextRunBatch {
     /// Lowest `DrawOrderIndex` in this batch.
     ///
     /// `PathRenderRecord::clip_depth_nudge` is uploaded relative to this value;
-    /// `PathRenderRecord::oit_depth_offset` stays panel-absolute.
+    /// `PathRenderRecord::oit_paint_order` stays panel-absolute.
     first_draw_order_index: DrawOrderIndex,
     runs:                   Vec<BatchRun>,
     path_records:           Vec<PathQuadRecord>,
@@ -257,6 +261,19 @@ impl TextRunBatch {
     /// upload payload.
     #[must_use]
     pub(in crate::render) fn path_records(&self) -> &[PathQuadRecord] { &self.path_records }
+
+    /// Source quads for one run, in glyph order.
+    #[must_use]
+    fn run_path_records(&self, key: RunStorageKey) -> Option<&[PathQuadRecord]> {
+        let position = self.position_of(key)?;
+        Some(&self.runs[position].path_records)
+    }
+
+    #[must_use]
+    fn run_transform(&self, key: RunStorageKey) -> Option<Mat4> {
+        let position = self.position_of(key)?;
+        Some(self.runs[position].record.transform)
+    }
 
     /// One record per member run — the run-table upload payload.
     #[must_use]
@@ -284,7 +301,9 @@ impl TextRunBatch {
         for record in &self.path_records {
             let run = &self.run_records[record.render_index.to_usize()];
             for (corner_x, corner_y) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
-                let local = record.rect_min + Vec2::new(corner_x, corner_y) * record.rect_size;
+                let local = record.rect_min
+                    + Vec2::new(corner_x, corner_y) * record.rect_size
+                    + record.text_fit_offset;
                 let world = run.transform * Vec4::new(local.x, local.y, 0.0, 1.0);
                 min = min.min(world.xyz());
                 max = max.max(world.xyz());
@@ -418,16 +437,47 @@ impl TextRunBatch {
 
     /// Writes one member run's transform into its `PathRenderRecord` slot, dirtying
     /// the run table only when the matrix actually changed.
-    fn update_run_transform(&mut self, key: RunStorageKey, transform: Mat4) {
+    fn update_run_transform(&mut self, key: RunStorageKey, transform: Mat4, panel_plane: Vec4) {
         let Some(position) = self.position_of(key) else {
             return;
         };
-        if self.runs[position].record.transform == transform {
+        if self.runs[position].record.transform == transform
+            && self.runs[position].record.panel_plane == panel_plane
+        {
             return;
         }
         self.runs[position].record.transform = transform;
         self.run_records[position].transform = transform;
+        self.runs[position].record.panel_plane = panel_plane;
+        self.run_records[position].panel_plane = panel_plane;
         self.placement_dirty.mark();
+    }
+
+    /// Changes only the fitted local offsets for one run's existing glyphs.
+    fn update_run_text_fit(&mut self, key: RunStorageKey, offsets: &[Vec2], mode: TextFitMode) {
+        let Some(position) = self.position_of(key) else {
+            return;
+        };
+        if self.runs[position].path_records.len() != offsets.len() {
+            return;
+        }
+        let mut changed = false;
+        for (index, offset) in offsets.iter().enumerate() {
+            let record = &self.runs[position].path_records[index];
+            let text_fit_mode = mode.shader_value();
+            if record.text_fit_offset == *offset && record.text_fit_mode == text_fit_mode {
+                continue;
+            }
+            self.runs[position].path_records[index].text_fit_offset = *offset;
+            self.runs[position].path_records[index].text_fit_mode = text_fit_mode;
+            let slot = self.runs[position].range.start.to_usize() + index;
+            self.path_records[slot].text_fit_offset = *offset;
+            self.path_records[slot].text_fit_mode = text_fit_mode;
+            changed = true;
+        }
+        if changed {
+            self.geometry_dirty.mark();
+        }
     }
 
     /// Writes one member run's frame-local material slot into its
@@ -557,6 +607,30 @@ impl TextRunBatchStore {
     #[must_use]
     pub(crate) fn is_routed(&self, run: RunStorageKey) -> bool { self.0.contains(run) }
 
+    /// Existing quads for one routed run, in glyph order.
+    #[must_use]
+    pub(crate) fn run_path_records(&self, run: RunStorageKey) -> Option<&[PathQuadRecord]> {
+        self.0.member_batch(run)?.run_path_records(run)
+    }
+
+    /// Current run transform after panel and slot offsets are composed.
+    #[must_use]
+    pub(crate) fn run_transform(&self, run: RunStorageKey) -> Option<Mat4> {
+        self.0.member_batch(run)?.run_transform(run)
+    }
+
+    /// Update only the local fit while preserving glyph geometry and material.
+    pub(crate) fn update_run_text_fit(
+        &mut self,
+        run: RunStorageKey,
+        offsets: &[Vec2],
+        mode: TextFitMode,
+    ) {
+        if let Some(batch) = self.0.member_batch_mut(run) {
+            batch.update_run_text_fit(run, offsets, mode);
+        }
+    }
+
     /// Current batch key for a routed run.
     #[must_use]
     pub(crate) fn key_for_run(&self, run: RunStorageKey) -> Option<&PathBatchKey> {
@@ -591,9 +665,14 @@ impl TextRunBatchStore {
 
     /// Writes a routed run's world transform into its `PathRenderRecord` slot. A
     /// no-op for unrouted runs (e.g. a fully clipped label).
-    pub(crate) fn update_run_transform(&mut self, run: RunStorageKey, transform: Mat4) {
+    pub(crate) fn update_run_transform(
+        &mut self,
+        run: RunStorageKey,
+        transform: Mat4,
+        panel_plane: Vec4,
+    ) {
         if let Some(batch) = self.0.member_batch_mut(run) {
-            batch.update_run_transform(run, transform);
+            batch.update_run_transform(run, transform, panel_plane);
         }
     }
 
@@ -650,6 +729,7 @@ mod tests {
     use bevy::prelude::AlphaMode;
 
     use super::*;
+    use crate::render::material::PanelDisplayTarget;
     use crate::render::material_table::MaterialSlotId;
 
     fn path_record(rect_min: Vec2, packed_path_index: u32) -> PathQuadRecord {
@@ -663,21 +743,27 @@ mod tests {
             packed_path_index,
             render_index: 0,
             box_uv_flip_x: 0,
+            clip_edges: 0,
+            text_fit_mode: TextFitMode::SmallGlyph.shader_value(),
+            padding_before_fit: 0,
+            text_fit_offset: Vec2::ZERO,
         }
     }
 
     fn record(transform: Mat4) -> PathRenderRecord {
         PathRenderRecord {
+            panel_plane: Vec4::ZERO,
             transform,
             material: GpuMaterialSlotId::from(
                 MaterialSlotId::try_from(0).expect("slot 0 is valid"),
             ),
             render_mode: 1,
             clip_depth_nudge: 0.0,
-            oit_depth_offset: 0.0,
+            oit_paint_order: 0.0,
             aa_flags: 3,
             text_coverage_bias: 0.0,
-            text_em_height: 0.0,
+            padding: 0,
+            tooltip_depth_priority: 0,
         }
     }
 
@@ -687,6 +773,7 @@ mod tests {
             ..Default::default()
         };
         PathBatchKey {
+            display_target:         PanelDisplayTarget::World,
             z_index:                0.into(),
             z_index_rank:           DrawZIndexRank::default(),
             batch_family:           DrawBatchFamily::Text,
@@ -1024,7 +1111,7 @@ mod tests {
             batch.clear_bounds_dirty();
         }
 
-        store.update_run_transform(run, Mat4::IDENTITY);
+        store.update_run_transform(run, Mat4::IDENTITY, Vec4::ZERO);
         let batch = store.get(&batch_key).expect("batch should exist");
         assert!(
             !batch.render_records_are_dirty(),
@@ -1032,11 +1119,37 @@ mod tests {
         );
 
         let moved = Mat4::from_translation(Vec3::X);
-        store.update_run_transform(run, moved);
+        store.update_run_transform(run, moved, Vec4::ZERO);
         let batch = store.get(&batch_key).expect("batch should exist");
         assert!(batch.render_records_are_dirty());
         assert!(batch.bounds_are_dirty());
         assert_eq!(batch.run_records()[0].transform, moved);
+    }
+
+    #[test]
+    fn cap_baseline_fit_mode_reaches_both_run_and_batch_records() {
+        let mut store = TextRunBatchStore::default();
+        let batch_key = key(AlphaMode::Blend);
+        let run = run_key(1);
+        upsert_run(
+            &mut store,
+            batch_key.clone(),
+            run,
+            vec![path_record(Vec2::ZERO, 0)],
+            record(Mat4::IDENTITY),
+        );
+
+        store.update_run_text_fit(run, &[Vec2::Y], TextFitMode::CapBaseline);
+
+        let batch = store.get(&batch_key).expect("batch should exist");
+        let expected_mode = TextFitMode::CapBaseline.shader_value();
+        assert_eq!(batch.path_records()[0].text_fit_offset, Vec2::Y);
+        assert_eq!(batch.path_records()[0].text_fit_mode, expected_mode);
+        let run_records = batch
+            .run_path_records(run)
+            .expect("run records should exist");
+        assert_eq!(run_records[0].text_fit_offset, Vec2::Y);
+        assert_eq!(run_records[0].text_fit_mode, expected_mode);
     }
 
     #[test]

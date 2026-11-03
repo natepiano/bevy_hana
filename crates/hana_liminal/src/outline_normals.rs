@@ -6,6 +6,7 @@ use bevy::mesh::VertexAttributeValues;
 use bevy::prelude::Add;
 use bevy::prelude::AssetId;
 use bevy::prelude::Assets;
+use bevy::prelude::Insert;
 use bevy::prelude::Mesh;
 use bevy::prelude::Mesh3d;
 use bevy::prelude::On;
@@ -115,7 +116,7 @@ pub fn generate_outline_normals(mesh: &mut Mesh) {
 /// When `Outline` is added to an entity that has `Mesh3d`, generate outline
 /// normals on the mesh asset if not already present.
 pub(crate) fn generate_normals_on_outline_added(
-    added: On<Add, Outline>,
+    added: On<Add<Outline>>,
     mesh_query: Query<&Mesh3d>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
@@ -126,10 +127,10 @@ pub(crate) fn generate_normals_on_outline_added(
     generate_normals_for_handle(mesh3d.id(), &mut meshes);
 }
 
-/// When `Mesh3d` is added to an entity that already has `Outline`, generate
-/// outline normals on the mesh asset if not already present.
+/// When `Mesh3d` is added to or replaced on an entity that already has
+/// `Outline`, generate outline normals on the mesh asset if not already present.
 pub(crate) fn generate_normals_on_mesh_added(
-    added: On<Add, Mesh3d>,
+    added: On<Insert<Mesh3d>>,
     mesh_query: Query<&Mesh3d>,
     outline_query: Query<(), With<Outline>>,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -189,15 +190,39 @@ fn accumulate_weighted_normal(
 fn triangle_indices(mesh: &Mesh, vertex_count: usize, triangle: usize) -> (usize, usize, usize) {
     let base = triangle * TRIANGLE_VERTEX_COUNT.to_usize();
     if let Some(indices) = mesh.indices() {
-        let mut iter = indices.iter().skip(base);
-        let i0 = iter.next().unwrap_or(0);
-        let i1 = iter.next().unwrap_or(0);
-        let i2 = iter.next().unwrap_or(0);
-        (i0, i1, i2)
+        match indices {
+            Indices::U16(values) => (
+                values[base] as usize,
+                values[base + 1] as usize,
+                values[base + 2] as usize,
+            ),
+            Indices::U32(values) => (
+                values[base] as usize,
+                values[base + 1] as usize,
+                values[base + 2] as usize,
+            ),
+        }
     } else {
         let i0 = base.min(vertex_count.saturating_sub(1));
         let i1 = (base + 1).min(vertex_count.saturating_sub(1));
         let i2 = (base + 2).min(vertex_count.saturating_sub(1));
         (i0, i1, i2)
     }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests should panic on unexpected values"
+)]
+mod tests {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/outline_normals/mesh_replacement.rs"
+    ));
+
+    use bevy::prelude::Cuboid;
+    use bevy::prelude::World;
+
+    use super::*;
 }

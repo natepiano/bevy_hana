@@ -7,14 +7,20 @@ use bevy_ecs::change_detection::DetectChanges;
 use bevy_ecs::change_detection::DetectChangesMut;
 use bevy_ecs::change_detection::Mut;
 use bevy_ecs::entity::Entity;
+use bevy_ecs::entity::EntityHashSet;
 use bevy_ecs::lifecycle::HookContext;
+use bevy_ecs::lifecycle::RemovedComponents;
 use bevy_ecs::prelude::Component;
 use bevy_ecs::prelude::ReflectComponent;
 use bevy_ecs::prelude::Resource;
+use bevy_ecs::query::Changed;
 use bevy_ecs::query::Has;
+use bevy_ecs::query::Or;
+use bevy_ecs::query::With;
 use bevy_ecs::schedule::IntoScheduleConfigs;
 use bevy_ecs::system::Commands;
 use bevy_ecs::system::Local;
+use bevy_ecs::system::ParamSet;
 use bevy_ecs::system::Query;
 use bevy_ecs::system::SystemChangeTick;
 use bevy_ecs::world::DeferredWorld;
@@ -82,7 +88,12 @@ impl Plugin for HingePlugin {
                 PostUpdate,
                 AnchorSystems::HingeToPose.in_set(AnchorSystems::AnimatePose),
             )
-            .add_systems(PostUpdate, hinge_to_pose.in_set(AnchorSystems::HingeToPose));
+            .add_systems(
+                PostUpdate,
+                hinge_to_pose
+                    .run_if(hinge_pose_inputs_changed)
+                    .in_set(AnchorSystems::HingeToPose),
+            );
     }
 }
 
@@ -357,18 +368,45 @@ fn hinge_to_pose(
     mut commands: Commands,
     system_tick: SystemChangeTick,
     mut fractions: Local<FoldFractionScratch>,
+    mut dirty: Local<EntityHashSet>,
     playbacks: Query<&FoldSequencePlayback>,
-    mut hinges: Query<(
-        Entity,
-        &Hinge,
-        Option<&AnchoredTo>,
-        Option<&ResolvedAnchorGeometry>,
-        &mut AnchorPose,
-        Has<HingePoseReported>,
+    mut hinges: ParamSet<(
+        Query<
+            Entity,
+            (
+                With<Hinge>,
+                Or<(
+                    Changed<Hinge>,
+                    Changed<AnchoredTo>,
+                    Changed<ResolvedAnchorGeometry>,
+                    Changed<AnchorPose>,
+                )>,
+            ),
+        >,
+        Query<(
+            &Hinge,
+            Option<&AnchoredTo>,
+            Option<&ResolvedAnchorGeometry>,
+            &mut AnchorPose,
+            Has<HingePoseReported>,
+        )>,
     )>,
+    mut removed_attachments: RemovedComponents<AnchoredTo>,
+    mut removed_geometry: RemovedComponents<ResolvedAnchorGeometry>,
 ) {
     fractions.reload(&playbacks);
-    for (entity, hinge, attachment, geometry, mut pose, reported) in &mut hinges {
+    dirty.clear();
+    dirty.extend(fractions.changed_members());
+    dirty.extend(hinges.p0().iter());
+    dirty.extend(removed_attachments.read());
+    dirty.extend(removed_geometry.read());
+    let dirty = dirty.iter().copied().collect::<Vec<_>>();
+    let mut hinge_values = hinges.p1();
+    for entity in dirty {
+        let Ok((hinge, attachment, geometry, mut pose, reported)) = hinge_values.get_mut(entity)
+        else {
+            continue;
+        };
         let fraction = match fractions.fraction(entity) {
             // A staged member with no fraction resolved yet holds every pose it
             // already has, including the one it entered the frame with.
@@ -389,7 +427,7 @@ fn hinge_to_pose(
             Err(HingePoseSkip::MissingSourceGeometry) => continue,
             Err(skipped) => {
                 if !reported {
-                    tracing::warn!(entity = ?entity, error = ?skipped, "hinge pose unavailable");
+                    tracing::warn!(target: "hana_valence::diagnostics", entity = ?entity, error = ?skipped, "hinge pose unavailable");
                     commands.entity(entity).insert(HingePoseReported);
                 }
                 continue;
@@ -405,6 +443,42 @@ fn hinge_to_pose(
     }
 }
 
+/// Opens the hinge pass only when an input to at least one pose can differ.
+fn hinge_pose_inputs_changed(
+    changed_hinges: Query<(), Changed<Hinge>>,
+    changed_attachments: Query<(), (With<Hinge>, Changed<AnchoredTo>)>,
+    changed_geometry: Query<(), (With<Hinge>, Changed<ResolvedAnchorGeometry>)>,
+    changed_poses: Query<(), (With<Hinge>, Changed<AnchorPose>)>,
+    changed_playbacks: Query<(), Changed<FoldSequencePlayback>>,
+    hinges: Query<(), With<Hinge>>,
+    mut removed_hinges: RemovedComponents<Hinge>,
+    mut removed_attachments: RemovedComponents<AnchoredTo>,
+    mut removed_geometry: RemovedComponents<ResolvedAnchorGeometry>,
+    mut removed_poses: RemovedComponents<AnchorPose>,
+    mut removed_playbacks: RemovedComponents<FoldSequencePlayback>,
+) -> bool {
+    let hinge_removed = removed_hinges.read().next().is_some();
+    let playback_removed = removed_playbacks.read().next().is_some();
+    let attachment_removed = removed_attachments
+        .read()
+        .any(|entity| hinges.contains(entity));
+    let geometry_removed = removed_geometry
+        .read()
+        .any(|entity| hinges.contains(entity));
+    let pose_removed = removed_poses.read().any(|entity| hinges.contains(entity));
+
+    hinge_removed
+        || playback_removed
+        || attachment_removed
+        || geometry_removed
+        || pose_removed
+        || !changed_hinges.is_empty()
+        || !changed_attachments.is_empty()
+        || !changed_geometry.is_empty()
+        || !changed_poses.is_empty()
+        || !changed_playbacks.is_empty()
+}
+
 /// Returns whether something else wrote this pose earlier in the current frame.
 fn pose_changed_this_frame(pose: &Mut<AnchorPose>, system_tick: SystemChangeTick) -> bool {
     let last_run = system_tick.last_run();
@@ -416,7 +490,7 @@ fn pose_changed_this_frame(pose: &Mut<AnchorPose>, system_tick: SystemChangeTick
 /// Reports one same-frame pose write this system replaced.
 fn warn_of_overwritten_pose(entity: Entity) {
     #[cfg(debug_assertions)]
-    tracing::warn!(
+    tracing::warn!(target: "hana_valence::diagnostics",
         entity = ?entity,
         "hinge overwrote an AnchorPose changed earlier this frame"
     );
@@ -433,6 +507,8 @@ mod tests {
 
     use bevy_ecs::entity::Entity;
     use bevy_ecs::prelude::Component;
+    use bevy_ecs::prelude::ResMut;
+    use bevy_ecs::prelude::Resource;
     use bevy_ecs::schedule::IntoScheduleConfigs;
     use bevy_ecs::schedule::Schedule;
     use bevy_ecs::world::World;
@@ -449,6 +525,7 @@ mod tests {
     use super::Hinge;
     use super::HingeError;
     use super::Pintle;
+    use super::hinge_pose_inputs_changed;
     use super::hinge_to_pose;
     use crate::AnchorFrame;
     use crate::AnchorPose;
@@ -468,6 +545,9 @@ mod tests {
 
     #[derive(Component)]
     struct Unhinged;
+
+    #[derive(Default, Resource)]
+    struct HingePoseVisits(usize);
 
     /// Unwraps a fixture, naming the rejected input and the error on failure.
     fn valid<T, E: Debug>(input: impl Debug, result: Result<T, E>) -> T {
@@ -726,6 +806,28 @@ mod tests {
 
         assert_eq!(pose(&world, unhinged), unchanged_pose());
     }
+
+    #[test]
+    fn hinge_pose_pass_skips_a_still_update_and_runs_for_a_changed_hinge() {
+        let mut world = hinge_world();
+        let entity = spawn_hinged(&mut world, hinge(top_edge(), BASE_ANGLE, Vec3::ZERO));
+        world.insert_resource(HingePoseVisits::default());
+        let mut schedule = Schedule::default();
+        schedule.add_systems(count_hinge_pose_visit.run_if(hinge_pose_inputs_changed));
+
+        schedule.run(&mut world);
+        world.resource_mut::<HingePoseVisits>().0 = 0;
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<HingePoseVisits>().0, 0);
+
+        world
+            .entity_mut(entity)
+            .insert(hinge(top_edge(), FOLD_ANGLE, Vec3::ZERO));
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<HingePoseVisits>().0, 1);
+    }
+
+    fn count_hinge_pose_visit(mut visits: ResMut<HingePoseVisits>) { visits.0 += 1; }
 
     /// A world already carrying the pintle [`HingePlugin`] would have issued,
     /// so these tests insert hinges without building an `App`.

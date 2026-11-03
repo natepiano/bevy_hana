@@ -2,13 +2,13 @@ use bevy::math::Mat4;
 use bevy::math::UVec4;
 use bevy::math::Vec2;
 use bevy::math::Vec4;
-use bevy::render::render_resource::ShaderSize;
 use bevy::render::render_resource::ShaderType;
 use hana_kana::ToF32;
 use hana_kana::ToU32;
 use hana_kana::ToUsize;
 
 use super::Bounds;
+use super::ContourRole;
 use super::PathContour;
 use super::PathOutline;
 use super::QuadraticSegment;
@@ -16,6 +16,21 @@ use crate::render::material_table::GpuMaterialSlotId;
 
 /// Default number of horizontal bands packed per path.
 pub(crate) const DEFAULT_BAND_COUNT: usize = 96;
+
+/// Vertex-stage rule for applying a retained panel-text fit offset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub(crate) enum TextFitMode {
+    /// Apply the offset only across the small-glyph size band.
+    SmallGlyph  = 0,
+    /// Apply the offset at every size to align the cap and baseline visually.
+    CapBaseline = 1,
+}
+
+impl TextFitMode {
+    #[must_use]
+    pub(crate) const fn shader_value(self) -> u32 { self as u32 }
+}
 
 const BAND_OVERLAP_EM_UNITS: f32 = 1.0;
 /// Fewest curves a band must hold. Band count is capped at
@@ -34,32 +49,48 @@ const CURVE_DEGENERATE_EPS: f32 = 0.000_000_01;
 /// deviation, so snapping it to zero routes such segments through the exact
 /// linear solve with no visible change.
 const CURVE_LINEAR_SNAP_RATIO: f32 = 0.000_1;
+// Two unsigned 16-bit axis extents span 0..2 em within the old four-byte word.
+const ISLAND_EXTENT_UNITS_PER_EM: f32 = 32_767.5;
+
+fn pack_island_extent(extent_em: Vec2) -> u32 {
+    let x = (extent_em.x.clamp(0.0, 2.0) * ISLAND_EXTENT_UNITS_PER_EM)
+        .round()
+        .to_u32();
+    let y = (extent_em.y.clamp(0.0, 2.0) * ISLAND_EXTENT_UNITS_PER_EM)
+        .round()
+        .to_u32();
+    x | (y << 16)
+}
 
 /// GPU curve record for a quadratic Bezier segment.
-#[derive(Clone, Copy, Debug, PartialEq, ShaderType)]
+#[derive(Clone, Copy, Debug, PartialEq, ShaderType, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
 pub(crate) struct CurveRecord {
     /// Segment start point in `.xy`, control-minus-start in `.zw`.
-    pub start_delta:   Vec4,
+    pub start_delta:      Vec4,
     /// Quadratic second-difference in `.xy`, segment end point in `.zw`.
-    pub curve_end:     Vec4,
+    pub curve_end:        Vec4,
     /// Conservative control-point bounds minimum in `.xy`, maximum in `.zw`.
-    pub bounds:        Vec4,
+    pub bounds:           Vec4,
     /// Distance-solver coefficients in `.xyz`; `.w` carries the owning
     /// contour's narrowest stroke in design units (per-curve hairline
     /// dilation), 0.0 for undilated contours (text paths).
-    pub solver:        Vec4,
+    pub solver:           Vec4,
     /// Owning contour's resolved hairline fade exponent
     /// (`PathContour::fade_exponent`). Each coverage evaluation fades by the
     /// winning (nearest) curve's exponent, so one merged path can mix fading
     /// and non-fading contours. `0.0` disables fade for this curve.
-    pub fade_exponent: f32,
-    /// Outward unit normal of this segment's edge line, oriented by the owning
+    pub fade_exponent:    f32,
+    /// Isolated contour x/y extents in em, quantized to two u16 values.
+    pub island_extent_xy: u32,
+    /// Outward normal of this segment's edge line, oriented by the owning
     /// contour's winding. The line branch's convex-corner clip reads it as the
     /// edge half-plane direction; the radial `normalize(point - closest)`
     /// degenerates to the vertex direction past a corner, so it cannot stand in
-    /// here. `Vec2::ZERO` (text paths, degenerate edges) routes the shader back
-    /// to the radial normal.
-    pub edge_normal:   Vec2,
+    /// here. Text counter edges use length 2 to suppress the analytic band
+    /// floor inside letter holes; other nondegenerate edges use length 1.
+    /// `Vec2::ZERO` routes the shader back to the radial normal.
+    pub edge_normal:      Vec2,
 }
 
 impl From<&QuadraticSegment> for CurveRecord {
@@ -79,36 +110,38 @@ impl From<&QuadraticSegment> for CurveRecord {
             0.0
         };
         Self {
-            start_delta:   Vec4::new(
+            start_delta:      Vec4::new(
                 segment.start.x,
                 segment.start.y,
                 control_delta.x,
                 control_delta.y,
             ),
-            curve_end:     Vec4::new(curve_delta.x, curve_delta.y, segment.end.x, segment.end.y),
-            bounds:        Vec4::new(
+            curve_end:        Vec4::new(curve_delta.x, curve_delta.y, segment.end.x, segment.end.y),
+            bounds:           Vec4::new(
                 segment.start.x.min(segment.control.x).min(segment.end.x),
                 segment.start.y.min(segment.control.y).min(segment.end.y),
                 segment.start.x.max(segment.control.x).max(segment.end.x),
                 segment.start.y.max(segment.control.y).max(segment.end.y),
             ),
-            solver:        Vec4::new(
+            solver:           Vec4::new(
                 3.0 * control_delta.dot(curve_delta) * inverse_curve_norm_sq,
                 2.0 * control_delta.length_squared() * inverse_curve_norm_sq,
                 inverse_curve_norm_sq,
                 0.0,
             ),
-            fade_exponent: 0.0,
+            fade_exponent:    0.0,
+            island_extent_xy: 0,
             // Winding is a per-contour property; the packer overwrites this from
             // the owning contour's orientation. A lone segment has no winding, so
             // it keeps the radial-fallback sentinel.
-            edge_normal:   Vec2::ZERO,
+            edge_normal:      Vec2::ZERO,
         }
     }
 }
 
 /// GPU band record pointing at a contiguous curve range.
-#[derive(Clone, Copy, Debug, PartialEq, ShaderType)]
+#[derive(Clone, Copy, Debug, PartialEq, ShaderType, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
 pub(crate) struct BandRecord {
     /// First curve record for this band.
     pub start:     u32,
@@ -121,7 +154,8 @@ pub(crate) struct BandRecord {
 }
 
 /// GPU path record for one packed analytic path's bounds and curve-band ranges.
-#[derive(Clone, Copy, Debug, PartialEq, ShaderType)]
+#[derive(Clone, Copy, Debug, PartialEq, ShaderType, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
 pub(crate) struct PackedPathRecord {
     /// Bounds minimum in `.xy`, bounds size in `.zw`, in font design-space units.
     pub bounds_min_size:      Vec4,
@@ -131,6 +165,12 @@ pub(crate) struct PackedPathRecord {
     /// the silhouette so that stroke covers at least one screen pixel
     /// (hairline rendering). `0.0` disables — text paths stay undilated.
     pub minimum_feature_size: f32,
+    /// Font em in this path's design units; zero for shapes and lines.
+    pub text_em_size:         f32,
+    /// Midpoint of the figure eight's crossbar, in font design units.
+    pub figure_crossbar_mid:  f32,
+    /// Nonzero when at least one curve belongs to an isolated ink contour.
+    pub has_island:           u32,
 }
 
 impl PackedPathRecord {
@@ -153,7 +193,28 @@ impl PackedPathRecord {
                 vertical_band_count,
             ),
             minimum_feature_size,
+            text_em_size: 0.0,
+            figure_crossbar_mid: 0.0,
+            has_island: 0,
         }
+    }
+
+    #[must_use]
+    pub(crate) const fn with_text_em_size(mut self, text_em_size: f32) -> Self {
+        self.text_em_size = text_em_size;
+        self
+    }
+
+    #[must_use]
+    pub(crate) const fn with_figure_crossbar_mid(mut self, figure_crossbar_mid: f32) -> Self {
+        self.figure_crossbar_mid = figure_crossbar_mid;
+        self
+    }
+
+    #[must_use]
+    pub(crate) const fn with_has_island(mut self, has_island: bool) -> Self {
+        self.has_island = has_island as u32;
+        self
     }
 }
 
@@ -162,64 +223,68 @@ impl PackedPathRecord {
 /// layout space, padded path UVs from `uv_min`/`uv_size`, material-sampling UVs
 /// from `box_uv_min`/`box_uv_size`, the shared-atlas slot through
 /// `packed_path_index`, and the owning run through `render_index`.
-#[derive(Clone, Copy, Debug, PartialEq, ShaderType)]
+#[derive(Clone, Copy, Debug, PartialEq, ShaderType, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
 pub(crate) struct PathQuadRecord {
     /// Quad minimum corner (left, bottom) in run layout space, clipped.
-    pub rect_min:          Vec2,
+    pub rect_min:           Vec2,
     /// Quad size (width, height) in run layout space.
-    pub rect_size:         Vec2,
+    pub rect_size:          Vec2,
     /// Padded path UV at the quad's (left, top) corner.
-    pub uv_min:            Vec2,
+    pub uv_min:             Vec2,
     /// Padded path UV extent from `uv_min` toward (right, bottom).
-    pub uv_size:           Vec2,
+    pub uv_size:            Vec2,
     /// Material box UV at the quad's top-left corner.
-    pub box_uv_min:        Vec2,
+    pub box_uv_min:         Vec2,
     /// Material box UV extent from `box_uv_min` toward (right, bottom).
-    pub box_uv_size:       Vec2,
+    pub box_uv_size:        Vec2,
     /// Shared-atlas [`PackedPathRecord`] index.
-    pub packed_path_index: u32,
+    pub packed_path_index:  u32,
     /// [`PathRenderRecord`] index within the same batch.
-    pub render_index:      u32,
+    pub render_index:       u32,
     /// Non-zero flips material box UVs horizontally for this quad.
-    pub box_uv_flip_x:     u32,
+    pub box_uv_flip_x:      u32,
+    /// Sides trimmed by the text clip rect; suppress vertex expansion there.
+    pub clip_edges:         u32,
+    /// Pixel-fit rule applied by the vertex stage.
+    pub text_fit_mode:      u32,
+    /// Explicit WGSL alignment before the two-component fit offset.
+    pub padding_before_fit: u32,
+    /// Retained local-space text fit, held while its view moves.
+    pub text_fit_offset:    Vec2,
 }
 
 /// GPU record for one text run or panel-shape primitive inside a path batch.
-#[derive(Clone, Copy, Debug, PartialEq, ShaderType)]
+#[derive(Clone, Copy, Debug, PartialEq, ShaderType, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
 pub(crate) struct PathRenderRecord {
+    /// Shared physical panel plane for stable coplanar OIT ordering.
+    pub panel_plane:            Vec4,
     /// Label world matrix (run layout space → world).
-    pub transform:          Mat4,
+    pub transform:              Mat4,
     /// Frame-local material-table row selected by this rendered path record.
-    pub material:           GpuMaterialSlotId,
+    pub material:               GpuMaterialSlotId,
     /// Visible render mode (`RenderMode` as `u32`).
-    pub render_mode:        u32,
+    pub render_mode:            u32,
     /// Clip-space depth nudge in layer units for non-OIT views.
-    pub clip_depth_nudge:   f32,
-    /// Per-run OIT position-z offset for coplanar ordering.
-    pub oit_depth_offset:   f32,
+    pub clip_depth_nudge:       f32,
+    /// Normalized local paint order used only at equal physical OIT depth.
+    pub oit_paint_order:        f32,
     /// Resolved anti-alias mode bits (`AntiAlias::aa_flags`:
     /// `AA_FLAG_SUPERSAMPLE` | `AA_FLAG_BAND`). Per-record so an element-level
     /// AA override never splits a batch or material.
-    pub aa_flags:           u32,
-    /// Signed coverage transfer for text paths. `0.0` leaves coverage at its
-    /// automatic screen-size adjustment; positive values make fractional edge
+    pub aa_flags:               u32,
+    /// Signed coverage transfer for text paths. `0.0` leaves the glyph's
+    /// geometric coverage unchanged; positive values make fractional edge
     /// pixels more opaque, and negative values make them thinner. Ignored by
     /// line and panel-shape paths.
-    pub text_coverage_bias: f32,
-    /// One em along the run's local Y axis. The fragment shader projects this
-    /// length into device pixels to adjust small text coverage automatically.
-    /// `0.0` disables that adjustment for non-text path runs.
-    pub text_em_height:     f32,
+    pub text_coverage_bias:     f32,
+    /// Vertex-stage reverse-Z band for world tooltip text, before opaque
+    /// prepass occlusion. `0` for other paths, `1` for tooltip text.
+    pub tooltip_depth_priority: u32,
+    /// Explicit WGSL array-stride padding.
+    pub padding:                u32,
 }
-
-// GPU-layout assertions against the std430 sizes the shaders index by — the
-// WGSL mirror structs in `analytic_path_vertex_pull.wgsl` are declared at these
-// strides.
-// `ShaderSize` measures the encase layout, not the Rust layout.
-const _: () = assert!(CurveRecord::SHADER_SIZE.get() == 80);
-const _: () = assert!(PackedPathRecord::SHADER_SIZE.get() == 48);
-const _: () = assert!(PathQuadRecord::SHADER_SIZE.get() == 64);
-const _: () = assert!(PathRenderRecord::SHADER_SIZE.get() == 96);
 
 /// One analytic path's packed curve and band data for the shader.
 #[derive(Clone, Debug, PartialEq)]
@@ -326,18 +391,36 @@ pub(super) fn build_packed_path_with_layout(path: PathOutline, layout: BandLayou
     let mut curves = Vec::new();
     let mut bands = Vec::with_capacity(horizontal_band_count + vertical_band_count);
     let bounds = path.bounds;
-
-    let oriented_segments: Vec<BandedSegment> = path
+    let outer_sign = path
+        .contours
+        .iter()
+        .map(contour_signed_area)
+        .max_by(|left, right| left.abs().total_cmp(&right.abs()))
+        .unwrap_or(0.0)
+        .signum();
+    let oriented_segments: Vec<PreparedBandCurve> = path
         .contours
         .iter()
         .flat_map(|contour| {
             let chirality = contour_signed_area(contour).signum();
-            contour.segments.iter().map(move |segment| BandedSegment {
-                segment:              *segment,
-                orientation:          segment_orientation(segment),
-                minimum_feature_size: contour.minimum_feature_size,
-                fade_exponent:        contour.fade_exponent,
-                edge_normal:          segment_outward_normal(segment, chirality),
+            contour.segments.iter().map(move |segment| {
+                let mut record = CurveRecord::from(segment);
+                record.solver.w = contour.minimum_feature_size;
+                record.fade_exponent = contour.fade_exponent;
+                record.island_extent_xy = match contour.role {
+                    ContourRole::Ink => 0,
+                    ContourRole::Island { extent_em } => pack_island_extent(extent_em),
+                };
+                record.edge_normal = segment_outward_normal(segment, chirality)
+                    * if contour.minimum_feature_size == 0.0 && chirality * outer_sign < 0.0 {
+                        2.0
+                    } else {
+                        1.0
+                    };
+                PreparedBandCurve {
+                    segment: *segment,
+                    record,
+                }
             })
         })
         .collect();
@@ -417,6 +500,10 @@ pub(super) fn build_packed_polygons(path: PathOutline) -> PackedPath {
             // ~1px dot off the receding end).
             record.solver.w = edge_slab_width(contour, segment, normal);
             record.fade_exponent = contour.fade_exponent;
+            record.island_extent_xy = match contour.role {
+                ContourRole::Ink => 0,
+                ContourRole::Island { extent_em } => pack_island_extent(extent_em),
+            };
             record.edge_normal = normal;
             curves.push(record);
         }
@@ -446,24 +533,15 @@ enum BandAxis {
     AlongX,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CurveOrientation {
-    Horizontal,
-    Vertical,
-}
-
-/// One outline segment with the per-band packing inputs it carries.
+/// One curve prepared once for reuse by every band that contains it.
 #[derive(Clone, Copy)]
-struct BandedSegment {
-    segment:              QuadraticSegment,
-    orientation:          CurveOrientation,
-    minimum_feature_size: f32,
-    fade_exponent:        f32,
-    edge_normal:          Vec2,
+struct PreparedBandCurve {
+    segment: QuadraticSegment,
+    record:  CurveRecord,
 }
 
 fn append_bands(
-    oriented_segments: &[BandedSegment],
+    oriented_segments: &[PreparedBandCurve],
     start_position: f32,
     extent: f32,
     band_count: usize,
@@ -472,10 +550,17 @@ fn append_bands(
     curves: &mut Vec<CurveRecord>,
     bands: &mut Vec<BandRecord>,
 ) {
+    // Filtering a stable axis ordering preserves the previous per-band sort,
+    // including the original contour order for equal sort values.
+    let mut sorted = oriented_segments.to_vec();
+    sorted.sort_by(|left, right| {
+        descending_band_sort_value(&right.segment, band_axis)
+            .total_cmp(&descending_band_sort_value(&left.segment, band_axis))
+    });
     let band_size = extent.max(1.0) / band_count.to_f32();
 
     for band_index in 0..band_count {
-        let band_min = start_position + band_size * band_index.to_f32();
+        let band_min = band_size.mul_add(band_index.to_f32(), start_position);
         let band_max = if band_index + 1 == band_count {
             start_position + extent
         } else {
@@ -483,7 +568,7 @@ fn append_bands(
         };
         let start = curves.len().to_u32();
         append_band_curves(
-            oriented_segments,
+            &sorted,
             band_min - overlap,
             band_max + overlap,
             band_axis,
@@ -499,33 +584,21 @@ fn append_bands(
 }
 
 fn append_band_curves(
-    oriented_segments: &[BandedSegment],
+    oriented_segments: &[PreparedBandCurve],
     band_min: f32,
     band_max: f32,
     band_axis: BandAxis,
     curves: &mut Vec<CurveRecord>,
 ) {
-    let mut filtered: Vec<BandedSegment> = oriented_segments
-        .iter()
-        .copied()
-        .filter(|banded| overlaps_band(&banded.segment, band_min, band_max, band_axis))
-        .filter(|banded| match band_axis {
-            BandAxis::AlongY => true,
-            BandAxis::AlongX => banded.orientation == CurveOrientation::Vertical,
-        })
-        .collect();
-
-    filtered.sort_by(|left, right| {
-        descending_band_sort_value(&right.segment, band_axis)
-            .total_cmp(&descending_band_sort_value(&left.segment, band_axis))
-    });
-    curves.extend(filtered.iter().map(|banded| {
-        let mut record = CurveRecord::from(&banded.segment);
-        record.solver.w = banded.minimum_feature_size;
-        record.fade_exponent = banded.fade_exponent;
-        record.edge_normal = banded.edge_normal;
-        record
-    }));
+    // Every edge can be the nearest silhouette just outside its y band.
+    // The x bands must include horizontal edges too: a thin H crossbar
+    // disappears at some pixel phases if only vertical edges are scanned.
+    curves.extend(
+        oriented_segments
+            .iter()
+            .filter(|banded| overlaps_band(&banded.segment, band_min, band_max, band_axis))
+            .map(|banded| banded.record),
+    );
 }
 
 /// Signed area of the contour's start-point polygon. The sign gives the
@@ -574,18 +647,6 @@ fn edge_slab_width(contour: &PathContour, segment: &QuadraticSegment, normal: Ve
     (edge_support - min_support).max(0.0)
 }
 
-const fn segment_orientation(segment: &QuadraticSegment) -> CurveOrientation {
-    let x_extent =
-        segment_axis_max(segment, BandAxis::AlongX) - segment_axis_min(segment, BandAxis::AlongX);
-    let y_extent =
-        segment_axis_max(segment, BandAxis::AlongY) - segment_axis_min(segment, BandAxis::AlongY);
-    if y_extent > x_extent {
-        CurveOrientation::Vertical
-    } else {
-        CurveOrientation::Horizontal
-    }
-}
-
 fn overlaps_band(segment: &QuadraticSegment, band_min: f32, band_max: f32, axis: BandAxis) -> bool {
     // Axis-parallel edges (e.g. a horizontal edge in an along-Y band) are kept:
     // they add 0 to winding (`curve_winding` returns 0 when the scanline is parallel)
@@ -624,7 +685,17 @@ const fn descending_band_sort_value(segment: &QuadraticSegment, axis: BandAxis) 
     reason = "tests should fail loudly when encase encoding breaks"
 )]
 mod tests {
+    use bevy::render::render_resource::ShaderSize;
     use bevy::render::render_resource::encase::StorageBuffer;
+
+    // GPU-layout assertions against the std430 sizes the shaders index by — the
+    // WGSL mirror structs in `analytic_path_vertex_pull.wesl` are declared at these
+    // strides.
+    // `ShaderSize` measures the encase layout, not the Rust layout.
+    const _: () = assert!(CurveRecord::SHADER_SIZE.get() == 80);
+    const _: () = assert!(PackedPathRecord::SHADER_SIZE.get() == 48);
+    const _: () = assert!(PathQuadRecord::SHADER_SIZE.get() == 80);
+    const _: () = assert!(PathRenderRecord::SHADER_SIZE.get() == 112);
 
     use super::*;
     use crate::render::material_table::MaterialSlotId;
@@ -640,39 +711,51 @@ mod tests {
             packed_path_index,
             render_index,
             box_uv_flip_x: 0,
+            clip_edges: 0,
+            text_fit_mode: TextFitMode::SmallGlyph.shader_value(),
+            padding_before_fit: 0,
+            text_fit_offset: Vec2::ZERO,
         }
     }
 
     fn run_record(seed: f32) -> PathRenderRecord {
         PathRenderRecord {
-            transform:          Mat4::from_translation(bevy::math::Vec3::new(
+            panel_plane:            Vec4::new(seed, 1.0, -2.0, 3.0),
+            transform:              Mat4::from_translation(bevy::math::Vec3::new(
                 seed,
                 -seed,
                 seed * 2.0,
             )),
-            material:           GpuMaterialSlotId::from(
+            material:               GpuMaterialSlotId::from(
                 MaterialSlotId::try_from(seed.to_bits()).expect("seed bits are valid slot ids"),
             ),
-            render_mode:        1,
-            clip_depth_nudge:   seed,
-            oit_depth_offset:   -seed,
-            aa_flags:           3,
-            text_coverage_bias: seed * 0.25,
-            text_em_height:     seed * 4.0,
+            render_mode:            1,
+            clip_depth_nudge:       seed,
+            oit_paint_order:        -seed,
+            aa_flags:               3,
+            text_coverage_bias:     seed * 0.25,
+            padding:                0,
+            tooltip_depth_priority: 1,
         }
     }
 
     #[test]
-    fn glyph_instance_records_round_trip_through_encase_at_64_byte_stride() {
+    fn glyph_instance_records_round_trip_through_encase_at_80_byte_stride() {
         let records = vec![glyph_record(1.0, 7, 0), glyph_record(-2.0, 11, 1)];
         let mut encoded = StorageBuffer::new(Vec::<u8>::new());
         encoded.write(&records).expect("records should encode");
         assert_eq!(
             encoded.as_ref().len(),
-            128,
-            "two records at a 64-byte stride"
+            160,
+            "two records at an 80-byte stride"
         );
 
+        assert_eq!(
+            bytemuck::cast_slice::<PathQuadRecord, u8>(&records),
+            encoded.as_ref()
+        );
+        assert_eq!(std::mem::offset_of!(PathQuadRecord, text_fit_offset), 72);
+        assert_storage_layout(&records[0], 80);
         let mut decoded: Vec<PathQuadRecord> = Vec::new();
         StorageBuffer::new(encoded.as_ref().clone())
             .read(&mut decoded)
@@ -681,20 +764,172 @@ mod tests {
     }
 
     #[test]
-    fn run_records_round_trip_through_encase_at_96_byte_stride() {
+    fn run_records_round_trip_through_encase_at_112_byte_stride() {
         let records = vec![run_record(0.0), run_record(3.5)];
         let mut encoded = StorageBuffer::new(Vec::<u8>::new());
         encoded.write(&records).expect("records should encode");
         assert_eq!(
             encoded.as_ref().len(),
-            192,
-            "two records at a 96-byte stride"
+            224,
+            "two records at a 112-byte stride"
         );
 
+        assert_eq!(
+            bytemuck::cast_slice::<PathRenderRecord, u8>(&records),
+            encoded.as_ref()
+        );
+        assert_eq!(std::mem::offset_of!(PathRenderRecord, material), 80);
+        assert_storage_layout(&records[1], 112);
         let mut decoded: Vec<PathRenderRecord> = Vec::new();
         StorageBuffer::new(encoded.as_ref().clone())
             .read(&mut decoded)
             .expect("records should decode");
         assert_eq!(decoded, records);
+    }
+    #[test]
+    fn curve_record_direct_bytes_match_encase_storage() {
+        let mut record = CurveRecord::from(&QuadraticSegment {
+            start:   Vec2::new(-3.0, 1.0),
+            control: Vec2::new(2.0, 8.0),
+            end:     Vec2::new(9.0, -2.0),
+        });
+        record.solver.w = 0.25;
+        record.fade_exponent = 0.75;
+        record.island_extent_xy = 0x1234_5678;
+        record.edge_normal = Vec2::new(-0.5, 0.25);
+        assert_storage_layout(&record, 80);
+    }
+
+    #[test]
+    fn band_record_direct_bytes_match_encase_storage() {
+        assert_storage_layout(
+            &BandRecord {
+                start:     7,
+                count:     13,
+                range_min: -2.0,
+                range_max: 12.5,
+            },
+            16,
+        );
+    }
+
+    #[test]
+    fn packed_path_record_direct_bytes_match_encase_storage() {
+        let record = PackedPathRecord::new(
+            Bounds {
+                min: Vec2::new(-1.0, -2.0),
+                max: Vec2::new(11.0, 17.0),
+            },
+            3,
+            7,
+            10,
+            5,
+            0.25,
+        )
+        .with_text_em_size(1000.0)
+        .with_figure_crossbar_mid(450.0)
+        .with_has_island(true);
+        assert_storage_layout(&record, 48);
+    }
+
+    fn assert_storage_layout<
+        T: bytemuck::Pod + ShaderType + bevy::render::render_resource::encase::internal::WriteInto,
+    >(
+        record: &T,
+        stride: usize,
+    ) {
+        let encoded =
+            crate::render::encase_storage_bytes(record).expect("canonical record encodes");
+        assert_eq!(std::mem::size_of::<T>(), stride);
+        assert_eq!(bytemuck::bytes_of(record), encoded.as_slice());
+    }
+
+    #[test]
+    fn prepared_curve_bands_match_per_band_conversion_and_stable_sort() {
+        let segments = vec![
+            QuadraticSegment {
+                start:   Vec2::ZERO,
+                control: Vec2::new(4.0, 12.0),
+                end:     Vec2::new(8.0, 0.0),
+            },
+            QuadraticSegment {
+                start:   Vec2::new(8.0, 0.0),
+                control: Vec2::new(4.0, 0.0),
+                end:     Vec2::ZERO,
+            },
+            QuadraticSegment {
+                start:   Vec2::new(8.0, 4.0),
+                control: Vec2::new(8.0, 7.0),
+                end:     Vec2::new(8.0, 10.0),
+            },
+        ];
+        let path = PathOutline {
+            bounds:   Bounds {
+                min: Vec2::ZERO,
+                max: Vec2::new(8.0, 12.0),
+            },
+            contours: vec![PathContour {
+                segments,
+                minimum_feature_size: 0.3,
+                fade_exponent: 0.7,
+                role: ContourRole::Island {
+                    extent_em: Vec2::new(0.2, 0.4),
+                },
+            }],
+        };
+        for count in [0, 1, 8, 96] {
+            let packed = build_packed_path(path.clone(), count);
+            let count = count.max(1);
+            let contour = &path.contours[0];
+            let chirality = contour_signed_area(contour).signum();
+            let mut expected_curves = Vec::new();
+            let mut expected_bands = Vec::new();
+            for (axis, start, extent) in
+                [(BandAxis::AlongY, 0.0, 12.0), (BandAxis::AlongX, 0.0, 8.0)]
+            {
+                let size = extent / count.to_f32();
+                for index in 0..count {
+                    let min = size.mul_add(index.to_f32(), start);
+                    let max = if index + 1 == count {
+                        start + extent
+                    } else {
+                        min + size
+                    };
+                    let first = expected_curves.len().to_u32();
+                    let mut segments: Vec<_> = contour
+                        .segments
+                        .iter()
+                        .filter(|segment| {
+                            overlaps_band(
+                                segment,
+                                min - BAND_OVERLAP_EM_UNITS,
+                                max + BAND_OVERLAP_EM_UNITS,
+                                axis,
+                            )
+                        })
+                        .collect();
+                    segments.sort_by(|left, right| {
+                        descending_band_sort_value(right, axis)
+                            .total_cmp(&descending_band_sort_value(left, axis))
+                    });
+                    expected_curves.extend(segments.into_iter().map(|segment| {
+                        let mut record = CurveRecord::from(segment);
+                        record.solver.w = contour.minimum_feature_size;
+                        record.fade_exponent = contour.fade_exponent;
+                        record.island_extent_xy = pack_island_extent(Vec2::new(0.2, 0.4));
+                        record.edge_normal = segment_outward_normal(segment, chirality);
+                        record
+                    }));
+                    expected_bands.push(BandRecord {
+                        start:     first,
+                        count:     expected_curves.len().to_u32() - first,
+                        range_min: min,
+                        range_max: max,
+                    });
+                }
+            }
+            assert_eq!(packed.curves(), expected_curves);
+            assert_eq!(packed.bands(), expected_bands);
+        }
     }
 }

@@ -233,7 +233,7 @@ fn a_window_first_reported_on_no_screen_stays_unconfirmed_without_output_lost() 
         observe_output_proof(&app, window),
         OutputProofObservation::Present(OutputProof::Unconfirmed { since: inserted_at })
     );
-    assert!(recorded_output_losses(&app).is_empty());
+    assert_eq!(recorded_output_losses(&app), []);
     Ok(())
 }
 

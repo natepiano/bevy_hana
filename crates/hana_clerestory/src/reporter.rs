@@ -186,12 +186,12 @@ fn fresh_display_evidence(
             });
             let entry = matches.next().ok_or_else(|| {
                 discovery_transport_error(
-                    "current winit display has no exact Clerestory evidence association",
+                    "current winit monitor has no exact Clerestory evidence association",
                 )
             })?;
             if matches.next().is_some() {
                 return Err(discovery_transport_error(
-                    "current winit display has multiple Clerestory evidence associations",
+                    "current winit monitor has multiple Clerestory evidence associations",
                 ));
             }
             Ok(entry.clone())

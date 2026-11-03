@@ -13,6 +13,7 @@ use bevy::prelude::ReflectComponent;
 use bevy::prelude::ReflectDefault;
 use bevy::prelude::Vec3;
 use bevy::prelude::warn;
+use bevy::reflect::ReflectSerialize;
 use hana_kana::Displacement;
 use hana_kana::Easing;
 use thiserror::Error;
@@ -28,7 +29,7 @@ use crate::operation::Roll;
 ///
 /// `InheritPrevious` carries the camera's current roll into the authored pose.
 /// `OrbitCam` has no roll axis and ignores this choice.
-#[derive(Clone, Copy, Debug, PartialEq, Reflect)]
+#[derive(Clone, Copy, Debug, PartialEq, Reflect, serde::Serialize)]
 pub enum FreeCamRollTarget {
     /// Hold the roll the camera already carries.
     InheritPrevious,
@@ -54,7 +55,7 @@ pub enum CameraMoveDestination {
 ///
 /// `OrbitalLookAt` preserves yaw at extreme pitch angles where decomposing a
 /// world-space `LookAt` position loses that information.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 enum AuthoredPose {
     LookAt {
         position: Position,
@@ -73,8 +74,8 @@ enum AuthoredPose {
 /// and a negative orbit radius, so a constructed move always carries a finite
 /// pose and a non-negative radius. Reflection is opaque, so a reflected write
 /// cannot reach the fields and skip that validation.
-#[derive(Clone, Debug, PartialEq, Reflect)]
-#[reflect(opaque)]
+#[derive(Clone, Debug, PartialEq, Reflect, serde::Serialize)]
+#[reflect(opaque, Serialize)]
 pub struct CameraMove {
     authored_pose:        AuthoredPose,
     free_cam_roll_target: FreeCamRollTarget,
@@ -240,8 +241,8 @@ impl CameraMove {
 /// Invalid explicit input supplied to [`CameraMove`] construction.
 ///
 /// Every variant rejects retained authoring before a journey can be built.
-#[derive(Clone, Copy, Debug, Error, PartialEq, Reflect)]
-#[reflect(opaque)]
+#[derive(Clone, Copy, Debug, Error, PartialEq, Reflect, serde::Serialize)]
+#[reflect(opaque, Serialize)]
 #[non_exhaustive]
 pub enum CameraMoveError {
     /// A camera position coordinate was NaN or infinite.
@@ -315,7 +316,7 @@ pub(crate) fn orbital_parameters_from_offset(offset: Displacement) -> (f32, f32,
 mod tests {
     use std::time::Duration;
 
-    use bevy::math::curve::easing::EaseFunction;
+    use bevy::curve::easing::EaseFunction;
 
     use super::*;
     use crate::Easing;

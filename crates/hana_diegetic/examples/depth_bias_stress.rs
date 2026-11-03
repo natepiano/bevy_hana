@@ -13,7 +13,7 @@
 //!
 //! This does not stress OIT. The probe uses opaque panels so it isolates Bevy's
 //! hardware `StandardMaterial::depth_bias` path from the separate OIT
-//! `OitDepthOffset` path.
+//! `OitPaintOrder` path.
 
 use bevy::prelude::Alpha;
 use bevy::prelude::AlphaMode;

@@ -15,6 +15,6 @@ use bevy::prelude::On;
 
 pub(crate) fn install(app: &mut App) { app.add_observer(enable_camera_hdr); }
 
-fn enable_camera_hdr(trigger: On<Add, Camera>, mut commands: Commands) {
+fn enable_camera_hdr(trigger: On<Add<Camera>>, mut commands: Commands) {
     commands.entity(trigger.entity).insert(Hdr);
 }

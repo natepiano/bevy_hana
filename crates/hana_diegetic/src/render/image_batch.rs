@@ -2,10 +2,11 @@
 //!
 //! Image batches always render through `AlphaMode::Blend`: authored images have
 //! no alpha-mode source, so `ImageBatchKey` omits alpha mode and orders records
-//! with per-record `DrawCommandDepth::oit_depth_offset()`. SDF and text batches
+//! with per-record `DrawCommandDepth::oit_paint_order()`. SDF and text batches
 //! have family-specific alpha remaps for prepass/shadow pipeline layouts; image
 //! batches need no remap because every image draw is already transparent.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 
 use bevy::asset::RenderAssetUsages;
@@ -20,9 +21,11 @@ use bevy::pbr::MaterialPlugin;
 use bevy::picking::Pickable;
 use bevy::prelude::App;
 use bevy::prelude::Assets;
+use bevy::prelude::Changed;
 use bevy::prelude::Color;
 use bevy::prelude::Commands;
 use bevy::prelude::Component;
+use bevy::prelude::DetectChanges;
 use bevy::prelude::Entity;
 use bevy::prelude::GlobalTransform;
 use bevy::prelude::Handle;
@@ -31,9 +34,11 @@ use bevy::prelude::Mat4;
 use bevy::prelude::Mesh;
 use bevy::prelude::Mesh3d;
 use bevy::prelude::MeshMaterial3d;
+use bevy::prelude::Or;
 use bevy::prelude::Plugin;
 use bevy::prelude::PostUpdate;
 use bevy::prelude::Query;
+use bevy::prelude::RemovedComponents;
 use bevy::prelude::Res;
 use bevy::prelude::ResMut;
 use bevy::prelude::Resource;
@@ -48,9 +53,12 @@ use bevy::render::render_resource::ShaderSize;
 use bevy::render::render_resource::ShaderType;
 use bevy::render::storage::ShaderBuffer;
 use bevy::transform::TransformSystems;
+use bytemuck::Pod;
+use bytemuck::Zeroable;
 use hana_kana::ToU32;
 use hana_kana::ToUsize;
 
+use super::AncestorVisibility;
 use super::BatchRenderLayers;
 use super::CommandIndex;
 use super::Dirty;
@@ -67,6 +75,7 @@ use super::constants::TEXT_Z_OFFSET;
 use super::draw_order::DrawCommandDepth;
 use super::draw_order::DrawOrderIndex;
 use super::draw_order::DrawZIndexRank;
+use super::fill_batch::WorldPanelPlane;
 use super::image_material;
 use super::image_material::ImageExtendedMaterial;
 use super::material_table;
@@ -166,12 +175,14 @@ pub(super) struct ResolvedImageRecord {
     pub draw_depth:      DrawCommandDepth,
     /// World transform written after `TransformSystems::Propagate`.
     pub transform:       Mat4,
+    /// Physical plane shared with the owning panel's fills and text.
+    pub panel_plane:     WorldPanelPlane,
 }
 
 impl ResolvedImageRecord {
     /// Builds a CPU-retained image record with an identity world transform.
     #[must_use]
-    const fn new(
+    fn new(
         record_key: ImageRecordKey,
         local_transform: Transform,
         size: Vec2,
@@ -187,11 +198,14 @@ impl ResolvedImageRecord {
             uv_rect,
             draw_depth,
             transform: Mat4::IDENTITY,
+            panel_plane: WorldPanelPlane::from_matrix(Mat4::IDENTITY, 0.0),
         }
     }
 
     fn update_world_transform(&mut self, panel_transform: &GlobalTransform) {
         self.transform = panel_transform.to_matrix() * self.local_transform.to_matrix();
+        self.panel_plane =
+            WorldPanelPlane::from_panel(panel_transform, self.local_transform.translation.z);
     }
 }
 
@@ -206,20 +220,27 @@ impl MemberRecord for ResolvedImageRecord {
 }
 
 /// GPU mirror for one batched image quad.
-#[derive(Clone, Copy, Debug, PartialEq, ShaderType)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, ShaderType, Pod, Zeroable)]
 struct ImageRenderRecord {
+    /// Shared world-space panel plane for physical OIT depth.
+    panel_plane:      Vec4,
     /// World-space transform used by the vertex shader.
     transform:        Mat4,
     /// Quad size in local record space.
     size:             Vec2,
+    /// Initializes the gap before the sixteen-byte-aligned UV rectangle.
+    size_padding:     Vec2,
     /// Source UV rectangle `[u_min, v_min, u_max, v_max]`.
     uv_rect:          Vec4,
     /// Linear RGBA tint multiplied after texture sRGB decode.
     tint:             Vec4,
     /// Clip-space depth nudge in layer units for non-OIT views.
     clip_depth_nudge: f32,
-    /// Per-record OIT position-z offset for coplanar ordering.
-    oit_depth_offset: f32,
+    /// Normalized local paint order used only at equal physical OIT depth.
+    oit_paint_order:  f32,
+    /// Initializes the storage-array stride tail.
+    tail_padding:     Vec2,
 }
 
 impl ImageRenderRecord {
@@ -227,13 +248,16 @@ impl ImageRenderRecord {
     #[must_use]
     fn from_resolved(record: &ResolvedImageRecord, first_draw_order_index: DrawOrderIndex) -> Self {
         Self {
+            panel_plane:      record.panel_plane.coefficients,
             transform:        image_record_transform(record),
             size:             record.size,
+            size_padding:     Vec2::ZERO,
             uv_rect:          record.uv_rect.as_vec4(),
             tint:             record.tint,
             clip_depth_nudge: record.draw_depth.clip_depth_nudge().get()
                 - first_draw_order_index.clip_depth_nudge().get(),
-            oit_depth_offset: record.draw_depth.oit_depth_offset().get(),
+            oit_paint_order:  record.draw_depth.oit_paint_order().get(),
+            tail_padding:     Vec2::ZERO,
         }
     }
 
@@ -241,17 +265,18 @@ impl ImageRenderRecord {
     #[must_use]
     const fn padded() -> Self {
         Self {
+            panel_plane:      Vec4::ZERO,
             transform:        Mat4::ZERO,
             size:             Vec2::ZERO,
+            size_padding:     Vec2::ZERO,
             uv_rect:          Vec4::ZERO,
             tint:             Vec4::ZERO,
             clip_depth_nudge: 0.0,
-            oit_depth_offset: 0.0,
+            oit_paint_order:  0.0,
+            tail_padding:     Vec2::ZERO,
         }
     }
 }
-
-const _: () = assert!(ImageRenderRecord::SHADER_SIZE.get() == 128);
 
 /// GPU assets owned by one image batch.
 #[derive(Debug)]
@@ -268,11 +293,45 @@ pub(super) struct ImageBatchResources {
 
 /// CPU record set and GPU handles for one `ImageBatchKey`.
 #[derive(Debug, Default)]
+enum ImageBatchAllocation {
+    /// No render entity or GPU resources exist yet.
+    #[default]
+    Unallocated,
+    /// The render entity and all GPU resources exist together.
+    Allocated {
+        entity:    Entity,
+        resources: ImageBatchResources,
+    },
+}
+
+impl ImageBatchAllocation {
+    const fn entity(&self) -> Option<Entity> {
+        match self {
+            Self::Unallocated => None,
+            Self::Allocated { entity, .. } => Some(*entity),
+        }
+    }
+
+    const fn resources(&self) -> Option<&ImageBatchResources> {
+        match self {
+            Self::Unallocated => None,
+            Self::Allocated { resources, .. } => Some(resources),
+        }
+    }
+
+    const fn resources_mut(&mut self) -> Option<&mut ImageBatchResources> {
+        match self {
+            Self::Unallocated => None,
+            Self::Allocated { resources, .. } => Some(resources),
+        }
+    }
+}
+
+/// CPU record set and allocation state for one `ImageBatchKey`.
+#[derive(Debug, Default)]
 pub(super) struct ImageBatch {
-    /// Batch render entity; `None` before the first GPU allocation.
-    pub entity:             Option<Entity>,
-    /// GPU handles; `None` before the first GPU allocation.
-    pub gpu:                Option<ImageBatchResources>,
+    /// Render entity and GPU resources, allocated atomically.
+    allocation:             ImageBatchAllocation,
     /// Record-buffer upload state for this batch.
     pub record_upload:      Dirty,
     /// Bounds recomputation state for this batch.
@@ -280,12 +339,17 @@ pub(super) struct ImageBatch {
     /// Lowest `DrawOrderIndex` in this batch.
     ///
     /// `ImageRenderRecord::clip_depth_nudge` is uploaded relative to this value;
-    /// `ImageRenderRecord::oit_depth_offset` stays panel-absolute.
+    /// `ImageRenderRecord::oit_paint_order` stays panel-absolute.
     first_draw_order_index: DrawOrderIndex,
     records:                Vec<ResolvedImageRecord>,
 }
 
 impl ImageBatch {
+    #[cfg(test)]
+    pub(super) const fn resources(&self) -> Option<&ImageBatchResources> {
+        self.allocation.resources()
+    }
+
     /// CPU records in upload order.
     #[must_use]
     pub(super) fn records(&self) -> &[ResolvedImageRecord] { &self.records }
@@ -337,6 +401,7 @@ impl ImageBatch {
     fn upsert_record(&mut self, mut record: ResolvedImageRecord) {
         if let Some(position) = self.position_of(record.record_key) {
             record.transform = self.records[position].transform;
+            record.panel_plane = self.records[position].panel_plane;
             if self.records[position] == record {
                 return;
             }
@@ -382,7 +447,7 @@ impl ImageBatch {
 impl BatchEntry for ImageBatch {
     fn is_empty(&self) -> bool { Self::is_empty(self) }
 
-    fn entity(&self) -> Option<Entity> { self.entity }
+    fn entity(&self) -> Option<Entity> { self.allocation.entity() }
 }
 
 impl Batch for ImageBatch {
@@ -418,35 +483,70 @@ impl MemberBatch for ImageBatch {
 
 /// Store that maps image records to `ImageBatchKey` batches.
 #[derive(Debug, Default, Resource)]
-pub(super) struct ImageBatchStore(BatchStore<ImageBatchKey, ImageBatch>);
+pub(super) struct ImageBatchStore {
+    batches:       BatchStore<ImageBatchKey, ImageBatch>,
+    panel_members: HashMap<Entity, Vec<ImageRecordKey>>,
+}
 
 impl ImageBatchStore {
-    /// Inserts or moves one retained image record.
     fn upsert_record(&mut self, batch_key: ImageBatchKey, record: ResolvedImageRecord) {
-        let record_key = record.record_key;
-        self.0.upsert(batch_key, record_key, record);
+        self.batches.upsert(batch_key, record.record_key, record);
     }
 
-    /// Removes every retained image record absent from the current append pass.
-    fn retain_records(&mut self, active: &HashSet<ImageRecordKey>) { self.0.retain(active); }
+    fn retain_records(&mut self, panel: Entity, incoming: &[ImageRecordKey]) {
+        let Some(members) = self.panel_members.get(&panel) else {
+            return;
+        };
+        for &stale in members.iter().filter(|key| !incoming.contains(key)) {
+            self.batches.remove(stale);
+        }
+    }
+
+    /// Inserts or moves one retained image record.
+    fn upsert_panel(&mut self, panel: Entity, records: Vec<(ImageBatchKey, ResolvedImageRecord)>) {
+        let incoming: Vec<_> = records
+            .iter()
+            .map(|(_, record)| record.record_key)
+            .collect();
+        self.retain_records(panel, &incoming);
+        for (batch_key, record) in records {
+            self.upsert_record(batch_key, record);
+        }
+        if incoming.is_empty() {
+            self.panel_members.remove(&panel);
+        } else {
+            self.panel_members.insert(panel, incoming);
+        }
+    }
+
+    fn remove_panel(&mut self, panel: Entity) {
+        let Some(records) = self.panel_members.remove(&panel) else {
+            return;
+        };
+        for record in records {
+            self.batches.remove(record);
+        }
+    }
 
     /// All image batches.
     #[cfg(test)]
     pub(super) fn batches(&self) -> impl Iterator<Item = (&ImageBatchKey, &ImageBatch)> {
-        self.0.batches()
+        self.batches.batches()
     }
 
     /// All image batches, mutable.
     fn batches_mut(&mut self) -> impl Iterator<Item = (&ImageBatchKey, &mut ImageBatch)> {
-        self.0.batches_mut()
+        self.batches.batches_mut()
     }
 
     /// One image batch by key, mutable.
     #[cfg(test)]
-    fn get_mut(&mut self, key: &ImageBatchKey) -> Option<&mut ImageBatch> { self.0.get_mut(key) }
+    fn get_mut(&mut self, key: &ImageBatchKey) -> Option<&mut ImageBatch> {
+        self.batches.get_mut(key)
+    }
 
     /// Drops empty batch entries, returning their entities for despawn.
-    fn take_empty_batches(&mut self) -> Vec<Entity> { self.0.take_empty_batches() }
+    fn take_empty_batches(&mut self) -> Vec<Entity> { self.batches.take_empty_batches() }
 }
 
 struct ImageMemberFamily;
@@ -458,8 +558,51 @@ impl MemberFamily for ImageMemberFamily {
     type Marker = DiegeticImageBatch;
 
     fn store_mut(store: &mut Self::Store) -> &mut BatchStore<Self::Key, Self::Batch> {
-        &mut store.0
+        &mut store.batches
     }
+}
+
+type ChangedImageRouteInput = Or<(
+    Changed<DiegeticPanel>,
+    Changed<ComputedDiegeticPanel>,
+    Changed<PanelPrecomposeCache>,
+    Changed<Transform>,
+    Changed<RenderLayers>,
+    Changed<Resolved<ShadowCasting>>,
+)>;
+
+#[cfg(test)]
+#[derive(Debug, Default, Eq, PartialEq, Resource)]
+struct ImageBatchRouteCounts {
+    runs:   usize,
+    visits: usize,
+}
+
+#[cfg(test)]
+fn reset_image_batch_route_counts(mut counts: ResMut<ImageBatchRouteCounts>) {
+    *counts = ImageBatchRouteCounts::default();
+}
+
+fn image_batch_route_inputs_changed(
+    changed_panels: Query<(), ChangedImageRouteInput>,
+    changed_visibility: Query<(), Changed<Visibility>>,
+    visual_overrides: Res<VisualOverrideIndex>,
+    mut removed_panels: RemovedComponents<DiegeticPanel>,
+    mut removed_computed: RemovedComponents<ComputedDiegeticPanel>,
+    mut removed_precompose: RemovedComponents<PanelPrecomposeCache>,
+    mut removed_layers: RemovedComponents<RenderLayers>,
+    mut removed_shadow: RemovedComponents<Resolved<ShadowCasting>>,
+    mut removed_visibility: RemovedComponents<Visibility>,
+) -> bool {
+    !changed_panels.is_empty()
+        || !changed_visibility.is_empty()
+        || visual_overrides.is_changed()
+        || removed_panels.read().next().is_some()
+        || removed_computed.read().next().is_some()
+        || removed_precompose.read().next().is_some()
+        || removed_layers.read().next().is_some()
+        || removed_shadow.read().next().is_some()
+        || removed_visibility.read().next().is_some()
 }
 
 /// Plugin that routes computed image commands into [`ImageBatchStore`].
@@ -484,6 +627,7 @@ impl Plugin for ImageBatchPlugin {
                 // are members of both `Build` and `BatchResourcesReady`, so an
                 // `after(Build).before(BatchResourcesReady)` edge is unsolvable.
                 route_image_batch_records
+                    .run_if(image_batch_route_inputs_changed)
                     .after(precompose::cleanup_retired_precompose_images)
                     .before(TransformSystems::Propagate)
                     .before(BatchResourcesReady),
@@ -517,6 +661,11 @@ impl Plugin for ImageBatchPlugin {
                     .before(batch_store::update_batch_bounds::<ImageMemberFamily>)
                     .in_set(BatchResourcesReady),
             );
+        #[cfg(test)]
+        app.init_resource::<ImageBatchRouteCounts>().add_systems(
+            PostUpdate,
+            reset_image_batch_route_counts.before(route_image_batch_records),
+        );
     }
 }
 
@@ -527,32 +676,59 @@ fn route_image_batch_records(
         &ComputedDiegeticPanel,
         &PanelPrecomposeCache,
         Option<&RenderLayers>,
-        Option<&Visibility>,
         Option<&Resolved<ShadowCasting>>,
     )>,
+    changed_panels: Query<Entity, ChangedImageRouteInput>,
+    changed_visibility: Query<(), Changed<Visibility>>,
+    mut ancestor_visibility: AncestorVisibility,
     visual_overrides: Res<VisualOverrideIndex>,
+    mut removed_panels: RemovedComponents<DiegeticPanel>,
+    mut removed_computed: RemovedComponents<ComputedDiegeticPanel>,
+    mut removed_precompose: RemovedComponents<PanelPrecomposeCache>,
+    mut removed_layers: RemovedComponents<RenderLayers>,
+    mut removed_shadow: RemovedComponents<Resolved<ShadowCasting>>,
+    mut removed_visibility: RemovedComponents<Visibility>,
     mut store: ResMut<ImageBatchStore>,
+    #[cfg(test)] mut counts: Option<ResMut<ImageBatchRouteCounts>>,
 ) {
-    let mut active_records = HashSet::new();
-    for (
-        panel_entity,
-        panel,
-        computed,
-        precompose_cache,
-        panel_layers,
-        panel_visibility,
-        panel_shadow_casting,
-    ) in &panels
-    {
-        let PanelLayout::Solved(result) = computed.layout() else {
+    #[cfg(test)]
+    if let Some(counts) = counts.as_deref_mut() {
+        counts.runs += 1;
+    }
+    let full_pass = visual_overrides.is_changed()
+        || !changed_visibility.is_empty()
+        || removed_visibility.read().next().is_some();
+    let mut dirty_panels: HashSet<_> = changed_panels.iter().collect();
+    dirty_panels.extend(removed_panels.read());
+    dirty_panels.extend(removed_computed.read());
+    dirty_panels.extend(removed_precompose.read());
+    dirty_panels.extend(removed_layers.read());
+    dirty_panels.extend(removed_shadow.read());
+    if full_pass {
+        dirty_panels.extend(panels.iter().map(|(entity, ..)| entity));
+    }
+    for panel_entity in dirty_panels {
+        #[cfg(test)]
+        if let Some(counts) = counts.as_deref_mut() {
+            counts.visits += 1;
+        }
+        let Ok((_, panel, computed, precompose_cache, panel_layers, panel_shadow_casting)) =
+            panels.get(panel_entity)
+        else {
+            store.remove_panel(panel_entity);
             continue;
         };
-        if matches!(panel_visibility, Some(Visibility::Hidden)) {
+        let PanelLayout::Solved(result) = computed.layout() else {
+            store.remove_panel(panel_entity);
+            continue;
+        };
+        if ancestor_visibility.is_hidden(panel_entity) {
+            store.remove_panel(panel_entity);
             continue;
         }
         let layers = panel_layers.cloned().unwrap_or(RenderLayers::layer(0));
         let shadow_casting = panel_shadow_casting.map_or(ShadowCasting::On, |resolved| resolved.0);
-        for (batch_key, record) in collect_panel_image_records(
+        let records = collect_panel_image_records(
             panel_entity,
             panel,
             result.commands.as_slice(),
@@ -561,12 +737,9 @@ fn route_image_batch_records(
             layers.clone(),
             shadow_casting,
             &visual_overrides,
-        ) {
-            active_records.insert(record.record_key);
-            store.upsert_record(batch_key, record);
-        }
+        );
+        store.upsert_panel(panel_entity, records);
     }
-    store.retain_records(&active_records);
 }
 
 fn collect_panel_image_records(
@@ -699,7 +872,7 @@ fn reconcile_image_batch_entities(
         if batch.is_empty() {
             continue;
         }
-        if batch.entity.is_some() {
+        if matches!(batch.allocation, ImageBatchAllocation::Allocated { .. }) {
             grow_image_batch_resources(
                 key,
                 batch,
@@ -730,7 +903,7 @@ fn commit_image_batch_buffers(
     for (key, batch) in store.batches_mut() {
         perf.image_breakdown
             .push(image_batch_summary(key, batch.record_count()));
-        let _ = commit_image_batch_records(batch, &mut staged_uploads);
+        commit_image_batch_records(batch, &mut staged_uploads);
     }
 }
 
@@ -758,14 +931,11 @@ fn spawn_image_batch_entity(
     materials: &mut Assets<ImageExtendedMaterial>,
     storage_buffers: &mut Assets<ShaderBuffer>,
 ) {
-    allocate_image_batch_resources(key, batch, meshes, materials, storage_buffers);
-    let Some(gpu) = batch.gpu.as_ref() else {
-        return;
-    };
+    let resources = allocate_image_batch_resources(key, batch, meshes, materials, storage_buffers);
     let mut entity = commands.spawn((
         DiegeticImageBatch,
-        Mesh3d(gpu.mesh.clone()),
-        MeshMaterial3d(gpu.material.clone()),
+        Mesh3d(resources.mesh.clone()),
+        MeshMaterial3d(resources.material.clone()),
         Pickable::IGNORE,
         Visibility::Inherited,
         NoAutoAabb,
@@ -775,7 +945,10 @@ fn spawn_image_batch_entity(
     if key.shadow == VisualShadow::None {
         entity.insert(NotShadowCaster);
     }
-    batch.entity = Some(entity.id());
+    batch.allocation = ImageBatchAllocation::Allocated {
+        entity: entity.id(),
+        resources,
+    };
 }
 
 /// Allocates an image batch record buffer, inert mesh, and material.
@@ -785,7 +958,7 @@ fn allocate_image_batch_resources(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<ImageExtendedMaterial>,
     storage_buffers: &mut Assets<ShaderBuffer>,
-) {
+) -> ImageBatchResources {
     let capacity = image_record_capacity(batch.record_count());
     let records = storage_buffers.add(ShaderBuffer::from(padded_image_render_records(
         batch.records(),
@@ -794,13 +967,14 @@ fn allocate_image_batch_resources(
     )));
     let mesh = meshes.add(inert_image_batch_mesh(capacity));
     let material = materials.add(image_material::image_batch_material(key, records.clone()));
-    batch.gpu = Some(ImageBatchResources {
+    let resources = ImageBatchResources {
         records,
         mesh,
         material,
         capacity,
-    });
+    };
     batch.record_upload.clear();
+    resources
 }
 
 /// Grows one image batch's record buffer to fit its live records.
@@ -812,10 +986,10 @@ fn grow_image_batch_resources(
     materials: &mut Assets<ImageExtendedMaterial>,
     storage_buffers: &mut Assets<ShaderBuffer>,
 ) {
-    let Some(entity) = batch.entity else {
+    let Some(entity) = batch.allocation.entity() else {
         return;
     };
-    let Some(current_capacity) = batch.gpu.as_ref().map(|gpu| gpu.capacity) else {
+    let Some(current_capacity) = batch.allocation.resources().map(|gpu| gpu.capacity) else {
         return;
     };
     let required = batch.record_count().max(1);
@@ -826,14 +1000,15 @@ fn grow_image_batch_resources(
     while capacity < required {
         capacity *= 2;
     }
-    let records = storage_buffers.add(ShaderBuffer::from(padded_image_render_records(
+    let records = ShaderBuffer::from(padded_image_render_records(
         batch.records(),
         batch.first_draw_order_index(),
         capacity,
-    )));
+    ));
+    let records = storage_buffers.add(records);
     let mesh = meshes.add(inert_image_batch_mesh(capacity));
     commands.entity(entity).insert(Mesh3d(mesh.clone()));
-    let Some(gpu) = batch.gpu.as_mut() else {
+    let Some(gpu) = batch.allocation.resources_mut() else {
         return;
     };
     if let Some(mut material) = materials.get_mut(&gpu.material) {
@@ -851,15 +1026,29 @@ fn grow_image_batch_resources(
     batch.record_upload.clear();
 }
 
+/// Whether a retained image buffer received a new payload.
+#[derive(Debug, Eq, PartialEq)]
+enum ImageRecordUpload {
+    /// No dirty record could be published to an allocated buffer.
+    Unchanged,
+    /// A capacity-sized payload is staged for the render-world buffer.
+    Staged { bytes: usize },
+}
+
 /// Uploads a dirty image record buffer with a fixed-capacity payload.
 fn commit_image_batch_records(
     batch: &mut ImageBatch,
     staged_uploads: &mut RetainedBatchBufferUploads,
-) -> Option<usize> {
+) -> ImageRecordUpload {
     if !batch.record_upload.is_set() {
-        return None;
+        return ImageRecordUpload::Unchanged;
     }
-    let gpu = batch.gpu.as_ref()?;
+    let Some(gpu) = batch.allocation.resources() else {
+        return ImageRecordUpload::Unchanged;
+    };
+    if batch.record_count() > gpu.capacity {
+        return ImageRecordUpload::Unchanged;
+    }
     let payload = padded_image_render_records(
         batch.records(),
         batch.first_draw_order_index(),
@@ -867,13 +1056,10 @@ fn commit_image_batch_records(
     );
     let byte_len = image_record_payload_bytes(gpu.capacity);
     let records = gpu.records.clone();
+    let bytes = bytemuck::cast_slice(&payload).to_vec();
     batch.record_upload.clear();
-    material_table::stage_retained_batch_buffer_upload(
-        staged_uploads,
-        &records,
-        ShaderBuffer::from(payload),
-    );
-    Some(byte_len)
+    material_table::stage_retained_batch_buffer_upload(staged_uploads, &records, bytes);
+    ImageRecordUpload::Staged { bytes: byte_len }
 }
 
 fn padded_image_render_records(
@@ -939,16 +1125,21 @@ fn centered_corners(size: Vec2) -> [Vec2; 4] {
 mod tests {
     use bevy::asset::AssetPlugin;
     use bevy::camera::visibility::RenderLayers;
+    use bevy::ecs::system::RunSystemOnce;
     use bevy::prelude::AssetApp;
+    use bevy::prelude::ChildOf;
     use bevy::prelude::MinimalPlugins;
+    use bevy::prelude::Quat;
     use bevy::prelude::TransformPlugin;
     use bevy::prelude::UVec2;
     use bevy::prelude::With;
+    use bevy::render::render_resource::ShaderSize;
 
     use super::*;
     use crate::Anchor;
     use crate::cascade::Resolved;
     use crate::layout::BoundingBox;
+    use crate::layout::LayoutBuilder;
     use crate::layout::LayoutResult;
     use crate::layout::Pt;
     use crate::layout::RectangleSource;
@@ -957,11 +1148,46 @@ mod tests {
     use crate::layout::ShadowCasting;
     use crate::panel::ComputedDiegeticPanel;
     use crate::panel::DiegeticPanel;
+    use crate::panel::DiegeticPanelCommands;
     use crate::panel::PanelPrecomposeCache;
     use crate::panel::PrecomposeCacheEntry;
+    use crate::render::PrivateViewLayerAllocator;
+    use crate::render::PrivateViewLayers;
     use crate::render::draw_order::DrawOrder;
     use crate::render::image_material;
 
+    const _: () = assert!(ImageRenderRecord::SHADER_SIZE.get() == 144);
+
+    #[test]
+    fn image_render_record_direct_storage_matches_encase() -> Result<(), String> {
+        let record = ImageRenderRecord {
+            panel_plane:      Vec4::new(1.0, 2.0, 3.0, 4.0),
+            transform:        Mat4::from_scale_rotation_translation(
+                Vec3::new(2.0, 3.0, 4.0),
+                Quat::from_rotation_z(0.3),
+                Vec3::new(5.0, 6.0, 7.0),
+            ),
+            size:             Vec2::new(8.0, 9.0),
+            size_padding:     Vec2::ZERO,
+            uv_rect:          Vec4::new(0.1, 0.2, 0.7, 0.8),
+            tint:             Vec4::new(0.3, 0.4, 0.5, 0.6),
+            clip_depth_nudge: 0.001,
+            oit_paint_order:  0.75,
+            tail_padding:     Vec2::ZERO,
+        };
+        assert_eq!(size_of::<ImageRenderRecord>(), 144);
+        assert_eq!(std::mem::offset_of!(ImageRenderRecord, uv_rect), 96);
+        assert_eq!(
+            bytemuck::bytes_of(&record),
+            crate::render::encase_storage_bytes(&record)?
+        );
+        let records = vec![record, ImageRenderRecord::padded()];
+        assert_eq!(
+            bytemuck::cast_slice::<_, u8>(&records),
+            crate::render::encase_storage_bytes(&records)?
+        );
+        Ok(())
+    }
     const FIRST_COMMAND_INDEX: usize = 0;
     const FIRST_PANEL_TRANSLATION: Vec3 = Vec3::new(1.0, 2.0, 3.0);
     const GROWN_RECORD_COUNT: u32 = 2;
@@ -976,6 +1202,7 @@ mod tests {
     const PANEL_WIDTH_PT: f32 = 100.0;
     const PRECOMPOSE_CAMERA_BITS: u64 = 12;
     const PRECOMPOSE_HELPER_BITS: u64 = 11;
+    const PRECOMPOSE_RIG_BITS: u64 = 13;
     const SECOND_PANEL_TRANSLATION: Vec3 = Vec3::new(-2.0, 0.5, 0.25);
     const TEST_CAPACITY: u32 = 8;
     const TEST_PANEL_BITS: u64 = 1;
@@ -1088,17 +1315,16 @@ mod tests {
         let entity = Entity::from_bits(TEST_BATCH_ENTITY_BITS);
         let initial_records = {
             let batch = store.get_mut(&key).expect("batch exists after insert");
-            batch.entity = Some(entity);
-            allocate_image_batch_resources(
+            let resources = allocate_image_batch_resources(
                 &key,
                 batch,
                 &mut meshes,
                 &mut materials,
                 &mut storage_buffers,
             );
+            batch.allocation = ImageBatchAllocation::Allocated { entity, resources };
             batch
-                .gpu
-                .as_ref()
+                .resources()
                 .expect("allocation installs resources")
                 .records
                 .clone()
@@ -1106,22 +1332,23 @@ mod tests {
 
         store.upsert_record(key.clone(), test_record(0, UPDATED_TINT));
         let batch = store.get_mut(&key).expect("updated batch still exists");
-        assert_eq!(batch.entity, Some(entity));
+        assert_eq!(batch.entity(), Some(entity));
         assert_eq!(
             batch
-                .gpu
-                .as_ref()
+                .resources()
                 .expect("same-key update keeps resources")
                 .records,
             initial_records
         );
         assert_eq!(
             commit_image_batch_records(batch, &mut staged_uploads),
-            Some(image_record_payload_bytes(INITIAL_CAPACITY))
+            ImageRecordUpload::Staged {
+                bytes: image_record_payload_bytes(INITIAL_CAPACITY),
+            }
         );
         assert!(staged_uploads.contains(&initial_records));
         assert_eq!(
-            batch.gpu.as_ref().expect("commit keeps resources").records,
+            batch.resources().expect("commit keeps resources").records,
             initial_records
         );
     }
@@ -1270,6 +1497,36 @@ mod tests {
     }
 
     #[test]
+    fn a_hidden_ancestor_drops_image_records_the_frame_it_hides() {
+        let mut app = image_batch_app();
+        let mut images = Assets::<Image>::default();
+        let texture = images.add(Image::default());
+        let panel = spawn_panel(&mut app, vec![image_command(texture, Color::WHITE, 0)]);
+        let tool = app
+            .world_mut()
+            .spawn((Transform::default(), Visibility::Inherited))
+            .id();
+        app.world_mut()
+            .entity_mut(panel)
+            .insert((Visibility::Inherited, ChildOf(tool)));
+        app.update();
+        assert_eq!(image_records(&app).len(), 1);
+
+        app.world_mut().entity_mut(tool).insert(Visibility::Hidden);
+        app.update();
+        assert!(
+            image_records(&app).is_empty(),
+            "hiding the panel's parent drops its images in the same frame"
+        );
+
+        app.world_mut()
+            .entity_mut(tool)
+            .insert(Visibility::Inherited);
+        app.update();
+        assert_eq!(image_records(&app).len(), 1);
+    }
+
+    #[test]
     fn router_rekeys_on_layer_and_shadow_changes() {
         let mut app = image_batch_app();
         let mut images = Assets::<Image>::default();
@@ -1320,7 +1577,7 @@ mod tests {
 
         app.update();
 
-        assert!(image_records(&app).is_empty());
+        assert_eq!(image_records(&app), []);
         assert_eq!(non_empty_image_batch_count(&app), 0);
     }
 
@@ -1347,7 +1604,7 @@ mod tests {
 
         app.update();
 
-        assert!(image_records(&app).is_empty());
+        assert_eq!(image_records(&app), []);
         assert_eq!(non_empty_image_batch_count(&app), 0);
     }
 
@@ -1469,6 +1726,35 @@ mod tests {
     }
 
     #[test]
+    fn p33_unrelated_layout_change_keeps_off_origin_image_batch_clean() {
+        let mut app = image_batch_app();
+        let mut images = Assets::<Image>::default();
+        let texture = images.add(Image::default());
+        let commands = vec![image_command(texture, Color::WHITE, 0)];
+        let panel = spawn_panel_with_anchor_transform(
+            &mut app,
+            commands.clone(),
+            Anchor::TopLeft,
+            Transform::from_xyz(0.0, 0.0, -10.0),
+        );
+        app.update();
+        assert_single_batch_not_dirty(&app);
+        let (_, before) = single_image_batch(&app);
+
+        // A slider elsewhere on this panel rebuilds its command stream while
+        // leaving the image command unchanged. Inspect routing before commit
+        // clears the flags, so a redundant upload cannot hide the regression.
+        set_panel_commands(&mut app, panel, commands);
+        app.world_mut()
+            .run_system_once(route_image_batch_records)
+            .expect("image routing should run");
+
+        assert_single_batch_not_dirty(&app);
+        let (_, after) = single_image_batch(&app);
+        assert_eq!(after, before);
+    }
+
+    #[test]
     fn static_batch_does_not_reupload_across_frames() {
         let mut app = image_batch_app();
         let mut images = Assets::<Image>::default();
@@ -1553,8 +1839,59 @@ mod tests {
             // `commit_image_batch_buffers` stages into the buffer-upload queue
             // `MaterialTablePlugin` owns, which this app does not add.
             .init_resource::<RetainedBatchBufferUploads>()
+            .init_resource::<PrivateViewLayers>()
             .add_plugins(ImageBatchPlugin);
         app
+    }
+
+    #[test]
+    fn image_batch_route_sleeps_and_visits_only_one_changed_panel() {
+        let mut app = image_batch_app();
+        let panels: Vec<_> = (0..30).map(|_| spawn_panel(&mut app, Vec::new())).collect();
+        app.update();
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<ImageBatchRouteCounts>(),
+            &ImageBatchRouteCounts::default()
+        );
+
+        let changed_panel = panels[0];
+        assert!(
+            app.world_mut()
+                .commands()
+                .set_tree(changed_panel, LayoutBuilder::new(100.0, 50.0).build())
+                .is_ok(),
+        );
+        app.world_mut().flush();
+        app.update();
+
+        let counts = app.world().resource::<ImageBatchRouteCounts>();
+        assert_eq!(counts.runs, 1);
+        assert_eq!(counts.visits, 1);
+
+        app.update();
+        app.world_mut()
+            .entity_mut(changed_panel)
+            .get_mut::<Transform>()
+            .expect("panel should carry a transform")
+            .translation
+            .x += 1.0;
+        app.update();
+
+        let counts = app.world().resource::<ImageBatchRouteCounts>();
+        assert_eq!(counts.runs, 1, "an authored panel move wakes the route");
+        assert_eq!(counts.visits, 1, "only the moved panel is visited");
+
+        app.update();
+        app.world_mut()
+            .entity_mut(changed_panel)
+            .remove::<DiegeticPanel>();
+        app.update();
+
+        let counts = app.world().resource::<ImageBatchRouteCounts>();
+        assert_eq!(counts.runs, 1, "panel removal wakes image retirement");
+        assert_eq!(counts.visits, 1, "only the removed panel is retired");
     }
 
     fn spawn_panel(app: &mut App, commands: Vec<RenderCommand>) -> Entity {
@@ -1617,6 +1954,16 @@ mod tests {
         element_idx: usize,
         texture: Handle<Image>,
     ) {
+        let layer = app
+            .world_mut()
+            .run_system_once(
+                |mut private_view_layer_allocator: PrivateViewLayerAllocator| {
+                    private_view_layer_allocator
+                        .allocate()
+                        .expect("private layer should be available")
+                },
+            )
+            .expect("private layer allocation system should run");
         app.world_mut()
             .get_mut::<PanelPrecomposeCache>(panel)
             .expect("panel should have a precompose cache")
@@ -1624,10 +1971,12 @@ mod tests {
             .insert(
                 element_idx,
                 PrecomposeCacheEntry {
-                    image:        texture,
+                    image: texture,
+                    rig: Entity::from_bits(PRECOMPOSE_RIG_BITS),
+                    layer,
                     helper_panel: Entity::from_bits(PRECOMPOSE_HELPER_BITS),
-                    camera:       Entity::from_bits(PRECOMPOSE_CAMERA_BITS),
-                    pixel_size:   UVec2::ONE,
+                    camera: Entity::from_bits(PRECOMPOSE_CAMERA_BITS),
+                    pixel_size: UVec2::ONE,
                 },
             );
     }
@@ -1692,8 +2041,7 @@ mod tests {
         assert_eq!(batches.len(), 1, "expected exactly one image batch");
         let gpu = batches[0]
             .1
-            .gpu
-            .as_ref()
+            .resources()
             .expect("batch should have GPU assets");
         BatchResourceHandles {
             records:  gpu.records.clone(),

@@ -12,6 +12,7 @@ mod space;
 pub use cast::ToF32;
 pub use cast::ToF64;
 pub use cast::ToI32;
+pub use cast::ToI64;
 pub use cast::ToU8;
 pub use cast::ToU16;
 pub use cast::ToU32;

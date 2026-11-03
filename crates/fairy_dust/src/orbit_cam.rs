@@ -32,7 +32,7 @@ use crate::constants::EXAMPLE_ORBIT_CAM_ZOOM_UPPER_LIMIT;
 /// attaches it by hand, so [`crate::SprinkleBuilder::with_camera_home`],
 /// [`crate::SprinkleBuilder::with_stable_transparency`], and
 /// [`crate::SprinkleBuilder::with_restore_camera_on_restart`] still find the
-/// camera. Capabilities locate it via `On<Add, FairyDustOrbitCam>` observers or
+/// camera. Capabilities locate it via `On<Add<FairyDustOrbitCam>>` observers or
 /// `With<FairyDustOrbitCam>` queries rather than scanning every `OrbitCam` in
 /// the world.
 ///

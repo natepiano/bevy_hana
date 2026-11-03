@@ -1,6 +1,6 @@
 use bevy::prelude::Reflect;
 
-use super::target::FullscreenMoveDeadline;
+use super::target::FullscreenRestoreDeadline;
 use crate::deadline::OperatingSystemWorkDeadline;
 use crate::restore::RestorePreparationSource;
 
@@ -51,10 +51,12 @@ pub(crate) enum WindowRestoreState {
 pub(crate) enum FullscreenRestoreState {
     /// Ask `AppKit` to leave the current fullscreen Space before changing monitor.
     LeaveFullscreen,
+    /// Wait for `AppKit` to finish leaving the native fullscreen Space.
+    WaitForWindowed { deadline: FullscreenRestoreDeadline },
     /// Keep moving the windowed macOS window until it reaches the target monitor.
     MoveWindowedToTarget {
         /// Whether the move has been requested, and the deadline once it has.
-        deadline: FullscreenMoveDeadline,
+        deadline: FullscreenRestoreDeadline,
     },
     /// Move window to target monitor position. Skipped on Wayland (no position).
     MoveToMonitor,
@@ -67,7 +69,9 @@ pub(crate) enum FullscreenRestoreState {
     /// Make the macOS window key after winit sends the fullscreen request.
     ActivateWindow,
     /// Wait until `AppKit` reports both fullscreen presentation and the target monitor.
-    WaitForTarget,
+    WaitForTarget { deadline: FullscreenRestoreDeadline },
+    /// Wait for a borderless fullscreen window to reach its selected monitor.
+    WaitForBorderlessTarget { deadline: FullscreenRestoreDeadline },
 }
 
 /// Last native fullscreen transition that the platform confirmed as complete.

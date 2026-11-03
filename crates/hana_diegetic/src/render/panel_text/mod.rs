@@ -8,14 +8,21 @@ mod layout;
 mod reify;
 mod relationship;
 mod shaping;
+mod small_text_fit;
 
+use batching::TextBatchInvalidation;
+#[cfg(test)]
+use batching::TextBatchRouteCounts;
 use bevy::camera::visibility::VisibilitySystems;
+use bevy::ecs::lifecycle::HookContext;
+use bevy::ecs::world::DeferredWorld;
 use bevy::prelude::App;
 use bevy::prelude::Color;
 use bevy::prelude::Component;
 use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::Plugin;
 use bevy::prelude::PostUpdate;
+use bevy::prelude::Resource;
 use bevy::prelude::TransformSystems;
 
 pub use self::access::DiegeticTextMut;
@@ -24,9 +31,17 @@ pub use self::access::PanelTextReader;
 pub use self::access::TextEdit;
 use self::alpha::seed_panel_text_child_alpha;
 pub use self::batching::DiegeticTextBatch;
+pub use self::batching::FirstTextBatchPipeline;
+pub use self::batching::QueuedTextPipelineCandidate;
+pub(super) use self::batching::TextBatchPhaseMembership;
+pub use self::batching::TextPipelineStartup;
 use self::batching::commit_batch_buffers;
+pub(super) use self::batching::extract_text_batch_entities;
+pub(super) use self::batching::observe_first_text_phase_item;
+use self::batching::panel_text_batch_inputs_changed;
 use self::batching::update_batch_bounds;
 use self::batching::update_panel_text_batches;
+pub(super) use self::batching::warm_text_pipeline;
 use self::batching::write_batch_run_transforms;
 use self::glyph_cascade::seed_panel_text_child_glyph;
 pub use self::layout::PanelTextLayout;
@@ -34,11 +49,15 @@ use self::reify::reify_text_entities;
 pub use self::relationship::PanelTextRuns;
 pub use self::relationship::TextRunOf;
 use self::shaping::shape_panel_text_children;
+use self::small_text_fit::SmallTextFitStates;
+use self::small_text_fit::settle_small_text_fit;
 use super::PanelChildSystems;
+use super::PrivateViewLayers;
 use super::material_table;
 use super::material_table::BatchAssetWrites;
 use super::material_table::BatchResourcesReady;
 use super::material_table::MaterialTableAppendReady;
+use super::material_table::MaterialTableBufferPrepared;
 use super::precompose;
 use super::text_shaping::TextShapingContext;
 use super::world_text;
@@ -75,8 +94,6 @@ pub(super) struct PreparedPanelText {
     pub shadow_mode: Cascade<GlyphShadowMode>,
     /// Text fill color.
     pub fill_color:  Color,
-    /// One em along the run's local Y axis.
-    pub em_height:   f32,
     /// Optional panel-local clipping rect.
     pub clip_rect:   Option<[f32; 4]>,
     /// Set when the change that marked this component dirty touched only render
@@ -84,6 +101,25 @@ pub(super) struct PreparedPanelText {
     /// The batching pass reads it to update the run record in place instead of
     /// re-deriving identical glyph quads. `false` on every full reshape.
     pub render_only: bool,
+}
+
+/// Enables the component hook for manually authored panel-text children.
+/// Keeping the gate in a resource also permits installing the renderer after
+/// `TextContent` entities already exist, as the observer bridge allowed.
+#[derive(Default, Resource)]
+struct PanelTextCascadeBridge;
+
+pub(super) struct PanelTextCascadeBridgePlugin;
+
+impl Plugin for PanelTextCascadeBridgePlugin {
+    fn build(&self, app: &mut App) { app.init_resource::<PanelTextCascadeBridge>(); }
+}
+
+pub(super) fn seed_panel_text_cascades(mut world: DeferredWorld, context: HookContext) {
+    if world.contains_resource::<PanelTextCascadeBridge>() {
+        seed_panel_text_child_alpha(&mut world, context.entity);
+        seed_panel_text_child_glyph(&mut world, context.entity);
+    }
 }
 
 /// Plugin that adds text rendering for diegetic panels.
@@ -94,12 +130,15 @@ pub(super) struct TextRenderPlugin;
 
 impl Plugin for TextRenderPlugin {
     fn build(&self, app: &mut App) {
+        app.init_resource::<TextBatchInvalidation>();
+        app.init_resource::<SmallTextFitStates>();
         app.add_plugins(cascade::cascade_plugin::<TextAlpha>());
         app.add_plugins(cascade::cascade_plugin::<GlyphShadowMode>());
         app.add_plugins(cascade::cascade_plugin::<Lighting>());
         app.add_plugins(cascade::cascade_plugin::<Sidedness>());
-        app.add_observer(seed_panel_text_child_alpha);
-        app.add_observer(seed_panel_text_child_glyph);
+        app.add_plugins(PanelTextCascadeBridgePlugin);
+        app.add_observer(precompose::release_precompose_rig_layer);
+        app.init_resource::<PrivateViewLayers>();
         app.init_resource::<TextShapingContext>();
         app.init_resource::<ShapedTextCache>();
         app.init_resource::<DiegeticPerfStats>();
@@ -107,6 +146,9 @@ impl Plugin for TextRenderPlugin {
         app.add_systems(
             PostUpdate,
             (
+                precompose::despawn_orphaned_precompose_rigs
+                    .in_set(PanelChildSystems::Build)
+                    .before(precompose::ensure_panel_precompose_caches),
                 precompose::ensure_panel_precompose_caches.in_set(PanelChildSystems::Build),
                 precompose::activate_pending_precompose_cameras
                     .in_set(PanelChildSystems::Build)
@@ -132,6 +174,7 @@ impl Plugin for TextRenderPlugin {
             PostUpdate,
             (
                 update_panel_text_batches
+                    .run_if(panel_text_batch_inputs_changed)
                     .after(shape_panel_text_children)
                     .after(MaterialTableAppendReady)
                     .in_set(BatchAssetWrites)
@@ -139,9 +182,15 @@ impl Plugin for TextRenderPlugin {
                     .before(BatchResourcesReady),
                 material_table::register_path_batch_materials::<DiegeticTextBatch>
                     .after(update_panel_text_batches)
+                    .before(MaterialTableBufferPrepared)
                     .in_set(BatchResourcesReady),
                 write_batch_run_transforms
                     .after(TransformSystems::Propagate)
+                    .in_set(BatchResourcesReady),
+                settle_small_text_fit
+                    .after(write_batch_run_transforms)
+                    .before(update_batch_bounds)
+                    .before(commit_batch_buffers)
                     .in_set(BatchResourcesReady),
                 update_batch_bounds
                     .after(write_batch_run_transforms)
@@ -153,6 +202,11 @@ impl Plugin for TextRenderPlugin {
                     .after(write_batch_run_transforms)
                     .in_set(BatchResourcesReady),
             ),
+        );
+        #[cfg(test)]
+        app.init_resource::<TextBatchRouteCounts>().add_systems(
+            PostUpdate,
+            batching::reset_text_batch_route_counts.before(update_panel_text_batches),
         );
     }
 }

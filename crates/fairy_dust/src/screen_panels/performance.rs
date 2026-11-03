@@ -1,6 +1,10 @@
 //! Shared screen-space instrumentation panels for examples.
 
+use std::ops::Deref;
+use std::ops::DerefMut;
+
 use bevy::prelude::Assets;
+use bevy::prelude::Bundle;
 use bevy::prelude::StandardMaterial;
 use hana_diegetic::AlignX;
 use hana_diegetic::AlignY;
@@ -33,7 +37,28 @@ use super::constants::STATS_SECTION_GAP;
 use super::constants::STATUS_LABEL_COLOR;
 use super::constants::STATUS_TEXT_COLOR;
 use super::screen_panel_frame;
+use super::separation::EdgePanelWidth;
 use crate::DEFAULT_PANEL_BACKGROUND;
+
+/// The lane labels and status card need this much horizontal room.
+pub(super) const GPU_METER_PANEL_MIN_WIDTH: f32 = 400.0;
+
+/// A GPU meter with an explicit width policy for edge separation.
+#[derive(Bundle)]
+pub struct GpuMeterPanel {
+    panel:        DiegeticPanel,
+    width_policy: EdgePanelWidth,
+}
+
+impl Deref for GpuMeterPanel {
+    type Target = DiegeticPanel;
+
+    fn deref(&self) -> &Self::Target { &self.panel }
+}
+
+impl DerefMut for GpuMeterPanel {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.panel }
+}
 
 /// One label/value group in a reusable instrumentation stats panel.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -222,15 +247,23 @@ pub fn fps_stats_panel(
 pub fn gpu_meter_panel(
     tree: LayoutTree,
     materials: &mut Assets<StandardMaterial>,
-) -> Result<DiegeticPanel, PanelBuildError> {
+) -> Result<GpuMeterPanel, PanelBuildError> {
     let unlit = super::screen_panel_material_handle(materials);
-    DiegeticPanel::screen()
+    let panel = DiegeticPanel::screen()
+        // Separation retains this authored fraction when it resolves a
+        // narrower pixel width beside another edge panel.
         .size(Percent(GPU_METER_PANEL_WIDTH_FRACTION), Fit)
         .anchor(Anchor::BottomLeft)
         .material(unlit.clone())
         .text_material(unlit)
         .with_tree(tree)
-        .build()
+        .build()?;
+    Ok(GpuMeterPanel {
+        panel,
+        width_policy: EdgePanelWidth::Resizable {
+            minimum: GPU_METER_PANEL_MIN_WIDTH,
+        },
+    })
 }
 
 /// Builds the reusable row-group tree used by [`diegetic_stats_panel`].
@@ -440,4 +473,33 @@ fn stats_separator(builder: &mut LayoutBuilder) {
             .background(PANEL_SEPARATOR_COLOR),
         |_builder| {},
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use hana_diegetic::CoordinateSpace;
+
+    use super::*;
+
+    #[test]
+    fn gpu_meter_keeps_an_authored_fraction_after_resolved_width_changes()
+    -> Result<(), PanelBuildError> {
+        let tree =
+            LayoutBuilder::with_root(El::new().width(Sizing::GROW).height(Sizing::FIT)).build();
+        let mut panel = gpu_meter_panel(tree, &mut Assets::default())?;
+        assert!(
+            matches!(panel.coordinate_space(), CoordinateSpace::Screen { width: Sizing::Percent(fraction), .. } if (*fraction - GPU_METER_PANEL_WIDTH_FRACTION).abs() < 0.001)
+        );
+        assert!(panel.set_screen_size(Sizing::fixed(1200.0), Sizing::FIT));
+        assert!(
+            matches!(panel.coordinate_space(), CoordinateSpace::Screen { width: Sizing::Fixed(dimension), .. } if (dimension.value - 1200.0).abs() < 0.001)
+        );
+        assert!(
+            panel.set_screen_size(Sizing::Percent(GPU_METER_PANEL_WIDTH_FRACTION), Sizing::FIT)
+        );
+        assert!(
+            matches!(panel.coordinate_space(), CoordinateSpace::Screen { width: Sizing::Percent(fraction), .. } if (*fraction - GPU_METER_PANEL_WIDTH_FRACTION).abs() < 0.001)
+        );
+        Ok(())
+    }
 }

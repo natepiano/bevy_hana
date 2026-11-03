@@ -19,6 +19,7 @@ use bevy::prelude::ResMut;
 use bevy::prelude::Resource;
 use bevy::prelude::Update;
 use bevy::prelude::With;
+use bevy::prelude::World;
 use bevy_enhanced_input::prelude::EnhancedInputPlugin;
 use bevy_enhanced_input::prelude::InputAction;
 use hana_diegetic::ScreenSpaceCamera;
@@ -51,8 +52,15 @@ command! {
     action:      ToggleScreenSpacePanels,
     event:       ToggleScreenSpacePanelsEvent,
     id:          "fairy_dust::toggle_screen_space_panels",
-    title:       "Toggle Screen-Space Panels",
+    title:       "Toggle screen-space panels",
     description: "Hide or restore the screen-space panel camera and its lights.",
+    toggle_state: screen_space_panels_are_shown,
+}
+
+fn screen_space_panels_are_shown(world: &World) -> bool {
+    world
+        .get_resource::<ScreenSpacePanelsEnabled>()
+        .is_some_and(|panels| panels.0 == ScreenSpacePanelsVisibility::Shown)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,6 +165,19 @@ fn apply_screen_space_panels(
     reason = "tests should panic on unexpected values"
 )]
 mod tests {
+
+    #[test]
+    fn command_palette_toggle_screen_panels_follows_the_live_visibility_resource() {
+        let mut app = crate::test_app();
+        app.init_resource::<ScreenSpacePanelsEnabled>()
+            .add_observer(toggle_screen_space_panels);
+        assert!(screen_space_panels_are_shown(app.world()));
+        app.world_mut().trigger(ToggleScreenSpacePanelsEvent);
+        assert!(!screen_space_panels_are_shown(app.world()));
+        app.world_mut().trigger(ToggleScreenSpacePanelsEvent);
+        assert!(screen_space_panels_are_shown(app.world()));
+    }
+
     use bevy::prelude::ButtonInput;
     use bevy::prelude::KeyCode;
     use bevy::prelude::MinimalPlugins;
@@ -203,7 +224,7 @@ mod tests {
     /// one from its keystroke.
     #[test]
     fn the_bound_chord_reaches_the_handler_without_the_palette() {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.add_plugins(MinimalPlugins);
         app.init_resource::<ButtonInput<KeyCode>>();
         install(&mut app);

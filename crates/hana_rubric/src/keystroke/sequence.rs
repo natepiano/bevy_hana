@@ -12,6 +12,9 @@ use super::Keystroke;
 use super::KeystrokeParseError;
 
 /// An ordered, non-empty collection of keystrokes.
+///
+/// `Display` retains canonical keymap spelling; alternate display (`{:#}`) prints
+/// capitalized on-screen hints, such as `F11` and `Ctrl+Home`.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct KeystrokeSequence {
     keystrokes: Vec<Keystroke>,
@@ -86,7 +89,11 @@ impl Display for KeystrokeSequence {
             if index != 0 {
                 formatter.write_str(" ")?;
             }
-            keystroke.fmt(formatter)?;
+            if formatter.alternate() {
+                formatter.write_str(&keystroke.label())?;
+            } else {
+                keystroke.fmt(formatter)?;
+            }
         }
 
         Ok(())
@@ -165,11 +172,35 @@ mod tests {
     use super::KeystrokeSequenceParseError;
 
     #[test]
-    fn sequence_display_round_trips() -> Result<(), KeystrokeSequenceParseError> {
+    fn sequence_display_keeps_canonical_keymap_round_trips()
+    -> Result<(), KeystrokeSequenceParseError> {
         let sequence: KeystrokeSequence = "cmd-k l".parse()?;
 
         assert_eq!(sequence.to_string().parse::<KeystrokeSequence>()?, sequence);
 
+        Ok(())
+    }
+
+    #[test]
+    fn shortcut_hints_capitalize_key_names_without_changing_keymap_spelling()
+    -> Result<(), KeystrokeSequenceParseError> {
+        for (source, hint) in [
+            ("f11", "F11"),
+            ("home", "Home"),
+            ("ctrl-k f11", "Ctrl+K F11"),
+        ] {
+            let sequence: KeystrokeSequence = source.parse()?;
+            assert_eq!(format!("{sequence:#}"), hint);
+            assert_eq!(sequence.to_string(), source);
+            assert_eq!(
+                sequence
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                source
+            );
+        }
         Ok(())
     }
 

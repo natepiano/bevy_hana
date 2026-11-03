@@ -259,7 +259,10 @@ fn main() {
         .with_camera_control_panel()
         .init_resource::<ControlFlashes>()
         .add_systems(Startup, setup)
-        .add_systems(Update, tick_control_flashes)
+        .add_systems(
+            Update,
+            tick_control_flashes.in_set(fairy_dust::TitleBarStateWriters),
+        )
         .add_systems(
             Update,
             (apply_resolved_scale, refresh_status_panel)

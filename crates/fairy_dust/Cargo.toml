@@ -15,11 +15,6 @@ version.workspace = true
 [lints]
 workspace = true
 
-[[example]]
-name = "keymap_contexts"
-path = "examples/keymap_contexts.rs"
-test = true
-
 [dependencies]
 bevy = { workspace = true, features = [
   "bevy_anti_alias",
@@ -51,4 +46,5 @@ hana_valence = { workspace = true }
 opener = { workspace = true }
 
 [dev-dependencies]
+hana_lagrange   = { workspace = true, features = ["test-support"] }
 strum.workspace = true

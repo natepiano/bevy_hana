@@ -1,14 +1,15 @@
 use bevy::prelude::Entity;
 use bevy::prelude::Reflect;
 use bevy::prelude::warn;
+use bevy::reflect::ReflectSerialize;
 use hana_kana::SequenceEasingError;
 use hana_kana::SequenceOwner;
 use hana_kana::SequenceScopeError;
 use thiserror::Error;
 
 /// Reasons a prepared camera pose cannot be evaluated.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq, Reflect)]
-#[reflect(opaque)]
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq, Reflect, serde::Serialize)]
+#[reflect(opaque, Serialize)]
 #[type_path = "hana_lagrange::animation::sequence"]
 #[non_exhaustive]
 pub enum CameraEvaluationError {

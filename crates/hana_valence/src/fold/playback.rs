@@ -4,6 +4,7 @@
 use bevy_ecs::component::Component;
 use bevy_ecs::entity::Entity;
 use bevy_ecs::entity::EntityHashMap;
+use bevy_ecs::entity::EntityHashSet;
 use bevy_ecs::query::Changed;
 use bevy_ecs::query::With;
 use bevy_ecs::reflect::ReflectComponent;
@@ -125,6 +126,7 @@ impl SequenceReport {
 pub struct FoldSequencePlayback {
     playback:        SequencePlayback,
     fractions:       EntityHashMap<FoldMemberFraction>,
+    last_inputs:     LastEvaluatedFoldInputs,
     scope_report:    DriverReport,
     curve_report:    DriverReport,
     movement_report: DriverReport,
@@ -188,6 +190,7 @@ impl FoldSequencePlayback {
                 .iter()
                 .map(|track| (track.member_entity(), FoldMemberFraction::Unresolved))
                 .collect(),
+            last_inputs: LastEvaluatedFoldInputs::default(),
             scope_report: DriverReport::Armed,
             curve_report: DriverReport::Armed,
             movement_report: DriverReport::Armed,
@@ -198,6 +201,81 @@ impl FoldSequencePlayback {
     }
 }
 
+/// The semantic inputs the movement and evaluation passes last completed.
+///
+/// Rejected inputs remain distinct from accepted ones so the same invalid
+/// state is retried and a later repair can never be mistaken for an idle hold.
+#[derive(Clone, Debug, Default, PartialEq, Reflect)]
+struct LastEvaluatedFoldInputs {
+    movement:   LastFoldMovementInputs,
+    evaluation: LastFoldEvaluationInputs,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Reflect)]
+enum LastFoldMovementInputs {
+    #[default]
+    AwaitingFirstPass,
+    Accepted(FoldMovementInputs),
+    Rejected(FoldMovementInputs),
+}
+
+#[derive(Clone, Debug, PartialEq, Reflect)]
+enum FoldMovementInputs {
+    MissingSequence,
+    Present {
+        position: SequencePosition,
+        source:   FoldMovementSource,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Reflect)]
+enum FoldMovementSource {
+    NativePlayback,
+    Driver {
+        driver:   Entity,
+        movement: DriverMovementInput,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Reflect)]
+enum DriverMovementInput {
+    Unpublished,
+    Published(SequenceMovement),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Reflect)]
+enum LastFoldEvaluationInputs {
+    #[default]
+    AwaitingFirstPass,
+    Accepted(FoldEvaluationInputs),
+    Rejected(FoldEvaluationInputs),
+}
+
+#[derive(Clone, Debug, PartialEq, Reflect)]
+enum FoldEvaluationInputs {
+    MissingSequence,
+    Present {
+        position:       SequencePosition,
+        source:         FoldEvaluationSource,
+        hinged_members: Vec<bool>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Reflect)]
+enum FoldEvaluationSource {
+    NativePlayback,
+    Driver {
+        driver:     Entity,
+        evaluation: DriverEvaluationInput,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Reflect)]
+enum DriverEvaluationInput {
+    Unpublished,
+    Published(SequenceEvaluation),
+}
+
 /// What every retained fold sequence holds for its staged members this frame.
 ///
 /// This is the batched form of [`FoldSequencePlayback::member_fraction`], with
@@ -206,28 +284,50 @@ impl FoldSequencePlayback {
 /// per-member lookup costs one pass over live sequences and reuses its
 /// allocation.
 #[derive(Debug, Default)]
-pub struct FoldFractionScratch(EntityHashMap<FoldMemberFraction>);
+pub struct FoldFractionScratch {
+    current: EntityHashMap<FoldMemberFraction>,
+    prior:   EntityHashMap<FoldMemberFraction>,
+    changed: EntityHashSet,
+}
 
 impl FoldFractionScratch {
     pub(crate) fn reload(&mut self, playbacks: &Query<&FoldSequencePlayback>) {
-        self.0.clear();
+        core::mem::swap(&mut self.current, &mut self.prior);
+        self.current.clear();
+        self.changed.clear();
         for playback in playbacks {
-            self.0.extend(
+            self.current.extend(
                 playback
                     .fractions
                     .iter()
                     .map(|(member_entity, fraction)| (*member_entity, *fraction)),
             );
         }
+        self.changed
+            .extend(self.current.iter().filter_map(|(&entity, fraction)| {
+                (self.prior.get(&entity) != Some(fraction)).then_some(entity)
+            }));
+        self.changed.extend(
+            self.prior
+                .keys()
+                .filter(|entity| !self.current.contains_key(*entity))
+                .copied(),
+        );
     }
 
     /// Answers what [`FoldSequencePlayback::member_fraction`] answers, across
     /// every live sequence at once.
     pub(crate) fn fraction(&self, member_entity: Entity) -> FoldMemberFraction {
-        self.0
+        self.current
             .get(&member_entity)
             .copied()
             .unwrap_or(FoldMemberFraction::Untracked)
+    }
+
+    /// Iterates the members whose retained fraction differs from the preceding
+    /// hinge pass.
+    pub(crate) fn changed_members(&self) -> impl Iterator<Item = Entity> + '_ {
+        self.changed.iter().copied()
     }
 }
 
@@ -363,7 +463,7 @@ pub(super) fn rebuild_fold_playback(
                     .insert((playback, sequence.sequence_stages().clone()));
             },
             Err(FoldPlaybackError(error)) => {
-                tracing::warn!(
+                tracing::warn!(target: "hana_valence::diagnostics",
                     sequence = ?sequence_entity,
                     error = ?error,
                     "authored fold ledger produced boundary positions playback rejected",
@@ -396,54 +496,110 @@ pub(super) fn apply_fold_movement(
     time: Res<Time<Virtual>>,
     mut sequence_commands: SequenceCommands,
     movements: Query<&SequenceMovement>,
-    mut sequences: Query<(Entity, &FoldSequence, &mut FoldSequencePlayback)>,
+    mut sequences: Query<(Entity, Option<&FoldSequence>, &mut FoldSequencePlayback)>,
 ) {
     let delta = time.delta();
     for (sequence_entity, sequence, mut retained) in &mut sequences {
+        let inputs = fold_movement_inputs(
+            sequence_entity,
+            sequence,
+            &retained,
+            &sequence_commands,
+            &movements,
+        );
+        let native_journey_playing = retained.playback.is_playing();
+        if !native_journey_playing
+            && retained.last_inputs.movement == LastFoldMovementInputs::Accepted(inputs.clone())
+        {
+            continue;
+        }
+        let Some(sequence) = sequence else {
+            retained.last_inputs.movement = LastFoldMovementInputs::Accepted(inputs);
+            continue;
+        };
         let total = sequence.total();
-        let FoldSequencePlayback {
-            playback,
-            movement_report,
-            boundary_report,
-            ..
-        } = &mut *retained;
-        let update = match sequence_commands.apply_selected_movement(sequence_entity, playback) {
-            SequenceMovementApplication::NativePlayback => {
-                let update =
-                    sequence_commands.advance_native(sequence_entity, playback, delta, total);
-                movement_report.rearm();
-                update
-            },
-            SequenceMovementApplication::HoldingPriorPosition => {
-                movement_report.rearm();
-                SequenceUpdate::NoTraversal
-            },
-            SequenceMovementApplication::Moved(update) => {
-                movement_report.rearm();
-                update
-            },
-            SequenceMovementApplication::Invalid(error) => {
-                if let SequenceOwner::Driver(driver) = sequence_commands.owner(sequence_entity)
-                    && movement_report.report(driver)
-                {
-                    tracing::warn!(
-                        arrangement = ?sequence_entity,
-                        driver = ?driver,
-                        movement = ?movements.get(driver).ok(),
-                        error = ?error,
-                        "fold movement contradicted local position and was not applied",
-                    );
-                }
-                SequenceUpdate::NoTraversal
-            },
+        let (update, rejected) = {
+            let FoldSequencePlayback {
+                playback,
+                movement_report,
+                ..
+            } = &mut *retained;
+            match sequence_commands.apply_selected_movement(sequence_entity, playback) {
+                SequenceMovementApplication::NativePlayback => {
+                    let update =
+                        sequence_commands.advance_native(sequence_entity, playback, delta, total);
+                    movement_report.rearm();
+                    (update, false)
+                },
+                SequenceMovementApplication::HoldingPriorPosition => {
+                    movement_report.rearm();
+                    (SequenceUpdate::NoTraversal, false)
+                },
+                SequenceMovementApplication::Moved(update) => {
+                    movement_report.rearm();
+                    (update, false)
+                },
+                SequenceMovementApplication::Invalid(error) => {
+                    if let SequenceOwner::Driver(driver) = sequence_commands.owner(sequence_entity)
+                        && movement_report.report(driver)
+                    {
+                        tracing::warn!(target: "hana_valence::diagnostics",
+                            arrangement = ?sequence_entity,
+                            driver = ?driver,
+                            movement = ?movements.get(driver).ok(),
+                            error = ?error,
+                            "fold movement contradicted local position and was not applied",
+                        );
+                    }
+                    (SequenceUpdate::NoTraversal, true)
+                },
+            }
         };
         events::emit_fold_boundaries(
             &mut commands,
             sequence_entity,
             sequence,
             update,
-            boundary_report,
+            &mut retained.boundary_report,
         );
+        let completed_inputs = fold_movement_inputs(
+            sequence_entity,
+            Some(sequence),
+            &retained,
+            &sequence_commands,
+            &movements,
+        );
+        retained.last_inputs.movement = if rejected {
+            LastFoldMovementInputs::Rejected(completed_inputs)
+        } else {
+            LastFoldMovementInputs::Accepted(completed_inputs)
+        };
+    }
+}
+
+fn fold_movement_inputs(
+    sequence_entity: Entity,
+    sequence: Option<&FoldSequence>,
+    retained: &FoldSequencePlayback,
+    sequence_commands: &SequenceCommands<'_, '_>,
+    movements: &Query<&SequenceMovement>,
+) -> FoldMovementInputs {
+    if sequence.is_none() {
+        return FoldMovementInputs::MissingSequence;
+    }
+    let source = match sequence_commands.owner(sequence_entity) {
+        SequenceOwner::NativePlayback => FoldMovementSource::NativePlayback,
+        SequenceOwner::Driver(driver) => FoldMovementSource::Driver {
+            driver,
+            movement: movements.get(driver).copied().map_or(
+                DriverMovementInput::Unpublished,
+                DriverMovementInput::Published,
+            ),
+        },
+    };
+    FoldMovementInputs::Present {
+        position: retained.playback.position(),
+        source,
     }
 }
 
@@ -458,12 +614,27 @@ pub(super) fn evaluate_fold_sequences(
     sequence_commands: SequenceCommands,
     evaluations: Query<&SequenceEvaluation>,
     hinged: Query<(), With<Hinge>>,
-    mut sequences: Query<(Entity, &FoldSequence, &mut FoldSequencePlayback)>,
+    mut sequences: Query<(Entity, Option<&FoldSequence>, &mut FoldSequencePlayback)>,
 ) {
     let easing_sampler = EasingSampler;
     let sequence_easing_sampler = SequenceEasingSampler;
     let mut skipped = Vec::new();
     for (sequence_entity, sequence, mut retained) in &mut sequences {
+        let inputs = fold_evaluation_inputs(
+            sequence_entity,
+            sequence,
+            &retained,
+            &sequence_commands,
+            &evaluations,
+            &hinged,
+        );
+        if retained.last_inputs.evaluation == LastFoldEvaluationInputs::Accepted(inputs.clone()) {
+            continue;
+        }
+        let Some(sequence) = sequence else {
+            retained.last_inputs.evaluation = LastFoldEvaluationInputs::Accepted(inputs);
+            continue;
+        };
         let owner = sequence_commands.owner(sequence_entity);
         let plan = resolve_plan(
             sequence,
@@ -474,12 +645,14 @@ pub(super) fn evaluate_fold_sequences(
             sequence_entity,
         );
         let EvaluationPlan::Sample { position, easing } = plan else {
+            retained.last_inputs.evaluation = LastFoldEvaluationInputs::Rejected(inputs);
             continue;
         };
 
         skipped.clear();
         let mut easing_failed = false;
         let mut curve_rejected = false;
+        let mut evaluation_rejected = false;
         for track in sequence.tracks() {
             let member_entity = track.member_entity();
             if !hinged.contains(member_entity) {
@@ -504,8 +677,11 @@ pub(super) fn evaluate_fold_sequences(
                 // Interpolating an angle is the only failure that can occur
                 // after finite easing has been accepted. It runs in
                 // `PostUpdate`, so this member holds its prior pose.
-                Err(FoldEvaluationError::UnrepresentableAngle) => {},
+                Err(FoldEvaluationError::UnrepresentableAngle) => {
+                    evaluation_rejected = true;
+                },
                 Err(FoldEvaluationError::ExternalCurveRejected(error)) => {
+                    evaluation_rejected = true;
                     curve_rejected = true;
                     report_rejected_curve(
                         sequence_entity,
@@ -516,9 +692,10 @@ pub(super) fn evaluate_fold_sequences(
                     );
                 },
                 Err(FoldEvaluationError::NonFiniteEasing) => {
+                    evaluation_rejected = true;
                     easing_failed = true;
                     if retained.easing_report.report() {
-                        tracing::warn!(
+                        tracing::warn!(target: "hana_valence::diagnostics",
                             arrangement = ?sequence_entity,
                             member = ?member_entity,
                             "fold easing produced a non-finite output; the pose holds",
@@ -536,6 +713,43 @@ pub(super) fn evaluate_fold_sequences(
             retained.curve_report.rearm();
         }
         report_hinge_less_tracks(sequence_entity, &skipped, &mut retained);
+        retained.last_inputs.evaluation = if evaluation_rejected {
+            LastFoldEvaluationInputs::Rejected(inputs)
+        } else {
+            LastFoldEvaluationInputs::Accepted(inputs)
+        };
+    }
+}
+
+fn fold_evaluation_inputs(
+    sequence_entity: Entity,
+    sequence: Option<&FoldSequence>,
+    retained: &FoldSequencePlayback,
+    sequence_commands: &SequenceCommands<'_, '_>,
+    evaluations: &Query<&SequenceEvaluation>,
+    hinged: &Query<(), With<Hinge>>,
+) -> FoldEvaluationInputs {
+    let Some(sequence) = sequence else {
+        return FoldEvaluationInputs::MissingSequence;
+    };
+    let source = match sequence_commands.owner(sequence_entity) {
+        SequenceOwner::NativePlayback => FoldEvaluationSource::NativePlayback,
+        SequenceOwner::Driver(driver) => FoldEvaluationSource::Driver {
+            driver,
+            evaluation: evaluations.get(driver).cloned().map_or(
+                DriverEvaluationInput::Unpublished,
+                DriverEvaluationInput::Published,
+            ),
+        },
+    };
+    FoldEvaluationInputs::Present {
+        position: retained.playback.position(),
+        source,
+        hinged_members: sequence
+            .tracks()
+            .iter()
+            .map(|track| hinged.contains(track.member_entity()))
+            .collect(),
     }
 }
 
@@ -569,7 +783,7 @@ fn resolve_plan<'evaluation>(
         },
         Err(error) => {
             if retained.scope_report.report(driver) {
-                tracing::warn!(
+                tracing::warn!(target: "hana_valence::diagnostics",
                     arrangement = ?sequence_entity,
                     driver = ?driver,
                     error = ?error,
@@ -638,14 +852,14 @@ fn report_rejected_curve(
         return;
     }
     match rejected_use {
-        RejectedCurveUse::MultiStageScope => tracing::warn!(
+        RejectedCurveUse::MultiStageScope => tracing::warn!(target: "hana_valence::diagnostics",
             arrangement = ?sequence_entity,
             driver = ?driver,
             error = ?error,
             "fold producer curve was rejected for its multi-stage scope and the pose holds; \
              a single-stage scope accepts the same curve as output easing",
         ),
-        RejectedCurveUse::StageOutputEasing => tracing::warn!(
+        RejectedCurveUse::StageOutputEasing => tracing::warn!(target: "hana_valence::diagnostics",
             arrangement = ?sequence_entity,
             driver = ?driver,
             error = ?error,
@@ -666,7 +880,7 @@ fn report_hinge_less_tracks(
         return;
     }
     if retained.hinge_report.report() {
-        tracing::warn!(
+        tracing::warn!(target: "hana_valence::diagnostics",
             arrangement = ?sequence_entity,
             members = ?skipped,
             "fold sequence stages members that carry no Hinge; they were skipped",

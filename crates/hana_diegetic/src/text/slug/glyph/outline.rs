@@ -4,8 +4,10 @@ use ttf_parser::GlyphId;
 use ttf_parser::OutlineBuilder;
 
 use crate::render::Bounds;
+use crate::render::ContourRole;
 use crate::render::PathContour;
 use crate::render::QuadraticSegment;
+use crate::text::TextOutlineError;
 
 const CUBIC_TO_QUADRATIC_TOLERANCE: f32 = 0.25;
 const CUBIC_TO_QUADRATIC_MAX_DEPTH: u8 = 10;
@@ -13,13 +15,14 @@ const HALF: f32 = 0.5;
 const ERROR_SAMPLE_A: f32 = 0.25;
 const ERROR_SAMPLE_B: f32 = 0.75;
 const TANGENT_INTERSECTION_EPSILON: f32 = 0.000_001;
+const ISLAND_CLEARANCE_FONT_UNITS: f32 = 0.5;
 
 /// One closed glyph contour expressed as quadratic segments.
-pub(in crate::text::slug) type Contour = PathContour;
+pub(in crate::text) type Contour = PathContour;
 
 /// Quadratic-only outline representation for one glyph.
 #[derive(Clone, Debug, PartialEq)]
-pub(in crate::text::slug) struct Glyph {
+pub(in crate::text) struct Glyph {
     /// Unicode scalar used to request this glyph.
     pub character: char,
     /// Font glyph ID selected for `character`.
@@ -41,9 +44,168 @@ pub(crate) enum OutlineError {
     MissingGlyphId(u16),
 }
 
+impl From<OutlineError> for TextOutlineError {
+    fn from(error: OutlineError) -> Self {
+        match error {
+            OutlineError::InvalidFont => Self::UnreadableFace,
+            OutlineError::MissingGlyphId(glyph_id) => Self::MissingGlyphId(glyph_id),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use bevy::math::Vec2;
+
+    use super::Contour;
     use super::OutlineError;
+    use super::load_glyph_by_id_from_face;
+    use super::mark_islands;
+    use crate::render::ContourRole;
+    use crate::render::QuadraticSegment;
+
+    fn line(start: (f32, f32), end: (f32, f32)) -> QuadraticSegment {
+        let start = Vec2::from(start);
+        let end = Vec2::from(end);
+        QuadraticSegment {
+            start,
+            control: start.midpoint(end),
+            end,
+        }
+    }
+
+    fn curve(start: (f32, f32), control: (f32, f32), end: (f32, f32)) -> QuadraticSegment {
+        QuadraticSegment {
+            start:   Vec2::from(start),
+            control: Vec2::from(control),
+            end:     Vec2::from(end),
+        }
+    }
+
+    fn contour(segments: Vec<QuadraticSegment>) -> Contour {
+        Contour {
+            segments,
+            minimum_feature_size: 0.0,
+            fade_exponent: 0.0,
+            role: ContourRole::Ink,
+        }
+    }
+
+    fn square(min: (f32, f32), max: (f32, f32), clockwise: bool) -> Contour {
+        let (left, bottom) = min;
+        let (right, top) = max;
+        let points = if clockwise {
+            [(left, bottom), (left, top), (right, top), (right, bottom)]
+        } else {
+            [(left, bottom), (right, bottom), (right, top), (left, top)]
+        };
+        contour(
+            (0..4)
+                .map(|index| line(points[index], points[(index + 1) % 4]))
+                .collect(),
+        )
+    }
+
+    fn ring_with(candidate: Contour) -> Vec<Contour> {
+        vec![
+            square((0.0, 0.0), (100.0, 100.0), false),
+            square((20.0, 20.0), (80.0, 80.0), true),
+            candidate,
+        ]
+    }
+
+    #[test]
+    fn curved_lens_inside_counter_is_an_island() {
+        let lens = contour(vec![
+            curve((40.0, 50.0), (50.0, 30.0), (60.0, 50.0)),
+            curve((60.0, 50.0), (50.0, 70.0), (40.0, 50.0)),
+        ]);
+        let mut contours = ring_with(lens);
+        mark_islands(&mut contours, 100.0);
+        assert!(matches!(contours[2].role, ContourRole::Island { .. }));
+    }
+
+    #[test]
+    fn island_touching_another_contour_at_a_point_stays_ink() {
+        let mut contours = ring_with(square((40.0, 40.0), (50.0, 50.0), false));
+        contours.push(square((50.0, 50.0), (60.0, 60.0), false));
+        mark_islands(&mut contours, 100.0);
+        assert_eq!(contours[2].role, ContourRole::Ink);
+    }
+
+    #[test]
+    fn island_tangent_to_another_contour_stays_ink() {
+        let mut contours = ring_with(square((40.0, 40.0), (60.0, 60.0), false));
+        contours.push(contour(vec![
+            curve((65.0, 45.0), (55.0, 50.0), (65.0, 55.0)),
+            line((65.0, 55.0), (65.0, 45.0)),
+        ]));
+        mark_islands(&mut contours, 100.0);
+        assert_eq!(contours[2].role, ContourRole::Ink);
+    }
+
+    #[test]
+    fn island_crossing_another_contour_stays_ink() {
+        let mut contours = ring_with(square((40.0, 40.0), (50.0, 50.0), false));
+        contours.push(square((45.0, 45.0), (55.0, 55.0), false));
+        mark_islands(&mut contours, 100.0);
+        assert_eq!(contours[2].role, ContourRole::Ink);
+    }
+
+    #[test]
+    fn curve_bulging_out_between_samples_stays_ink() {
+        let counter = contour(vec![
+            line((20.0, 20.0), (20.0, 80.0)),
+            curve((20.0, 80.0), (50.0, 120.0), (80.0, 80.0)),
+            line((80.0, 80.0), (80.0, 20.0)),
+            line((80.0, 20.0), (20.0, 20.0)),
+        ]);
+        let candidate = contour(vec![
+            line((49.5, 99.06), (45.0, 30.0)),
+            line((45.0, 30.0), (55.0, 30.0)),
+            curve((55.0, 30.0), (52.25, 110.57), (49.5, 99.06)),
+        ]);
+        let mut contours = vec![
+            square((0.0, 0.0), (100.0, 110.0), false),
+            counter,
+            candidate,
+        ];
+        mark_islands(&mut contours, 100.0);
+        assert_eq!(contours[2].role, ContourRole::Ink);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "the embedded mono fixture must exist")]
+    fn real_isolated_glyph_features_keep_their_roles() {
+        const FONT: &[u8] = include_bytes!("../../../../assets/fonts/JetBrainsMono-Regular.ttf");
+        let face = ttf_parser::Face::parse(FONT, 0).expect("embedded mono face");
+        for character in ['0', 'Θ'] {
+            let id = face
+                .glyph_index(character)
+                .expect("glyph in embedded mono face");
+            let glyph =
+                load_glyph_by_id_from_face(FONT, 0, id.0, character).expect("glyph outline");
+            assert_eq!(
+                glyph
+                    .contours
+                    .iter()
+                    .filter(|contour| matches!(contour.role, ContourRole::Island { .. }))
+                    .count(),
+                1,
+                "{character} needs one island",
+            );
+        }
+        let id = face
+            .glyph_index('@')
+            .expect("at sign in embedded mono face");
+        let glyph = load_glyph_by_id_from_face(FONT, 0, id.0, '@').expect("at sign outline");
+        assert!(
+            glyph
+                .contours
+                .iter()
+                .all(|contour| contour.role == ContourRole::Ink)
+        );
+    }
 
     #[test]
     fn outline_error_messages_are_stable() {
@@ -62,7 +224,7 @@ mod tests {
 }
 
 /// Loads one glyph by resolved font face and glyph ID.
-pub(in crate::text::slug) fn load_glyph_by_id_from_face(
+pub(in crate::text) fn load_glyph_by_id_from_face(
     font_data: &[u8],
     face_index: u32,
     glyph_id: u16,
@@ -73,6 +235,28 @@ pub(in crate::text::slug) fn load_glyph_by_id_from_face(
     load_glyph_from_face(&face, glyph_id, character)
 }
 
+/// Visibility established while extracting an outline from a parsed face.
+#[derive(Debug)]
+pub(in crate::text::slug) enum GlyphOutline {
+    /// Extracted contours for a glyph that draws.
+    Visible(Glyph),
+    /// A blank or out-of-range glyph has no outline.
+    Invisible,
+}
+
+/// Extracts a glyph once; blank and out-of-range glyphs retain explicit visibility.
+pub(in crate::text::slug) fn prepare_glyph_outline(
+    face: &Face<'_>,
+    glyph_id: u16,
+    character: char,
+) -> Result<GlyphOutline, OutlineError> {
+    match load_glyph_from_face(face, GlyphId(glyph_id), character) {
+        Ok(glyph) => Ok(GlyphOutline::Visible(glyph)),
+        Err(OutlineError::MissingGlyphId(_)) => Ok(GlyphOutline::Invisible),
+        Err(error) => Err(error),
+    }
+}
+
 /// Returns whether `glyph_id` can produce visible curve data.
 #[must_use]
 fn glyph_id_has_visible_outline(face: &Face<'_>, glyph_id: u16) -> bool {
@@ -81,7 +265,7 @@ fn glyph_id_has_visible_outline(face: &Face<'_>, glyph_id: u16) -> bool {
 
 /// Parses the face and returns whether `glyph_id` can produce visible curve
 /// data, for callers without an already-parsed [`Face`].
-pub(in crate::text::slug) fn font_glyph_id_has_visible_outline(
+pub(in crate::text) fn font_glyph_id_has_visible_outline(
     font_data: &[u8],
     face_index: u32,
     glyph_id: u16,
@@ -90,7 +274,8 @@ pub(in crate::text::slug) fn font_glyph_id_has_visible_outline(
     Ok(glyph_id_has_visible_outline(&face, glyph_id))
 }
 
-fn load_glyph_from_face(
+/// Loads an outline from an already parsed face.
+pub(in crate::text::slug) fn load_glyph_from_face(
     face: &Face<'_>,
     glyph_id: GlyphId,
     character: char,
@@ -99,13 +284,170 @@ fn load_glyph_from_face(
     let rect = face
         .outline_glyph(glyph_id, &mut builder)
         .ok_or(OutlineError::MissingGlyphId(glyph_id.0))?;
-    Ok(builder.finish(
+    let mut glyph = builder.finish(
         glyph_id,
         Bounds {
             min: Vec2::new(f32::from(rect.x_min), f32::from(rect.y_min)),
             max: Vec2::new(f32::from(rect.x_max), f32::from(rect.y_max)),
         },
-    ))
+    );
+    mark_islands(&mut glyph.contours, f32::from(face.units_per_em()));
+    Ok(glyph)
+}
+
+fn contour_bounds(contour: &Contour) -> Bounds {
+    let mut bounds = Bounds {
+        min: Vec2::splat(f32::INFINITY),
+        max: Vec2::splat(f32::NEG_INFINITY),
+    };
+    for segment in &contour.segments {
+        for point in [segment.start, segment.control, segment.end] {
+            bounds.min = bounds.min.min(point);
+            bounds.max = bounds.max.max(point);
+        }
+    }
+    bounds
+}
+
+fn contour_area(contour: &Contour) -> f32 {
+    contour
+        .segments
+        .iter()
+        .map(|segment| {
+            (2.0_f32 / 3.0).mul_add(
+                cross(segment.control - segment.start, segment.end - segment.start),
+                cross(segment.start, segment.end),
+            )
+        })
+        .sum()
+}
+
+fn segment_bounds(segment: QuadraticSegment) -> Bounds {
+    Bounds {
+        min: segment.start.min(segment.control).min(segment.end),
+        max: segment.start.max(segment.control).max(segment.end),
+    }
+}
+
+fn bounds_may_touch(left: Bounds, right: Bounds) -> bool {
+    let gap = (left.min - right.max)
+        .max(right.min - left.max)
+        .max(Vec2::ZERO);
+    gap.length_squared() <= ISLAND_CLEARANCE_FONT_UNITS * ISLAND_CLEARANCE_FONT_UNITS
+}
+
+fn split_quadratic(segment: QuadraticSegment) -> (QuadraticSegment, QuadraticSegment) {
+    let start_control = segment.start.midpoint(segment.control);
+    let control_end = segment.control.midpoint(segment.end);
+    let middle = start_control.midpoint(control_end);
+    (
+        QuadraticSegment {
+            start:   segment.start,
+            control: start_control,
+            end:     middle,
+        },
+        QuadraticSegment {
+            start:   middle,
+            control: control_end,
+            end:     segment.end,
+        },
+    )
+}
+
+fn curves_may_touch(left: QuadraticSegment, right: QuadraticSegment) -> bool {
+    let left_bounds = segment_bounds(left);
+    let right_bounds = segment_bounds(right);
+    if !bounds_may_touch(left_bounds, right_bounds) {
+        return false;
+    }
+    let left_size = left_bounds.width().max(left_bounds.height());
+    let right_size = right_bounds.width().max(right_bounds.height());
+    if left_size <= ISLAND_CLEARANCE_FONT_UNITS * HALF
+        && right_size <= ISLAND_CLEARANCE_FONT_UNITS * HALF
+    {
+        return true;
+    }
+    if left_size >= right_size {
+        let (first, second) = split_quadratic(left);
+        curves_may_touch(first, right) || curves_may_touch(second, right)
+    } else {
+        let (first, second) = split_quadratic(right);
+        curves_may_touch(left, first) || curves_may_touch(left, second)
+    }
+}
+
+fn contours_may_touch(
+    left: &Contour,
+    left_bounds: Bounds,
+    right: &Contour,
+    right_bounds: Bounds,
+) -> bool {
+    bounds_may_touch(left_bounds, right_bounds)
+        && left.segments.iter().any(|left_segment| {
+            right
+                .segments
+                .iter()
+                .any(|right_segment| curves_may_touch(*left_segment, *right_segment))
+        })
+}
+
+fn contour_contains(contour: &Contour, point: Vec2) -> bool {
+    let mut crossings = 0;
+    for segment in &contour.segments {
+        let mut before = segment.start;
+        for step in 1..=16_u8 {
+            let t = f32::from(step) / 16.0;
+            let after = sample_quadratic(*segment, t);
+            if (before.y > point.y) != (after.y > point.y)
+                && point.x
+                    < before.x + (point.y - before.y) * (after.x - before.x) / (after.y - before.y)
+            {
+                crossings += 1;
+            }
+            before = after;
+        }
+    }
+    crossings % 2 != 0
+}
+
+fn mark_islands(contours: &mut [Contour], em_size: f32) {
+    if contours.len() < 3 || em_size <= 0.0 {
+        return;
+    }
+    let bounds: Vec<_> = contours.iter().map(contour_bounds).collect();
+    let areas: Vec<_> = contours.iter().map(contour_area).collect();
+    let outer_sign = areas
+        .iter()
+        .copied()
+        .max_by(|a, b| a.abs().total_cmp(&b.abs()))
+        .unwrap_or(0.0)
+        .signum();
+    for index in 0..contours.len() {
+        if areas[index] * outer_sign <= 0.0 || contours[index].segments.is_empty() {
+            continue;
+        }
+        let island = bounds[index];
+        if contours.iter().enumerate().any(|(other_index, other)| {
+            other_index != index
+                && contours_may_touch(&contours[index], island, other, bounds[other_index])
+        }) {
+            continue;
+        }
+        let point = contours[index].segments[0].start;
+        let inside_counter = contours.iter().enumerate().any(|(parent_index, parent)| {
+            areas[parent_index] * outer_sign < 0.0
+                && point.x >= bounds[parent_index].min.x
+                && point.y >= bounds[parent_index].min.y
+                && point.x <= bounds[parent_index].max.x
+                && point.y <= bounds[parent_index].max.y
+                && contour_contains(parent, point)
+        });
+        if inside_counter {
+            contours[index].role = ContourRole::Island {
+                extent_em: Vec2::new(island.width(), island.height()) / em_size,
+            };
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -148,6 +490,7 @@ impl QuadraticOutlineBuilder {
             segments:             std::mem::take(&mut self.current),
             minimum_feature_size: 0.0,
             fade_exponent:        0.0,
+            role:                 ContourRole::Ink,
         });
         self.contour_start = None;
         self.current_point = None;

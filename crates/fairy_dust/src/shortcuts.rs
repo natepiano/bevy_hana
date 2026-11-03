@@ -26,6 +26,7 @@ use bevy::prelude::App;
 use bevy::prelude::ButtonInput;
 use bevy::prelude::Commands;
 use bevy::prelude::Entity;
+use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::KeyCode;
 use bevy::prelude::Query;
 use bevy::prelude::Res;
@@ -107,7 +108,7 @@ pub(crate) fn install(app: &mut App) {
     }
     app.insert_resource(ShortcutsInstalled);
     app.add_systems(Startup, assert_no_reserved_collisions);
-    app.add_systems(Update, run_shortcuts);
+    app.add_systems(Update, run_shortcuts.in_set(crate::TitleBarStateWriters));
 }
 
 /// Whether the window is free of a text editor, which is the condition every
@@ -238,7 +239,7 @@ fn assert_no_reserved_collisions(
         | ShortcutCollisionCheckAvailability::ReadyToCheck { .. } => {
             ShortcutCollisionCheckLifecycle::Complete
         },
-        ShortcutCollisionCheckAvailability::AwaitingRegistryAssembly
+        ShortcutCollisionCheckAvailability::AwaitingRegistry
         | ShortcutCollisionCheckAvailability::AuthoredBindingsUnavailable(_) => {
             ShortcutCollisionCheckLifecycle::WaitingForAuthoredBindings
         },
@@ -325,7 +326,7 @@ enum ShortcutCollisionCheckAvailability<'world> {
     /// No keymap plugin is installed, so no document can claim the key.
     NoKeymapPlugin,
     /// The keymap plugin is installed but command metadata is not ready yet.
-    AwaitingRegistryAssembly,
+    AwaitingRegistry,
     /// Authored keymap bindings cannot yet name a collision.
     AuthoredBindingsUnavailable(KeymapBindingUnavailability),
     /// Loaded command metadata and authored bindings can answer the question.
@@ -344,7 +345,7 @@ impl<'world> ShortcutCollisionCheckAvailability<'world> {
             return Self::NoKeymapPlugin;
         };
         let Some(command_registry) = command_registry else {
-            return Self::AwaitingRegistryAssembly;
+            return Self::AwaitingRegistry;
         };
         match keymap_bindings.authored() {
             AuthoredKeymapBindings::Unavailable(unavailability) => {
@@ -374,9 +375,9 @@ impl<'world> ShortcutCollisionCheckAvailability<'world> {
                 keymap_bindings,
             } => (command_registry, keymap_bindings),
             Self::NoKeymapPlugin => return ShortcutKeyClaim::Unclaimed,
-            Self::AwaitingRegistryAssembly => {
+            Self::AwaitingRegistry => {
                 warn!(
-                    "fairy_dust: example shortcut key {key:?} awaits command-registry assembly \
+                    "fairy_dust: example shortcut key {key:?} awaits the command registry \
                      before its authored-keymap collision check"
                 );
                 return ShortcutKeyClaim::Unclaimed;
@@ -512,7 +513,7 @@ mod tests {
     /// Builds the exact permanent-control `SprinkleBuilder::with_shortcut` mapping that the
     /// canonical example installs, with Fairy Dust's test-only headless baseline.
     fn permanent_context_control_builder() -> SprinkleBuilder<NoOrbitCam> {
-        let builder = SprinkleBuilder::<NoOrbitCam, AssetRootPending>::new(App::new());
+        let builder = SprinkleBuilder::<NoOrbitCam, AssetRootPending>::new(crate::test_app());
         let mut builder = with_context_state_shortcuts!(
             builder;
             enter_main_menu,
@@ -554,7 +555,7 @@ mod tests {
     /// Builds the same registered command table and committed authored binding resource an
     /// application receives after Rubric finishes a valid default document.
     fn loaded_keymap_resources(defaults: &'static str) -> (CommandRegistry, KeymapBindings) {
-        let mut source = App::new();
+        let mut source = crate::test_app();
         crate::keymap::configure(&mut source, CommandPaletteKeymap::new(defaults));
         crate::keymap::install(&mut source);
         source.finish();
@@ -573,7 +574,7 @@ mod tests {
     /// Builds the pre-load shortcut state that has command metadata but cannot yet inspect an
     /// authored binding for collision.
     fn awaiting_authored_bindings_shortcut_app(command_registry: CommandRegistry) -> App {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<ShortcutRuns>();
         install(&mut app);
@@ -590,7 +591,7 @@ mod tests {
     /// field holds the window's IME lease, so the shortcut must not run.
     #[test]
     fn a_bound_key_does_not_fire_while_an_editor_holds_the_lease() {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.add_plugins(MinimalPlugins)
             .insert_resource(DiegeticTextMeasurer::default())
             .add_plugins(HeadlessDiegeticUiPlugin);
@@ -624,7 +625,7 @@ mod tests {
 
     #[test]
     fn same_capability_key_reservation_is_idempotent() {
-        let mut app = App::new();
+        let mut app = crate::test_app();
 
         reserve_key::<FirstCapability>(&mut app, KeyCode::KeyP, "first");
         reserve_key::<FirstCapability>(&mut app, KeyCode::KeyP, "first");
@@ -634,7 +635,7 @@ mod tests {
 
     #[test]
     fn different_capability_key_reservation_is_rejected() {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         reserve_key::<FirstCapability>(&mut app, KeyCode::KeyP, "first");
 
         let collision = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -855,7 +856,7 @@ mod tests {
     /// keymap as well.
     #[test]
     fn an_example_shortcut_on_a_bare_key_the_keymap_binds_is_rejected_at_startup() {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.init_resource::<ShortcutRegistrations>();
         app.init_resource::<ReservedKeys>();
         crate::keymap::configure(
@@ -881,7 +882,7 @@ mod tests {
     /// which would otherwise double-fire against the reserving capability.
     #[test]
     fn an_example_shortcut_on_a_reserved_key_is_rejected_at_startup() {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.init_resource::<ShortcutRegistrations>();
         reserve_key::<FirstCapability>(&mut app, KeyCode::KeyP, "first");
         let system_id = app.world_mut().register_system(|| {});

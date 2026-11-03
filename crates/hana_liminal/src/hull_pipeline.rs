@@ -1,5 +1,6 @@
 use bevy::ecs::system::SystemParamItem;
 use bevy::ecs::system::lifetimeless::SRes;
+use bevy::extract::sync_world::MainEntity;
 use bevy::mesh::MeshVertexAttributeId;
 use bevy::mesh::MeshVertexBufferLayoutRef;
 use bevy::pbr::MeshInputUniform;
@@ -18,7 +19,7 @@ use bevy::prelude::error;
 use bevy::shader::ShaderDefVal;
 use bevy_render::batching::GetBatchData;
 use bevy_render::batching::GetFullBatchData;
-use bevy_render::batching::gpu_preprocessing::IndirectParametersCpuMetadata;
+use bevy_render::batching::gpu_preprocessing::IndirectParametersMetadata;
 use bevy_render::batching::gpu_preprocessing::UntypedPhaseIndirectParametersBuffers;
 use bevy_render::mesh::RenderMesh;
 use bevy_render::mesh::allocator::MeshAllocator;
@@ -46,7 +47,6 @@ use bevy_render::render_resource::VertexAttribute;
 use bevy_render::render_resource::VertexFormat;
 use bevy_render::render_resource::binding_types;
 use bevy_render::renderer::RenderDevice;
-use bevy_render::sync_world::MainEntity;
 use nonmax::NonMaxU32;
 
 use super::constants::ATTRIBUTE_OUTLINE_NORMAL;
@@ -64,8 +64,8 @@ use super::constants::HULL_OUTLINE_INSTANCE_BIND_GROUP_LAYOUT_LABEL;
 use super::constants::HULL_OUTLINE_PIPELINE_LABEL;
 use super::constants::HULL_SHADER_HANDLE;
 use super::constants::MISSING_BATCH_SET_INDEX;
+use super::constants::OUTLINE_INSTANCE_BATCH_SIZE_SHADER_DEF;
 use super::constants::OUTLINE_NORMAL_SHADER_LOCATION;
-use super::constants::PER_OBJECT_BUFFER_BATCH_SIZE_SHADER_DEF;
 use super::indexing_mode::IndexingMode;
 use super::uniforms::OutlineUniform;
 
@@ -159,7 +159,7 @@ impl SpecializedMeshPipeline for HullPipeline {
         let mut shader_defs = vec![];
         if let Some(per_object_buffer_batch_size) = self.per_object_buffer_batch_size {
             shader_defs.push(ShaderDefVal::UInt(
-                PER_OBJECT_BUFFER_BATCH_SIZE_SHADER_DEF.into(),
+                OUTLINE_INSTANCE_BATCH_SIZE_SHADER_DEF.into(),
                 per_object_buffer_batch_size,
             ));
         }
@@ -197,6 +197,7 @@ impl SpecializedMeshPipeline for HullPipeline {
         };
 
         descriptor.fragment = Some(FragmentState {
+            constants: Vec::default(),
             shader: HULL_SHADER_HANDLE,
             shader_defs,
             entry_point: Some(FRAGMENT_SHADER_ENTRY_POINT.into()),
@@ -264,6 +265,7 @@ impl GetBatchData for HullPipeline {
                 current_skin_index,
                 None,
                 Some(mesh_instance.tag()),
+                None,
             ),
             Some(((), mesh_instance.mesh_asset_id())),
         ))
@@ -314,6 +316,7 @@ impl GetFullBatchData for HullPipeline {
             current_skin_index,
             None,
             Some(mesh_instance.tag()),
+            None,
         ))
     }
 
@@ -337,9 +340,13 @@ impl GetFullBatchData for HullPipeline {
         phase_indirect_parameters_buffers: &mut UntypedPhaseIndirectParametersBuffers,
         indirect_parameters_offset: u32,
     ) {
-        let indirect_parameters = IndirectParametersCpuMetadata {
+        let indirect_parameters = IndirectParametersMetadata {
             base_output_index,
             batch_set_index: batch_set_index.map_or(MISSING_BATCH_SET_INDEX, u32::from),
+            // Filled by GPU preprocessing, as in Bevy's mesh pipeline.
+            mesh_index: 0,
+            early_instance_count: 0,
+            late_instance_count: 0,
         };
 
         IndexingMode::from(indexed).write_metadata(

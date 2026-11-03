@@ -10,23 +10,30 @@ mod indexing_mode;
 mod mask;
 mod mask_pipeline;
 mod node;
+mod occlusion;
 mod outline;
 mod outline_builder;
+mod outline_depth;
 mod outline_normals;
 mod propagation;
 mod queue;
 mod render;
+#[cfg(test)]
+mod shader_variants;
 mod shaders;
 mod texture;
 mod uniforms;
 mod view;
 
+use bevy::camera::CameraUpdateSystems;
 use bevy::core_pipeline::Core3d;
 use bevy::core_pipeline::Core3dSystems;
+use bevy::core_pipeline::core_3d::main_opaque_pass_3d;
+use bevy::extract::ExtractSchedule;
+use bevy::extract::extract_component::ExtractComponentPlugin;
 use bevy::pbr;
 use bevy::pbr::MeshPipelineSystems;
 use bevy::prelude::App;
-use bevy::prelude::ExtractSchedule;
 use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::Plugin;
 use bevy::prelude::PostUpdate;
@@ -36,7 +43,6 @@ use bevy_render::RenderApp;
 use bevy_render::RenderDebugFlags;
 use bevy_render::RenderStartup;
 use bevy_render::RenderSystems;
-use bevy_render::extract_component::ExtractComponentPlugin;
 use bevy_render::render_phase::AddRenderCommand;
 use bevy_render::render_phase::BinnedRenderPhasePlugin;
 use bevy_render::render_phase::DrawFunctions;
@@ -55,6 +61,9 @@ use mask::HullOutlinePhase;
 use mask::JumpFloodOutlinePhase;
 use mask_pipeline::MeshMaskPipeline;
 use node::outline_pass;
+use occlusion::TranslucentDepthPhase;
+use occlusion::TranslucentDepthPipeline;
+use occlusion::TranslucentOccluders;
 pub use outline::LineStyle;
 pub use outline::NoOutline;
 pub use outline::Outline;
@@ -68,9 +77,13 @@ pub use outline_builder::OutlineBuilder;
 pub use outline_builder::OutlineModeState;
 pub use outline_builder::ScreenHullState;
 pub use outline_builder::WorldHullState;
+pub use outline_depth::OutlineDepthTest;
+pub use outline_depth::OutlineDepthTestPlugin;
+pub use outline_depth::OutlineDepthTexture;
 pub use outline_normals::generate_outline_normals;
 use render::DrawHull;
 use render::DrawOutline;
+use render::DrawTranslucentDepth;
 use render::HullOutlineBindGroup;
 use render::HullOutlineUniformBuffer;
 use render::OutlineBindGroup;
@@ -84,7 +97,8 @@ impl Plugin for LiminalPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins((
             ShaderPlugin,
-            ExtractComponentPlugin::<OutlineCamera>::default(),
+            ExtractComponentPlugin::<OutlineCamera, RenderApp>::default(),
+            ExtractComponentPlugin::<OutlineDepthTexture, RenderApp>::default(),
         ));
 
         // Propagation observers
@@ -100,12 +114,19 @@ impl Plugin for LiminalPlugin {
 
         // Change detection for propagated outlines
         app.add_systems(PostUpdate, propagation::sync_propagated_outlines);
+        app.add_systems(
+            PostUpdate,
+            outline_depth::prepare_camera_outline_depth.after(CameraUpdateSystems),
+        );
 
         // Ensure the main pass depth texture has TEXTURE_BINDING so the compose
         // shader can sample it for correct occlusion of transmissive/transparent geometry.
         app.add_observer(camera::configure_outline_camera_depth_texture);
 
         app.add_plugins((
+            BinnedRenderPhasePlugin::<occlusion::TranslucentDepthPhase, MeshMaskPipeline>::new(
+                RenderDebugFlags::default(),
+            ),
             BinnedRenderPhasePlugin::<JumpFloodOutlinePhase, MeshMaskPipeline>::new(
                 RenderDebugFlags::default(),
             ),
@@ -114,7 +135,14 @@ impl Plugin for LiminalPlugin {
             ),
         ));
 
-        app.sub_app_mut(RenderApp)
+        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+            return;
+        };
+        render_app
+            .init_resource::<DrawFunctions<TranslucentDepthPhase>>()
+            .init_resource::<ViewBinnedRenderPhases<TranslucentDepthPhase>>()
+            .init_resource::<TranslucentOccluders>()
+            .init_resource::<SpecializedMeshPipelines<TranslucentDepthPipeline>>()
             .init_resource::<DrawFunctions<JumpFloodOutlinePhase>>()
             .init_resource::<DrawFunctions<HullOutlinePhase>>()
             .init_resource::<SpecializedMeshPipelines<MeshMaskPipeline>>()
@@ -136,6 +164,7 @@ impl Plugin for LiminalPlugin {
                 ExtractSchedule,
                 (
                     extract::extract_outline_uniforms,
+                    occlusion::extract_translucent_occluders,
                     view::update_views.after(pbr::extract_skins),
                 ),
             )
@@ -145,13 +174,14 @@ impl Plugin for LiminalPlugin {
                     extract::update_active_outline_modes
                         .in_set(RenderSystems::Queue)
                         .before(RenderSystems::QueueMeshes),
+                    queue::queue_translucent_depth.in_set(RenderSystems::QueueMeshes),
                     queue::queue_outline.in_set(RenderSystems::QueueMeshes),
                     queue::queue_hull_outline.in_set(RenderSystems::QueueMeshes),
                     render::prepare_outline_buffer.in_set(RenderSystems::PrepareResources),
                     render::prepare_hull_outline_buffer.in_set(RenderSystems::PrepareResources),
                     (
                         flood::prepare_flood_settings,
-                        texture::prepare_flood_textures,
+                        texture::prepare_flood_textures.run_if(texture::flood_textures_are_needed),
                         render::prepare_outline_bind_group.after(texture::prepare_flood_textures),
                         render::prepare_hull_outline_bind_group,
                         render::prepare_hull_depth_view_bind_groups
@@ -160,11 +190,20 @@ impl Plugin for LiminalPlugin {
                         .in_set(RenderSystems::PrepareBindGroups),
                 ),
             )
+            .add_render_command::<TranslucentDepthPhase, DrawTranslucentDepth>()
             .add_render_command::<JumpFloodOutlinePhase, DrawOutline>()
             .add_render_command::<HullOutlinePhase, DrawHull>()
             // Run after the main pass and before bloom (`Core3dSystems::PostProcess`),
             // matching the former `EndMainPass -> OutlineNode -> Bloom` render-graph edges.
             .add_systems(Core3d, outline_pass.in_set(Core3dSystems::EarlyPostProcess));
+        render_app.add_systems(
+            Core3d,
+            // GPU preprocessing and indirect-parameter preparation finish before
+            // MainPass. The mask needs those meshes, then must precede overlays.
+            node::outline_mask_pass
+                .in_set(Core3dSystems::MainPass)
+                .before(main_opaque_pass_3d),
+        );
     }
 
     fn finish(&self, app: &mut App) {
@@ -189,6 +228,7 @@ impl Plugin for LiminalPlugin {
 /// Initializes the outline pipelines that clone `MeshPipeline`. Runs in `RenderStartup`
 /// after `MeshPipelineSystems` so the `MeshPipeline` resource already exists.
 fn init_outline_pipelines(world: &mut World) {
+    world.init_resource::<TranslucentDepthPipeline>();
     world.init_resource::<MeshMaskPipeline>();
     world.init_resource::<HullPipeline>();
 }

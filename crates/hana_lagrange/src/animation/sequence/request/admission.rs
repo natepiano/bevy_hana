@@ -29,6 +29,7 @@ use crate::animation::lifecycle::AnimationConflictPolicy;
 use crate::animation::lifecycle::FreeFlightControllerOverrideRestoration;
 use crate::animation::lifecycle::OrbitControllerOverrideRestoration;
 use crate::animation::sequence::CameraSequence;
+use crate::fit::AdmittedFitBounds;
 use crate::fit::ZoomBegin;
 
 /// The queries final facade admission reads and writes.
@@ -292,7 +293,10 @@ impl CameraRequestAdmission<'_, '_> {
             }
         }
         if let CameraFitTargetEffect::Set(target) = request.effects.fit_target {
-            commands.entity(camera).insert(CurrentFitTarget(target));
+            commands.entity(camera).insert((
+                CurrentFitTarget(target),
+                AdmittedFitBounds(request.bounds.clone()),
+            ));
         }
         if let PreparedCameraProjectionEffect::SetOrthographicScale(scale) = projection
             && let Ok(mut camera_projection) = self.projections.p1().get_mut(camera)

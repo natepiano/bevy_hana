@@ -81,9 +81,9 @@ use super::palette_binding_presentation;
 /// The mutually exclusive command content states one palette rebuild can render.
 pub(super) enum PalettePresentationInput<'view, 'registry, 'keymap, 'context> {
     /// No `CommandRegistry` exists yet, so no shared query can run.
-    AwaitingRegistryAssembly,
+    AwaitingRegistry,
     /// One borrowed query result from the live registry and its complete context observation.
-    AssembledQuery {
+    RegistryReady {
         /// What the query resolved to, which sets the row the query highlights and the status
         /// line.
         selection_outcome: PaletteSelectionOutcome<'registry>,
@@ -128,7 +128,7 @@ pub(super) fn palette_tree_for_query(
 ) -> LayoutTree {
     palette_tree(&PaletteView {
         query,
-        presentation_input: PalettePresentationInput::AssembledQuery {
+        presentation_input: PalettePresentationInput::RegistryReady {
             selection_outcome: query_result.selection(),
             row_cursor,
             command_rows: query_result.rows(),
@@ -159,14 +159,14 @@ pub(super) const fn command_row_list(
     }
 }
 
-pub(super) fn palette_tree_awaiting_assembly(
+pub(super) fn palette_tree_awaiting_registry(
     query: &str,
     keymap_failures: &[KeymapFailureRow],
     panel_width: f32,
 ) -> LayoutTree {
     palette_tree(&PaletteView {
         query,
-        presentation_input: PalettePresentationInput::AwaitingRegistryAssembly,
+        presentation_input: PalettePresentationInput::AwaitingRegistry,
         keymap_failure_rows: keymap_failures,
         panel_width,
     })
@@ -350,6 +350,7 @@ fn build_query_field(builder: &mut LayoutBuilder, view: &PaletteView<'_, '_, '_,
             .editable_field(
                 FIELD_ID,
                 ImeEditableFieldSpec::AppOwned(ImeAppOwnedFieldSpec::new(FIELD_ID)),
+                style.clone(),
             )
             .editor_text(EditorStateColors::new().focused(FIELD_TEXT_COLOR))
             .editor_selection(EditorStateColors::new().focused(FIELD_SELECTION_COLOR))
@@ -377,12 +378,12 @@ fn build_command_rows(builder: &mut LayoutBuilder, view: &PaletteView<'_, '_, '_
             .height(Sizing::FIT)
             .gap(PANEL_ROW_GAP),
         |builder| match &view.presentation_input {
-            PalettePresentationInput::AwaitingRegistryAssembly => build_note_row(
+            PalettePresentationInput::AwaitingRegistry => build_note_row(
                 builder,
                 String::from("Command palette is starting; declared commands will appear shortly."),
                 FAILURE_ADVISORY_COLOR,
             ),
-            PalettePresentationInput::AssembledQuery {
+            PalettePresentationInput::RegistryReady {
                 selection_outcome,
                 row_cursor,
                 command_rows,
@@ -541,7 +542,6 @@ const fn selection_status(selection: PaletteSelectionOutcome<'_>) -> SelectionSt
 mod tests {
     use std::path::PathBuf;
 
-    use bevy::prelude::App;
     use bevy::prelude::States;
     use bevy::prelude::Window;
     use bevy::state::app::AppExtStates;
@@ -577,7 +577,7 @@ mod tests {
     use super::failure_line;
     use super::palette_panel_origin;
     use super::palette_panel_width;
-    use super::palette_tree_awaiting_assembly;
+    use super::palette_tree_awaiting_registry;
     use super::palette_tree_for_query;
     use super::selection_status;
     use crate::command_palette;
@@ -779,7 +779,7 @@ mod tests {
     /// The tree that proves app-owned failure rows can render before Rubric has
     /// assembled a registry to query.
     fn awaiting_tree(keymap_failures: &[KeymapFailureRow]) -> LayoutTree {
-        palette_tree_awaiting_assembly("", keymap_failures, PANEL_MAX_WIDTH)
+        palette_tree_awaiting_registry("", keymap_failures, PANEL_MAX_WIDTH)
     }
 
     /// Builds one tree from the public borrowed query result, keeping it local
@@ -803,7 +803,7 @@ mod tests {
     }
 
     fn awaiting_context() -> ActiveKeymapContext {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.add_plugins(
             KeymapPlugin::new().with_state_dimension::<AbsentPaletteContext>("palette"),
         );
@@ -814,7 +814,7 @@ mod tests {
     }
 
     fn unavailable_context() -> ActiveKeymapContext {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.add_plugins(
             KeymapPlugin::new()
                 .with_state_dimension::<AbsentPaletteContext>("zebra")
@@ -828,7 +828,7 @@ mod tests {
     }
 
     fn resolved_context() -> ActiveKeymapContext {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.add_plugins(StatesPlugin)
             .insert_state(PaletteApplicationContext::Ready)
             .insert_state(PaletteInteractionContext::Editing)
@@ -1088,7 +1088,7 @@ mod tests {
             )
         );
 
-        let mut application_recovery_app = App::new();
+        let mut application_recovery_app = crate::test_app();
         application_recovery_app.add_plugins(
             KeymapPlugin::new()
                 .with_defaults(crate::keymap::FAIRY_DUST_DEFAULT_KEYMAP)
@@ -1109,7 +1109,7 @@ mod tests {
         );
 
         assert!(bound.contains("ctrl-shift-r"));
-        assert!(unbound.contains("Open Command Palette"));
+        assert!(unbound.contains("Open command palette"));
         assert!(!unbound.contains("ctrl-shift-r"));
         assert!(application_recovery.contains(&format!(
             "protected {}",
@@ -1129,7 +1129,7 @@ mod tests {
         );
         let held = format!("{:?}", shared_tree(HELD_COMMAND_ID, keymap_bindings));
 
-        assert!(empty.contains("Open Command Palette"));
+        assert!(empty.contains("Cycle camera preset"));
         assert!(selected.contains(DISPATCH_COMMAND_TITLE));
         assert!(no_match.contains("No command matches this text."));
         assert!(held.contains("That command is hold-to-act"));
@@ -1148,7 +1148,7 @@ mod tests {
         );
 
         assert!(awaiting.contains("Command palette is starting"));
-        assert!(assembled.contains("Open Command Palette"));
+        assert!(assembled.contains("Cycle camera preset"));
         assert_ne!(awaiting, assembled);
     }
 }

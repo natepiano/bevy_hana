@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::time::Duration;
 
 use bevy::ecs::query::QueryData;
 use bevy::ecs::query::QueryEntityError;
@@ -24,6 +25,7 @@ use bevy::prelude::Remove;
 use bevy::prelude::Res;
 use bevy::prelude::ResMut;
 use bevy::prelude::Resource;
+use bevy::prelude::Time;
 use bevy::prelude::Window;
 use bevy::prelude::WindowPosition;
 use bevy::prelude::With;
@@ -64,6 +66,7 @@ use crate::WindowRevealDisposition;
 use crate::constants::FIRST_DUPLICATE_SUFFIX;
 use crate::constants::MANAGED_WINDOW_NAME_SEPARATOR;
 use crate::constants::PRIMARY_WINDOW_KEY;
+use crate::constants::SETTLE_STABILITY_SECS;
 use crate::driver::WindowDriverId;
 use crate::driver::WindowRoleDriverState;
 use crate::monitors;
@@ -161,7 +164,7 @@ const fn recovery_policy(markers: RecoveryMarkersItem<'_, '_>) -> RecoveryPolicy
 }
 
 pub(crate) fn warn_conflicting_recovery_markers(
-    added: On<Add, (RecoverOnReturn, RecoverOnRequest)>,
+    added: On<Add<(RecoverOnReturn, RecoverOnRequest)>>,
     managed: Query<(), With<ManagedWindow>>,
     conflicts: Query<(), (With<RecoverOnReturn>, With<RecoverOnRequest>)>,
     warned: Query<(), With<RecoveryMarkerConflictWarned>>,
@@ -399,11 +402,59 @@ pub(crate) fn sync_binding_window_monitor(
 #[reflect(Component)]
 pub(crate) struct WindowsWithRiggingRole(Vec<Entity>);
 
+/// The position evidence a reported cross-display move must hold before Clerestory adopts it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReportedWindowMoveRest {
+    last_observed_position:   ReadbackWindowPosition,
+    position_unchanged_since: Duration,
+}
+
+impl ReportedWindowMoveRest {
+    const fn from_window(window: &Window, observed_at: Duration) -> Self {
+        Self {
+            last_observed_position:   Self::position(window),
+            position_unchanged_since: observed_at,
+        }
+    }
+
+    const fn position(window: &Window) -> ReadbackWindowPosition {
+        match window.position {
+            WindowPosition::At(position) => ReadbackWindowPosition::Observed(position),
+            _ => ReadbackWindowPosition::Unavailable,
+        }
+    }
+
+    fn has_held_for_rest_window(&mut self, window: &Window, observed_at: Duration) -> bool {
+        let position = Self::position(window);
+        if position != self.last_observed_position {
+            self.last_observed_position = position;
+            self.position_unchanged_since = observed_at;
+            return false;
+        }
+        observed_at.saturating_sub(self.position_unchanged_since)
+            >= Duration::from_secs_f32(SETTLE_STABILITY_SECS)
+    }
+}
+
+fn window_display_rebind_is_ready(
+    rebind: &mut WindowDisplayRebindPending,
+    window: &Window,
+    observed_at: Duration,
+) -> bool {
+    let WindowDisplayRebindPending::ReportedMove(rest) = rebind else {
+        return true;
+    };
+    // A reported move costs one position comparison per frame per managed window while its
+    // marker is pending. Holding the marker prevents a mid-drag readback from authoring a
+    // placement the window has already left.
+    rest.has_held_for_rest_window(window, observed_at)
+}
+
 /// Marks a current-monitor change that still needs an exact live-device lookup.
 #[derive(Clone, Copy, Component, Debug, PartialEq, Eq)]
 pub(crate) enum WindowDisplayRebindPending {
     /// `CurrentMonitor` was reinserted for a window without [`ProvisionalCurrentMonitor`].
-    ReportedMove,
+    ReportedMove(ReportedWindowMoveRest),
     /// `CurrentMonitor` was reinserted while the window carries [`ProvisionalCurrentMonitor`], so
     /// the display change reflects where the window manager placed the window.
     AssociationCorrection,
@@ -411,15 +462,17 @@ pub(crate) enum WindowDisplayRebindPending {
 
 /// Defer display rebind work until reporter capabilities have been projected.
 pub(crate) fn queue_window_display_rebind(
-    current_monitor_added: On<Insert, CurrentMonitor>,
+    current_monitor_added: On<Insert<CurrentMonitor>>,
     windows: Query<(
+        &Window,
         Option<&ProvisionalCurrentMonitor>,
         Option<&WindowDisplayRebindPending>,
     )>,
+    time: Res<Time>,
     mut commands: Commands,
 ) {
     let entity = current_monitor_added.entity;
-    let Ok((provisional, pending)) = windows.get(entity) else {
+    let Ok((reported_window, provisional, pending)) = windows.get(entity) else {
         return;
     };
     let mut window = commands.entity(entity);
@@ -434,9 +487,14 @@ pub(crate) fn queue_window_display_rebind(
         },
         // A correction still waiting for its live-device lookup keeps its kind when a later
         // reinsertion lands before `rebind_window_to_its_current_display` reads it.
-        None if pending == Some(&WindowDisplayRebindPending::AssociationCorrection) => {},
+        None if matches!(
+            pending,
+            Some(WindowDisplayRebindPending::AssociationCorrection)
+        ) => {},
         None => {
-            window.insert(WindowDisplayRebindPending::ReportedMove);
+            window.insert(WindowDisplayRebindPending::ReportedMove(
+                ReportedWindowMoveRest::from_window(reported_window, time.elapsed()),
+            ));
         },
     }
 }
@@ -882,13 +940,13 @@ const fn window_binding(
 /// was dropped on.
 pub(crate) fn rebind_window_to_its_current_display(
     mut commands: Commands,
-    windows: Query<
+    mut windows: Query<
         (
             Entity,
             &Window,
             &CurrentMonitor,
             &WindowRiggingRole,
-            &WindowDisplayRebindPending,
+            &mut WindowDisplayRebindPending,
             Has<PrimaryWindow>,
         ),
         With<WindowBindingAuthoring>,
@@ -901,10 +959,16 @@ pub(crate) fn rebind_window_to_its_current_display(
     resolved_devices: Query<&ResolvedToDevice>,
     persisted: Res<PersistedWindowPlacements>,
     monitors: Res<Monitors>,
+    time: Res<Time>,
     mut bindings: ResMut<Bindings>,
     mut stranded: ResMut<StrandedWindowMovementBaselines>,
 ) {
-    for (entity, window, current_monitor, window_rigging_role, rebind, primary) in &windows {
+    for (entity, window, current_monitor, window_rigging_role, mut rebind, primary) in &mut windows
+    {
+        if !window_display_rebind_is_ready(&mut rebind, window, time.elapsed()) {
+            continue;
+        }
+        let rebind = *rebind;
         let role_source = if primary {
             WindowBindingRoleSource::Primary
         } else {
@@ -976,7 +1040,7 @@ pub(crate) fn rebind_window_to_its_current_display(
         let first_restore = if existing.last_known_good().is_err() && !stranded.is_tracked(&role) {
             first_restore_rebind(
                 &role,
-                *rebind,
+                rebind,
                 role_statuses.get(window_rigging_role.entity()).ok(),
                 &persisted,
                 &monitors,
@@ -1067,13 +1131,13 @@ fn first_restore_rebind(
             ))
         },
         WindowDisplayRebindPending::AssociationCorrection => FirstRestoreRebind::KeepSavedEndpoint,
-        WindowDisplayRebindPending::ReportedMove
+        WindowDisplayRebindPending::ReportedMove(_)
             if status
                 .is_some_and(|status| matches!(status.view(), RoleStatusView::Applying { .. })) =>
         {
             FirstRestoreRebind::KeepSavedEndpoint
         },
-        WindowDisplayRebindPending::ReportedMove => FirstRestoreRebind::ReadBack,
+        WindowDisplayRebindPending::ReportedMove(_) => FirstRestoreRebind::ReadBack,
     }
 }
 
@@ -1295,7 +1359,7 @@ pub(crate) fn window_for_role_entity(world: &World, role_entity: Entity) -> Opti
 /// The marker and the name each trigger this, so the pair arriving together registers once and a
 /// name inserted after the marker still registers.
 pub(crate) fn on_managed_window_added(
-    add: On<Add, (ManagedWindow, ManagedWindowName)>,
+    add: On<Add<(ManagedWindow, ManagedWindowName)>>,
     mut commands: Commands,
     mut names: Query<&mut ManagedWindowName>,
     mut registry: ResMut<ManagedWindowRegistry>,
@@ -1347,7 +1411,7 @@ pub(crate) fn on_managed_window_added(
 
 /// Retire the kernel role when a managed window lifetime ends.
 pub(crate) fn on_managed_window_removed(
-    remove: On<Remove, (ManagedWindow, ManagedWindowName)>,
+    remove: On<Remove<(ManagedWindow, ManagedWindowName)>>,
     mut commands: Commands,
     mut registry: ResMut<ManagedWindowRegistry>,
     primary_windows: Query<(), With<PrimaryWindow>>,
@@ -1401,7 +1465,7 @@ pub(crate) fn on_managed_window_removed(
 /// unregistered window has `window:primary` and nothing else, so losing the marker leaves it with
 /// no role at all and Clerestory takes back everything it attached, management included.
 pub(crate) fn on_primary_window_removed(
-    remove: On<Remove, PrimaryWindow>,
+    remove: On<Remove<PrimaryWindow>>,
     mut commands: Commands,
     registry: Res<ManagedWindowRegistry>,
     bindings: Res<Bindings>,
@@ -1450,7 +1514,7 @@ pub(crate) fn on_primary_window_removed(
 
 /// Remove the proof source when relationship cleanup stops a window from being an output.
 pub(crate) fn on_window_rigging_role_removed(
-    remove: On<Remove, WindowRiggingRole>,
+    remove: On<Remove<WindowRiggingRole>>,
     mut commands: Commands,
 ) {
     let window = remove.entity;
@@ -1620,7 +1684,7 @@ mod tests {
     }
 
     fn record_recovery_marker_warning(
-        _added: On<Add, RecoveryMarkerConflictWarned>,
+        _added: On<Add<RecoveryMarkerConflictWarned>>,
         mut warnings: ResMut<RecoveryMarkerWarnings>,
     ) {
         warnings.0 += 1;
@@ -2429,7 +2493,7 @@ mod tests {
         let despawned = app.world_mut().despawn(entity);
         assert!(despawned);
         app.update();
-        assert!(app.world().resource::<RetiredRoles>().0.is_empty());
+        assert_eq!(app.world().resource::<RetiredRoles>().0, []);
     }
 
     #[test]

@@ -2,8 +2,8 @@
 //!
 //! Each material source keeps one `MaterialSlotId` while it exists. Producers
 //! update that row while building records, and removed sources wait two frames
-//! before their rows can be reused. A replacement GPU buffer is prepared for
-//! one render frame before batch materials bind it.
+//! before their rows can be reused. A replacement GPU buffer is prepared and
+//! bound with the records that need it in the same frame.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -14,6 +14,8 @@ use std::time::Instant;
 
 use bevy::asset::AssetEventSystems;
 use bevy::color::Color;
+use bevy::extract::Extract;
+use bevy::extract::ExtractSchedule;
 use bevy::log::warn_once;
 use bevy::pbr::MeshMaterial3d;
 use bevy::pbr::StandardMaterial;
@@ -28,7 +30,6 @@ use bevy::prelude::Entity;
 use bevy::prelude::Handle;
 use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::LinearRgba;
-use bevy::prelude::Mat3;
 use bevy::prelude::Or;
 use bevy::prelude::Plugin;
 use bevy::prelude::PostUpdate;
@@ -44,11 +45,9 @@ use bevy::prelude::Vec2;
 use bevy::prelude::Vec3;
 use bevy::prelude::Vec4;
 use bevy::prelude::With;
+use bevy::prelude::debug;
 use bevy::prelude::default;
-use bevy::prelude::info;
 use bevy::prelude::warn;
-use bevy::render::Extract;
-use bevy::render::ExtractSchedule;
 use bevy::render::Render;
 use bevy::render::RenderApp;
 use bevy::render::RenderSystems;
@@ -62,6 +61,8 @@ use bevy::render::renderer::RenderQueue;
 use bevy::render::storage::GpuShaderBuffer;
 use bevy::render::storage::ShaderBuffer;
 use bevy::render::texture::GpuImage;
+use bytemuck::Pod;
+use bytemuck::Zeroable;
 use hana_kana::ToF32;
 use hana_kana::ToU32;
 use hana_kana::ToUsize;
@@ -74,7 +75,10 @@ use super::batch_key::ResourceCompatibility;
 use super::fill_batch::SdfMaterialRole;
 use super::fill_batch::SdfMaterialSourceKey;
 use super::image_material::ImageExtendedMaterial;
+#[cfg(test)]
+use super::panel_geometry::SdfSourcePart;
 use super::panel_shapes::PanelShapeRenderKey;
+use crate::constants::DIAGNOSTIC_LOG_TARGET;
 use crate::panel::DiegeticPerfStats;
 use crate::panel::LifetimeTotal;
 use crate::text::RunStorageKey;
@@ -207,7 +211,8 @@ pub(crate) enum MaterialSlotIdError {
 }
 
 /// Opaque GPU record row id for SDF fill and border material references.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, ShaderType)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, ShaderType, Pod, Zeroable)]
 pub(crate) struct GpuMaterialSlotId {
     /// Raw row index or `INVALID_GPU_MATERIAL_SLOT` sentinel stored in GPU records.
     raw: u32,
@@ -268,7 +273,8 @@ impl SdfPaintMaterial {
 /// scalar fields without a depth-map resource, lightmap exposure, and
 /// feature-gated texture-channel values whose textures are absent remain
 /// deferred until a render-family design intentionally consumes them.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Reflect, ShaderType)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Reflect, ShaderType, Pod, Zeroable)]
 pub(crate) struct MaterialSlotValues {
     /// `StandardMaterialUniform::base_color` read by material-table shaders.
     pub base_color:                     Vec4,
@@ -277,7 +283,7 @@ pub(crate) struct MaterialSlotValues {
     /// `StandardMaterialUniform::attenuation_color` read by PBR table sampling.
     pub attenuation_color:              Vec4,
     /// `StandardMaterialUniform::uv_transform` composed with element-local box UVs.
-    pub uv_transform:                   Mat3,
+    pub uv_transform:                   [Vec4; 3],
     /// `StandardMaterialUniform::reflectance`, the Bevy-computed specular tint.
     pub reflectance:                    Vec3,
     /// `StandardMaterialUniform::roughness` table value.
@@ -300,6 +306,8 @@ pub(crate) struct MaterialSlotValues {
     pub clearcoat_perceptual_roughness: f32,
     /// `StandardMaterialUniform::anisotropy_strength` table value.
     pub anisotropy_strength:            f32,
+    /// Initializes the gap before the eight-byte-aligned anisotropy vector.
+    padding:                            f32,
     /// `StandardMaterialUniform::anisotropy_rotation` as Bevy's computed unit vector.
     pub anisotropy_rotation:            Vec2,
 }
@@ -307,7 +315,7 @@ pub(crate) struct MaterialSlotValues {
 impl MaterialSlotValues {
     /// Builds the frame-table row from a fully classified Bevy material uniform.
     #[must_use]
-    const fn from_standard_material_uniform(uniform: StandardMaterialUniform) -> Self {
+    fn from_standard_material_uniform(uniform: StandardMaterialUniform) -> Self {
         let StandardMaterialUniform {
             base_color,
             emissive,
@@ -338,7 +346,11 @@ impl MaterialSlotValues {
             base_color,
             emissive,
             attenuation_color,
-            uv_transform,
+            uv_transform: [
+                uv_transform.x_axis.extend(0.0),
+                uv_transform.y_axis.extend(0.0),
+                uv_transform.z_axis.extend(0.0),
+            ],
             reflectance,
             roughness,
             metallic,
@@ -350,6 +362,7 @@ impl MaterialSlotValues {
             clearcoat,
             clearcoat_perceptual_roughness,
             anisotropy_strength,
+            padding: 0.0,
             anisotropy_rotation,
         }
     }
@@ -542,18 +555,58 @@ impl FrameMaterialTable {
         rows
     }
 
-    fn encoded_rows(&self, capacity: u32) -> Vec<u8> {
-        ShaderBuffer::from(self.padded_rows(capacity))
-            .data
-            .unwrap_or_default()
+    fn upload_bytes(&self, capacity: u32) -> Vec<u8> {
+        bytemuck::cast_slice(&self.padded_rows(capacity)).to_vec()
     }
+}
+
+/// Whether a retained material-table slot is available or names a live source.
+#[derive(Clone, Copy, Debug, Default)]
+enum MaterialSlotOccupancy {
+    /// No live source owns this slot.
+    #[default]
+    Vacant,
+    /// The slot belongs to this material source.
+    Occupied(MaterialSourceKey),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct MaterialSlotEntry {
-    source:     Option<MaterialSourceKey>,
-    values:     MaterialSlotValues,
-    seen_frame: u64,
+    occupancy:       MaterialSlotOccupancy,
+    values:          MaterialSlotValues,
+    published_frame: u64,
+}
+
+/// Producer-local lifetime boundary for retained material rows.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum MaterialRetentionScope {
+    /// All rows owned by one panel's SDF surfaces.
+    SdfPanel(Entity),
+    /// The row owned by one prepared text run.
+    TextRun(RunStorageKey),
+    /// The row owned by one retained panel-line record.
+    PanelLine(PanelShapeRenderKey),
+    /// Rows whose producers still publish every frame.
+    FramePublished,
+}
+
+impl MaterialSourceKey {
+    const fn retention_scope(self) -> MaterialRetentionScope {
+        match self {
+            Self::Sdf(key) => MaterialRetentionScope::SdfPanel(key.panel),
+            Self::Text(key) => MaterialRetentionScope::TextRun(key),
+            Self::PanelLine(key) => MaterialRetentionScope::PanelLine(key),
+            Self::AnalyticLine(_) | Self::Measurement(_) => MaterialRetentionScope::FramePublished,
+            #[cfg(test)]
+            Self::TestSdf(_) => MaterialRetentionScope::FramePublished,
+            #[cfg(test)]
+            Self::TestText(_) => MaterialRetentionScope::FramePublished,
+            #[cfg(test)]
+            Self::TestPanelLine(_) => MaterialRetentionScope::FramePublished,
+            #[cfg(test)]
+            Self::Test(_) => MaterialRetentionScope::FramePublished,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -573,10 +626,13 @@ pub(super) struct FrameMaterialTableBuilder {
     /// records extracted in earlier frames still read the values they were
     /// built with.
     retired:           VecDeque<RetiredMaterialSlot>,
-    /// New source identities rejected by the active GPU capacity.
+    /// New source identities rejected by the device row limit.
     rejected:          HashSet<MaterialSourceKey>,
     /// New assignments made during the current producer-update window.
     new_assignments:   Vec<(MaterialSourceKey, MaterialSlotId)>,
+    /// Producer scopes refreshed this frame. Unrefreshed scopes retain their
+    /// rows while their batching system sleeps.
+    refreshed_scopes:  HashSet<MaterialRetentionScope>,
     /// Maximum row count allowed by the current storage-buffer capacity limit.
     row_limit:         u32,
     /// Current retained-table frame number.
@@ -598,6 +654,7 @@ impl Default for FrameMaterialTableBuilder {
             retired:                        VecDeque::new(),
             rejected:                       HashSet::new(),
             new_assignments:                Vec::new(),
+            refreshed_scopes:               HashSet::new(),
             row_limit:                      INVALID_GPU_MATERIAL_SLOT - 1,
             frame:                          0,
             frozen:                         false,
@@ -616,6 +673,9 @@ impl FrameMaterialTableBuilder {
         self.trim_reusable_tail();
         self.rejected.clear();
         self.new_assignments.clear();
+        self.refreshed_scopes.clear();
+        self.refreshed_scopes
+            .insert(MaterialRetentionScope::FramePublished);
         self.frozen = false;
         self.dropped_records = 0;
         #[cfg(test)]
@@ -638,7 +698,7 @@ impl FrameMaterialTableBuilder {
         if let Some(slot) = self.source_slots.get(&source).copied() {
             let entry = &mut self.entries[slot.as_u32().to_usize()];
             entry.values = values;
-            entry.seen_frame = self.frame;
+            entry.published_frame = self.frame;
             return FrameMaterialSlotAppend::Appended(slot);
         }
 
@@ -660,9 +720,9 @@ impl FrameMaterialTableBuilder {
         };
         let entry = &mut self.entries[slot.as_u32().to_usize()];
         *entry = MaterialSlotEntry {
-            source: Some(source),
+            occupancy: MaterialSlotOccupancy::Occupied(source),
             values,
-            seen_frame: self.frame,
+            published_frame: self.frame,
         };
         self.source_slots.insert(source, slot);
         self.new_assignments.push((source, slot));
@@ -679,6 +739,24 @@ impl FrameMaterialTableBuilder {
     /// Marks the current new-assignment count for a producer transaction.
     #[must_use]
     pub(super) const fn assignment_checkpoint(&self) -> usize { self.new_assignments.len() }
+
+    /// Marks one panel's SDF row set as republished this frame.
+    pub(super) fn refresh_sdf_panel(&mut self, panel: Entity) {
+        self.refreshed_scopes
+            .insert(MaterialRetentionScope::SdfPanel(panel));
+    }
+
+    /// Marks one text run's row as republished or removed this frame.
+    pub(super) fn refresh_text_run(&mut self, run: RunStorageKey) {
+        self.refreshed_scopes
+            .insert(MaterialRetentionScope::TextRun(run));
+    }
+
+    /// Marks one retained panel-line material row as republished or removed.
+    pub(super) fn refresh_panel_line(&mut self, key: PanelShapeRenderKey) {
+        self.refreshed_scopes
+            .insert(MaterialRetentionScope::PanelLine(key));
+    }
 
     /// Returns the retained row extent.
     #[must_use]
@@ -706,7 +784,7 @@ impl FrameMaterialTableBuilder {
             "FrameMaterialTableBuilder::freeze called more than once in one frame"
         );
         self.frozen = true;
-        self.retire_unseen_sources();
+        self.retire_unpublished_sources();
         FrameMaterialTable {
             rows:      self.entries.iter().map(|entry| entry.values).collect(),
             live_rows: self.source_slots.len(),
@@ -733,12 +811,14 @@ impl FrameMaterialTableBuilder {
         self.retired.remove(index).map(|retired| retired.slot)
     }
 
-    fn retire_unseen_sources(&mut self) {
+    fn retire_unpublished_sources(&mut self) {
         let stale: Vec<_> = self
             .source_slots
             .iter()
             .filter_map(|(source, slot)| {
-                (self.entries[slot.as_u32().to_usize()].seen_frame != self.frame)
+                let entry = &self.entries[slot.as_u32().to_usize()];
+                (self.refreshed_scopes.contains(&source.retention_scope())
+                    && entry.published_frame != self.frame)
                     .then_some((*source, *slot))
             })
             .collect();
@@ -757,7 +837,11 @@ impl FrameMaterialTableBuilder {
             let Some(last_index) = self.entries.len().checked_sub(1) else {
                 return;
             };
-            if self.entries[last_index].source.is_some() {
+            if let MaterialSlotOccupancy::Occupied(source) = self.entries[last_index].occupancy {
+                debug_assert_eq!(
+                    self.source_slots.get(&source),
+                    Some(&MaterialSlotId(last_index.to_u32()))
+                );
                 return;
             }
             let raw = last_index.to_u32();
@@ -809,11 +893,6 @@ impl FrameMaterialTableBuild {
     /// Starts the frame's append window using the configured row cap.
     fn clear(&mut self) { self.builder.clear(self.row_limit); }
 
-    /// Starts a frame capped by the active GPU buffer while preserving the device cap.
-    fn clear_with_active_capacity(&mut self, capacity: u32) {
-        self.builder.clear(capacity.min(self.row_limit));
-    }
-
     /// Updates the storage-buffer-derived row cap used by the next clear.
     fn set_row_limit(&mut self, row_limit: u32) {
         self.row_limit = row_limit.min(INVALID_GPU_MATERIAL_SLOT - 1);
@@ -842,9 +921,9 @@ impl FrameMaterialTableBuild {
     #[must_use]
     fn required_row_count(&self) -> u32 { self.builder.required_row_count() }
 
-    fn encode_upload(&mut self, capacity: u32) {
+    fn prepare_upload(&mut self, capacity: u32) {
         let start = Instant::now();
-        self.upload_data = self.table.encoded_rows(capacity);
+        self.upload_data = self.table.upload_bytes(capacity);
         self.last_upload = start.elapsed();
     }
 }
@@ -859,33 +938,62 @@ fn material_table_capacity(required_rows: u32, row_limit: u32) -> u32 {
         .min(row_limit.max(1))
 }
 
-const fn should_prepare_larger_buffer(required_rows: u32, capacity: u32) -> bool {
-    required_rows >= capacity
+const fn should_grow_material_table_buffer(required_rows: u32, capacity: u32) -> bool {
+    required_rows > capacity
 }
 
-#[derive(Clone, Debug)]
-struct PendingMaterialTableBuffer {
-    handle:   Handle<ShaderBuffer>,
-    capacity: u32,
+/// GPU allocation state for the retained material table.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Reflect)]
+enum MaterialTableAllocation {
+    /// No shader buffer has been allocated yet.
+    #[default]
+    Unallocated,
+    /// This shader buffer stores the retained table.
+    Allocated(Handle<ShaderBuffer>),
 }
 
-/// Main-world material-table storage-buffer handle and capacity.
+impl MaterialTableAllocation {
+    const fn handle(&self) -> Option<&Handle<ShaderBuffer>> {
+        match self {
+            Self::Unallocated => None,
+            Self::Allocated(handle) => Some(handle),
+        }
+    }
+}
+
+/// Whether batch materials are bound to the current table allocation.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Reflect)]
+enum MaterialTableBinding {
+    /// No table allocation has been written to this binding.
+    #[default]
+    Unbound,
+    /// This allocation is the one currently written to the binding.
+    Bound(Handle<ShaderBuffer>),
+}
+
+impl MaterialTableBinding {
+    fn matches(&self, handle: &Handle<ShaderBuffer>) -> bool {
+        matches!(self, Self::Bound(bound) if bound == handle)
+    }
+}
+
+/// Main-world material-table storage-buffer allocation and binding state.
 #[derive(Clone, Debug, Default, Reflect, Resource)]
 #[reflect(Resource)]
 pub(super) struct MaterialTableBuffer {
-    /// Shader buffer asset handle registered on batch materials.
-    #[reflect(ignore)]
-    pub handle:      Option<Handle<ShaderBuffer>>,
-    /// Row capacity represented by `handle`.
+    /// Shader-buffer allocation that stores table rows.
+    allocation:      MaterialTableAllocation,
+    /// Row capacity represented by `allocation`.
     pub capacity:    u32,
     /// Buffer assets allocated for table growth events, since startup.
     pub allocations: LifetimeTotal,
-    /// Table-buffer handle last rebound into all registered path materials.
-    #[reflect(ignore)]
-    bound_handle:    Option<Handle<ShaderBuffer>>,
-    /// Larger buffer created after the activation boundary and bound there next frame.
-    #[reflect(ignore)]
-    pending:         Option<PendingMaterialTableBuffer>,
+    /// Allocation last rebound into all registered batch materials.
+    binding:         MaterialTableBinding,
+}
+
+impl MaterialTableBuffer {
+    #[cfg(test)]
+    pub(super) const fn handle(&self) -> Option<&Handle<ShaderBuffer>> { self.allocation.handle() }
 }
 
 /// Render-world copy of the frame table and current buffer handle.
@@ -899,11 +1007,11 @@ struct ExtractedFrameMaterialTable {
             reason = "Phase 3 record extraction reads material rows from this render-world resource"
         )
     )]
-    table:  FrameMaterialTable,
-    /// Current table buffer handle already rebound into batch materials.
-    handle: Option<Handle<ShaderBuffer>>,
+    table:      FrameMaterialTable,
+    /// Current table-buffer allocation already rebound into batch materials.
+    allocation: MaterialTableAllocation,
     /// Encoded capacity-sized payload written after `GpuShaderBuffer` preparation.
-    data:   Vec<u8>,
+    data:       Vec<u8>,
 }
 
 /// One path batch material registered for material-table rebinding.
@@ -911,16 +1019,13 @@ struct ExtractedFrameMaterialTable {
 struct RegisteredPathMaterial {
     /// Batch material handle.
     #[reflect(ignore)]
-    material:     Handle<PathExtendedMaterial>,
-    /// Table-buffer handle last written to `PathExtension::material_table`.
-    #[reflect(ignore)]
-    bound_handle: Option<Handle<ShaderBuffer>>,
+    material: Handle<PathExtendedMaterial>,
+    /// Table-buffer allocation last written to `PathExtension::material_table`.
+    binding:  MaterialTableBinding,
 }
 
 impl RegisteredPathMaterial {
-    fn needs_rebind(&self, handle: &Handle<ShaderBuffer>) -> bool {
-        self.bound_handle.as_ref() != Some(handle)
-    }
+    fn needs_rebind(&self, handle: &Handle<ShaderBuffer>) -> bool { !self.binding.matches(handle) }
 }
 
 /// One SDF batch material registered for material-table rebinding.
@@ -928,16 +1033,13 @@ impl RegisteredPathMaterial {
 struct RegisteredSdfMaterial {
     /// Batch material handle.
     #[reflect(ignore)]
-    material:     Handle<SdfExtendedMaterial>,
-    /// Table-buffer handle last written to `SdfExtension::material_table`.
-    #[reflect(ignore)]
-    bound_handle: Option<Handle<ShaderBuffer>>,
+    material: Handle<SdfExtendedMaterial>,
+    /// Table-buffer allocation last written to `SdfExtension::material_table`.
+    binding:  MaterialTableBinding,
 }
 
 impl RegisteredSdfMaterial {
-    fn needs_rebind(&self, handle: &Handle<ShaderBuffer>) -> bool {
-        self.bound_handle.as_ref() != Some(handle)
-    }
+    fn needs_rebind(&self, handle: &Handle<ShaderBuffer>) -> bool { !self.binding.matches(handle) }
 }
 
 /// Registered batch material handles that need table-buffer rebinding.
@@ -963,7 +1065,7 @@ impl BatchMaterialTableRegistry {
             Some(registered) if registered.material == material => {},
             Some(registered) => {
                 registered.material = material;
-                registered.bound_handle = None;
+                registered.binding = MaterialTableBinding::Unbound;
                 self.pending_rebind = true;
             },
             None => {
@@ -971,7 +1073,7 @@ impl BatchMaterialTableRegistry {
                     batch_entity,
                     RegisteredPathMaterial {
                         material,
-                        bound_handle: None,
+                        binding: MaterialTableBinding::Unbound,
                     },
                 );
                 self.pending_rebind = true;
@@ -985,7 +1087,7 @@ impl BatchMaterialTableRegistry {
             Some(registered) if registered.material == material => {},
             Some(registered) => {
                 registered.material = material;
-                registered.bound_handle = None;
+                registered.binding = MaterialTableBinding::Unbound;
                 self.pending_rebind = true;
             },
             None => {
@@ -993,7 +1095,7 @@ impl BatchMaterialTableRegistry {
                     batch_entity,
                     RegisteredSdfMaterial {
                         material,
-                        bound_handle: None,
+                        binding: MaterialTableBinding::Unbound,
                     },
                 );
                 self.pending_rebind = true;
@@ -1054,14 +1156,13 @@ pub(super) struct BatchResourcesReady;
 #[derive(SystemSet, Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct BatchAssetWrites;
 
+/// `PostUpdate` boundary that prepares storage for all production batch rows
+/// before [`AssetEventSystems`] extracts the new `ShaderBuffer`.
+#[derive(SystemSet, Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) struct MaterialTableBufferPrepared;
+
 /// `PostUpdate` boundary after which the frame material table is frozen.
-///
-/// A capacity-growth `ShaderBuffer` created in this set must remain in
-/// `MaterialTableBuffer::pending` until the following frame. This set has no
-/// ordering edge to `AssetEventSystems`, so binding a fresh handle here while
-/// batch materials still reference the old buffer uploads nothing and renders
-/// stale table rows. [`activate_prepared_material_table_buffer`] promotes the
-/// pending handle in [`MaterialTableAppendReady`] on the following frame.
+/// Row producers finish before the buffer-preparation boundary.
 #[derive(SystemSet, Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct MaterialTableUpdatedToCurrent;
 
@@ -1123,12 +1224,9 @@ impl RetainedBatchBufferUploads {
 pub(super) fn stage_retained_batch_buffer_upload(
     uploads: &mut RetainedBatchBufferUploads,
     handle: &Handle<ShaderBuffer>,
-    encoded: ShaderBuffer,
+    encoded: Vec<u8>,
 ) {
-    let Some(data) = encoded.data else {
-        return;
-    };
-    uploads.stage(handle, data);
+    uploads.stage(handle, encoded);
 }
 
 #[derive(Clone, Debug, Default, Resource)]
@@ -1154,13 +1252,17 @@ impl Plugin for MaterialTablePlugin {
                     BatchAssetWrites.before(AssetEventSystems),
                     MaterialTableAppendReady.before(TransformSystems::Propagate),
                     BatchResourcesReady.after(TransformSystems::Propagate),
-                    MaterialTableUpdatedToCurrent.after(BatchResourcesReady),
+                    MaterialTableBufferPrepared
+                        .after(BatchAssetWrites)
+                        .before(AssetEventSystems),
+                    MaterialTableUpdatedToCurrent
+                        .after(BatchResourcesReady)
+                        .after(MaterialTableBufferPrepared),
                 ),
             )
             .add_systems(
                 PostUpdate,
                 (
-                    activate_prepared_material_table_buffer,
                     clear_frame_material_table,
                     clear_retained_batch_buffer_uploads,
                 )
@@ -1174,9 +1276,16 @@ impl Plugin for MaterialTablePlugin {
             .add_systems(
                 PostUpdate,
                 (
-                    freeze_frame_material_table,
                     ensure_material_table_buffer_handle,
                     rebind_registered_material_table_buffers,
+                )
+                    .chain()
+                    .in_set(MaterialTableBufferPrepared),
+            )
+            .add_systems(
+                PostUpdate,
+                (
+                    freeze_frame_material_table,
                     encode_material_table_upload,
                     update_material_table_perf_stats,
                     warn_material_table_drops,
@@ -1231,27 +1340,18 @@ impl Plugin for MaterialTablePlugin {
     }
 }
 
-fn activate_prepared_material_table_buffer(mut table_buffer: ResMut<MaterialTableBuffer>) {
-    let Some(pending) = table_buffer.pending.take() else {
-        return;
-    };
-    table_buffer.handle = Some(pending.handle);
-    table_buffer.capacity = pending.capacity;
+pub(super) fn clear_frame_material_table(mut build: ResMut<FrameMaterialTableBuild>) {
+    build.clear();
 }
 
-pub(super) fn clear_frame_material_table(
-    mut build: ResMut<FrameMaterialTableBuild>,
-    table_buffer: Res<MaterialTableBuffer>,
+fn clear_retained_batch_buffer_uploads(
+    build: Res<FrameMaterialTableBuild>,
+    mut uploads: ResMut<RetainedBatchBufferUploads>,
 ) {
-    if table_buffer.handle.is_some() {
-        build.clear_with_active_capacity(table_buffer.capacity);
-    } else {
-        build.clear();
+    // Keep staged batches for retry if their material table could not be encoded.
+    if !build.upload_data.is_empty() {
+        uploads.clear();
     }
-}
-
-fn clear_retained_batch_buffer_uploads(mut uploads: ResMut<RetainedBatchBufferUploads>) {
-    uploads.clear();
 }
 
 fn freeze_frame_material_table(mut build: ResMut<FrameMaterialTableBuild>) {
@@ -1268,17 +1368,19 @@ fn ensure_material_table_buffer_handle(
     let required_rows = build
         .required_row_count()
         .max(build.table().row_count().to_u32());
-    if table_buffer.handle.is_none() {
+    if matches!(
+        table_buffer.allocation,
+        MaterialTableAllocation::Unallocated
+    ) {
         let capacity = material_table_capacity(required_rows, build.row_limit());
         let shader_buffer = ShaderBuffer::from(build.table().padded_rows(capacity));
-        table_buffer.handle = Some(storage_buffers.add(shader_buffer));
+        table_buffer.allocation =
+            MaterialTableAllocation::Allocated(storage_buffers.add(shader_buffer));
         table_buffer.capacity = capacity;
         table_buffer.allocations += 1;
         return;
     }
-    if table_buffer.pending.is_some()
-        || !should_prepare_larger_buffer(required_rows, table_buffer.capacity)
-    {
+    if !should_grow_material_table_buffer(required_rows, table_buffer.capacity) {
         return;
     }
     let capacity = material_table_capacity(
@@ -1291,10 +1393,9 @@ fn ensure_material_table_buffer_handle(
         return;
     }
     let shader_buffer = ShaderBuffer::from(build.table().padded_rows(capacity));
-    table_buffer.pending = Some(PendingMaterialTableBuffer {
-        handle: storage_buffers.add(shader_buffer),
-        capacity,
-    });
+    table_buffer.allocation =
+        MaterialTableAllocation::Allocated(storage_buffers.add(shader_buffer));
+    table_buffer.capacity = capacity;
     table_buffer.allocations += 1;
 }
 
@@ -1357,17 +1458,17 @@ fn rebind_registered_material_table_buffers(
     mut path_materials: ResMut<Assets<PathExtendedMaterial>>,
     sdf_materials: Option<ResMut<Assets<SdfExtendedMaterial>>>,
 ) {
-    let Some(handle) = table_buffer.handle.clone() else {
+    let Some(handle) = table_buffer.allocation.handle().cloned() else {
         return;
     };
-    if table_buffer.bound_handle.as_ref() == Some(&handle) && !registry.needs_rebind(&handle) {
+    if table_buffer.binding.matches(&handle) && !registry.needs_rebind(&handle) {
         return;
     }
     rebind_registered_path_materials(&mut registry, &handle, &mut path_materials);
     if let Some(mut sdf_materials) = sdf_materials {
         rebind_registered_sdf_materials(&mut registry, &handle, &mut sdf_materials);
     }
-    table_buffer.bound_handle = Some(handle);
+    table_buffer.binding = MaterialTableBinding::Bound(handle);
 }
 
 fn rebind_registered_path_materials(
@@ -1383,7 +1484,7 @@ fn rebind_registered_path_materials(
         }
         if let Some(mut material) = path_materials.get_mut(&registered.material) {
             super::set_path_material_table_buffer(&mut material, handle.clone());
-            registered.bound_handle = Some(handle.clone());
+            registered.binding = MaterialTableBinding::Bound(handle.clone());
             rebound += 1;
         } else {
             pending_rebind = true;
@@ -1406,7 +1507,7 @@ fn rebind_registered_sdf_materials(
         }
         if let Some(mut material) = sdf_materials.get_mut(&registered.material) {
             super::set_sdf_material_table_buffer(&mut material, handle.clone());
-            registered.bound_handle = Some(handle.clone());
+            registered.binding = MaterialTableBinding::Bound(handle.clone());
             rebound += 1;
         } else {
             pending_rebind = true;
@@ -1421,11 +1522,18 @@ fn encode_material_table_upload(
     table_buffer: Res<MaterialTableBuffer>,
 ) {
     build.last_upload = Duration::ZERO;
-    if table_buffer.handle.is_none() {
+    build.upload_data.clear();
+    if matches!(
+        table_buffer.allocation,
+        MaterialTableAllocation::Unallocated
+    ) {
+        return;
+    }
+    if build.table().row_count() > table_buffer.capacity.to_usize() {
         return;
     }
     let capacity = table_buffer.capacity.max(DEFAULT_TABLE_CAPACITY);
-    build.encode_upload(capacity);
+    build.prepare_upload(capacity);
 }
 
 fn update_material_table_perf_stats(
@@ -1447,7 +1555,8 @@ fn warn_material_table_drops(build: Res<FrameMaterialTableBuild>) {
     let drops = build.dropped_record_count();
     if drops > 0 {
         warn!(
-            material_table.dropped_records = drops,
+            target: DIAGNOSTIC_LOG_TARGET,
+            { material_table.dropped_records = drops },
             "material table row limit dropped render records this frame"
         );
     }
@@ -1459,18 +1568,23 @@ fn extract_frame_material_table(
     table_buffer: Extract<Res<MaterialTableBuffer>>,
 ) {
     commands.insert_resource(ExtractedFrameMaterialTable {
-        table:  build.table().clone(),
-        handle: table_buffer.handle.clone(),
-        data:   build.upload_data.clone(),
+        table:      build.table().clone(),
+        allocation: table_buffer.allocation.clone(),
+        data:       build.upload_data.clone(),
     });
 }
 
 fn extract_retained_batch_buffer_uploads(
     mut commands: Commands,
+    build: Extract<Res<FrameMaterialTableBuild>>,
     uploads: Extract<Res<RetainedBatchBufferUploads>>,
 ) {
     commands.insert_resource(ExtractedRetainedBatchBufferUploads {
-        uploads: uploads.uploads.clone(),
+        uploads: if build.upload_data.is_empty() {
+            Vec::new()
+        } else {
+            uploads.uploads.clone()
+        },
     });
 }
 
@@ -1479,7 +1593,7 @@ fn upload_extracted_material_table(
     gpu_buffers: Res<RenderAssets<GpuShaderBuffer>>,
     render_queue: Res<RenderQueue>,
 ) {
-    let Some(handle) = extracted.handle.as_ref() else {
+    let Some(handle) = extracted.allocation.handle() else {
         return;
     };
     let Some(gpu_buffer) = gpu_buffers.get(handle) else {
@@ -1500,11 +1614,11 @@ fn upload_extracted_retained_batch_buffers(
         let Some(gpu_buffer) = gpu_buffers.get(&upload.handle) else {
             continue;
         };
-        if upload.data.len() as u64 != gpu_buffer.buffer_descriptor.size {
+        if upload.data.len() as u64 != gpu_buffer.buffer.size() {
             warn_once!(
-                "retained batch upload size {} did not match GPU buffer size {} for {:?}",
+                target: DIAGNOSTIC_LOG_TARGET, "retained batch upload size {} did not match GPU buffer size {} for {:?}",
                 upload.data.len(),
-                gpu_buffer.buffer_descriptor.size,
+                gpu_buffer.buffer.size(),
                 upload.handle.id(),
             );
             continue;
@@ -1601,7 +1715,7 @@ fn emit_material_table_measurements() -> Vec<MaterialTableMeasurement> {
         measure_material_table_scenario("stress_mixed", STRESS_MEASUREMENT_ENTRIES),
     ];
     for measurement in &measurements {
-        info!(
+        debug!(
             material_table.scenario = measurement.scenario,
             material_table.sampled_frames = measurement.sampled_frames,
             material_table.rows = measurement.rows,
@@ -1727,33 +1841,49 @@ fn synthetic_color(index: usize) -> Color {
 )]
 mod tests {
     use bevy::app::SubApp;
+    use bevy::asset::AssetApp;
     use bevy::asset::AssetPlugin;
+    use bevy::asset::AssetServer;
     use bevy::camera::visibility::VisibilityPlugin;
     use bevy::ecs::schedule::NodeId;
     use bevy::ecs::schedule::Schedule;
     use bevy::ecs::schedule::Schedules;
     use bevy::ecs::schedule::SystemSet;
+    use bevy::ecs::system::Local;
+    use bevy::gizmos::GizmoAsset;
     use bevy::math::Affine2;
+    use bevy::math::Vec2;
     use bevy::pbr::MaterialPlugin;
     use bevy::prelude::AlphaMode;
+    use bevy::prelude::Image;
     use bevy::prelude::IntoSystemSet;
+    use bevy::prelude::Mesh;
     use bevy::prelude::MinimalPlugins;
     use bevy::prelude::Update;
     use bevy::prelude::World;
     use bevy::render::render_resource::Face;
     use bevy::render::render_resource::ShaderType;
+    use bevy::shader::Shader;
 
     use super::*;
+    use crate::DiegeticPanel;
+    use crate::DiegeticUiPlugin;
+    use crate::LayoutBuilder;
+    use crate::Mm;
+    use crate::TextStyle;
     use crate::render;
     use crate::render::AntiAlias;
     use crate::render::PathAtlasHandles;
     use crate::render::PathMaterialBuffers;
     use crate::render::RenderMode;
+    use crate::render::analytic_line_probe::AnalyticLine;
+    use crate::render::analytic_line_probe::AnalyticLineProbePlugin;
     use crate::render::batch_key::BatchAlphaMode;
     use crate::render::draw_order::ElementIndex;
     use crate::render::fill_batch::FillBatchPlugin;
     use crate::render::image_batch::ImageBatchPlugin;
     use crate::render::panel_shapes::PanelShapePlugin;
+    use crate::render::panel_text::DiegeticTextBatch;
     use crate::render::panel_text::TextRenderPlugin;
 
     const MATERIAL_SLOT_VALUES_SHADER_SIZE_BYTES: u64 = 160;
@@ -1779,6 +1909,38 @@ mod tests {
         "anisotropy_strength",
         "anisotropy_rotation",
     ];
+
+    #[test]
+    fn material_slot_values_direct_storage_matches_encase() -> Result<(), String> {
+        let material = material_with_values(7);
+        let images = RenderAssets::<GpuImage>::default();
+        let uniform: StandardMaterialUniform = material.as_bind_group_shader_type(&images);
+        let record = MaterialSlotValues::from(&material);
+        // The table keeps the uniform's first sixteen value fields, including
+        // its padded mat3 columns and the vec3/roughness shared lane.
+        let encoded = crate::render::encase_storage_bytes(&uniform)?;
+        assert_eq!(bytemuck::bytes_of(&record), &encoded[..160]);
+        assert_eq!(size_of::<MaterialSlotValues>(), 160);
+        let records = vec![record, MaterialSlotValues::from(&material_with_values(11))];
+        assert_eq!(
+            bytemuck::cast_slice::<_, u8>(&records),
+            crate::render::encase_storage_bytes(&records)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gpu_material_slot_id_direct_storage_matches_encase() -> Result<(), String> {
+        let record = GpuMaterialSlotId::from(
+            MaterialSlotId::try_from(17).map_err(|error| format!("{error:?}"))?,
+        );
+        assert_eq!(
+            bytemuck::bytes_of(&record),
+            crate::render::encase_storage_bytes(&record)?
+        );
+        assert_eq!(size_of::<GpuMaterialSlotId>(), 4);
+        Ok(())
+    }
 
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
     enum ProducerKey {
@@ -1976,6 +2138,10 @@ mod tests {
             .system_sets
             .get_key(MaterialTableUpdatedToCurrent.intern())
             .expect("MaterialTableUpdatedToCurrent set should exist");
+        let buffer_set = graph
+            .system_sets
+            .get_key(MaterialTableBufferPrepared.intern())
+            .expect("MaterialTableBufferPrepared set should exist");
         let asset_event_set = graph
             .system_sets
             .get_key(AssetEventSystems.intern())
@@ -1988,6 +2154,16 @@ mod tests {
             graph
                 .dependency()
                 .contains_edge(NodeId::Set(batch_set), NodeId::Set(material_set))
+        );
+        assert!(
+            graph
+                .dependency()
+                .contains_edge(NodeId::Set(asset_write_set), NodeId::Set(buffer_set))
+        );
+        assert!(
+            graph
+                .dependency()
+                .contains_edge(NodeId::Set(buffer_set), NodeId::Set(asset_event_set))
         );
         assert!(
             graph
@@ -2204,6 +2380,34 @@ mod tests {
     }
 
     #[test]
+    fn sleeping_producer_retains_its_row_until_its_scope_is_refreshed() {
+        let mut builder = FrameMaterialTableBuilder::default();
+        let panel = Entity::from_bits(1);
+        let source = SdfMaterialSourceKey {
+            panel,
+            element: ElementIndex::default(),
+            source_part: SdfSourcePart::Element,
+            role: SdfMaterialRole::Fill,
+        };
+        let values = MaterialSlotValues::from(&material_with_values(1));
+
+        builder.clear(INVALID_GPU_MATERIAL_SLOT - 1);
+        let slot = builder.upsert_values(source.into(), values);
+        let painted = builder.freeze();
+
+        builder.clear(INVALID_GPU_MATERIAL_SLOT - 1);
+        let sleeping = builder.freeze();
+        assert_eq!(slot, FrameMaterialSlotAppend::Appended(MaterialSlotId(0)));
+        assert_eq!(sleeping.live_row_count(), painted.live_row_count());
+        assert_eq!(sleeping.rows(), painted.rows());
+
+        builder.clear(INVALID_GPU_MATERIAL_SLOT - 1);
+        builder.refresh_sdf_panel(panel);
+        let retired = builder.freeze();
+        assert_eq!(retired.live_row_count(), 0);
+    }
+
+    #[test]
     fn retired_slot_waits_two_frames_before_reuse() {
         let mut builder = FrameMaterialTableBuilder::default();
         let removed_source = MaterialSourceKey::TestSdf(1);
@@ -2313,18 +2517,18 @@ mod tests {
     }
 
     #[test]
-    fn spare_capacity_does_not_prepare_a_replacement_buffer() {
-        assert!(!should_prepare_larger_buffer(255, 256));
-        assert!(should_prepare_larger_buffer(256, 256));
+    fn spare_capacity_does_not_grow_the_buffer() {
+        assert!(!should_grow_material_table_buffer(255, 256));
+        assert!(!should_grow_material_table_buffer(256, 256));
     }
 
     #[test]
     fn growth_is_required_when_demand_exceeds_capacity() {
-        assert!(should_prepare_larger_buffer(257, 256));
+        assert!(should_grow_material_table_buffer(257, 256));
     }
 
     #[test]
-    fn larger_buffer_activates_at_the_next_frame_boundary() {
+    fn larger_buffer_activates_in_the_frame_that_needs_it() {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
             .insert_resource(Assets::<ShaderBuffer>::default())
@@ -2334,7 +2538,6 @@ mod tests {
             .add_systems(
                 Update,
                 (
-                    activate_prepared_material_table_buffer,
                     clear_frame_material_table,
                     write_test_material_rows,
                     freeze_frame_material_table,
@@ -2347,31 +2550,48 @@ mod tests {
         let first_handle = app
             .world()
             .resource::<MaterialTableBuffer>()
-            .handle
-            .clone()
+            .allocation
+            .handle()
+            .cloned()
             .expect("the first frame should create the active material table buffer");
         let first_capacity = app.world().resource::<MaterialTableBuffer>().capacity;
-        app.world_mut().resource_mut::<TestMaterialRows>().0 = first_capacity;
+        app.world_mut().resource_mut::<TestMaterialRows>().0 = first_capacity + 1;
 
         app.update();
         let table_buffer = app.world().resource::<MaterialTableBuffer>();
-        assert_eq!(table_buffer.handle.as_ref(), Some(&first_handle));
-        let pending_handle = table_buffer
-            .pending
-            .as_ref()
-            .map(|pending| pending.handle.clone())
-            .expect("the full-capacity frame should prepare a larger buffer");
-        assert_ne!(pending_handle, first_handle);
-
-        app.update();
-        let table_buffer = app.world().resource::<MaterialTableBuffer>();
-        assert_eq!(table_buffer.handle.as_ref(), Some(&pending_handle));
-        assert!(table_buffer.pending.is_none());
+        assert_ne!(table_buffer.allocation.handle(), Some(&first_handle));
         assert!(table_buffer.capacity > first_capacity);
+        assert_material_table_frame(&app, first_capacity + 1);
     }
 
     #[test]
-    fn growth_prepares_a_pending_handle_without_rebinding_the_active_buffer() {
+    fn active_buffer_handles_a_several_fold_burst_without_drops() {
+        let mut app = material_table_test_app();
+        app.insert_resource(TestMaterialRows(1)).add_systems(
+            Update,
+            (
+                clear_frame_material_table,
+                write_test_material_rows,
+                freeze_frame_material_table,
+                ensure_material_table_buffer_handle,
+                warn_material_table_drops,
+            )
+                .chain(),
+        );
+
+        app.update();
+        let initial_capacity = app.world().resource::<MaterialTableBuffer>().capacity;
+        let burst_rows = DEFAULT_TABLE_CAPACITY * 5;
+        assert!(burst_rows > initial_capacity);
+        app.world_mut().resource_mut::<TestMaterialRows>().0 = burst_rows;
+        app.update();
+
+        assert_material_table_frame(&app, burst_rows);
+        assert!(app.world().resource::<MaterialTableBuffer>().capacity >= burst_rows);
+    }
+
+    #[test]
+    fn growth_rebinds_the_current_frame_buffer() {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
             .insert_resource(Assets::<ShaderBuffer>::default())
@@ -2381,7 +2601,6 @@ mod tests {
             .add_systems(
                 Update,
                 (
-                    activate_prepared_material_table_buffer,
                     clear_frame_material_table,
                     write_test_material_rows,
                     freeze_frame_material_table,
@@ -2391,7 +2610,12 @@ mod tests {
             );
 
         app.update();
-        let active_handle = app.world().resource::<MaterialTableBuffer>().handle.clone();
+        let active_handle = app
+            .world()
+            .resource::<MaterialTableBuffer>()
+            .allocation
+            .handle()
+            .cloned();
         assert!(active_handle.is_some());
         let active_handle = active_handle.unwrap_or_default();
         let active_capacity = app.world().resource::<MaterialTableBuffer>().capacity;
@@ -2400,8 +2624,8 @@ mod tests {
         app.update();
 
         let table_buffer = app.world().resource::<MaterialTableBuffer>();
-        assert_eq!(table_buffer.handle.as_ref(), Some(&active_handle));
-        assert!(table_buffer.pending.is_some());
+        assert_ne!(table_buffer.allocation.handle(), Some(&active_handle));
+        assert_material_table_frame(&app, active_capacity + 1);
     }
 
     #[test]
@@ -2480,7 +2704,14 @@ mod tests {
         assert_eq!(values.base_color, uniform.base_color);
         assert_eq!(values.emissive, uniform.emissive);
         assert_eq!(values.attenuation_color, uniform.attenuation_color);
-        assert_eq!(values.uv_transform, uniform.uv_transform);
+        assert_eq!(
+            values.uv_transform,
+            [
+                uniform.uv_transform.x_axis.extend(0.0),
+                uniform.uv_transform.y_axis.extend(0.0),
+                uniform.uv_transform.z_axis.extend(0.0),
+            ]
+        );
         assert_eq!(values.reflectance, uniform.reflectance);
         assert_same_f32(values.roughness, uniform.roughness);
         assert_same_f32(values.metallic, uniform.metallic);
@@ -2558,7 +2789,10 @@ mod tests {
                 cull_mode,
                 ..default()
             };
-            assert_eq!(PipelineCompatibility::from(&material).cull_mode, cull_mode);
+            assert_eq!(
+                Option::<Face>::from(PipelineCompatibility::from(&material).cull_mode),
+                cull_mode
+            );
         }
     }
 
@@ -2601,20 +2835,36 @@ mod tests {
         count: u32,
     }
 
+    #[derive(Default)]
+    enum PanelRespawnPublication {
+        #[default]
+        Unpublished,
+        Published(Entity),
+    }
+
     fn write_panel_respawn_rows(
         keys: Res<PanelRespawnKeys>,
         mut build: ResMut<FrameMaterialTableBuild>,
+        mut publication: Local<PanelRespawnPublication>,
     ) {
         let values = MaterialSlotValues::from(&StandardMaterial::default());
+        let builder = build.builder_mut();
+        if let PanelRespawnPublication::Published(previous_panel) = *publication
+            && previous_panel != keys.panel
+        {
+            builder.refresh_sdf_panel(previous_panel);
+        }
+        builder.refresh_sdf_panel(keys.panel);
         for element_index in 0..keys.count.to_usize() {
             let source = SdfMaterialSourceKey {
-                panel:           keys.panel,
-                element:         ElementIndex::from(element_index),
-                divider_ordinal: None,
-                role:            SdfMaterialRole::Fill,
+                panel:       keys.panel,
+                element:     ElementIndex::from(element_index),
+                source_part: SdfSourcePart::Element,
+                role:        SdfMaterialRole::Fill,
             };
-            let _ = build.builder_mut().upsert_values(source.into(), values);
+            let _ = builder.upsert_values(source.into(), values);
         }
+        *publication = PanelRespawnPublication::Published(keys.panel);
     }
 
     #[test]
@@ -2757,13 +3007,16 @@ mod tests {
         let table = build.table().clone();
         let handle = Handle::<ShaderBuffer>::default();
         let extracted = ExtractedFrameMaterialTable {
-            table:  table.clone(),
-            handle: Some(handle),
-            data:   Vec::new(),
+            table:      table.clone(),
+            allocation: MaterialTableAllocation::Allocated(handle),
+            data:       Vec::new(),
         };
 
         assert_eq!(extracted.table.row_count(), 1);
-        assert_eq!(extracted.handle, Some(Handle::<ShaderBuffer>::default()));
+        assert_eq!(
+            extracted.allocation,
+            MaterialTableAllocation::Allocated(Handle::<ShaderBuffer>::default())
+        );
         assert_eq!(table.row_count(), extracted.table.row_count());
     }
 
@@ -2818,7 +3071,7 @@ mod tests {
             .path_materials
             .get(&entity)
             .expect("registered material should remain tracked");
-        assert_eq!(registered.bound_handle.as_ref(), Some(&handle));
+        assert!(registered.binding.matches(&handle));
     }
 
     #[test]
@@ -2873,16 +3126,87 @@ mod tests {
             snapshot
                 .append_ready
                 .iter()
-                .any(|name| name.contains("activate_prepared_material_table_buffer")),
-            "activate_prepared_material_table_buffer must promote a pending ShaderBuffer before producers append"
+                .any(|name| name.contains("clear_frame_material_table")),
+            "clear_frame_material_table must open the producer append window"
         );
+    }
+
+    fn assert_burst_materials_bound_before_asset_events(
+        build: Res<FrameMaterialTableBuild>,
+        table_buffer: Res<MaterialTableBuffer>,
+        storage_buffers: Res<Assets<ShaderBuffer>>,
+        registry: Res<BatchMaterialTableRegistry>,
+        path_materials: Res<Assets<PathExtendedMaterial>>,
+        sdf_materials: Res<Assets<SdfExtendedMaterial>>,
+        text_batches: Query<Entity, With<DiegeticTextBatch>>,
+    ) {
+        let rows = build.builder.entries.len();
+        assert_eq!(rows, (DEFAULT_TABLE_CAPACITY * 10).to_usize());
+        let handle = table_buffer
+            .allocation
+            .handle()
+            .expect("the grown table buffer exists");
+        assert!(storage_buffers.get(handle).is_some());
+        assert!(table_buffer.capacity.to_usize() >= rows);
+        assert!(!text_batches.is_empty());
+        for entity in &text_batches {
+            let registered = registry.path_materials.get(&entity);
+            assert!(
+                registered.is_some(),
+                "new text batches must be registered before asset events"
+            );
+        }
+        for registered in registry.path_materials.values() {
+            assert!(registered.binding.matches(handle));
+            assert!(path_materials.get(&registered.material).is_some());
+        }
+        for registered in registry.sdf_materials.values() {
+            assert!(registered.binding.matches(handle));
+            assert!(sdf_materials.get(&registered.material).is_some());
+        }
+    }
+
+    #[test]
+    fn burst_batches_bind_grown_table_before_asset_events() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<Shader>()
+            .init_asset::<Mesh>()
+            .init_asset::<GizmoAsset>()
+            .init_asset::<Image>()
+            .init_asset::<ShaderBuffer>()
+            .add_plugins((DiegeticUiPlugin, AnalyticLineProbePlugin))
+            .add_systems(
+                PostUpdate,
+                assert_burst_materials_bound_before_asset_events
+                    .after(MaterialTableBufferPrepared)
+                    .before(AssetEventSystems),
+            );
+
+        for index in 0..(DEFAULT_TABLE_CAPACITY * 5) {
+            let mut builder = LayoutBuilder::new(20.0, 5.0);
+            builder.text((format!("Run {index}"), TextStyle::new(2.0)));
+            let panel = DiegeticPanel::world()
+                .size(Mm(20.0), Mm(5.0))
+                .with_tree(builder.build())
+                .build()
+                .expect("burst panel should build");
+            app.world_mut().spawn(panel);
+            app.world_mut()
+                .spawn(AnalyticLine::new(Vec2::ZERO, Vec2::X));
+        }
+
+        app.update();
     }
 
     #[test]
     fn retained_gpu_writes_run_between_buffer_and_material_preparation() {
         let mut app = App::new();
-        app.add_plugins(AssetPlugin::default());
-        app.insert_sub_app(RenderApp, SubApp::new());
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<Shader>();
+        let mut render_app = SubApp::new();
+        render_app.insert_resource(app.world().resource::<AssetServer>().clone());
+        app.insert_sub_app(RenderApp, render_app);
         app.add_plugins((
             MaterialTablePlugin,
             MaterialPlugin::<PathExtendedMaterial>::default(),
@@ -2930,7 +3254,7 @@ mod tests {
             assert!(!bindings[index + 1..].contains(binding));
         }
 
-        let wgsl = include_str!("material_table.wgsl");
+        let wgsl = include_str!("material_table.wesl");
         assert!(wgsl.contains("const MATERIAL_TABLE_BINDING: u32 = 106u;"));
         assert!(wgsl.contains("const INVALID_GPU_MATERIAL_SLOT: u32 = 4294967295u;"));
     }
@@ -2945,7 +3269,7 @@ mod tests {
             StandardMaterialUniform::min_size().get(),
             STANDARD_MATERIAL_UNIFORM_SHADER_SIZE_BYTES
         );
-        let wgsl = include_str!("material_table.wgsl");
+        let wgsl = include_str!("material_table.wesl");
         assert_eq!(
             wgsl_material_slot_fields(wgsl),
             MATERIAL_SLOT_VALUES_WGSL_FIELDS

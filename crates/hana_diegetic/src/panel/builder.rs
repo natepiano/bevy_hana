@@ -73,6 +73,12 @@ pub enum PanelBuildError {
     /// A slider subtree marks more than one thumb.
     #[error("slider `{0}` contains more than one thumb")]
     SliderHasMultipleThumbs(PanelElementId),
+    /// A slider-fill marker sits outside every slider subtree.
+    #[error("slider fill `{0}` must be inside a slider subtree")]
+    SliderFillOutsideSlider(PanelElementId),
+    /// A slider subtree marks more than one fill.
+    #[error("slider `{0}` contains more than one fill")]
+    SliderHasMultipleFills(PanelElementId),
     /// A widget part named a state text color without emitting text itself.
     #[error("widget part `{0}` state text color requires text; add a text child")]
     StateTextColorRequiresText(PanelElementId),
@@ -197,26 +203,29 @@ pub struct Ready;
 
 #[derive(Default)]
 pub(super) struct BuilderData {
-    width:                      f32,
-    height:                     f32,
-    layout_unit:                Unit,
-    font_unit:                  Cascade<Unit>,
-    anchor:                     Option<Anchor>,
-    world_width:                Option<f32>,
-    world_height:               Option<f32>,
-    shadow_casting:             Cascade<ShadowCasting>,
-    widget_hovered_appearance:  Cascade<WidgetHoveredAppearance>,
-    widget_pressed_appearance:  Cascade<WidgetPressedAppearance>,
-    widget_focused_appearance:  Cascade<WidgetFocusedAppearance>,
-    widget_disabled_appearance: Cascade<WidgetDisabledAppearance>,
-    material:                   Cascade<Handle<StandardMaterial>>,
-    text_material:              Cascade<Handle<StandardMaterial>>,
-    shape_material:             Cascade<Handle<StandardMaterial>>,
-    text_alpha_mode:            Cascade<AlphaMode>,
-    hdr_text_coverage_bias:     Cascade<f32>,
-    picking:                    PanelPicking,
-    tree:                       Option<LayoutTree>,
-    coordinate_space:           CoordinateSpace,
+    width:                         f32,
+    height:                        f32,
+    layout_unit:                   Unit,
+    font_unit:                     Cascade<Unit>,
+    anchor:                        Option<Anchor>,
+    world_width:                   Option<f32>,
+    world_height:                  Option<f32>,
+    sdf_surface_depth_offset:      f32,
+    contain_sdf_surface:           bool,
+    shadow_casting:                Cascade<ShadowCasting>,
+    widget_hovered_appearance:     Cascade<WidgetHoveredAppearance>,
+    widget_pressed_appearance:     Cascade<WidgetPressedAppearance>,
+    widget_focused_appearance:     Cascade<WidgetFocusedAppearance>,
+    widget_disabled_appearance:    Cascade<WidgetDisabledAppearance>,
+    material:                      Cascade<Handle<StandardMaterial>>,
+    text_material:                 Cascade<Handle<StandardMaterial>>,
+    shape_material:                Cascade<Handle<StandardMaterial>>,
+    text_alpha_mode:               Cascade<AlphaMode>,
+    hdr_text_coverage_bias:        Cascade<f32>,
+    picking:                       PanelPicking,
+    single_click_field_activation: bool,
+    tree:                          Option<LayoutTree>,
+    coordinate_space:              CoordinateSpace,
 }
 
 /// Builder for [`DiegeticPanel`].
@@ -335,6 +344,13 @@ impl<M, S> DiegeticPanelBuilder<M, S> {
         self
     }
 
+    /// Opens an editable field on one click in a world panel.
+    #[must_use]
+    pub const fn single_click_field_activation(mut self) -> Self {
+        self.data.single_click_field_activation = true;
+        self
+    }
+
     /// Sets the default PBR material handle for backgrounds and borders.
     ///
     /// Create the handle once through `Assets<StandardMaterial>` and pass the
@@ -383,10 +399,10 @@ impl<M, S> DiegeticPanelBuilder<M, S> {
     /// Sets a panel-wide HDR text coverage bias inherited by text runs in this
     /// panel.
     ///
-    /// The default is `0.0`, which leaves the automatic screen-size adjustment
-    /// unchanged. Positive values add opacity to fractional glyph edges beyond
-    /// that adjustment, which can help dark text on light backgrounds under
-    /// HDR. Per-label
+    /// The default is `0.0`, which leaves each glyph's geometric coverage
+    /// unchanged at every size. Positive values add opacity to fractional glyph
+    /// edges, which can help dark text on light backgrounds under HDR.
+    /// Per-label
     /// [`TextStyle::with_hdr_text_coverage_bias`](crate::TextStyle::with_hdr_text_coverage_bias)
     /// still wins.
     #[must_use]
@@ -650,6 +666,24 @@ impl<S> DiegeticPanelBuilder<World, S> {
     #[must_use]
     pub const fn world_height(mut self, meters: f32) -> Self {
         self.data.world_height = Some(meters);
+        self
+    }
+
+    /// Moves the panel's rendered fill and border surfaces along local Z.
+    ///
+    /// The offset is measured in panel-local meters and does not move text,
+    /// shapes, or the panel's interaction surface.
+    #[must_use]
+    pub const fn sdf_surface_depth_offset(mut self, meters: f32) -> Self {
+        self.data.sdf_surface_depth_offset = meters;
+        self
+    }
+
+    /// Keeps rendered fill and border surfaces, including their exterior
+    /// anti-aliasing fringe, within the panel's authored layout bounds.
+    #[must_use]
+    pub const fn contain_sdf_surface(mut self) -> Self {
+        self.data.contain_sdf_surface = true;
         self
     }
 }
@@ -980,6 +1014,8 @@ fn build_panel(data: BuilderData) -> DiegeticPanel {
     panel.anchor = data.anchor.unwrap_or(Anchor::TopLeft);
     panel.world_width = data.world_width;
     panel.world_height = data.world_height;
+    panel.sdf_surface_depth_offset = data.sdf_surface_depth_offset;
+    panel.contain_sdf_surface = data.contain_sdf_surface;
     panel.shadow_casting = data.shadow_casting;
     panel.widget_hovered_appearance = data.widget_hovered_appearance;
     panel.widget_pressed_appearance = data.widget_pressed_appearance;
@@ -991,6 +1027,7 @@ fn build_panel(data: BuilderData) -> DiegeticPanel {
     panel.text_alpha_mode = data.text_alpha_mode;
     panel.hdr_text_coverage_bias = data.hdr_text_coverage_bias;
     panel.picking = data.picking;
+    panel.single_click_field_activation = data.single_click_field_activation;
     panel.coordinate_space = data.coordinate_space;
     panel
 }
@@ -1055,6 +1092,14 @@ mod tests {
             (
                 PanelBuildError::SliderHasMultipleThumbs(PanelElementId::named("volume")),
                 "slider `volume` contains more than one thumb",
+            ),
+            (
+                PanelBuildError::SliderFillOutsideSlider(PanelElementId::named("fill")),
+                "slider fill `fill` must be inside a slider subtree",
+            ),
+            (
+                PanelBuildError::SliderHasMultipleFills(PanelElementId::named("volume")),
+                "slider `volume` contains more than one fill",
             ),
             (
                 PanelBuildError::StateTintRequiresImage(PanelElementId::named("image")),
@@ -1210,7 +1255,7 @@ mod tests {
             .layout(|builder| {
                 builder.with(
                     El::new()
-                        .editable_field("name", field_spec())
+                        .editable_field("name", field_spec(), crate::TextStyle::new(10.0))
                         .focused(Appearance::new().border_color(Color::srgb(0.9, 0.8, 0.2))),
                     |_| {},
                 );
@@ -1314,9 +1359,12 @@ mod tests {
         let result = DiegeticPanel::world()
             .size(Mm(50.0), Mm(30.0))
             .layout(|builder| {
-                builder.with(El::new().editable_field("name", field_spec()), |builder| {
-                    builder.text(("v", style()));
-                });
+                builder.with(
+                    El::new().editable_field("name", field_spec(), crate::TextStyle::new(10.0)),
+                    |builder| {
+                        builder.text(("v", style()));
+                    },
+                );
                 builder.text(Text::new("dup", style()).id("name"));
             })
             .build();

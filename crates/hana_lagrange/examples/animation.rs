@@ -32,8 +32,8 @@ use std::f32::consts::TAU;
 use std::time::Duration;
 
 use bevy::color::LinearRgba;
+use bevy::curve::easing::EaseFunction;
 use bevy::ecs::schedule::IntoScheduleConfigs;
-use bevy::math::curve::easing::EaseFunction;
 use bevy::prelude::AlphaMode;
 use bevy::prelude::Assets;
 use bevy::prelude::ButtonInput;
@@ -73,6 +73,7 @@ use fairy_dust::Face;
 use fairy_dust::LABEL_SIZE;
 use fairy_dust::TITLE_SIZE;
 use fairy_dust::TitleBar;
+use fairy_dust::TitleBarStateWriters;
 use fairy_dust::cube_face_transform;
 use fairy_dust::example_cube_on_ground;
 use hana_diegetic::AlignX;
@@ -182,7 +183,7 @@ fn main() {
         .with_shortcut(KeyCode::KeyT, take_over_with_replacing_easing)
         .with_shortcut(KeyCode::KeyL, release_takeover)
         .add_observer(stop_manual_on_animation_begin)
-        .add_systems(Update, manual_animate)
+        .add_systems(Update, manual_animate.in_set(TitleBarStateWriters))
         .add_systems(
             Update,
             produce_example_sequence_movement.in_set(SequencePlaybackSystems::ProduceMovement),

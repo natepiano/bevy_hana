@@ -24,6 +24,7 @@
 mod fixtures;
 
 use std::hint::black_box;
+use std::sync::Arc;
 
 use bevy::color::Color;
 use criterion::Criterion;
@@ -31,7 +32,12 @@ use criterion::criterion_group;
 use criterion::criterion_main;
 use fixtures::measurement::monospace_measure_text_fn;
 use fixtures::panels::DiegeticStatusTreeStyle;
+use fixtures::panels::FOOTER_PANEL_SIZE;
 use fixtures::panels::PANEL_SIZE;
+use fixtures::panels::build_diegetic_footer_rich_tree;
+use fixtures::panels::build_diegetic_footer_rich_tree_with_dim_color;
+use fixtures::panels::build_diegetic_footer_sibling_tree;
+use fixtures::panels::build_diegetic_footer_sibling_tree_with_dim_color;
 use fixtures::panels::build_diegetic_status_tree;
 use fixtures::panels::build_diegetic_status_tree_with_style;
 use fixtures::panels::layout_to_points;
@@ -40,6 +46,7 @@ use fixtures::rows::StatusRow;
 use fixtures::rows::generate_status_rows;
 use hana_diegetic::bench_support::LayoutEngine;
 use hana_diegetic::bench_support::LayoutTreeChange;
+use hana_diegetic::bench_support::RenderCommandKind;
 
 fn bench_raw_layout(c: &mut Criterion) {
     let scale = layout_to_points(PANEL_SIZE);
@@ -133,12 +140,13 @@ fn bench_raw_status_panel(
             },
         )
         .scaled(scale, scale);
-        let engine = LayoutEngine::new(monospace_measure_text_fn());
+        let measure_text = monospace_measure_text_fn();
+        let engine = LayoutEngine::new(Arc::clone(&measure_text));
         let base_result = engine.compute(&tree, viewport_size, viewport_size, 1.0);
 
         b.iter(|| {
             let mut result = black_box(base_result.clone());
-            result.regenerate_commands(black_box(&text_color_tree));
+            result.regenerate_commands(black_box(&text_color_tree), &measure_text);
             black_box(result);
         });
     });
@@ -257,5 +265,104 @@ fn assert_tree_diff_fixtures(
     );
 }
 
-criterion_group!(benches, bench_raw_layout);
+fn bench_raw_footer_sibling_layout(c: &mut Criterion) {
+    let scale = layout_to_points(FOOTER_PANEL_SIZE);
+    let viewport_size = FOOTER_PANEL_SIZE * scale;
+    for row_count in ROW_COUNTS {
+        let mut group = c.benchmark_group(format!("raw_footer_sibling_{row_count}_rows"));
+        let tree = build_diegetic_footer_sibling_tree(row_count).scaled(scale, scale);
+        let text_color_tree = build_diegetic_footer_sibling_tree_with_dim_color(
+            row_count,
+            Color::srgb(0.2, 0.8, 1.0),
+        )
+        .scaled(scale, scale);
+        assert_eq!(
+            tree.classify_change(&text_color_tree),
+            LayoutTreeChange::VisualOnly,
+        );
+        let measure_text = monospace_measure_text_fn();
+        let engine = LayoutEngine::new(Arc::clone(&measure_text));
+        let base_result = engine.compute(&tree, viewport_size, viewport_size, 1.0);
+        assert_eq!(
+            base_result
+                .commands
+                .iter()
+                .filter(|command| matches!(command.kind, RenderCommandKind::Text { .. }))
+                .count(),
+            row_count * 9,
+        );
+        group.bench_function("raw_compute_prebuilt_tree", |b| {
+            b.iter(|| {
+                let result = engine.compute(
+                    black_box(&tree),
+                    black_box(viewport_size),
+                    black_box(viewport_size),
+                    black_box(1.0),
+                );
+                black_box(result);
+            });
+        });
+        group.bench_function("regenerate_commands_only", |b| {
+            b.iter(|| {
+                let mut result = black_box(base_result.clone());
+                result.regenerate_commands(black_box(&text_color_tree), &measure_text);
+                black_box(result);
+            });
+        });
+        group.finish();
+    }
+}
+
+fn bench_raw_footer_rich_layout(c: &mut Criterion) {
+    let scale = layout_to_points(FOOTER_PANEL_SIZE);
+    let viewport_size = FOOTER_PANEL_SIZE * scale;
+    for row_count in ROW_COUNTS {
+        let mut group = c.benchmark_group(format!("raw_footer_rich_{row_count}_rows"));
+        let tree = build_diegetic_footer_rich_tree(row_count).scaled(scale, scale);
+        let text_color_tree =
+            build_diegetic_footer_rich_tree_with_dim_color(row_count, Color::srgb(0.2, 0.8, 1.0))
+                .scaled(scale, scale);
+        assert_eq!(
+            tree.classify_change(&text_color_tree),
+            LayoutTreeChange::VisualOnly,
+        );
+        let measure_text = monospace_measure_text_fn();
+        let engine = LayoutEngine::new(Arc::clone(&measure_text));
+        let base_result = engine.compute(&tree, viewport_size, viewport_size, 1.0);
+        assert_eq!(
+            base_result
+                .commands
+                .iter()
+                .filter(|command| matches!(command.kind, RenderCommandKind::RichText { .. }))
+                .count(),
+            row_count,
+        );
+        group.bench_function("raw_compute_prebuilt_tree", |b| {
+            b.iter(|| {
+                let result = engine.compute(
+                    black_box(&tree),
+                    black_box(viewport_size),
+                    black_box(viewport_size),
+                    black_box(1.0),
+                );
+                black_box(result);
+            });
+        });
+        group.bench_function("regenerate_commands_only", |b| {
+            b.iter(|| {
+                let mut result = black_box(base_result.clone());
+                result.regenerate_commands(black_box(&text_color_tree), &measure_text);
+                black_box(result);
+            });
+        });
+        group.finish();
+    }
+}
+
+criterion_group!(
+    benches,
+    bench_raw_layout,
+    bench_raw_footer_sibling_layout,
+    bench_raw_footer_rich_layout
+);
 criterion_main!(benches);

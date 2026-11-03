@@ -44,7 +44,7 @@ use bevy::prelude::With;
 use bevy::prelude::default;
 use bevy::prelude::error;
 use fairy_dust::CameraHomeTarget;
-use hana_diegetic::AlignY;
+use fairy_dust::TitleBar;
 use hana_diegetic::Anchor;
 use hana_diegetic::Border;
 use hana_diegetic::DiegeticPanel;
@@ -54,7 +54,6 @@ use hana_diegetic::LayoutBuilder;
 use hana_diegetic::Padding;
 use hana_diegetic::Pt;
 use hana_diegetic::Px;
-use hana_diegetic::Sidedness;
 use hana_diegetic::Sizing;
 use hana_diegetic::TextAlpha;
 use hana_diegetic::TextStyle;
@@ -63,17 +62,10 @@ use hana_lagrange::OrbitCamPreset;
 const HOME_YAW: f32 = 0.3;
 const HOME_PITCH: f32 = 0.80;
 
-const HUD_HEIGHT: Px = Px(44.0);
-const HUD_PADDING: Px = Px(10.0);
-const HUD_GAP: Px = Px(14.0);
-const HUD_WIDTH: Px = Px(600.0);
-
-const INFO_HEIGHT: Px = Px(720.0);
 const INFO_HEADER_SIZE: Pt = Pt(14.0);
 const INFO_BODY_SIZE: Pt = Pt(10.0);
 const INFO_TITLE_SIZE: Pt = Pt(16.0);
 
-const HUD_TITLE_SIZE: Pt = Pt(14.0);
 const HUD_HINT_SIZE: Pt = Pt(11.0);
 const HUD_FRAME_BACKGROUND: Color = Color::srgba(0.01, 0.01, 0.03, 0.95);
 const HUD_BACKGROUND: Color = Color::srgba(0.02, 0.03, 0.07, 0.80);
@@ -83,9 +75,6 @@ const HUD_TITLE_COLOR: Color = Color::srgb(0.9, 0.95, 1.0);
 const HUD_DIVIDER_COLOR: Color = Color::srgba(0.15, 0.4, 0.6, 0.25);
 const HUD_INACTIVE_COLOR: Color = Color::srgba(0.55, 0.60, 0.75, 0.85);
 const HUD_ACTIVE_COLOR: Color = Color::srgb(0.3, 1.0, 0.8);
-
-#[derive(Component)]
-struct HudPanel;
 
 #[derive(Component)]
 struct InfoPanel;
@@ -158,7 +147,7 @@ const fn alpha_mode_description(mode: AlphaMode) -> &'static str {
              backgrounds; disappears on dark ones.\n\n\
              The world text and the camera panel follow this global default \
              and go dark over the dark scene — expected, not a bug. The mode \
-             bar and this info panel pin Blend to stay readable."
+             shared bar and this info panel pin Blend to stay readable."
         },
         AlphaMode::Mask(_) => {
             "Hard alpha test at the configured threshold (0.5 here). \
@@ -190,9 +179,10 @@ fn main() {
         .yaw(HOME_YAW)
         .pitch(HOME_PITCH)
         .with_camera_control_panel()
+        .with_title_bar(text_alpha_title_bar())
         .init_resource::<ControlsState>()
         .add_systems(Startup, setup)
-        .add_systems(Update, apply_state_and_rebuild_hud)
+        .add_systems(Update, apply_state_and_rebuild_info)
         // 1..7 select the active AlphaMode through Fairy Dust's shortcut binding,
         // which fires each only when no modifier is held.
         .with_shortcut(KeyCode::Digit1, select_alpha_blend)
@@ -203,6 +193,13 @@ fn main() {
         .with_shortcut(KeyCode::Digit6, select_alpha_mask)
         .with_shortcut(KeyCode::Digit7, select_alpha_opaque)
         .run();
+}
+
+fn text_alpha_title_bar() -> TitleBar {
+    TitleBar::new()
+        .with_title("Text alpha")
+        .control("H Home")
+        .control("1-7 Alpha mode")
 }
 
 fn setup(
@@ -239,7 +236,6 @@ fn setup(
                 DiegeticText::world("HELLO")
                     .size(0.22)
                     .color(Color::srgb(0.9, 0.3, 0.1))
-                    .sidedness(Sidedness::FrontOnly)
                     .transform(Transform::from_xyz(0.0, 0.0, 0.501))
                     .build(),
             );
@@ -272,13 +268,13 @@ fn setup(
         Transform::from_xyz(4.0, 8.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
-    // HUD and info panels are spawned by `apply_state_and_rebuild_hud` on
+    // The info panel is spawned by `apply_state_and_rebuild_info` on
     // the first frame (via `Res::is_changed()` on initial resource insert).
 }
 
 // Digit 1..7 → ALPHA_MODES[0..7], each bound through Fairy Dust's shortcut
 // binding. Setting `alpha_mode` flips `ControlsState`, which
-// `apply_state_and_rebuild_hud` picks up via change detection.
+// `apply_state_and_rebuild_info` picks up via change detection.
 fn select_alpha_blend(mut state: ResMut<ControlsState>) { state.alpha_mode = ALPHA_MODES[0].0; }
 
 fn select_alpha_premultiplied(mut state: ResMut<ControlsState>) {
@@ -295,11 +291,10 @@ fn select_alpha_mask(mut state: ResMut<ControlsState>) { state.alpha_mode = ALPH
 
 fn select_alpha_opaque(mut state: ResMut<ControlsState>) { state.alpha_mode = ALPHA_MODES[6].0; }
 
-fn apply_state_and_rebuild_hud(
+fn apply_state_and_rebuild_info(
     state: Res<ControlsState>,
     mut commands: Commands,
     mut alpha_default: ResMut<TextAlpha>,
-    hud_panels: Query<Entity, With<HudPanel>>,
     info_panels: Query<Entity, With<InfoPanel>>,
 ) {
     if !state.is_changed() {
@@ -308,35 +303,16 @@ fn apply_state_and_rebuild_hud(
 
     alpha_default.0 = state.alpha_mode;
 
-    for e in &hud_panels {
-        commands.entity(e).despawn();
-    }
     for e in &info_panels {
         commands.entity(e).despawn();
     }
-    spawn_hud_panel(&mut commands);
     spawn_info_panel(&mut commands, &state);
-}
-
-fn spawn_hud_panel(commands: &mut Commands) {
-    let hud_panel = DiegeticPanel::screen()
-        .size(HUD_WIDTH, HUD_HEIGHT)
-        .anchor(Anchor::TopLeft)
-        .text_alpha_mode(AlphaMode::Blend)
-        .layout(build_controls)
-        .build();
-    let Ok(hud_panel) = hud_panel else {
-        error!("failed to build HUD");
-        return;
-    };
-
-    commands.spawn((HudPanel, hud_panel, Transform::default()));
 }
 
 fn spawn_info_panel(commands: &mut Commands, state: &ControlsState) {
     let mode = state.alpha_mode;
     let info_panel = DiegeticPanel::screen()
-        .size(hana_diegetic::Percent(0.22), INFO_HEIGHT)
+        .size(hana_diegetic::Percent(0.22), Sizing::FIT)
         .anchor(Anchor::TopRight)
         .text_alpha_mode(AlphaMode::Blend)
         .layout(move |b| build_info_panel(b, mode))
@@ -357,49 +333,6 @@ fn hud_text_style(active: bool) -> TextStyle {
     })
 }
 
-fn build_controls(b: &mut LayoutBuilder) {
-    let title = TextStyle::new(HUD_TITLE_SIZE).with_color(HUD_TITLE_COLOR);
-
-    b.with(
-        El::new()
-            .width(Sizing::GROW)
-            .height(Sizing::GROW)
-            .padding(Padding::all(Px(2.0)))
-            .background(HUD_FRAME_BACKGROUND)
-            .border(Border::all(Px(2.0), HUD_BORDER_ACCENT)),
-        |b| {
-            b.with(
-                El::row()
-                    .width(Sizing::GROW)
-                    .height(Sizing::GROW)
-                    .padding(Padding::new(Px(8.0), HUD_PADDING, Px(8.0), HUD_PADDING))
-                    .gap(HUD_GAP)
-                    .align_y(AlignY::Center)
-                    .clip()
-                    .background(HUD_BACKGROUND)
-                    .border(Border::all(Px(1.0), HUD_BORDER_DIM)),
-                |b| {
-                    b.text(("CONTROLS", title));
-                    hud_divider(b);
-                    b.text(("H home", hud_text_style(false)));
-                    hud_divider(b);
-                    b.text(("1-7 alpha mode", hud_text_style(false)));
-                },
-            );
-        },
-    );
-}
-
-fn hud_divider(b: &mut LayoutBuilder) {
-    b.with(
-        El::new()
-            .width(Sizing::fixed(Px(1.0)))
-            .height(Sizing::fixed(Px(20.0)))
-            .background(HUD_DIVIDER_COLOR),
-        |_| {},
-    );
-}
-
 fn build_info_panel(b: &mut LayoutBuilder, active: AlphaMode) {
     let title = TextStyle::new(INFO_TITLE_SIZE).with_color(HUD_TITLE_COLOR);
     let active_header = TextStyle::new(INFO_HEADER_SIZE).with_color(HUD_ACTIVE_COLOR);
@@ -408,7 +341,7 @@ fn build_info_panel(b: &mut LayoutBuilder, active: AlphaMode) {
     b.with(
         El::new()
             .width(Sizing::GROW)
-            .height(Sizing::GROW)
+            .height(Sizing::FIT)
             .padding(Padding::all(Px(2.0)))
             .background(HUD_FRAME_BACKGROUND)
             .border(Border::all(Px(2.0), HUD_BORDER_ACCENT)),
@@ -416,7 +349,7 @@ fn build_info_panel(b: &mut LayoutBuilder, active: AlphaMode) {
             b.with(
                 El::column()
                     .width(Sizing::GROW)
-                    .height(Sizing::GROW)
+                    .height(Sizing::FIT)
                     .padding(Padding::all(Px(10.0)))
                     .gap(Px(8.0))
                     .background(HUD_BACKGROUND)

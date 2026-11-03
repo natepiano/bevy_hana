@@ -10,7 +10,6 @@ use bevy::prelude::Component;
 use bevy::prelude::Entity;
 use bevy::prelude::GlobalTransform;
 use bevy::prelude::Mesh;
-use bevy::prelude::Mesh3d;
 use bevy::prelude::Node;
 use bevy::prelude::On;
 use bevy::prelude::Projection;
@@ -33,6 +32,8 @@ use super::margin_lines;
 use super::margin_lines::DrawContext;
 use super::ui_camera;
 use crate::CurrentFitTarget;
+use crate::fit::AdmittedFitBounds;
+use crate::fit::geometry::FitMeshQuery;
 use crate::fit::geometry::ScreenSpaceBounds;
 use crate::fit::overlay::FitOverlay;
 use crate::fit::overlay::constants::PERCENT_MULTIPLIER;
@@ -106,7 +107,7 @@ fn silhouette_points(layout: &FitOverlayLayout) -> Vec<Vec2> {
 /// Despawns a camera's generated overlay visuals when `FitOverlay` is removed
 /// from it.
 pub fn on_remove_fit_visualization(
-    trigger: On<Remove, FitOverlay>,
+    trigger: On<Remove<FitOverlay>>,
     mut commands: Commands,
     visual_query: Query<(Entity, &FitOverlayVisual)>,
 ) {
@@ -127,7 +128,7 @@ pub fn draw_fit_target_bounds(
             Option<&RenderLayers>,
             &GlobalTransform,
             &Projection,
-            Option<&CurrentFitTarget>,
+            (Option<&CurrentFitTarget>, Option<&AdmittedFitBounds>),
         ),
         With<FitOverlay>,
     >,
@@ -139,7 +140,7 @@ pub fn draw_fit_target_bounds(
         Option<&Camera2d>,
         Option<&Camera3d>,
     )>,
-    mesh_query: Query<&Mesh3d>,
+    mesh_query: FitMeshQuery,
     children_query: Query<&Children>,
     global_transform_query: Query<&GlobalTransform>,
     mut meshes: ResMut<Assets<Mesh>>,

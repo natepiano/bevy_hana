@@ -700,7 +700,7 @@ fn warn_state_dimensions_unavailable(missing: &[ContextDimensionName]) {
         .map(ContextDimensionName::as_str)
         .collect::<Vec<_>>()
         .join(", ");
-    bevy::log::warn!(
+    bevy::log::debug!(
         "Keymap state dimensions [{names}] are unavailable, so keymap routing is disabled. \
          Initialize and own every required State<C> before adding KeymapPlugin."
     );
@@ -732,7 +732,7 @@ fn state_dimension_diagnostic(
 
 fn retain_state_dimension_diagnostics(app: &mut App, diagnostics: &[Diagnostic]) {
     for diagnostic in diagnostics {
-        bevy::log::error!("{}", diagnostic.message);
+        crate::log_keymap_diagnostic(diagnostic);
     }
     app.world_mut()
         .resource_mut::<KeymapLoadFailures>()

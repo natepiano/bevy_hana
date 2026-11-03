@@ -6,7 +6,34 @@ use crate::PanelElementId;
 use crate::layout::BoundingBox;
 use crate::layout::LayoutResult;
 use crate::layout::LayoutTree;
+use crate::layout::ScrollDrive;
+use crate::layout::SolvedScrollIndicator;
 use crate::layout::VisibleScrollRegion;
+
+/// Who supplies a computed scrolling element's position.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScrollRecordDrive {
+    /// The tree author supplies the offset and receives `PanelScrolled`.
+    #[default]
+    Author,
+    /// The library owns the offset, gesture motion and indicator.
+    Library,
+}
+
+/// The overlay indicator recorded by the latest layout solve.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum ScrollIndicatorState {
+    /// The view is idle or its content fits.
+    #[default]
+    Hidden,
+    /// A thumb in panel-local layout points, before panel projection.
+    Shown {
+        /// Panel-local thumb rectangle.
+        thumb:   BoundingBox,
+        /// Activity fade in the range zero to one.
+        opacity: f32,
+    },
+}
 
 /// Content size of a scrolling element against the viewport that shows it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -32,8 +59,9 @@ impl ScrollExtent {
 
 /// Computed scroll state of one named scrolling element on a laid-out panel.
 ///
-/// Only elements built with `scroll_x`, `scroll_y`, or `scroll_y_from_end`
-/// carry a record; a clip-only element does not. `extent`, `offset`, and
+/// Elements built with `scroll_x`, `scroll_y`, `scroll_y_from_end`,
+/// `scroll_view`, or `scroll_view_from_end` carry a record; a clip-only element
+/// does not. `extent`, `offset`, and
 /// `line_pitch` are in the panel's layout unit, the unit its tree is authored
 /// in. `bounds` and `visible_region` are in panel-local layout points, the space
 /// [`ComputedDiegeticPanel::scroll_record_at_local_position`](crate::ComputedDiegeticPanel::scroll_record_at_local_position)
@@ -41,22 +69,30 @@ impl ScrollExtent {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ComputedScrollRecord {
     /// Panel-local semantic identity of the scrolling element.
-    pub id:             PanelElementId,
+    pub id:                      PanelElementId,
     /// Element bounds in panel-local layout points.
-    pub bounds:         BoundingBox,
+    pub bounds:                  BoundingBox,
     /// Part of `bounds` left visible by clipping ancestors, in panel-local
     /// layout points; pointer lookup tests against this.
-    pub visible_region: VisibleScrollRegion,
+    pub visible_region:          VisibleScrollRegion,
     /// Content and viewport size in the panel's layout unit.
-    pub extent:         ScrollExtent,
+    pub extent:                  ScrollExtent,
     /// Offset from the start the layout solve applied, after clamping, in the
     /// panel's layout unit.
-    pub offset:         Vec2,
+    pub offset:                  Vec2,
+    /// Total leading content removed by the author, in the panel's layout unit.
+    pub(super) content_origin_y: f32,
     /// Source element index in the panel's [`LayoutTree`].
-    pub element_index:  usize,
+    pub element_index:           usize,
     /// Distance one wheel line moves the content, in the panel's layout unit:
     /// one measured line of the element's scroll line style plus its child gap.
-    pub line_pitch:     f32,
+    pub line_pitch:              f32,
+    /// Who drives the offset of this scrolling element.
+    pub drive:                   ScrollRecordDrive,
+    /// Signed elastic displacement in the panel's layout unit.
+    pub overscroll:              f32,
+    /// Indicator thumb in panel-local points and its activity fade.
+    pub indicator:               ScrollIndicatorState,
 }
 
 impl ComputedScrollRecord {
@@ -92,16 +128,33 @@ pub(super) fn collect_panel_scroll_records(
             let id = tree.element_id(solved.element_index)?;
             let computed = result.computed.get(solved.element_index)?;
             Some(ComputedScrollRecord {
-                id:             id.clone(),
-                bounds:         computed.bounds,
-                visible_region: solved.visible_region,
-                extent:         ScrollExtent {
+                id:               id.clone(),
+                bounds:           computed.bounds,
+                visible_region:   solved.visible_region,
+                extent:           ScrollExtent {
                     content:  solved.content_points / layout_to_points,
                     viewport: solved.viewport_points / layout_to_points,
                 },
-                offset:         solved.offset_points / layout_to_points,
-                element_index:  solved.element_index,
-                line_pitch:     solved.line_pitch_points / layout_to_points,
+                offset:           solved.offset_points / layout_to_points,
+                content_origin_y: tree.element_scroll_content_origin_y(solved.element_index)
+                    / layout_to_points,
+                element_index:    solved.element_index,
+                line_pitch:       solved.line_pitch_points / layout_to_points,
+                drive:            match tree.element_scroll_drive(solved.element_index) {
+                    ScrollDrive::Author => ScrollRecordDrive::Author,
+                    ScrollDrive::Library(_) => ScrollRecordDrive::Library,
+                },
+                overscroll:       solved.overscroll_points / layout_to_points,
+                indicator:        match solved.indicator {
+                    SolvedScrollIndicator::Hidden => ScrollIndicatorState::Hidden,
+                    SolvedScrollIndicator::Shown {
+                        thumb_points,
+                        opacity,
+                    } => ScrollIndicatorState::Shown {
+                        thumb: thumb_points,
+                        opacity,
+                    },
+                },
             })
         })
         .collect()
@@ -125,6 +178,9 @@ mod tests {
     use crate::DiegeticPanelCommands;
     use crate::El;
     use crate::HeadlessLayoutPlugin;
+    use crate::ImeBuiltInFieldKind;
+    use crate::ImeBuiltInFieldSpec;
+    use crate::ImeEditableFieldSpec;
     use crate::LayoutBuilder;
     use crate::LayoutTree;
     use crate::LayoutTreeChange;
@@ -256,6 +312,63 @@ mod tests {
         assert_eq!(id_under(Vec2::new(150.0, 20.0)), None);
     }
 
+    #[test]
+    fn vertical_wheel_over_editing_field_targets_scrolling_column() {
+        let style = TextStyle::new(10.0);
+        let mut builder = LayoutBuilder::new(200.0, 100.0);
+        builder.with(
+            El::column().id("body").size(100.0, 60.0).scroll_y(0.0),
+            |builder| {
+                builder.with(
+                    El::new().size(80.0, 20.0).editable_field(
+                        "field",
+                        ImeEditableFieldSpec::BuiltIn(ImeBuiltInFieldSpec::new(
+                            ImeBuiltInFieldKind::Text,
+                        )),
+                        style.clone(),
+                    ),
+                    |builder| {
+                        builder.text(("value", style.clone()));
+                    },
+                );
+                builder.with(El::new().size(100.0, 100.0), |_| {});
+            },
+        );
+        let mut tree = builder.build();
+        let mut replacement = LayoutBuilder::with_root(El::column());
+        replacement.with(El::row(), |builder| {
+            builder.text(("abcdefghijklmnopqrstuv", style));
+            builder.with(El::new().caret_marker().size(0.0, 10.0), |_| {});
+        });
+        tree.set_field_editing_content(&PanelElementId::named("field"), &replacement.build());
+        let result = LayoutEngine::new(Arc::new(measure)).compute(&tree, 200.0, 100.0, 1.0);
+        let records = collect_panel_scroll_records(&tree, &result, 1.0);
+        assert!(records.iter().any(|record| {
+            record.id == PanelElementId::named("field")
+                && record.extent.max_offset().x > 0.0
+                && record.extent.max_offset().y == 0.0
+        }));
+        let mut panel = ComputedDiegeticPanel::default();
+        panel.set_result_with_fields(
+            result,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            records,
+        );
+        let target = panel.scroll_record_at_local_position(Vec2::new(20.0, 20.0));
+        let (id, movement) = match target {
+            ScrollRecordUnderPoint::Inside(record) => (
+                Some(record.id.clone()),
+                record.extent.scrolled(record.offset.y, record.line_pitch) - record.offset.y,
+            ),
+            ScrollRecordUnderPoint::OutsideScrollingElements => (None, 0.0),
+        };
+        assert_eq!(id, Some(PanelElementId::named("body")));
+        assert!(movement > 0.0);
+    }
+
     /// A 100-tall body over three 100-tall rows with a 5 gap, optionally
     /// declaring a 10-size scroll line.
     fn gapped_body_record(declared: bool) -> Option<ComputedScrollRecord> {
@@ -315,7 +428,7 @@ mod tests {
                 );
             },
         );
-        assert!(records_of(&builder.build()).is_empty());
+        assert_eq!(records_of(&builder.build()), []);
     }
 
     #[test]

@@ -31,6 +31,36 @@ impl Capability {
     pub const fn is_user_bindable(self) -> bool { !matches!(self, Self::Unremappable) }
 }
 
+/// The current state declared by a command that switches a feature on and off.
+///
+/// Toggle state is independent of binding capability: a toggle remains a one-shot command.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Reflect)]
+pub enum CommandToggleState {
+    /// This command does not switch a feature on and off.
+    #[default]
+    NotToggle,
+    /// The feature this command toggles is currently enabled.
+    On,
+    /// The feature this command toggles is currently disabled.
+    Off,
+}
+
+impl CommandToggleState {
+    /// Converts a declared toggle's state reader into its current On/Off state.
+    #[must_use]
+    pub const fn from_enabled(enabled: bool) -> Self { if enabled { Self::On } else { Self::Off } }
+
+    /// The current state word, or an empty string for a command without toggle state.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NotToggle => "",
+            Self::On => "On",
+            Self::Off => "Off",
+        }
+    }
+}
+
 /// The semantic transition requested for a held command.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Reflect)]
 pub enum HoldPhase {

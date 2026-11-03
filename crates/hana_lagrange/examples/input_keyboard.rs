@@ -35,8 +35,6 @@ use fairy_dust::TitleBar;
 use fairy_dust::apply_example_orbit_cam_limits;
 use fairy_dust::cube_face_label;
 use hana_diegetic::DiegeticTextMut;
-use hana_lagrange::CameraInputRoutingConfig;
-use hana_lagrange::NoPositionFallback;
 use hana_lagrange::OrbitCam;
 use hana_lagrange::OrbitCamControlSummary;
 use hana_lagrange::OrbitCamInputMode;
@@ -48,10 +46,6 @@ const EXAMPLE_TITLE: &str = "Keyboard Bindings";
 
 fn main() {
     fairy_dust::sprinkle_example()
-        .insert_resource(
-            CameraInputRoutingConfig::cursor_hit_test()
-                .with_no_position_fallback(NoPositionFallback::OnlyEligibleCamera),
-        )
         .with_brp_extras()
         .with_save_window_position()
         .with_studio_lighting()

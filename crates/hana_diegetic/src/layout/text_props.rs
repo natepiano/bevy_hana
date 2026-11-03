@@ -41,6 +41,9 @@ pub enum TextWrap {
     /// Each line between newlines is measured as a single run. The element's
     /// width is the widest line; height is the sum of all line heights.
     Newlines,
+    /// Keep one line and replace its trailing characters with an ellipsis
+    /// when the text exceeds the available width.
+    TruncateTail,
 }
 
 // ── Font property types ──────────────────────────────────────────────────────
@@ -98,7 +101,7 @@ pub enum TextAlign {
 /// mode: that resolves through the `TextAlpha` cascade, whose default is
 /// `AlphaMode::Blend` for smooth anti-aliased edges. Discriminants are
 /// `#[repr(u32)]` and explicit because they map directly to shader
-/// constants in `analytic_path.wgsl`; the compile-time assertions below keep
+/// constants in `analytic_path.wesl`; the compile-time assertions below keep
 /// them in sync.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Reflect)]
 #[repr(u32)]
@@ -126,7 +129,10 @@ impl From<GlyphRenderMode> for u32 {
 
 /// Whether glyphs cast a shadow.
 ///
-/// The visible glyph mesh casts its own coverage-silhouette shadow directly.
+/// Panel text casts no 3D shadow unless it asks for one with `Cast`; panels
+/// and other diegetic content keep [`ShadowCasting`]'s default.
+///
+/// A `Cast` glyph mesh casts its own coverage-silhouette shadow directly.
 /// For a shadow with no visible fill (ghost text), spawn a `Cast` glyph and
 /// set its fill color alpha to `0`: the color pass paints nothing while the
 /// shadow pass still writes the full letter silhouette.
@@ -134,9 +140,9 @@ impl From<GlyphRenderMode> for u32 {
 #[reflect(Resource)]
 pub enum GlyphShadowMode {
     /// Glyph casts no shadow.
+    #[default]
     None,
     /// Glyph casts its coverage-silhouette shadow.
-    #[default]
     Cast,
 }
 
@@ -151,15 +157,10 @@ pub enum ShadowCasting {
     On,
 }
 
-/// Which face(s) of a glyph mesh render, by back/front-face culling.
+/// Which faces of a panel surface or shape render, by back/front-face culling.
 ///
-/// World text defaults to both faces; screen text defaults to front-only.
-/// The cascade carries the contextual default (`Sidedness` is a cascade
-/// attribute); a per-label value on [`TextStyle`] overrides it.
-///
-/// On a transparent panel the front and back faces are both viewable, so
-/// `FrontOnly` and `BackOnly` author labels visible from one side only.
-/// Back-only glyphs read mirror-reversed when viewed from behind.
+/// Text and icon ink always render only their front face, independently of
+/// the surface's sidedness, so a panel back never displays mirrored words.
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Reflect)]
 #[reflect(Resource)]
 pub enum Sidedness {
@@ -206,13 +207,20 @@ impl From<DrawZIndex> for i32 {
     fn from(value: DrawZIndex) -> Self { Self::from(value.0) }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Reflect)]
+enum CapBaselinePixelAlignment {
+    #[default]
+    Natural,
+    WholePixels,
+}
+
 // ── TextStyle ────────────────────────────────────────────────────────────────
 
 /// Unified text styling for both layout (panel) text and standalone world text.
 ///
 /// One struct carries every typography and render field. Layout and
 /// standalone contexts share the data; context-specific defaults (lighting,
-/// sidedness, font unit) are supplied by the cascade and per-context builders
+/// font unit) are supplied by the cascade and per-context builders
 /// rather than by separate types.
 ///
 /// All fields are private and authored through builder methods.
@@ -229,25 +237,23 @@ impl From<DrawZIndex> for i32 {
 /// ```
 #[derive(Component, Clone, Debug, Reflect)]
 pub struct TextStyle {
-    font_id:                u16,
-    size:                   f32,
-    weight:                 FontWeight,
-    slant:                  FontSlant,
-    line_height:            f32,
-    letter_spacing:         f32,
-    word_spacing:           f32,
-    color:                  Color,
-    align:                  TextAlign,
-    anchor:                 Anchor,
-    render_mode:            GlyphRenderMode,
+    font_id:                      u16,
+    size:                         f32,
+    weight:                       FontWeight,
+    slant:                        FontSlant,
+    line_height:                  f32,
+    letter_spacing:               f32,
+    word_spacing:                 f32,
+    color:                        Color,
+    align:                        TextAlign,
+    anchor:                       Anchor,
+    render_mode:                  GlyphRenderMode,
     /// Per-label glyph-shadow authoring.
-    shadow_mode:            Cascade<GlyphShadowMode>,
+    shadow_mode:                  Cascade<GlyphShadowMode>,
     /// Per-label shadow-casting authoring.
-    shadow_casting:         Cascade<ShadowCasting>,
-    /// Per-label sidedness authoring.
-    sidedness:              Cascade<Sidedness>,
+    shadow_casting:               Cascade<ShadowCasting>,
     /// Per-label lighting authoring.
-    lighting:               Cascade<Lighting>,
+    lighting:                     Cascade<Lighting>,
     /// Per-label source material handle for text runs.
     ///
     /// This is an authored cascade/source handle. It is not a Bevy render
@@ -255,14 +261,16 @@ pub struct TextStyle {
     /// keys. Create the material once through `Assets<StandardMaterial>` and
     /// pass the handle here; do not create a fresh asset while rebuilding panel
     /// data each frame.
-    material:               Cascade<Handle<StandardMaterial>>,
-    font_features:          FontFeatures,
+    material:                     Cascade<Handle<StandardMaterial>>,
+    font_features:                FontFeatures,
     /// What unit `size` is expressed in.
-    unit:                   Cascade<Unit>,
+    unit:                         Cascade<Unit>,
     /// Per-label alpha-mode authoring.
-    alpha_mode:             Cascade<AlphaMode>,
+    alpha_mode:                   Cascade<AlphaMode>,
     /// Per-label HDR text coverage-bias authoring.
-    hdr_text_coverage_bias: Cascade<f32>,
+    hdr_text_coverage_bias:       Cascade<f32>,
+    /// Whether panel text fits its cap-to-baseline span to the physical pixel grid.
+    cap_baseline_pixel_alignment: CapBaselinePixelAlignment,
 }
 
 impl PartialEq for TextStyle {
@@ -280,13 +288,13 @@ impl PartialEq for TextStyle {
             && self.render_mode == other.render_mode
             && self.shadow_mode == other.shadow_mode
             && self.shadow_casting == other.shadow_casting
-            && self.sidedness == other.sidedness
             && self.lighting == other.lighting
             && self.material == other.material
             && self.font_features == other.font_features
             && self.unit == other.unit
             && self.alpha_mode == other.alpha_mode
             && self.hdr_text_coverage_bias == other.hdr_text_coverage_bias
+            && self.cap_baseline_pixel_alignment == other.cap_baseline_pixel_alignment
     }
 }
 
@@ -307,26 +315,28 @@ impl TextStyle {
     pub fn new(size: impl Into<Dimension>) -> Self {
         let font_size = size.into();
         Self {
-            font_id:                0,
-            size:                   font_size.value,
-            weight:                 FontWeight::NORMAL,
-            slant:                  FontSlant::Normal,
-            line_height:            0.0,
-            letter_spacing:         0.0,
-            word_spacing:           0.0,
-            color:                  Color::WHITE,
-            align:                  TextAlign::Left,
-            anchor:                 Anchor::Center,
-            render_mode:            GlyphRenderMode::Text,
-            shadow_mode:            Cascade::Inherit,
-            shadow_casting:         Cascade::Inherit,
-            sidedness:              Cascade::Inherit,
-            lighting:               Cascade::Inherit,
-            material:               Cascade::Inherit,
-            font_features:          FontFeatures::NONE,
-            unit:                   font_size.unit.map_or(Cascade::Inherit, Cascade::Override),
-            alpha_mode:             Cascade::Inherit,
-            hdr_text_coverage_bias: Cascade::Inherit,
+            font_id:                      0,
+            size:                         font_size.value,
+            weight:                       FontWeight::NORMAL,
+            slant:                        FontSlant::Normal,
+            line_height:                  0.0,
+            letter_spacing:               0.0,
+            word_spacing:                 0.0,
+            color:                        Color::WHITE,
+            align:                        TextAlign::Left,
+            anchor:                       Anchor::Center,
+            render_mode:                  GlyphRenderMode::Text,
+            shadow_mode:                  Cascade::Inherit,
+            shadow_casting:               Cascade::Inherit,
+            lighting:                     Cascade::Inherit,
+            material:                     Cascade::Inherit,
+            font_features:                FontFeatures::NONE,
+            unit:                         font_size
+                .unit
+                .map_or(Cascade::Inherit, Cascade::Override),
+            alpha_mode:                   Cascade::Inherit,
+            hdr_text_coverage_bias:       Cascade::Inherit,
+            cap_baseline_pixel_alignment: CapBaselinePixelAlignment::Natural,
         }
     }
 
@@ -376,9 +386,11 @@ impl TextStyle {
     #[must_use]
     pub(crate) const fn shadow_casting(&self) -> Cascade<ShadowCasting> { self.shadow_casting }
 
-    /// Returns the per-label sidedness authoring.
+    /// Text and icon ink is always front-only, independent of its panel surface.
     #[must_use]
-    pub(crate) const fn sidedness(&self) -> Cascade<Sidedness> { self.sidedness }
+    pub(crate) const fn sidedness() -> Cascade<Sidedness> {
+        Cascade::Override(Sidedness::FrontOnly)
+    }
 
     /// Returns the per-label lighting authoring.
     #[must_use]
@@ -396,7 +408,7 @@ impl TextStyle {
 
     /// Returns the per-label unit authoring.
     #[must_use]
-    pub(super) const fn unit(&self) -> Cascade<Unit> { self.unit }
+    pub(crate) const fn unit(&self) -> Cascade<Unit> { self.unit }
 
     /// Returns the text alignment.
     #[must_use]
@@ -414,6 +426,15 @@ impl TextStyle {
     #[must_use]
     pub(crate) const fn hdr_text_coverage_bias(&self) -> Cascade<f32> {
         self.hdr_text_coverage_bias
+    }
+
+    /// Returns whether the cap-to-baseline span should settle onto physical pixels.
+    #[must_use]
+    pub(crate) const fn aligns_cap_baseline_to_pixels(&self) -> bool {
+        matches!(
+            self.cap_baseline_pixel_alignment,
+            CapBaselinePixelAlignment::WholePixels
+        )
     }
 
     // ── Chained (with_*) setters ──────────────────────────────────────────
@@ -530,13 +551,6 @@ impl TextStyle {
         self
     }
 
-    /// Sets a per-label sidedness override (overrides the panel/context default).
-    #[must_use]
-    pub const fn with_sidedness(mut self, sidedness: Sidedness) -> Self {
-        self.sidedness = Cascade::Override(sidedness);
-        self
-    }
-
     /// Sets a per-label lighting override (overrides the panel/context default).
     #[must_use]
     pub const fn with_lighting(mut self, lighting: Lighting) -> Self {
@@ -597,14 +611,24 @@ impl TextStyle {
 
     /// Sets the per-label HDR text coverage-bias override.
     ///
-    /// `0.0` keeps the automatic screen-size adjustment unchanged. Positive
-    /// values make fractional glyph edges more opaque beyond that adjustment,
-    /// which can compensate for dark text that looks too thin under HDR,
+    /// `0.0` keeps the glyph's geometric coverage, so small text stays as thin
+    /// as its strokes. Positive values make fractional glyph edges more
+    /// opaque, which can compensate for dark text that looks too thin under HDR,
     /// especially on light backgrounds. Tune this per scene, panel, or label;
     /// it can make light text on dark backgrounds look heavier.
     #[must_use]
     pub const fn with_hdr_text_coverage_bias(mut self, bias: f32) -> Self {
         self.hdr_text_coverage_bias = Cascade::Override(bias);
+        self
+    }
+
+    /// Fits this panel label's cap-to-baseline span to the physical pixel grid.
+    ///
+    /// Use this for view-facing control values whose vertical padding must
+    /// remain visually even as their projected text size changes.
+    #[must_use]
+    pub const fn with_cap_baseline_pixel_alignment(mut self) -> Self {
+        self.cap_baseline_pixel_alignment = CapBaselinePixelAlignment::WholePixels;
         self
     }
 
@@ -663,11 +687,6 @@ impl TextStyle {
 
     /// Removes the per-label shadow-casting override.
     pub const fn set_shadow_casting_inherit(&mut self) { self.shadow_casting = Cascade::Inherit; }
-
-    /// Sets a per-label sidedness override (overrides the panel/context default).
-    pub const fn set_sidedness(&mut self, sidedness: Sidedness) {
-        self.sidedness = Cascade::Override(sidedness);
-    }
 
     /// Sets a per-label lighting override (overrides the panel/context default).
     pub const fn set_lighting(&mut self, lighting: Lighting) {
@@ -797,7 +816,6 @@ impl TextStyle {
             render_mode: _,
             shadow_mode: _,
             shadow_casting: _,
-            sidedness: _,
             lighting: _,
             material: _,
             // Measurement context — not a layout-cache key.
@@ -806,6 +824,8 @@ impl TextStyle {
             alpha_mode: _,
             // Render-only — coverage transfer, not measurement.
             hdr_text_coverage_bias: _,
+            // Render placement only — does not change measured layout.
+            cap_baseline_pixel_alignment: _,
         } = self;
 
         font_id.hash(hasher);
@@ -840,11 +860,11 @@ impl TextStyle {
             render_mode: _,
             shadow_mode: _,
             shadow_casting: _,
-            sidedness: _,
             lighting: _,
             material: _,
             alpha_mode: _,
             hdr_text_coverage_bias: _,
+            cap_baseline_pixel_alignment: _,
         } = self;
 
         *font_id == other.font_id
@@ -865,10 +885,11 @@ impl TextStyle {
     ///
     /// Compares the measurement fields (`font_id`, `size`, `weight`, `slant`,
     /// `line_height`, letter/word spacing, `align`, `anchor`, `font_features`)
-    /// via `to_bits`.
+    /// via `to_bits`, plus cap-to-baseline pixel alignment because it changes
+    /// the retained per-glyph render offsets.
     ///
     /// Excludes render/material fields (`color`, `render_mode`, `shadow_mode`,
-    /// `shadow_casting`, `sidedness`, `lighting`, `material`, `alpha_mode`,
+    /// `shadow_casting`, `lighting`, `material`, `alpha_mode`,
     /// `hdr_text_coverage_bias`) because `PreparedPanelText`, cascade
     /// overrides, `PathRenderRecord`, and the frame material table own those
     /// updates without changing glyph geometry.
@@ -890,12 +911,12 @@ impl TextStyle {
             render_mode: _,
             shadow_mode: _,
             shadow_casting: _,
-            sidedness: _,
             lighting: _,
             material: _,
             unit: _,
             alpha_mode: _,
             hdr_text_coverage_bias: _,
+            cap_baseline_pixel_alignment,
         } = self;
 
         *font_id == other.font_id
@@ -908,6 +929,7 @@ impl TextStyle {
             && *align == other.align
             && *anchor == other.anchor
             && *font_features == other.font_features
+            && *cap_baseline_pixel_alignment == other.cap_baseline_pixel_alignment
     }
 }
 
@@ -965,10 +987,38 @@ pub struct TextDimensions {
     pub line_height: f32,
 }
 
+/// Tight bounds of the ink a laid-out string draws.
+///
+/// Read from the glyph outlines, so it is the drawn extent rather than the line
+/// box: a descender reaches below the baseline, and words without one stop at
+/// it. Edges are in layout units from the top-left corner of the layout box, x
+/// right and y down — the frame panel text places its glyphs in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextInk {
+    /// Left edge of the leftmost ink.
+    pub left:   f32,
+    /// Top edge of the highest ink.
+    pub top:    f32,
+    /// Right edge of the rightmost ink.
+    pub right:  f32,
+    /// Bottom edge of the lowest ink.
+    pub bottom: f32,
+}
+
+/// The ink a laid-out string draws, measured by
+/// [`FontRegistry::measure_ink`](crate::FontRegistry::measure_ink).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TextInkMeasurement {
+    /// No glyph draws any ink (empty or blank text).
+    NoVisibleInk,
+    /// The glyphs draw ink within these bounds.
+    Visible(TextInk),
+}
+
 // ── Shader discriminant assertions ──────────────────────────────────────────
 //
 // These compile-time assertions pin the `GlyphRenderMode` discriminants to the
-// values the `render_mode` constants in `analytic_path.wgsl` use (and the
+// values the `render_mode` constants in `analytic_path.wesl` use (and the
 // matching `RenderMode` variants). Adding or reordering a variant means updating
 // the shader constants to match and adjusting these assertions.
 
@@ -1041,6 +1091,20 @@ mod tests {
         assert!(
             base.gating_eq(&recolored),
             "text color updates material-table rows without rebuilding glyph geometry"
+        );
+    }
+
+    #[test]
+    fn cap_baseline_pixel_alignment_is_render_placement_not_layout() {
+        let natural = TextStyle::new(24.0);
+        let pixel_aligned = natural.clone().with_cap_baseline_pixel_alignment();
+
+        assert!(!natural.aligns_cap_baseline_to_pixels());
+        assert!(pixel_aligned.aligns_cap_baseline_to_pixels());
+        assert!(natural.layout_eq_excluding_visuals(&pixel_aligned));
+        assert!(
+            !natural.gating_eq(&pixel_aligned),
+            "pixel alignment changes the retained glyph offsets"
         );
     }
 

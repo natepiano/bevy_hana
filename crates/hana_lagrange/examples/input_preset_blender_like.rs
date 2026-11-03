@@ -50,6 +50,7 @@ use hana_lagrange::OrbitCamInteractionKind;
 use hana_lagrange::OrbitCamInteractionStarted;
 use hana_lagrange::OrbitCamInteractionState;
 use hana_lagrange::ZoomDirection;
+use hana_lagrange::ZoomRowFilter;
 use hana_lagrange::describe_orbit_cam_controls;
 
 const EXAMPLE_TITLE: &str = "Blender-Like";
@@ -334,10 +335,10 @@ fn active_labels(
 /// direction matches the live one. While the live direction is unknown — a
 /// zero-delta frame before the sign resolves — directional rows are kept so the
 /// zoom face never blanks mid-gesture.
-fn row_matches_zoom_direction(row: Option<ZoomDirection>, live: Option<ZoomDirection>) -> bool {
+fn row_matches_zoom_direction(row: ZoomRowFilter, live: Option<ZoomDirection>) -> bool {
     match (row, live) {
-        (None, _) | (Some(_), None) => true,
-        (Some(row), Some(live)) => row == live,
+        (ZoomRowFilter::Unrestricted, _) | (ZoomRowFilter::Only(_), None) => true,
+        (ZoomRowFilter::Only(row), Some(live)) => row == live,
     }
 }
 

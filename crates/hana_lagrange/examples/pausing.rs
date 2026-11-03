@@ -34,6 +34,7 @@ use fairy_dust::CameraHomeTarget;
 use fairy_dust::ControlActivation;
 use fairy_dust::CubeFacePanelContent;
 use fairy_dust::CubeFacePanelStyle;
+use fairy_dust::CubeFaceSpacing;
 use fairy_dust::DescriptionPanel;
 use fairy_dust::Face;
 use fairy_dust::LABEL_SIZE;
@@ -173,8 +174,10 @@ const HOME_MARGIN: f32 = 0.5;
 const FACE_PANEL_TEXT_SIZE: f32 = 68.0;
 const FACE_PANEL_STYLE: CubeFacePanelStyle = CubeFacePanelStyle {
     size:             CUBE_SIZE,
-    padding:          0.04,
-    row_gap:          0.05,
+    spacing:          CubeFaceSpacing::Fixed {
+        padding: 0.04,
+        row_gap: 0.05,
+    },
     title_size:       FACE_PANEL_TEXT_SIZE,
     body_size:        FACE_PANEL_TEXT_SIZE,
     active_body_size: FACE_PANEL_TEXT_SIZE,

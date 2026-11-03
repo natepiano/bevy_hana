@@ -15,13 +15,18 @@ mod overlay;
 use bevy::prelude::App;
 use bevy::prelude::Plugin;
 pub use geometry::FitAnchor;
+pub use geometry::FitViewportInsets;
 #[cfg(feature = "fit_overlay")]
 pub use overlay::FitOverlay;
 #[cfg(feature = "fit_overlay")]
 use overlay::FitOverlayPlugin;
 #[cfg(feature = "fit_overlay")]
 pub use overlay::FitTargetOverlayConfig;
+pub(crate) use target::AdmittedFitBounds;
 pub use target::CurrentFitTarget;
+pub use target::FitBounds;
+pub(crate) use target::FitBoundsSource;
+pub use target::OutsideFitBounds;
 pub use target::SetFitTarget;
 pub use triggers::AnimateToFit;
 pub use triggers::LookAt;

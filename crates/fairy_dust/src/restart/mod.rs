@@ -57,7 +57,7 @@ command! {
     action:      Restart,
     event:       RestartEvent,
     id:          "fairy_dust::restart",
-    title:       "Restart Example",
+    title:       "Restart example",
     description: "Exit and relaunch this example through cargo, rebuilding any source edits.",
 }
 

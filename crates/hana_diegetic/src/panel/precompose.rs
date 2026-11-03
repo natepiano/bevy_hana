@@ -6,6 +6,8 @@ use bevy::ecs::entity::Entity;
 use bevy::image::Image;
 use bevy::math::UVec2;
 
+use crate::render::PrivateViewLayer;
+
 /// Marks internal helper entities used to precompose panel subtrees.
 ///
 /// These entities are implementation details: scene-fit and inspection code
@@ -25,6 +27,8 @@ pub(crate) struct PanelPrecomposeCache {
 #[derive(Debug)]
 pub(crate) struct PrecomposeCacheEntry {
     pub(crate) image:        Handle<Image>,
+    pub(crate) rig:          Entity,
+    pub(crate) layer:        PrivateViewLayer,
     pub(crate) helper_panel: Entity,
     pub(crate) camera:       Entity,
     pub(crate) pixel_size:   UVec2,
@@ -49,6 +53,12 @@ impl PanelPrecomposeCache {
     #[must_use]
     pub(crate) fn entry(&self, element_idx: usize) -> Option<&PrecomposeCacheEntry> {
         self.entries.get(&element_idx)
+    }
+
+    /// Whether an entry still owns the given precompose rig.
+    #[must_use]
+    pub(crate) fn contains_rig(&self, rig: Entity) -> bool {
+        self.entries.values().any(|entry| entry.rig == rig)
     }
 
     /// Returns the entry map for reconcile systems to write into.

@@ -1,4 +1,5 @@
 use bevy::ecs::observer::On;
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::Commands;
 use bevy::prelude::Has;
 use bevy::prelude::Query;
@@ -16,101 +17,121 @@ use crate::OrbitCam;
 use crate::animation::events::AnimationRejectionReason;
 use crate::animation::events::AnimationSource;
 use crate::animation::events::CameraRequestPreparationError;
+use crate::animation::events::FitAnimationRequest;
 use crate::animation::events::PlayAnimation;
 use crate::animation::lifecycle::AnimationConflictPolicy;
 use crate::animation::sequence::CameraSequence;
 use crate::animation::sequence::playback::CameraSequencePlayback;
+use crate::fit::FitBoundsSource;
+
+/// Captures facade and prepared-fit requests through the same rejection checks.
+#[derive(SystemParam)]
+pub(in crate::animation) struct CameraRequestCapture<'w, 's> {
+    commands:              Commands<'w, 's>,
+    controller_components: Query<'w, 's, (Has<OrbitCam>, Has<FreeCam>, Has<CameraBasis>)>,
+    conflict_policies:     Query<'w, 's, &'static AnimationConflictPolicy>,
+    playbacks:             Query<'w, 's, &'static CameraSequencePlayback>,
+    pending:               ResMut<'w, PendingCameraRequests>,
+}
 
 /// Captures the public request after cheap rejection checks but before any
 /// retained authoring, controller, fit, or ownership mutation.
 pub(in crate::animation) fn capture_play_animation(
     start: On<PlayAnimation>,
-    mut commands: Commands,
-    controller_components: Query<(Has<OrbitCam>, Has<FreeCam>, Has<CameraBasis>)>,
-    conflict_policies: Query<&AnimationConflictPolicy>,
-    playbacks: Query<&CameraSequencePlayback>,
-    mut pending: ResMut<PendingCameraRequests>,
+    mut capture: CameraRequestCapture,
 ) {
-    let camera = start.camera;
-    let source = if start.zoom_context.is_some() {
-        AnimationSource::ZoomToFit
-    } else {
-        start.source
-    };
-    let target = start.target;
-    if start.camera_moves.is_empty() {
-        rejection::trigger_animation_rejected(
-            &mut commands,
-            camera,
-            source,
-            target,
-            AnimationRejectionReason::EmptySequence,
-        );
-        return;
-    }
-    let availability = controller_components.get(camera).map_or(
-        CameraControllerAvailability::NoController,
-        |(orbit, free, basis)| {
-            camera_controller_availability(
-                orbit.then_some(&OrbitCam::default()),
-                free.then_some(&FreeCam::default()),
-                basis.then_some(&CameraBasis::Y_UP),
-            )
-        },
-    );
-    if let Some(reason) = rejection::rejection_for_controller_availability(availability) {
-        rejection::trigger_animation_rejected(&mut commands, camera, source, target, reason);
-        return;
-    }
-    if conflict_policies.get(camera).copied().unwrap_or_default()
-        == AnimationConflictPolicy::FirstWins
-        && playbacks
-            .get(camera)
-            .is_ok_and(|playback| playback.playback.is_playing())
-    {
-        rejection::trigger_animation_rejected(
-            &mut commands,
-            camera,
-            source,
-            target,
-            AnimationRejectionReason::NativeConflict(AnimationConflictPolicy::FirstWins),
-        );
-        return;
+    capture.capture(&start, FitBoundsSource::MeasureTarget);
+}
+
+/// Keeps prepared fit bounds beside their exact animation request until admission.
+pub(in crate::animation) fn capture_fit_animation(
+    start: On<FitAnimationRequest>,
+    mut capture: CameraRequestCapture,
+) {
+    capture.capture(&start.animation, start.bounds.clone());
+}
+
+impl CameraRequestCapture<'_, '_> {
+    fn capture(&mut self, start: &PlayAnimation, bounds: FitBoundsSource) {
+        let source = if start.zoom_context.is_some() {
+            AnimationSource::ZoomToFit
+        } else {
+            start.source
+        };
+        match self.prepare(start, source, bounds) {
+            Ok(request) => {
+                self.pending.0.push(request);
+                self.commands
+                    .entity(start.camera)
+                    .insert(CameraSequencePreparationRequested);
+            },
+            Err(reason) => rejection::trigger_animation_rejected(
+                &mut self.commands,
+                start.camera,
+                source,
+                start.target,
+                reason,
+            ),
+        }
     }
 
-    let Ok(sequence) = CameraSequence::try_from_moves(start.camera_moves.iter().cloned()) else {
-        rejection::trigger_animation_rejected(
-            &mut commands,
+    fn prepare(
+        &self,
+        start: &PlayAnimation,
+        source: AnimationSource,
+        bounds: FitBoundsSource,
+    ) -> Result<PendingCameraRequest, AnimationRejectionReason> {
+        if start.camera_moves.is_empty() {
+            return Err(AnimationRejectionReason::EmptySequence);
+        }
+        let camera = start.camera;
+        let availability = self.controller_components.get(camera).map_or(
+            CameraControllerAvailability::NoController,
+            |(orbit, free, basis)| {
+                camera_controller_availability(
+                    orbit.then_some(&OrbitCam::default()),
+                    free.then_some(&FreeCam::default()),
+                    basis.then_some(&CameraBasis::Y_UP),
+                )
+            },
+        );
+        if let Some(reason) = rejection::rejection_for_controller_availability(availability) {
+            return Err(reason);
+        }
+        if self
+            .conflict_policies
+            .get(camera)
+            .copied()
+            .unwrap_or_default()
+            == AnimationConflictPolicy::FirstWins
+            && self
+                .playbacks
+                .get(camera)
+                .is_ok_and(|playback| playback.playback.is_playing())
+        {
+            return Err(AnimationRejectionReason::NativeConflict(
+                AnimationConflictPolicy::FirstWins,
+            ));
+        }
+        let sequence = CameraSequence::try_from_moves(start.camera_moves.iter().cloned())
+            .map_err(|_| AnimationRejectionReason::EmptySequence)?;
+        let target = start.target;
+        let effects =
+            PendingCameraAdmissionEffects::derive(source, target, &sequence).map_err(|_| {
+                AnimationRejectionReason::RequestPreparationFailed(
+                    CameraRequestPreparationError::MissingTargetGeometry,
+                )
+            })?;
+        Ok(PendingCameraRequest {
             camera,
+            sequence,
             source,
             target,
-            AnimationRejectionReason::EmptySequence,
-        );
-        return;
-    };
-    let Ok(effects) = PendingCameraAdmissionEffects::derive(source, target, &sequence) else {
-        rejection::trigger_animation_rejected(
-            &mut commands,
-            camera,
-            source,
-            target,
-            AnimationRejectionReason::RequestPreparationFailed(
-                CameraRequestPreparationError::MissingTargetGeometry,
-            ),
-        );
-        return;
-    };
-    pending.0.push(PendingCameraRequest {
-        camera,
-        sequence,
-        source,
-        target,
-        zoom: start.zoom_context.clone(),
-        effects,
-    });
-    commands
-        .entity(camera)
-        .insert(CameraSequencePreparationRequested);
+            zoom: start.zoom_context.clone(),
+            bounds,
+            effects,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -123,7 +144,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::time::Duration;
 
-    use bevy::math::curve::easing::EaseFunction;
+    use bevy::curve::easing::EaseFunction;
     use bevy::prelude::Camera;
     use bevy::prelude::Cuboid;
     use bevy::prelude::Entity;
@@ -350,11 +371,11 @@ mod tests {
             .trigger(|_| PlayAnimation::new(camera, [camera_move]));
         app.update();
 
-        assert!(
+        assert_eq!(
             app.world()
                 .resource::<HigherRequestEventRecord>()
-                .rejections
-                .is_empty()
+                .rejections,
+            []
         );
         assert!(app.world().get::<CameraSequence>(camera).is_some());
         assert!(app.world().get::<SequenceStages>(camera).is_some());
@@ -363,6 +384,13 @@ mod tests {
 
     #[test]
     fn phase22_play_animation_api_remains_source_compatible() {
+        const fn with_zoom_context(
+            animation: PlayAnimation,
+            context: ZoomContext,
+        ) -> PlayAnimation {
+            animation.zoom_context(context)
+        }
+
         let camera = Entity::from_raw_u32(31).expect("31 is a valid test entity index");
         let target = Entity::from_raw_u32(47).expect("47 is a valid test entity index");
         let zoom_context = ZoomContext {
@@ -391,10 +419,12 @@ mod tests {
         assert_eq!(literal_zoom.duration, Duration::from_millis(250));
         assert_eq!(literal_zoom.easing, EaseFunction::SineInOut);
 
-        let built = PlayAnimation::new(camera, [move_lasting(Duration::from_millis(1))])
-            .source(AnimationSource::AnimateToFit)
-            .target(target)
-            .zoom_context(zoom_context);
+        let built = with_zoom_context(
+            PlayAnimation::new(camera, [move_lasting(Duration::from_millis(1))])
+                .source(AnimationSource::AnimateToFit)
+                .target(target),
+            zoom_context,
+        );
         assert_eq!(built.camera, camera);
         assert_eq!(built.camera_moves.len(), 1);
         assert_eq!(built.source, AnimationSource::ZoomToFit);

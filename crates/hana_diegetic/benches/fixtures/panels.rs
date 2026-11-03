@@ -16,7 +16,9 @@ use hana_diegetic::LayoutBuilder;
 use hana_diegetic::LayoutTree;
 use hana_diegetic::Padding;
 use hana_diegetic::Sizing;
+use hana_diegetic::Text;
 use hana_diegetic::TextStyle;
+use hana_diegetic::TextWrap;
 use hana_diegetic::Unit;
 
 use super::measurement::CLAY_FONT_SIZE;
@@ -25,6 +27,8 @@ use super::rows::StatusRow;
 
 pub const PANEL_SIZE: f32 = 160.0;
 pub const RESIZED_PANEL_SIZE: f32 = 192.0;
+pub const FOOTER_PANEL_SIZE: f32 = 480.0;
+pub const RESIZED_FOOTER_PANEL_SIZE: f32 = 576.0;
 
 #[derive(Clone, Copy)]
 pub struct DiegeticStatusTreeStyle {
@@ -126,6 +130,62 @@ pub fn build_diegetic_status_tree_with_style(
         |_| {},
     );
     build_diegetic_body(&mut builder, rows, style);
+    builder.build()
+}
+
+#[must_use = "benchmarks need the tree as fixture input"]
+pub fn build_diegetic_footer_sibling_tree(rows: usize) -> LayoutTree {
+    build_diegetic_footer_sibling_tree_with_dim_color(rows, Color::srgb(0.6, 0.6, 0.6))
+}
+
+#[must_use = "benchmarks need a colour-only variant of the sibling fixture"]
+pub fn build_diegetic_footer_sibling_tree_with_dim_color(
+    rows: usize,
+    dim_color: Color,
+) -> LayoutTree {
+    let key_style = TextStyle::new(FONT_SIZE).with_color(Color::WHITE);
+    let dim_style = TextStyle::new(FONT_SIZE).with_color(dim_color);
+    let mut builder = LayoutBuilder::with_root(
+        El::column()
+            .width(Sizing::GROW)
+            .height(Sizing::GROW)
+            .padding(Padding::all(8.0))
+            .gap(2.0)
+            .background(Color::srgb_u8(22, 28, 34)),
+    );
+    for row in 0..rows {
+        builder.with(
+            El::row()
+                .width(Sizing::GROW)
+                .height(Sizing::FIT)
+                .gap(4.0)
+                .align_y(AlignY::Center),
+            |builder| {
+                for (index, (key, action)) in [
+                    ("↑↓", "to navigate"),
+                    ("⏎", "to use"),
+                    ("esc", "to dismiss"),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    if index > 0 {
+                        builder.text(Text::new("-", dim_style.clone()).wrap(TextWrap::None));
+                    }
+                    builder.text(Text::new(key, key_style.clone()).wrap(TextWrap::None));
+                    builder.text(Text::new(action, dim_style.clone()).wrap(TextWrap::None));
+                }
+                builder.with(
+                    El::new().width(Sizing::GROW).height(Sizing::fixed(1.0)),
+                    |_| {},
+                );
+                builder.text(
+                    Text::new(format!("{} of {rows}", row + 1), dim_style.clone())
+                        .wrap(TextWrap::None),
+                );
+            },
+        );
+    }
     builder.build()
 }
 
@@ -349,4 +409,60 @@ fn build_diegetic_body(
             );
         },
     );
+}
+
+/// The sibling footer's same content and fixed separators authored as one paragraph.
+#[must_use]
+pub fn build_diegetic_footer_rich_tree(rows: usize) -> LayoutTree {
+    build_diegetic_footer_rich_tree_with_dim_color(rows, Color::srgb(0.6, 0.6, 0.6))
+}
+
+#[must_use]
+pub fn build_diegetic_footer_rich_tree_with_dim_color(rows: usize, dim: Color) -> LayoutTree {
+    let base = TextStyle::new(FONT_SIZE).with_color(dim);
+    let bright = hana_diegetic::SpanStyle::new().with_color(Color::WHITE);
+    let separator =
+        hana_diegetic::SpanStyle::new().with_word_spacing((-FONT_SIZE).mul_add(0.6, 4.0));
+    let mut builder = LayoutBuilder::with_root(
+        El::column()
+            .width(Sizing::GROW)
+            .height(Sizing::GROW)
+            .padding(Padding::all(8.0))
+            .gap(2.0)
+            .background(Color::srgb_u8(22, 28, 34)),
+    );
+    for row in 0..rows {
+        builder.with(
+            El::row()
+                .width(Sizing::GROW)
+                .height(Sizing::FIT)
+                .gap(4.0)
+                .align_y(AlignY::Center),
+            |builder| {
+                builder.rich_text(hana_diegetic::RichText::new(base.clone()), |rich| {
+                    for (index, (key, action)) in [
+                        ("↑↓", "to navigate"),
+                        ("⏎", "to use"),
+                        ("esc", "to dismiss"),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        if index > 0 {
+                            rich.span((" ", separator)).span("-").span((" ", separator));
+                        }
+                        rich.span((key, bright)).span((" ", separator)).span(action);
+                    }
+                });
+                builder.with(
+                    El::new().width(Sizing::GROW).height(Sizing::fixed(1.0)),
+                    |_| {},
+                );
+                builder.text(
+                    Text::new(format!("{} of {rows}", row + 1), base.clone()).wrap(TextWrap::None),
+                );
+            },
+        );
+    }
+    builder.build()
 }

@@ -32,6 +32,16 @@ impl Bounds {
     pub(crate) fn height(self) -> f32 { self.max.y - self.min.y }
 }
 
+/// Whether a contour is ordinary ink or an isolated part of a counter.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) enum ContourRole {
+    /// Ordinary ink, including counter boundaries.
+    #[default]
+    Ink,
+    /// An isolated ink contour enclosed by a counter, with each axis extent in em.
+    Island { extent_em: Vec2 },
+}
+
 /// One closed analytic path contour expressed as quadratic segments.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PathContour {
@@ -49,6 +59,8 @@ pub(crate) struct PathContour {
     /// ([`HairlineFade::Full`](crate::HairlineFade::Full)); text path
     /// contours carry `0.0` and are exempt regardless (dilation 0).
     pub fade_exponent:        f32,
+    /// Whether this contour is an isolated ink island inside a counter.
+    pub role:                 ContourRole,
 }
 
 /// Renderer-owned quadratic outline representation.
@@ -123,6 +135,7 @@ impl PathOutline {
                     .collect(),
                 minimum_feature_size: contour.minimum_feature_size / extent,
                 fade_exponent:        contour.fade_exponent,
+                role:                 contour.role,
             })
             .collect();
         let bounds = Bounds {

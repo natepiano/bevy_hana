@@ -30,6 +30,8 @@ use hana_diegetic::RequestWidgetFocus;
 use hana_diegetic::Slider;
 use hana_diegetic::SliderAdjustment;
 use hana_diegetic::SliderChangeRequested;
+use hana_diegetic::SwitchSide;
+use hana_diegetic::SwitchState;
 use hana_diegetic::WidgetInput;
 
 #[derive(Default, Resource)]
@@ -43,7 +45,7 @@ fn record_button_click(click: On<ButtonClicked>, mut observed: ResMut<ObservedBe
 }
 
 fn record_slider_change(change: On<SliderChangeRequested>, mut observed: ResMut<ObservedBehavior>) {
-    observed.proposed_value = Some(change.value);
+    observed.proposed_value = Some(change.value.get());
 }
 
 fn resolve_widget(app: &mut App, panel: Entity, id: &'static str) -> Option<Entity> {
@@ -101,7 +103,9 @@ fn client_can_test_button_slider_and_ime_behavior_without_rendering() {
         widget: button,
     });
     app.world_mut()
-        .write_message(WidgetInput::Activate { window });
+        .write_message(WidgetInput::ActivatePress { window });
+    app.world_mut()
+        .write_message(WidgetInput::ActivateRelease { window });
     app.update();
     assert_eq!(
         app.world().resource::<ObservedBehavior>().clicked,
@@ -133,6 +137,38 @@ fn client_can_test_button_slider_and_ime_behavior_without_rendering() {
     assert_eq!(
         app.world().resource::<ImeInputBlocker>().window(),
         Some(window)
+    );
+    assert!(app.get_sub_app(RenderApp).is_none());
+}
+
+#[test]
+fn a_switch_reifies_on_through_the_headless_plugin() {
+    let mut app = App::new();
+    app.add_plugins(MinimalPlugins)
+        .insert_resource(DiegeticTextMeasurer::default())
+        .add_plugins(HeadlessDiegeticUiPlugin);
+
+    let mut builder = LayoutBuilder::new(60.0, 25.0);
+    builder.with(El::new().size(24.0, 12.0).switch("power"), |builder| {
+        builder.with(El::new().size(10.0, 10.0).switch_knob(), |_| {});
+    });
+    let panel = DiegeticPanel::world()
+        .size(Mm(60.0), Mm(25.0))
+        .with_tree(builder.build())
+        .build();
+    assert!(panel.is_ok());
+    let Ok(panel) = panel else { return };
+    let panel = app.world_mut().spawn(panel).id();
+    app.update();
+
+    let widget = resolve_widget(&mut app, panel, "power");
+    assert!(widget.is_some(), "switch root slot reifies");
+    let Some(widget) = widget else { return };
+    assert_eq!(
+        app.world()
+            .get::<SwitchState>(widget)
+            .map(|state| state.side),
+        Some(SwitchSide::On),
     );
     assert!(app.get_sub_app(RenderApp).is_none());
 }

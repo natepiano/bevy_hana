@@ -19,20 +19,17 @@
 //!     highlights while it is on
 //!
 //! A left screen overlay, anchored above the bottom-left GPU pipeline
-//! visualization, reports the frame as additive main/render blocks, each row
-//! with a 5-second peak column.
-//! Main thread: `ms/frame` is the sum of `layout`, `reify`, `shaping`,
-//! `mesh`, `other`, `wait for render`, `extract`, and `frame slack`. Render
-//! thread: `render cycle` is the end-to-end frame N cycle from one render
-//! schedule start to the next: `assets`, `prep`, `wait for GPU`, `render graph`,
-//! `cleanup`, `return`, and `extract handoff`.
+//! visualization, reports `hana_metrics` frame and render spans alongside
+//! the local `layout`, `reify`, `shaping`, and `mesh` spans. Each row has a
+//! five-second peak column. The bottom bars illustrate durations; their GPU
+//! lane is inferred and is not a GPU timer.
 
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 
 use bevy::camera::primitives::Aabb;
 use bevy::diagnostic::Diagnostic;
@@ -48,10 +45,8 @@ use bevy::prelude::Color;
 use bevy::prelude::Commands;
 use bevy::prelude::Component;
 use bevy::prelude::Entity;
-use bevy::prelude::First;
 use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::KeyCode;
-use bevy::prelude::Last;
 use bevy::prelude::Local;
 use bevy::prelude::On;
 use bevy::prelude::Plugin;
@@ -70,20 +65,12 @@ use bevy::prelude::Vec3;
 use bevy::prelude::Visibility;
 use bevy::prelude::With;
 use bevy::prelude::error;
-use bevy::render::Extract;
-use bevy::render::ExtractSchedule;
 use bevy::render::Render;
 use bevy::render::RenderApp;
 use bevy::render::RenderSystems;
 use bevy::render::render_phase::ViewBinnedRenderPhases;
-use bevy::render::renderer::RenderGraph;
-use bevy::render::renderer::RenderGraphSystems;
 use diagnostics::DrawCounts;
-use diagnostics::MainThreadMs;
-use diagnostics::RenderThreadSpans;
 use diagnostics::StressDiagnosticsPlugin;
-use diagnostics::relative_timeline_offset_ms;
-use diagnostics::timeline_duration_ms;
 use fairy_dust::CameraHomeTarget;
 use fairy_dust::ControlActivation;
 use fairy_dust::DEFAULT_PANEL_BACKGROUND;
@@ -92,6 +79,7 @@ use fairy_dust::StatsPanelRow;
 use fairy_dust::TitleBar;
 use fairy_dust::TitleBarControl;
 use fairy_dust::TitleBarSegment;
+use fairy_dust::TitleBarStateWriters;
 use fairy_dust::diegetic_stats_panel_with_integral_advance;
 use fairy_dust::diegetic_stats_tree_with_integral_advance;
 use fairy_dust::fps_stats_panel;
@@ -101,15 +89,20 @@ use hana_diegetic::AlignX;
 use hana_diegetic::AlignY;
 use hana_diegetic::Anchor;
 use hana_diegetic::AntiAlias;
+use hana_diegetic::ComputedDiegeticPanel;
+use hana_diegetic::DiegeticPanel;
 use hana_diegetic::DiegeticPanelCommands;
 use hana_diegetic::DiegeticPerfStats;
 use hana_diegetic::DiegeticText;
+use hana_diegetic::DiegeticTextMeasurer;
 use hana_diegetic::DiegeticTextMut;
 use hana_diegetic::El;
 use hana_diegetic::FontRegistry;
+use hana_diegetic::FontUnit;
 use hana_diegetic::GlyphShadowMode;
 use hana_diegetic::LayoutBuilder;
 use hana_diegetic::LayoutTree;
+use hana_diegetic::MeasureTextFn;
 use hana_diegetic::Padding;
 use hana_diegetic::PanelAnchorOffset;
 use hana_diegetic::PanelAttachment;
@@ -117,12 +110,28 @@ use hana_diegetic::PanelEntityReader;
 use hana_diegetic::Px;
 use hana_diegetic::Sizing;
 use hana_diegetic::StableTransparency;
+use hana_diegetic::Text;
 use hana_diegetic::TextAlign;
 use hana_diegetic::TextStyle;
+use hana_diegetic::TextWrap;
+use hana_diegetic::Unit;
+use hana_kana::Resolved;
 use hana_kana::ToF32;
 use hana_kana::ToU32;
 use hana_lagrange::OrbitCam;
 use hana_lagrange::OrbitCamPreset;
+use hana_metrics::FrameTiming;
+use hana_metrics::FrameTimingPlugin;
+use hana_metrics::SpanSample;
+use hana_metrics::SpanTiming;
+
+/// The stress graphs keep the old zero baseline until a span first measures.
+const fn last_ms_or_zero(span: &SpanTiming) -> f32 {
+    match span.sample {
+        SpanSample::NeverMeasured => 0.0,
+        SpanSample::Measured { last_ms, .. } => last_ms,
+    }
+}
 
 // ── App — plugin wiring, resources, startup/update systems, shortcuts ────────
 
@@ -171,7 +180,7 @@ fn main() {
         })
         .wire_chip_to_state::<OitState, _>(OIT_CHIP, |oit| chip_activation(oit.0))
         .with_camera_control_panel()
-        .add_plugins(StressDiagnosticsPlugin)
+        .add_plugins((FrameTimingPlugin, StressDiagnosticsPlugin))
         .init_resource::<FrameCounter>()
         .init_resource::<Mutating>()
         .init_resource::<OitState>()
@@ -193,7 +202,7 @@ fn main() {
         .add_systems(
             Update,
             (
-                toggle_mutation,
+                toggle_mutation.in_set(TitleBarStateWriters),
                 advance_frame,
                 mutate_labels,
                 update_status_panel,
@@ -443,456 +452,8 @@ mod diagnostics {
     pub(super) struct StressDiagnosticsPlugin;
 
     impl Plugin for StressDiagnosticsPlugin {
-        fn build(&self, app: &mut App) {
-            app.insert_resource(MainSpanStart(Instant::now()));
-            app.insert_resource(MainScheduleEnd(Instant::now()));
-            app.init_resource::<MainThreadMs>();
-            app.add_systems(First, mark_main_span_start);
-            app.add_systems(Last, publish_main_span);
-            app.add_plugins((RenderThreadTimingPlugin, DrawCountPlugin));
-        }
+        fn build(&self, app: &mut App) { app.add_plugins(DrawCountPlugin); }
     }
-
-    // ── Main-thread span: frame wall time and the recv block ─────────────────────
-
-    /// Start instant of the current main-world frame, recorded in `First`.
-    #[derive(Resource)]
-    struct MainSpanStart(Instant);
-
-    /// Wall time of the previous main-world schedule run (`First` → `Last`) in
-    /// milliseconds. The `other` row is this minus the four measured diegetic
-    /// spans; the `wait` row is the frame time minus this.
-    #[derive(Resource, Default)]
-    pub(super) struct MainThreadMs(f32);
-
-    impl MainThreadMs {
-        pub(super) const fn ms(&self) -> f32 { self.0 }
-    }
-
-    /// Instant the main schedule finished (end of `Last`). Read on the main thread
-    /// inside `ExtractSchedule` (which runs during `renderer_extract`) to measure
-    /// the `recv` block: `extract_begin - main_schedule_end`.
-    #[derive(Resource)]
-    struct MainScheduleEnd(Instant);
-
-    fn mark_main_span_start(mut start: ResMut<MainSpanStart>) { start.0 = Instant::now(); }
-
-    fn publish_main_span(
-        start: Res<MainSpanStart>,
-        mut main_thread: ResMut<MainThreadMs>,
-        mut schedule_end: ResMut<MainScheduleEnd>,
-        spans: Res<RenderThreadSpans>,
-    ) {
-        let end = Instant::now();
-        main_thread.0 = duration_ms(start.0, end);
-        schedule_end.0 = end;
-        spans.0.store_offset(&spans.0.main_start_ms, start.0);
-        spans.0.store_offset(&spans.0.main_end_ms, end);
-    }
-
-    /// First system in `ExtractSchedule` (runs on the main thread the instant the
-    /// `recv().await` in `renderer_extract` unblocks). Stores the wait the main
-    /// thread just spent blocked on the render thread returning the previous
-    /// frame's render app — the true Main-lane `wait`.
-    fn mark_extract_begin(main_end: Extract<Res<MainScheduleEnd>>, spans: Res<RenderThreadSpans>) {
-        let now = Instant::now();
-        let recv = duration_ms(main_end.0, now);
-        let extract_begin_ms = duration_ms(spans.0.epoch, now);
-        let render_end_ms = span_ms(&spans.0.render_end_ms);
-        let return_gap = timeline_duration_ms(render_end_ms, extract_begin_ms).unwrap_or(0.0);
-        spans.0.recv.store(recv.to_bits(), Ordering::Relaxed);
-        spans
-            .0
-            .extract_begin_ms
-            .store(extract_begin_ms.to_bits(), Ordering::Relaxed);
-        spans
-            .0
-            .return_gap
-            .store(return_gap.to_bits(), Ordering::Relaxed);
-    }
-
-    // ── Measurement — render-thread spans: per-stage render timings ──────────────
-
-    /// Latest render-thread segment values in milliseconds, stored as `f32` bits.
-    /// Written at the end of each `Render` schedule run on the render thread and
-    /// read by the overlay on the main thread. The segments sum to `render`.
-    struct RenderSpanBits {
-        /// Shared epoch for every timeline offset written by either thread.
-        epoch:            Instant,
-        /// Whole `Render` schedule.
-        render:           AtomicU32,
-        /// The `PrepareAssets` stage: re-uploading every mesh / image / buffer
-        /// asset modified this frame.
-        assets:           AtomicU32,
-        /// CPU before `PrepareViews` / render graph: extract-commands apply,
-        /// prepare meshes and views, specialize, queue, phase sort, bind groups.
-        prep:             AtomicU32,
-        /// The `PrepareViews` stage containing the swapchain acquire — where the
-        /// render thread blocks when the GPU is behind.
-        gpu_wait:         AtomicU32,
-        /// Root `RenderGraph` schedule: camera graph execution, command encoding,
-        /// queued command-buffer submit, and finish systems.
-        render_graph:     AtomicU32,
-        /// `RenderGraphSystems::Render`: camera graph execution and command
-        /// encoding before queued command buffers are submitted.
-        graph_render:     AtomicU32,
-        /// `RenderGraphSystems::Submit`: queued command-buffer submit and
-        /// uncovered-swapchain handling.
-        graph_submit:     AtomicU32,
-        /// `RenderGraphSystems::Finish`: final root-graph systems.
-        graph_finish:     AtomicU32,
-        /// Render cleanup and schedule closeout after the root `RenderGraph`
-        /// schedule has run.
-        cleanup:          AtomicU32,
-        /// Main-thread block in `renderer_extract`: the `recv().await` that waits
-        /// for the render thread to return the previous frame's render app (after
-        /// its whole `Render` schedule, render graph and cleanup included) before
-        /// extract can run.
-        /// Measured on the main thread as `extract_begin - main_schedule_end`; this
-        /// is what the Main lane's `wait` actually is.
-        recv:             AtomicU32,
-        /// Render thread parked after a complete `Render` schedule, waiting for the
-        /// main thread to extract and return the render app.
-        wait_for_extract: AtomicU32,
-        /// Gap between render-schedule publication and the main thread beginning
-        /// extract: schedule closeout, return-app handoff, and main `recv` unblock
-        /// overhead.
-        return_gap:       AtomicU32,
-        /// Main `First` mark, as milliseconds since [`Self::epoch`].
-        main_start_ms:    AtomicU32,
-        /// Main `Last` mark, as milliseconds since [`Self::epoch`].
-        main_end_ms:      AtomicU32,
-        /// Main-thread `ExtractSchedule` begin mark, as milliseconds since
-        /// [`Self::epoch`].
-        extract_begin_ms: AtomicU32,
-        /// Render schedule start mark, as milliseconds since [`Self::epoch`].
-        render_start_ms:  AtomicU32,
-        /// Render schedule published-end mark, as milliseconds since [`Self::epoch`].
-        render_end_ms:    AtomicU32,
-    }
-
-    impl RenderSpanBits {
-        const fn new(epoch: Instant) -> Self {
-            Self {
-                epoch,
-                render: AtomicU32::new(0),
-                assets: AtomicU32::new(0),
-                prep: AtomicU32::new(0),
-                gpu_wait: AtomicU32::new(0),
-                render_graph: AtomicU32::new(0),
-                graph_render: AtomicU32::new(0),
-                graph_submit: AtomicU32::new(0),
-                graph_finish: AtomicU32::new(0),
-                cleanup: AtomicU32::new(0),
-                recv: AtomicU32::new(0),
-                wait_for_extract: AtomicU32::new(0),
-                return_gap: AtomicU32::new(0),
-                main_start_ms: AtomicU32::new(0),
-                main_end_ms: AtomicU32::new(0),
-                extract_begin_ms: AtomicU32::new(0),
-                render_start_ms: AtomicU32::new(0),
-                render_end_ms: AtomicU32::new(0),
-            }
-        }
-
-        fn store_offset(&self, bits: &AtomicU32, instant: Instant) {
-            bits.store(
-                duration_ms(self.epoch, instant).to_bits(),
-                Ordering::Relaxed,
-            );
-        }
-    }
-
-    /// Main-world handle to the shared [`RenderSpanBits`].
-    #[derive(Resource, Clone)]
-    pub(super) struct RenderThreadSpans(Arc<RenderSpanBits>);
-
-    impl RenderThreadSpans {
-        pub(super) fn recv_ms(&self) -> f32 { span_ms(&self.0.recv) }
-
-        pub(super) fn main_start_ms(&self) -> f32 { span_ms(&self.0.main_start_ms) }
-
-        pub(super) fn main_end_ms(&self) -> f32 { span_ms(&self.0.main_end_ms) }
-
-        pub(super) fn render_start_ms(&self) -> f32 { span_ms(&self.0.render_start_ms) }
-
-        pub(super) fn render_ms(&self) -> f32 { span_ms(&self.0.render) }
-
-        pub(super) fn assets_ms(&self) -> f32 { span_ms(&self.0.assets) }
-
-        pub(super) fn prep_ms(&self) -> f32 { span_ms(&self.0.prep) }
-
-        pub(super) fn gpu_wait_ms(&self) -> f32 { span_ms(&self.0.gpu_wait) }
-
-        pub(super) fn render_graph_ms(&self) -> f32 { span_ms(&self.0.render_graph) }
-
-        pub(super) fn graph_render_ms(&self) -> f32 { span_ms(&self.0.graph_render) }
-
-        pub(super) fn graph_submit_ms(&self) -> f32 { span_ms(&self.0.graph_submit) }
-
-        pub(super) fn graph_finish_ms(&self) -> f32 { span_ms(&self.0.graph_finish) }
-
-        pub(super) fn cleanup_ms(&self) -> f32 { span_ms(&self.0.cleanup) }
-
-        pub(super) fn return_gap_ms(&self) -> f32 { span_ms(&self.0.return_gap) }
-
-        pub(super) fn wait_for_extract_ms(&self) -> f32 { span_ms(&self.0.wait_for_extract) }
-    }
-
-    /// Render-world `Instant` marks at `Render`-schedule set boundaries.
-    #[derive(Resource)]
-    struct RenderMarks {
-        start:               Instant,
-        before_assets:       Instant,
-        after_assets:        Instant,
-        before_views:        Instant,
-        after_views:         Instant,
-        before_render_graph: Instant,
-        after_render_graph:  Instant,
-        end:                 Instant,
-        completed:           bool,
-    }
-
-    /// Root `RenderGraph` schedule marks inside Bevy's `RenderSystems::Render`
-    /// system.
-    #[derive(Resource)]
-    struct RenderGraphMarks {
-        start:        Instant,
-        after_render: Instant,
-        after_submit: Instant,
-        end:          Instant,
-        completed:    bool,
-    }
-
-    impl Default for RenderGraphMarks {
-        fn default() -> Self {
-            let now = Instant::now();
-            Self {
-                start:        now,
-                after_render: now,
-                after_submit: now,
-                end:          now,
-                completed:    false,
-            }
-        }
-    }
-
-    impl RenderGraphMarks {
-        fn total_ms(&self) -> Option<f32> {
-            self.completed.then(|| duration_ms(self.start, self.end))
-        }
-
-        fn render_ms(&self) -> Option<f32> {
-            self.completed
-                .then(|| duration_ms(self.start, self.after_render))
-        }
-
-        fn submit_ms(&self) -> Option<f32> {
-            self.completed
-                .then(|| duration_ms(self.after_render, self.after_submit))
-        }
-
-        fn finish_ms(&self) -> Option<f32> {
-            self.completed
-                .then(|| duration_ms(self.after_submit, self.end))
-        }
-    }
-
-    impl Default for RenderMarks {
-        fn default() -> Self {
-            let now = Instant::now();
-            Self {
-                start:               now,
-                before_assets:       now,
-                after_assets:        now,
-                before_views:        now,
-                after_views:         now,
-                before_render_graph: now,
-                after_render_graph:  now,
-                end:                 now,
-                completed:           false,
-            }
-        }
-    }
-
-    /// Brackets the render app's `Render` schedule with `Instant` marks at its set
-    /// boundaries and publishes the segment milliseconds to the main world through
-    /// [`RenderThreadSpans`].
-    ///
-    /// The render thread runs in parallel with the next main-world frame, so on a
-    /// GPU-bound frame `render` approaches the frame time — with the excess
-    /// sitting in `gpu_wait` — while the main-world rows stay small.
-    struct RenderThreadTimingPlugin;
-
-    impl Plugin for RenderThreadTimingPlugin {
-        fn build(&self, app: &mut App) {
-            let shared = RenderThreadSpans(Arc::new(RenderSpanBits::new(Instant::now())));
-            app.insert_resource(shared.clone());
-            let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
-                return;
-            };
-            render_app.insert_resource(shared);
-            render_app.init_resource::<RenderMarks>();
-            render_app.init_resource::<RenderGraphMarks>();
-            render_app.add_systems(ExtractSchedule, mark_extract_begin);
-            render_app.add_systems(
-                Render,
-                (
-                    mark_render_start.before(RenderSystems::ExtractCommands),
-                    mark_before_assets
-                        .after(RenderSystems::ExtractCommands)
-                        .before(RenderSystems::PrepareAssets),
-                    mark_after_assets
-                        .after(RenderSystems::PrepareAssets)
-                        .before(RenderSystems::PrepareMeshes),
-                    mark_before_views
-                        .after(RenderSystems::Specialize)
-                        .before(RenderSystems::PrepareViews),
-                    mark_after_views
-                        .after(RenderSystems::PrepareViews)
-                        .before(RenderSystems::Queue),
-                    mark_before_render_graph
-                        .after(RenderSystems::Prepare)
-                        .before(RenderSystems::Render),
-                    mark_after_render_graph
-                        .after(RenderSystems::Render)
-                        .before(RenderSystems::Cleanup),
-                    publish_render_spans.after(RenderSystems::PostCleanup),
-                ),
-            );
-            render_app.add_systems(
-                RenderGraph,
-                (
-                    mark_root_graph_start.in_set(RenderGraphSystems::Begin),
-                    mark_root_graph_after_render
-                        .after(RenderGraphSystems::Render)
-                        .before(RenderGraphSystems::Submit),
-                    mark_root_graph_after_submit
-                        .after(RenderGraphSystems::Submit)
-                        .before(RenderGraphSystems::Finish),
-                    mark_root_graph_end.after(RenderGraphSystems::Finish),
-                ),
-            );
-        }
-    }
-
-    fn mark_render_start(mut marks: ResMut<RenderMarks>, spans: Res<RenderThreadSpans>) {
-        let now = Instant::now();
-        if marks.completed {
-            let wait_for_extract = duration_ms(marks.end, now);
-            spans
-                .0
-                .wait_for_extract
-                .store(wait_for_extract.to_bits(), Ordering::Relaxed);
-        }
-        marks.start = now;
-        spans.0.store_offset(&spans.0.render_start_ms, now);
-    }
-
-    fn mark_before_assets(mut marks: ResMut<RenderMarks>) { marks.before_assets = Instant::now(); }
-
-    fn mark_after_assets(mut marks: ResMut<RenderMarks>) { marks.after_assets = Instant::now(); }
-
-    fn mark_before_views(mut marks: ResMut<RenderMarks>) { marks.before_views = Instant::now(); }
-
-    fn mark_after_views(mut marks: ResMut<RenderMarks>) { marks.after_views = Instant::now(); }
-
-    fn mark_before_render_graph(mut marks: ResMut<RenderMarks>) {
-        marks.before_render_graph = Instant::now();
-    }
-
-    fn mark_after_render_graph(mut marks: ResMut<RenderMarks>) {
-        marks.after_render_graph = Instant::now();
-    }
-
-    fn mark_root_graph_start(mut marks: ResMut<RenderGraphMarks>) {
-        marks.start = Instant::now();
-        marks.completed = false;
-    }
-
-    fn mark_root_graph_after_render(mut marks: ResMut<RenderGraphMarks>) {
-        marks.after_render = Instant::now();
-    }
-
-    fn mark_root_graph_after_submit(mut marks: ResMut<RenderGraphMarks>) {
-        marks.after_submit = Instant::now();
-    }
-
-    fn mark_root_graph_end(mut marks: ResMut<RenderGraphMarks>) {
-        marks.end = Instant::now();
-        marks.completed = true;
-    }
-
-    fn publish_render_spans(
-        mut marks: ResMut<RenderMarks>,
-        graph_marks: Res<RenderGraphMarks>,
-        spans: Res<RenderThreadSpans>,
-    ) {
-        let end = Instant::now();
-        let render = duration_ms(marks.start, end);
-        let assets = duration_ms(marks.before_assets, marks.after_assets);
-        let gpu_wait = duration_ms(marks.before_views, marks.after_views);
-        let outer_render_stage = duration_ms(marks.before_render_graph, marks.after_render_graph);
-        let render_graph = graph_marks.total_ms().unwrap_or(outer_render_stage);
-        let graph_render = graph_marks.render_ms().unwrap_or(render_graph);
-        let graph_submit = graph_marks.submit_ms().unwrap_or(0.0);
-        let graph_finish = graph_marks.finish_ms().unwrap_or(0.0);
-        let post_graph_tail = (outer_render_stage - render_graph).max(0.0);
-        let cleanup = duration_ms(marks.after_render_graph, end) + post_graph_tail;
-        let prep = (render - assets - gpu_wait - render_graph - cleanup).max(0.0);
-        spans.0.render.store(render.to_bits(), Ordering::Relaxed);
-        spans.0.assets.store(assets.to_bits(), Ordering::Relaxed);
-        spans.0.prep.store(prep.to_bits(), Ordering::Relaxed);
-        spans
-            .0
-            .gpu_wait
-            .store(gpu_wait.to_bits(), Ordering::Relaxed);
-        spans
-            .0
-            .render_graph
-            .store(render_graph.to_bits(), Ordering::Relaxed);
-        spans
-            .0
-            .graph_render
-            .store(graph_render.to_bits(), Ordering::Relaxed);
-        spans
-            .0
-            .graph_submit
-            .store(graph_submit.to_bits(), Ordering::Relaxed);
-        spans
-            .0
-            .graph_finish
-            .store(graph_finish.to_bits(), Ordering::Relaxed);
-        spans.0.cleanup.store(cleanup.to_bits(), Ordering::Relaxed);
-        spans.0.store_offset(&spans.0.render_end_ms, end);
-        marks.end = end;
-        marks.completed = true;
-    }
-
-    /// One shared segment value, decoded from its `f32` bits.
-    fn span_ms(bits: &AtomicU32) -> f32 { f32::from_bits(bits.load(Ordering::Relaxed)) }
-
-    fn duration_ms(start: Instant, end: Instant) -> f32 {
-        end.saturating_duration_since(start).as_secs_f32() * MILLISECONDS_PER_SECOND
-    }
-
-    pub(super) fn timeline_duration_ms(start_ms: f32, end_ms: f32) -> Option<f32> {
-        if has_timeline_mark(start_ms) && has_timeline_mark(end_ms) && end_ms >= start_ms {
-            Some(end_ms - start_ms)
-        } else {
-            None
-        }
-    }
-
-    pub(super) fn relative_timeline_offset_ms(anchor_ms: f32, mark_ms: f32) -> f32 {
-        if has_timeline_mark(anchor_ms) && has_timeline_mark(mark_ms) {
-            (mark_ms - anchor_ms).max(0.0)
-        } else {
-            0.0
-        }
-    }
-
-    fn has_timeline_mark(mark_ms: f32) -> bool { mark_ms.is_finite() && mark_ms > 0.0 }
 
     // ── Measurement — shadow draw counts: per-view shadow phase items ────────────
 
@@ -1007,7 +568,6 @@ const STATUS_TABLE_WIDTH: f32 = LABEL_COLUMN_WIDTH + VALUE_COLUMN_WIDTH * 2.0 + 
 const SUB_ROW_INDENT: f32 = 12.0;
 const FPS_UPDATE_INTERVAL: f32 = 1.0;
 const PERF_PEAK_WINDOW_SECS: f32 = 5.0;
-const MILLISECONDS_PER_SECOND: f32 = 1000.0;
 /// Larger text for section labels in the left perf panel.
 const STATS_HEADER_FONT_SIZE: f32 = 15.0;
 
@@ -1054,30 +614,10 @@ impl MetricRow {
     }
 }
 
-/// Diagnostic table rows, in display order — two additive CPU blocks.
-///
-/// Main thread: `ms` (frame wall time) = `layout` + `reify` + `shaping` +
-/// `mesh` (the measured diegetic spans) + `other` (the rest of the main
-/// schedules: cascade, transform propagation, every other system) +
-/// `wait for render` (blocked in `renderer_extract` waiting for the render
-/// thread to return the render app) + `extract` (main world → render world copy
-/// and send-back) + `frame slack` (the outer app-frame residual not covered by
-/// those measured spans).
-///
-/// Render lane, frame N: `render cycle` = `assets` (the `PrepareAssets` stage —
-/// re-uploading every mesh / image / buffer asset modified this frame) +
-/// `prep` (extract-commands apply, prepare meshes and views, specialize,
-/// queue, sort, bind groups) + `wait for GPU` (the `PrepareViews` stage
-/// containing the swapchain acquire — where the render thread blocks when the
-/// GPU is behind) + `render graph` (root `RenderGraph` schedule: camera graphs,
-/// queued command-buffer submit, and finish systems) + `cleanup` (post-graph
-/// render-system tail and cleanup closeout) + `return` (post-schedule
-/// app-return handoff and main `recv` unblock gap) + `extract handoff` (main
-/// extracts into the render world and sends the render app back, allowing the
-/// next render schedule to start).
-/// [`RowIndent`] controls display hierarchy only; the metric values stay in
-/// this fixed array order.
-const METRIC_ROWS: [MetricRow; 21] = [
+/// Diagnostic table rows, in display order. The local diegetic spans are
+/// sampled separately from the latest complete `hana_metrics` frame. Render
+/// work overlaps main work, so the two groups must not be added together.
+const METRIC_ROWS: [MetricRow; 17] = [
     MetricRow::new("fps", RowIndent::None),
     MetricRow::new("ms/frame", RowIndent::None),
     MetricRow::accented("layout", RowIndent::Detail, GPU_PIPELINE_WORK_COLOR),
@@ -1092,29 +632,17 @@ const METRIC_ROWS: [MetricRow; 21] = [
         RowIndent::Phase,
         GPU_PIPELINE_FRAME_SLACK_COLOR,
     ),
-    MetricRow::new("render cycle", RowIndent::None),
+    MetricRow::new("render work", RowIndent::None),
     MetricRow::accented("assets", RowIndent::Detail, GPU_PIPELINE_WORK_COLOR),
     MetricRow::accented("prep", RowIndent::Detail, GPU_PIPELINE_WORK_COLOR),
-    MetricRow::accented("wait for GPU", RowIndent::Phase, GPU_PIPELINE_WAIT_COLOR),
+    MetricRow::accented("next image wait", RowIndent::Phase, GPU_PIPELINE_WAIT_COLOR),
     MetricRow::accented(
         "render graph",
         RowIndent::Phase,
         GPU_PIPELINE_RENDER_GRAPH_COLOR,
     ),
-    MetricRow::accented(
-        "camera graphs",
-        RowIndent::Detail,
-        GPU_PIPELINE_RENDER_GRAPH_COLOR,
-    ),
     MetricRow::accented("submit", RowIndent::Detail, GPU_PIPELINE_GRAPH_SUBMIT_COLOR),
-    MetricRow::accented("finish", RowIndent::Detail, GPU_PIPELINE_GRAPH_FINISH_COLOR),
     MetricRow::accented("cleanup", RowIndent::Phase, GPU_PIPELINE_CLEANUP_COLOR),
-    MetricRow::accented("return", RowIndent::Phase, GPU_PIPELINE_RETURN_COLOR),
-    MetricRow::accented(
-        "extract handoff",
-        RowIndent::Phase,
-        GPU_PIPELINE_GAP_LABEL_COLOR,
-    ),
 ];
 const METRIC_COUNT: usize = METRIC_ROWS.len();
 const FPS_METRIC_INDEX: usize = 0;
@@ -1144,17 +672,13 @@ struct PerfSnapshot {
     wait_for_render_ms: f32,
     extract_ms:         f32,
     frame_slack_ms:     f32,
-    render_cycle_ms:    f32,
+    render_work_ms:     f32,
     assets_ms:          f32,
     prep_ms:            f32,
     wait_for_gpu_ms:    f32,
     render_graph_ms:    f32,
-    graph_render_ms:    f32,
     graph_submit_ms:    f32,
-    graph_finish_ms:    f32,
     cleanup_ms:         f32,
-    return_ms:          f32,
-    extract_handoff_ms: f32,
 }
 
 impl PerfSnapshot {
@@ -1170,17 +694,13 @@ impl PerfSnapshot {
         wait_for_render_ms: 0.0,
         extract_ms:         0.0,
         frame_slack_ms:     0.0,
-        render_cycle_ms:    0.0,
+        render_work_ms:     0.0,
         assets_ms:          0.0,
         prep_ms:            0.0,
         wait_for_gpu_ms:    0.0,
         render_graph_ms:    0.0,
-        graph_render_ms:    0.0,
         graph_submit_ms:    0.0,
-        graph_finish_ms:    0.0,
         cleanup_ms:         0.0,
-        return_ms:          0.0,
-        extract_handoff_ms: 0.0,
     };
 }
 
@@ -1233,12 +753,14 @@ fn spawn_batch_stats_overlay(
 }
 
 fn status_panel_pipeline_attachment() -> PanelAttachment {
-    PanelAttachment::new(Anchor::BottomLeft, Anchor::TopLeft)
-        .with_offset(PanelAnchorOffset::new(Px(0.0), Px(-5.0)))
+    PanelAttachment::new(Anchor::BottomLeft, Anchor::TopLeft).with_offset(PanelAnchorOffset::new(
+        Px(0.0),
+        Px(-fairy_dust::SCREEN_PANEL_GAP),
+    ))
 }
 
 fn anchor_status_panel_when_gpu_pipeline_added(
-    trigger: On<Add, GpuPipelinePanel>,
+    trigger: On<Add<GpuPipelinePanel>>,
     status_panels: Query<Entity, With<StatusPanel>>,
     panel_entities: PanelEntityReader,
     mut attachments: Commands,
@@ -1255,7 +777,7 @@ fn anchor_status_panel_when_gpu_pipeline_added(
 }
 
 fn anchor_status_panel_when_status_panel_added(
-    trigger: On<Add, StatusPanel>,
+    trigger: On<Add<StatusPanel>>,
     gpu_pipeline_panels: Query<Entity, With<GpuPipelinePanel>>,
     panel_entities: PanelEntityReader,
     mut attachments: Commands,
@@ -1524,8 +1046,7 @@ fn update_status_panel(
     time: Res<Time>,
     diagnostics: Res<DiagnosticsStore>,
     diegetic_perf: Res<DiegeticPerfStats>,
-    main_thread: Res<MainThreadMs>,
-    render_spans: Res<RenderThreadSpans>,
+    timing: Res<FrameTiming>,
     panels: Query<Entity, With<StatusPanel>>,
     mut last_displayed: ResMut<LastDisplayedStatus>,
     mut commands: Commands,
@@ -1537,39 +1058,39 @@ fn update_status_panel(
         .and_then(Diagnostic::smoothed);
 
     // Sample every frame so the smoothed `now` mean and the 5-second peak see
-    // every value, not one arbitrary frame per second. `ms` is the raw frame
-    // delta (not the smoothed diagnostic) so the additive rows derived from it
-    // are per-frame exact; the displayed `now` column is window-meaned anyway.
-    let frame_ms = time.delta_secs() * MILLISECONDS_PER_SECOND;
+    // every value, not one arbitrary frame per second. The service's latest
+    // complete frame can be older than the local diegetic measurements.
+    let frame_ms = last_ms_or_zero(&timing.frame_time);
     let layout_ms = diegetic_perf.compute_ms;
     let reify_ms = diegetic_perf.reify_ms;
     let shaping_ms = diegetic_perf.panel_text.shape_ms;
     let mesh_ms = diegetic_perf.panel_text.mesh_build_ms;
-    // other = main-schedule wall time minus the four measured diegetic spans:
-    // the real main-thread CPU everything else consumes. Outside the main
-    // schedule, `wait for render` is the measured recv block and `extract` is
-    // the measured main->render handoff. `frame slack` is the remaining
-    // app-frame time not covered by those spans. Values are clamped because
-    // spans are sampled one frame apart, so a hitch can momentarily invert
-    // them.
-    let main_span_ms = main_thread.ms();
+    // The local diegetic spans and complete service record can differ by one
+    // frame. Clamp the illustrative remainder when that difference matters.
+    let main_span_ms = last_ms_or_zero(&timing.first)
+        + last_ms_or_zero(&timing.pre_update)
+        + last_ms_or_zero(&timing.state_transition)
+        + last_ms_or_zero(&timing.fixed_update)
+        + last_ms_or_zero(&timing.update)
+        + last_ms_or_zero(&timing.spawn_scene)
+        + last_ms_or_zero(&timing.post_update)
+        + last_ms_or_zero(&timing.last);
     let other_ms = (main_span_ms - layout_ms - reify_ms - shaping_ms - mesh_ms).max(0.0);
     let outside_main_ms = (frame_ms - main_span_ms).max(0.0);
-    let wait_for_render_ms = render_spans.recv_ms().clamp(0.0, outside_main_ms);
-    let return_ms = render_spans.return_gap_ms();
-    let wait_for_extract_ms = render_spans.wait_for_extract_ms();
-    let extract_handoff_ms = (wait_for_extract_ms - return_ms).max(0.0);
-    let extract_ms = extract_handoff_ms;
+    let wait_for_render_ms =
+        last_ms_or_zero(&timing.waiting_for_render).clamp(0.0, outside_main_ms);
+    let extract_ms =
+        last_ms_or_zero(&timing.extract).clamp(0.0, outside_main_ms - wait_for_render_ms);
     let frame_slack_ms = (outside_main_ms - wait_for_render_ms - extract_ms).max(0.0);
-    let render_cycle_ms = render_spans.render_ms() + wait_for_extract_ms;
-    let assets_ms = render_spans.assets_ms();
-    let prep_ms = render_spans.prep_ms();
-    let wait_for_gpu_ms = render_spans.gpu_wait_ms();
-    let render_graph_ms = render_spans.render_graph_ms();
-    let graph_render_ms = render_spans.graph_render_ms();
-    let graph_submit_ms = render_spans.graph_submit_ms();
-    let graph_finish_ms = render_spans.graph_finish_ms();
-    let cleanup_ms = render_spans.cleanup_ms();
+    let assets_ms = last_ms_or_zero(&timing.prepare_assets);
+    let prep_ms =
+        last_ms_or_zero(&timing.extract_commands) + last_ms_or_zero(&timing.prepare_and_queue);
+    let wait_for_gpu_ms = last_ms_or_zero(&timing.waiting_for_next_image);
+    let render_graph_ms = last_ms_or_zero(&timing.render_graph);
+    let graph_submit_ms = last_ms_or_zero(&timing.submit);
+    let cleanup_ms = last_ms_or_zero(&timing.cleanup);
+    let render_work_ms =
+        assets_ms + prep_ms + wait_for_gpu_ms + render_graph_ms + graph_submit_ms + cleanup_ms;
     history.push_back(PerfSnapshot {
         timestamp: time.elapsed_secs(),
         fps: frames_per_second.unwrap_or(0.0).to_f32(),
@@ -1582,17 +1103,13 @@ fn update_status_panel(
         wait_for_render_ms,
         extract_ms,
         frame_slack_ms,
-        render_cycle_ms,
+        render_work_ms,
         assets_ms,
         prep_ms,
         wait_for_gpu_ms,
         render_graph_ms,
-        graph_render_ms,
         graph_submit_ms,
-        graph_finish_ms,
         cleanup_ms,
-        return_ms,
-        extract_handoff_ms,
     });
 
     let cutoff = time.elapsed_secs() - PERF_PEAK_WINDOW_SECS;
@@ -1642,17 +1159,13 @@ fn format_perf_snapshot(snapshot: PerfSnapshot) -> [String; METRIC_COUNT] {
         format!("{:.2}", snapshot.wait_for_render_ms),
         format!("{:.2}", snapshot.extract_ms),
         format!("{:.2}", snapshot.frame_slack_ms),
-        format!("{:.1}", snapshot.render_cycle_ms),
+        format!("{:.1}", snapshot.render_work_ms),
         format!("{:.2}", snapshot.assets_ms),
         format!("{:.2}", snapshot.prep_ms),
         format!("{:.2}", snapshot.wait_for_gpu_ms),
         format!("{:.2}", snapshot.render_graph_ms),
-        format!("{:.2}", snapshot.graph_render_ms),
         format!("{:.2}", snapshot.graph_submit_ms),
-        format!("{:.2}", snapshot.graph_finish_ms),
         format!("{:.2}", snapshot.cleanup_ms),
-        format!("{:.2}", snapshot.return_ms),
-        format!("{:.2}", snapshot.extract_handoff_ms),
     ]
 }
 
@@ -1856,17 +1369,13 @@ fn window_mean(history: &VecDeque<PerfSnapshot>) -> PerfSnapshot {
         sum.wait_for_render_ms += sample.wait_for_render_ms;
         sum.extract_ms += sample.extract_ms;
         sum.frame_slack_ms += sample.frame_slack_ms;
-        sum.render_cycle_ms += sample.render_cycle_ms;
+        sum.render_work_ms += sample.render_work_ms;
         sum.assets_ms += sample.assets_ms;
         sum.prep_ms += sample.prep_ms;
         sum.wait_for_gpu_ms += sample.wait_for_gpu_ms;
         sum.render_graph_ms += sample.render_graph_ms;
-        sum.graph_render_ms += sample.graph_render_ms;
         sum.graph_submit_ms += sample.graph_submit_ms;
-        sum.graph_finish_ms += sample.graph_finish_ms;
         sum.cleanup_ms += sample.cleanup_ms;
-        sum.return_ms += sample.return_ms;
-        sum.extract_handoff_ms += sample.extract_handoff_ms;
     }
     PerfSnapshot {
         timestamp:          0.0,
@@ -1880,17 +1389,13 @@ fn window_mean(history: &VecDeque<PerfSnapshot>) -> PerfSnapshot {
         wait_for_render_ms: sum.wait_for_render_ms / count,
         extract_ms:         sum.extract_ms / count,
         frame_slack_ms:     sum.frame_slack_ms / count,
-        render_cycle_ms:    sum.render_cycle_ms / count,
+        render_work_ms:     sum.render_work_ms / count,
         assets_ms:          sum.assets_ms / count,
         prep_ms:            sum.prep_ms / count,
         wait_for_gpu_ms:    sum.wait_for_gpu_ms / count,
         render_graph_ms:    sum.render_graph_ms / count,
-        graph_render_ms:    sum.graph_render_ms / count,
         graph_submit_ms:    sum.graph_submit_ms / count,
-        graph_finish_ms:    sum.graph_finish_ms / count,
         cleanup_ms:         sum.cleanup_ms / count,
-        return_ms:          sum.return_ms / count,
-        extract_handoff_ms: sum.extract_handoff_ms / count,
     }
 }
 
@@ -1908,17 +1413,13 @@ fn window_peak(history: &VecDeque<PerfSnapshot>) -> PerfSnapshot {
         peak.wait_for_render_ms = peak.wait_for_render_ms.max(sample.wait_for_render_ms);
         peak.extract_ms = peak.extract_ms.max(sample.extract_ms);
         peak.frame_slack_ms = peak.frame_slack_ms.max(sample.frame_slack_ms);
-        peak.render_cycle_ms = peak.render_cycle_ms.max(sample.render_cycle_ms);
+        peak.render_work_ms = peak.render_work_ms.max(sample.render_work_ms);
         peak.assets_ms = peak.assets_ms.max(sample.assets_ms);
         peak.prep_ms = peak.prep_ms.max(sample.prep_ms);
         peak.wait_for_gpu_ms = peak.wait_for_gpu_ms.max(sample.wait_for_gpu_ms);
         peak.render_graph_ms = peak.render_graph_ms.max(sample.render_graph_ms);
-        peak.graph_render_ms = peak.graph_render_ms.max(sample.graph_render_ms);
         peak.graph_submit_ms = peak.graph_submit_ms.max(sample.graph_submit_ms);
-        peak.graph_finish_ms = peak.graph_finish_ms.max(sample.graph_finish_ms);
         peak.cleanup_ms = peak.cleanup_ms.max(sample.cleanup_ms);
-        peak.return_ms = peak.return_ms.max(sample.return_ms);
-        peak.extract_handoff_ms = peak.extract_handoff_ms.max(sample.extract_handoff_ms);
     }
     peak
 }
@@ -1938,15 +1439,11 @@ const GPU_PIPELINE_WORK_COLOR: Color = Color::srgb(0.30, 0.60, 0.95);
 const GPU_PIPELINE_RENDER_GRAPH_COLOR: Color = Color::srgb(0.35, 0.85, 0.45);
 /// Root render-graph submit set.
 const GPU_PIPELINE_GRAPH_SUBMIT_COLOR: Color = Color::srgb(0.70, 0.92, 0.36);
-/// Root render-graph finish set.
-const GPU_PIPELINE_GRAPH_FINISH_COLOR: Color = Color::srgb(0.54, 0.78, 0.38);
 /// Render world N post-graph cleanup work.
 const GPU_PIPELINE_CLEANUP_COLOR: Color = Color::srgb(1.0, 0.22, 0.10);
-/// Render world N return-app / main-unblock gap before extract starts.
-const GPU_PIPELINE_RETURN_COLOR: Color = Color::srgb(0.95, 0.40, 0.56);
 /// Track tint behind each lane — the empty tail past the drawn segments.
 const GPU_PIPELINE_TRACK_COLOR: Color = Color::srgba(1.0, 1.0, 1.0, 0.06);
-/// Shared between main world N+1 `wait for render` and render world N `wait for GPU`.
+/// Shared between main render wait and render image-acquisition wait.
 const GPU_PIPELINE_WAIT_COLOR: Color = Color::srgb(0.95, 0.65, 0.20);
 /// Main lane `extract` — the main->render copy and send-back.
 const GPU_PIPELINE_EXTRACT_COLOR: Color = Color::srgb(0.72, 0.54, 1.0);
@@ -1954,9 +1451,6 @@ const GPU_PIPELINE_EXTRACT_COLOR: Color = Color::srgb(0.72, 0.54, 1.0);
 const GPU_PIPELINE_FRAME_SLACK_COLOR: Color = GPU_PIPELINE_GAP_COLOR;
 /// Segment label color for dark backgrounds.
 const GPU_PIPELINE_LIGHT_LABEL_COLOR: Color = Color::srgba(1.0, 1.0, 1.0, 1.0);
-/// Perf-table color for rows whose GPU pipeline segment uses
-/// [`GPU_PIPELINE_GAP_COLOR`].
-const GPU_PIPELINE_GAP_LABEL_COLOR: Color = GPU_PIPELINE_GAP_COLOR;
 /// Segment label color for light backgrounds.
 const GPU_PIPELINE_DARK_LABEL_COLOR: Color = Color::srgba(0.03, 0.04, 0.06, 1.0);
 /// WCAG luminance weight for linear red.
@@ -1997,8 +1491,21 @@ const GPU_PIPELINE_MIN_AXIS_MS: f32 = 1.0;
 const GPU_PIPELINE_MIN_SEGMENT_FRACTION: f32 = 0.001;
 /// Segment label font size in panel pixels.
 const GPU_PIPELINE_SEGMENT_LABEL_FONT_SIZE: f32 = 9.0;
-/// Edge padding for leading- and trailing-aligned segment labels.
-const GPU_PIPELINE_SEGMENT_EDGE_LABEL_PADDING: f32 = 6.0;
+/// Gap a segment label keeps from each end of its segment. Leading- and
+/// trailing-aligned labels pad their own edge by it.
+const GPU_PIPELINE_SEGMENT_LABEL_INSET: f32 = 6.0;
+const GPU_PIPELINE_LABELS: [&str; 10] = [
+    "main work",
+    "wait for render",
+    "extract",
+    "render prep",
+    "next image wait",
+    "camera graphs",
+    "submit",
+    "current",
+    "available",
+    "next",
+];
 
 // timing
 /// How long each on-screen picture is sampled before it refreshes (seconds).
@@ -2031,85 +1538,71 @@ enum GpuPipelineShown {
 /// labeled [`TimelineSegment`]s when the tree is rebuilt.
 #[derive(Clone, Copy, Default)]
 struct GpuPipelineBars {
-    /// Shared window width in milliseconds, anchored at the render start mark.
-    axis:             f32,
-    /// Main-lane start offset relative to the render frame's start mark.
-    main_offset:      f32,
-    main_work:        f32,
-    prep:             f32,
-    gpu_wait:         f32,
-    render_graph:     f32,
+    /// Shared duration scale in milliseconds, without cross-thread alignment.
+    axis:          f32,
+    main_work:     f32,
+    main_wait:     f32,
+    main_extract:  f32,
+    prep:          f32,
+    gpu_wait:      f32,
+    render_graph:  f32,
     /// CPU camera/shadow graph execution before queued command buffers are
     /// submitted to the GPU queue.
-    camera_graphs:    f32,
+    camera_graphs: f32,
     /// Root render-graph submit set, ending after queued command buffers have
     /// been submitted to the GPU queue.
-    graph_submit:     f32,
-    cleanup:          f32,
-    /// Gap from render-schedule publication to main extract begin.
-    return_gap:       f32,
-    /// Render lane's right-side parked span, measured from the previous render
-    /// schedule end to the next render start.
-    wait_for_extract: f32,
+    graph_submit:  f32,
+    cleanup:       f32,
 }
 
 impl GpuPipelineBars {
     /// Field-wise sum, for accumulating the per-second mean.
     fn add(self, other: Self) -> Self {
         Self {
-            axis:             self.axis + other.axis,
-            main_offset:      self.main_offset + other.main_offset,
-            main_work:        self.main_work + other.main_work,
-            prep:             self.prep + other.prep,
-            gpu_wait:         self.gpu_wait + other.gpu_wait,
-            render_graph:     self.render_graph + other.render_graph,
-            camera_graphs:    self.camera_graphs + other.camera_graphs,
-            graph_submit:     self.graph_submit + other.graph_submit,
-            cleanup:          self.cleanup + other.cleanup,
-            return_gap:       self.return_gap + other.return_gap,
-            wait_for_extract: self.wait_for_extract + other.wait_for_extract,
+            axis:          self.axis + other.axis,
+            main_work:     self.main_work + other.main_work,
+            main_wait:     self.main_wait + other.main_wait,
+            main_extract:  self.main_extract + other.main_extract,
+            prep:          self.prep + other.prep,
+            gpu_wait:      self.gpu_wait + other.gpu_wait,
+            render_graph:  self.render_graph + other.render_graph,
+            camera_graphs: self.camera_graphs + other.camera_graphs,
+            graph_submit:  self.graph_submit + other.graph_submit,
+            cleanup:       self.cleanup + other.cleanup,
         }
     }
 
     /// Field-wise scale, dividing the accumulated sum by the sample count.
     fn scale(self, factor: f32) -> Self {
         Self {
-            axis:             self.axis * factor,
-            main_offset:      self.main_offset * factor,
-            main_work:        self.main_work * factor,
-            prep:             self.prep * factor,
-            gpu_wait:         self.gpu_wait * factor,
-            render_graph:     self.render_graph * factor,
-            camera_graphs:    self.camera_graphs * factor,
-            graph_submit:     self.graph_submit * factor,
-            cleanup:          self.cleanup * factor,
-            return_gap:       self.return_gap * factor,
-            wait_for_extract: self.wait_for_extract * factor,
+            axis:          self.axis * factor,
+            main_work:     self.main_work * factor,
+            main_wait:     self.main_wait * factor,
+            main_extract:  self.main_extract * factor,
+            prep:          self.prep * factor,
+            gpu_wait:      self.gpu_wait * factor,
+            render_graph:  self.render_graph * factor,
+            camera_graphs: self.camera_graphs * factor,
+            graph_submit:  self.graph_submit * factor,
+            cleanup:       self.cleanup * factor,
         }
     }
 
     /// Field-wise lerp from `self` toward `to` by fraction `t`, for the morph.
     const fn lerp(self, to: Self, t: f32) -> Self {
         Self {
-            axis:             lerp(self.axis, to.axis, t),
-            main_offset:      lerp(self.main_offset, to.main_offset, t),
-            main_work:        lerp(self.main_work, to.main_work, t),
-            prep:             lerp(self.prep, to.prep, t),
-            gpu_wait:         lerp(self.gpu_wait, to.gpu_wait, t),
-            render_graph:     lerp(self.render_graph, to.render_graph, t),
-            camera_graphs:    lerp(self.camera_graphs, to.camera_graphs, t),
-            graph_submit:     lerp(self.graph_submit, to.graph_submit, t),
-            cleanup:          lerp(self.cleanup, to.cleanup, t),
-            return_gap:       lerp(self.return_gap, to.return_gap, t),
-            wait_for_extract: lerp(self.wait_for_extract, to.wait_for_extract, t),
+            axis:          lerp(self.axis, to.axis, t),
+            main_work:     lerp(self.main_work, to.main_work, t),
+            main_wait:     lerp(self.main_wait, to.main_wait, t),
+            main_extract:  lerp(self.main_extract, to.main_extract, t),
+            prep:          lerp(self.prep, to.prep, t),
+            gpu_wait:      lerp(self.gpu_wait, to.gpu_wait, t),
+            render_graph:  lerp(self.render_graph, to.render_graph, t),
+            camera_graphs: lerp(self.camera_graphs, to.camera_graphs, t),
+            graph_submit:  lerp(self.graph_submit, to.graph_submit, t),
+            cleanup:       lerp(self.cleanup, to.cleanup, t),
         }
     }
-
-    fn render_end(self) -> f32 { self.prep + self.gpu_wait + self.render_graph + self.cleanup }
-
-    fn extract_begin(self) -> f32 { self.render_end() + self.return_gap }
-
-    fn main_extract(self) -> f32 { (self.wait_for_extract - self.return_gap).max(0.0) }
 }
 
 /// Label placement inside a GPU pipeline segment.
@@ -2140,16 +1633,8 @@ impl SegmentLabelAlignment {
     fn padding(self) -> Padding {
         match self {
             Self::Center => Padding::default(),
-            Self::Leading => Padding::new(GPU_PIPELINE_SEGMENT_EDGE_LABEL_PADDING, 0.0, 0.0, 0.0),
-            Self::Trailing => Padding::new(0.0, GPU_PIPELINE_SEGMENT_EDGE_LABEL_PADDING, 0.0, 0.0),
-        }
-    }
-
-    const fn label_cell(self, start_fraction: f32, end_fraction: f32) -> (f32, f32) {
-        match self {
-            Self::Center => (start_fraction, end_fraction - start_fraction),
-            Self::Leading => (start_fraction, 1.0 - start_fraction),
-            Self::Trailing => (0.0, end_fraction),
+            Self::Leading => Padding::new(GPU_PIPELINE_SEGMENT_LABEL_INSET, 0.0, 0.0, 0.0),
+            Self::Trailing => Padding::new(0.0, GPU_PIPELINE_SEGMENT_LABEL_INSET, 0.0, 0.0),
         }
     }
 }
@@ -2197,7 +1682,11 @@ fn spawn_gpu_pipeline_overlay(
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     let built = gpu_meter_panel(
-        build_gpu_pipeline_tree(&GpuPipelineBars::default()),
+        build_gpu_pipeline_tree(
+            &GpuPipelineBars::default(),
+            0.0,
+            &GpuPipelineLabelWidths::default(),
+        ),
         &mut materials,
     );
     match built {
@@ -2208,11 +1697,99 @@ fn spawn_gpu_pipeline_overlay(
     }
 }
 
+#[derive(Default)]
+struct GpuPipelineLabelWidths(HashMap<&'static str, f32>);
+
+impl GpuPipelineLabelWidths {
+    fn measure(measure_text: &MeasureTextFn, font_scale: f32) -> Self {
+        let style = TextStyle::new(GPU_PIPELINE_SEGMENT_LABEL_FONT_SIZE).bold();
+        let measure = style.as_measure().scaled(font_scale);
+        Self(
+            GPU_PIPELINE_LABELS
+                .iter()
+                .map(|&label| (label, measure_text(label, &measure).width))
+                .collect(),
+        )
+    }
+
+    fn width(&self, label: &str) -> f32 { self.0.get(label).copied().unwrap_or(f32::INFINITY) }
+}
+
+#[derive(Default)]
+enum GpuPipelineLabelFit {
+    #[default]
+    AwaitingLayout,
+    BuiltAt {
+        track_width: f32,
+        font_scale:  f32,
+        widths:      GpuPipelineLabelWidths,
+    },
+}
+
+impl GpuPipelineLabelFit {
+    const fn needs_rebuild(&self, moving: bool, track_width: f32, font_scale: f32) -> bool {
+        match self {
+            Self::AwaitingLayout => true,
+            Self::BuiltAt {
+                track_width: previous_width,
+                font_scale: previous_scale,
+                ..
+            } => {
+                moving
+                    || previous_width.to_bits() != track_width.to_bits()
+                    || previous_scale.to_bits() != font_scale.to_bits()
+            },
+        }
+    }
+}
+
+fn gpu_pipeline_track_index(tree: &LayoutTree) -> Result<usize, &'static str> {
+    let child = |index| {
+        tree.children_of(index)
+            .first()
+            .copied()
+            .ok_or("pipeline tree is incomplete")
+    };
+    let frame = child(0)?;
+    let inner = child(frame)?;
+    let columns = child(inner)?;
+    let bars = *tree
+        .children_of(columns)
+        .get(1)
+        .ok_or("pipeline bar column is missing")?;
+    let lane = child(bars)?;
+    child(lane)
+}
+
+fn laid_out_gpu_pipeline_track_width(
+    tree: &LayoutTree,
+    computed: &ComputedDiegeticPanel,
+) -> Result<f32, &'static str> {
+    let layout = computed
+        .layout()
+        .solved()
+        .ok_or("pipeline layout is unsolved")?;
+    let track = gpu_pipeline_track_index(tree)?;
+    // LayoutResult stores points; the authored padding and label measurement
+    // below use the panel's pixel layout unit.
+    Ok(layout
+        .computed
+        .get(track)
+        .ok_or("pipeline track layout is missing")?
+        .bounds
+        .width
+        / Unit::Pixels.to_points())
+}
+
 /// Builds the panel: a left label column (`Fit` width, sized to the widest
 /// label and right-flushed) beside a bar column, so every bar starts at the
 /// same x. Lane rows in both columns share [`GPU_PIPELINE_LANE_ROW_HEIGHT`] to keep
 /// them aligned.
-fn build_gpu_pipeline_tree(bars: &GpuPipelineBars) -> LayoutTree {
+fn build_gpu_pipeline_tree(
+    bars: &GpuPipelineBars,
+    track_width: f32,
+    label_widths: &GpuPipelineLabelWidths,
+) -> LayoutTree {
     let mut builder = LayoutBuilder::with_root(El::new().width(Sizing::GROW).height(Sizing::FIT));
     screen_panel_frame(
         &mut builder,
@@ -2236,7 +1813,7 @@ fn build_gpu_pipeline_tree(bars: &GpuPipelineBars) -> LayoutTree {
                         |builder| {
                             lane_label(builder, "main world");
                             lane_label(builder, "render world");
-                            lane_label_with_color(builder, "GPU", GPU_PIPELINE_GPU_COLOR);
+                            lane_label_with_color(builder, "GPU inferred", GPU_PIPELINE_GPU_COLOR);
                         },
                     );
                     builder.with(
@@ -2246,9 +1823,27 @@ fn build_gpu_pipeline_tree(bars: &GpuPipelineBars) -> LayoutTree {
                             .gap(GPU_PIPELINE_LANE_GAP),
                         |builder| {
                             let span = bars.axis.max(GPU_PIPELINE_MIN_AXIS_MS);
-                            lane_bars(builder, span, &main_lane_segments(bars));
-                            lane_bars(builder, span, &render_lane_segments(bars));
-                            lane_bars(builder, span, &gpu_lane_segments(bars));
+                            lane_bars(
+                                builder,
+                                span,
+                                &main_lane_segments(bars),
+                                track_width,
+                                label_widths,
+                            );
+                            lane_bars(
+                                builder,
+                                span,
+                                &render_lane_segments(bars),
+                                track_width,
+                                label_widths,
+                            );
+                            lane_bars(
+                                builder,
+                                span,
+                                &gpu_lane_segments(bars),
+                                track_width,
+                                label_widths,
+                            );
                         },
                     );
                 },
@@ -2287,7 +1882,13 @@ fn gpu_pipeline_lane_label_style(color: Color) -> TextStyle {
 /// [`GPU_PIPELINE_TRACK_COLOR`] with fractional-offset [`TimelineSegment`]
 /// blocks. Empty timeline spans become transparent spacers, so reading straight
 /// down at one x compares the same process-monotonic time on every lane.
-fn lane_bars(builder: &mut LayoutBuilder, axis_ms: f32, segments: &[TimelineSegment]) {
+fn lane_bars(
+    builder: &mut LayoutBuilder,
+    axis_ms: f32,
+    segments: &[TimelineSegment],
+    track_width: f32,
+    label_widths: &GpuPipelineLabelWidths,
+) {
     let axis = axis_ms.max(GPU_PIPELINE_MIN_AXIS_MS);
     builder.with(
         El::row()
@@ -2295,12 +1896,18 @@ fn lane_bars(builder: &mut LayoutBuilder, axis_ms: f32, segments: &[TimelineSegm
             .height(Sizing::fixed(GPU_PIPELINE_LANE_ROW_HEIGHT))
             .alignment(AlignX::Left, AlignY::Center),
         |builder| {
-            gpu_pipeline_track(builder, axis, segments);
+            gpu_pipeline_track(builder, axis, segments, track_width, label_widths);
         },
     );
 }
 
-fn gpu_pipeline_track(builder: &mut LayoutBuilder, axis: f32, segments: &[TimelineSegment]) {
+fn gpu_pipeline_track(
+    builder: &mut LayoutBuilder,
+    axis: f32,
+    segments: &[TimelineSegment],
+    track_width: f32,
+    label_widths: &GpuPipelineLabelWidths,
+) {
     builder.with(
         El::overlay()
             .width(Sizing::GROW)
@@ -2309,7 +1916,7 @@ fn gpu_pipeline_track(builder: &mut LayoutBuilder, axis: f32, segments: &[Timeli
         |builder| {
             gpu_pipeline_segment_row(builder, axis, segments);
             for segment in segments {
-                gpu_pipeline_label_row(builder, axis, *segment);
+                gpu_pipeline_label_row(builder, axis, *segment, track_width, label_widths);
             }
         },
     );
@@ -2362,15 +1969,23 @@ fn add_gpu_pipeline_segment(builder: &mut LayoutBuilder, fraction: f32, segment:
     builder.with(cell, |_builder| {});
 }
 
-fn gpu_pipeline_label_row(builder: &mut LayoutBuilder, axis: f32, segment: TimelineSegment) {
+fn gpu_pipeline_label_row(
+    builder: &mut LayoutBuilder,
+    axis: f32,
+    segment: TimelineSegment,
+    track_width: f32,
+    label_widths: &GpuPipelineLabelWidths,
+) {
     if segment.label.is_empty() {
         return;
     }
     let start_fraction = (segment.start / axis).clamp(0.0, 1.0);
     let end_fraction = (segment.end / axis).clamp(start_fraction, 1.0);
-    let (spacer_fraction, label_fraction) =
-        segment.alignment.label_cell(start_fraction, end_fraction);
-    if label_fraction <= 0.0 {
+    let label_fraction = end_fraction - start_fraction;
+    let style = gpu_pipeline_segment_label_style(segment);
+    let label_width = label_widths.width(segment.label);
+    if label_fraction <= 0.0 || !gpu_pipeline_label_fits(label_width, label_fraction * track_width)
+    {
         return;
     }
     builder.with(
@@ -2379,7 +1994,7 @@ fn gpu_pipeline_label_row(builder: &mut LayoutBuilder, axis: f32, segment: Timel
             .height(Sizing::fixed(GPU_PIPELINE_LANE_HEIGHT))
             .alignment(AlignX::Left, AlignY::Center),
         |builder| {
-            add_gpu_pipeline_position_spacer(builder, spacer_fraction);
+            add_gpu_pipeline_position_spacer(builder, start_fraction);
             builder.with(
                 El::new()
                     .width(Sizing::percent(label_fraction))
@@ -2387,11 +2002,17 @@ fn gpu_pipeline_label_row(builder: &mut LayoutBuilder, axis: f32, segment: Timel
                     .padding(segment.alignment.padding())
                     .alignment(segment.alignment.align_x(), AlignY::Center),
                 |builder| {
-                    builder.text((segment.label, gpu_pipeline_segment_label_style(segment)));
+                    builder.text(Text::new(segment.label, style).wrap(TextWrap::None));
                 },
             );
         },
     );
+}
+
+/// Whether a label of `label_width` fits a segment of `segment_width` with
+/// `GPU_PIPELINE_SEGMENT_LABEL_INSET` clear at both ends, whatever its alignment.
+fn gpu_pipeline_label_fits(label_width: f32, segment_width: f32) -> bool {
+    GPU_PIPELINE_SEGMENT_LABEL_INSET.mul_add(2.0, label_width) <= segment_width
 }
 
 fn add_gpu_pipeline_position_spacer(builder: &mut LayoutBuilder, fraction: f32) {
@@ -2461,18 +2082,15 @@ fn gpu_pipeline_linear_srgb(channel: f32) -> f32 {
     }
 }
 
-/// Main lane, frame N+1 on the shared timeline: `work` (main schedule span) ·
-/// `wait` (the measured `recv` block — main blocked until the render thread
-/// returns the previous frame's app) · `extract` (the main→render copy and
-/// send-back before the next render schedule begins).
+/// Main-lane durations from one complete frame: schedules, render wait, and
+/// extraction, placed consecutively on a shared duration scale.
 fn main_lane_segments(b: &GpuPipelineBars) -> Vec<TimelineSegment> {
     let period = b.axis.max(GPU_PIPELINE_MIN_AXIS_MS);
-    let extract_start = b.extract_begin().clamp(0.0, period);
-    let work_start = b.main_offset.clamp(0.0, extract_start);
-    let work_end = (work_start + b.main_work).clamp(work_start, extract_start);
-    let extract_end = (extract_start + b.main_extract()).clamp(extract_start, period);
+    let work_end = b.main_work.clamp(0.0, period);
+    let extract_start = (work_end + b.main_wait).clamp(work_end, period);
+    let extract_end = (extract_start + b.main_extract).clamp(extract_start, period);
     vec![
-        TimelineSegment::measured(work_start, work_end, GPU_PIPELINE_WORK_COLOR, "work N+1")
+        TimelineSegment::measured(0.0, work_end, GPU_PIPELINE_WORK_COLOR, "main work")
             .with_label_alignment(SegmentLabelAlignment::Leading),
         TimelineSegment::measured(
             work_end,
@@ -2490,13 +2108,8 @@ fn main_lane_segments(b: &GpuPipelineBars) -> Vec<TimelineSegment> {
     ]
 }
 
-/// Render lane, frame N: `work` (`assets` + prepare) · `wait for GPU`
-/// (swapchain acquire — the stall waiting on the GPU below) · root render graph
-/// internals (`camera graphs`, submit plus the tiny finish tail) · cleanup
-/// block · return block · extract-handoff block. GPU `next` starts after the
-/// submit block, so this row shows the CPU handoff span before the inferred GPU
-/// pressure begins. The short post-graph blocks are unlabeled in the GPU
-/// pipeline visualization; their names and colors live in the perf panel rows.
+/// Render-lane stage durations from the same service record. The image wait is
+/// a presentable-image acquire, not a GPU execution timer.
 fn render_lane_segments(b: &GpuPipelineBars) -> Vec<TimelineSegment> {
     let period = b.axis.max(GPU_PIPELINE_MIN_AXIS_MS);
     let prep_end = b.prep.clamp(0.0, period);
@@ -2504,12 +2117,15 @@ fn render_lane_segments(b: &GpuPipelineBars) -> Vec<TimelineSegment> {
     let graph_end = (wait_end + b.render_graph).clamp(wait_end, period);
     let camera_end = (wait_end + b.camera_graphs).clamp(wait_end, graph_end);
     let cleanup_end = (graph_end + b.cleanup).clamp(graph_end, period);
-    let return_end = b.extract_begin().clamp(cleanup_end, period);
-    let extract_end = (return_end + b.main_extract()).clamp(return_end, period);
     vec![
-        TimelineSegment::measured(0.0, prep_end, GPU_PIPELINE_WORK_COLOR, "work N")
+        TimelineSegment::measured(0.0, prep_end, GPU_PIPELINE_WORK_COLOR, "render prep")
             .with_label_alignment(SegmentLabelAlignment::Leading),
-        TimelineSegment::measured(prep_end, wait_end, GPU_PIPELINE_WAIT_COLOR, "wait for GPU"),
+        TimelineSegment::measured(
+            prep_end,
+            wait_end,
+            GPU_PIPELINE_WAIT_COLOR,
+            "next image wait",
+        ),
         TimelineSegment::measured(
             wait_end,
             camera_end,
@@ -2523,8 +2139,6 @@ fn render_lane_segments(b: &GpuPipelineBars) -> Vec<TimelineSegment> {
             "submit",
         ),
         TimelineSegment::measured(graph_end, cleanup_end, GPU_PIPELINE_CLEANUP_COLOR, ""),
-        TimelineSegment::measured(cleanup_end, return_end, GPU_PIPELINE_RETURN_COLOR, ""),
-        TimelineSegment::measured(return_end, extract_end, GPU_PIPELINE_GAP_COLOR, ""),
     ]
 }
 
@@ -2576,46 +2190,55 @@ struct GpuPipelineAnim {
 
 /// Samples the three lanes into a one-second mean and animates the panel toward
 /// it: a [`GPU_PIPELINE_MORPH_DURATION`] slide at each boundary, then a still hold
-/// for the rest of the second. Main and render marks are stored as offsets from
-/// one shared epoch, then drawn relative to the render frame's start mark.
+/// for the rest of the second. These are duration bars from one complete
+/// service record, with an inferred GPU lane rather than a shared-clock trace.
 fn update_gpu_pipeline_panel(
     time: Res<Time>,
-    main_thread: Res<MainThreadMs>,
-    render_spans: Res<RenderThreadSpans>,
+    timing: Res<FrameTiming>,
     shown: Res<GpuPipelineShown>,
-    panels: Query<Entity, With<GpuPipelinePanel>>,
+    panels: Query<
+        (
+            Entity,
+            &DiegeticPanel,
+            &ComputedDiegeticPanel,
+            &Resolved<FontUnit>,
+        ),
+        With<GpuPipelinePanel>,
+    >,
+    measurer: Res<DiegeticTextMeasurer>,
     mut commands: Commands,
     mut anim: Local<GpuPipelineAnim>,
+    mut label_fit: Local<GpuPipelineLabelFit>,
 ) {
     let delta_secs = time.delta_secs();
-    let render_start_ms = render_spans.render_start_ms();
-    let main_start_ms = render_spans.main_start_ms();
-    let main_end_ms = render_spans.main_end_ms();
-    let main_span_ms =
-        timeline_duration_ms(main_start_ms, main_end_ms).unwrap_or_else(|| main_thread.ms());
-    let prep = render_spans.assets_ms() + render_spans.prep_ms();
-    let gpu_wait = render_spans.gpu_wait_ms();
-    let render_graph = render_spans.render_graph_ms();
-    let camera_graphs = render_spans.graph_render_ms();
-    let graph_submit = render_spans.graph_submit_ms();
-    let cleanup = render_spans.cleanup_ms();
-    let return_gap = render_spans.return_gap_ms();
-    let render = render_spans.render_ms();
-    let wait_for_extract = render_spans.wait_for_extract_ms();
-    let main_offset = relative_timeline_offset_ms(render_start_ms, main_start_ms);
-    let render_period = render + wait_for_extract;
+    let main_span_ms = last_ms_or_zero(&timing.first)
+        + last_ms_or_zero(&timing.pre_update)
+        + last_ms_or_zero(&timing.state_transition)
+        + last_ms_or_zero(&timing.fixed_update)
+        + last_ms_or_zero(&timing.update)
+        + last_ms_or_zero(&timing.spawn_scene)
+        + last_ms_or_zero(&timing.post_update)
+        + last_ms_or_zero(&timing.last);
+    let prep = last_ms_or_zero(&timing.extract_commands)
+        + last_ms_or_zero(&timing.prepare_assets)
+        + last_ms_or_zero(&timing.prepare_and_queue);
+    let gpu_wait = last_ms_or_zero(&timing.waiting_for_next_image);
+    let render_graph = last_ms_or_zero(&timing.render_graph) + last_ms_or_zero(&timing.submit);
+    let camera_graphs = last_ms_or_zero(&timing.render_graph);
+    let graph_submit = last_ms_or_zero(&timing.submit);
+    let cleanup = last_ms_or_zero(&timing.cleanup);
+    let render_period = last_ms_or_zero(&timing.frame_time);
     let instant = GpuPipelineBars {
         axis: render_period,
-        main_offset,
         main_work: main_span_ms,
+        main_wait: last_ms_or_zero(&timing.waiting_for_render),
+        main_extract: last_ms_or_zero(&timing.extract),
         prep,
         gpu_wait,
         render_graph,
         camera_graphs,
         graph_submit,
         cleanup,
-        return_gap,
-        wait_for_extract,
     };
 
     if !anim.primed {
@@ -2649,13 +2272,46 @@ fn update_gpu_pipeline_panel(
     // Rebuild only while the bars are moving (the morph plus one settle frame);
     // during the hold the picture is unchanged, so the tree is left as-is.
     let moving = anim.morph <= GPU_PIPELINE_MORPH_DURATION + delta_secs;
-    if !moving || matches!(*shown, GpuPipelineShown::Hidden) {
+    if matches!(*shown, GpuPipelineShown::Hidden) {
         return;
     }
     let displayed = anim.displayed;
-    for entity in &panels {
-        if let Err(error) = commands.set_tree(entity, build_gpu_pipeline_tree(&displayed)) {
-            error!("failed to replace GPU pipeline panel tree: {error}");
+    for (entity, panel, computed, font_unit) in &panels {
+        let Ok(track_width) = laid_out_gpu_pipeline_track_width(panel.tree(), computed) else {
+            continue;
+        };
+        let font_scale = panel.font_scale(font_unit.0.0);
+        if !label_fit.needs_rebuild(moving, track_width, font_scale) {
+            continue;
+        }
+        let metrics_changed = match &*label_fit {
+            GpuPipelineLabelFit::AwaitingLayout => true,
+            GpuPipelineLabelFit::BuiltAt {
+                font_scale: previous,
+                ..
+            } => previous.to_bits() != font_scale.to_bits(),
+        };
+        if metrics_changed {
+            *label_fit = GpuPipelineLabelFit::BuiltAt {
+                track_width,
+                font_scale,
+                widths: GpuPipelineLabelWidths::measure(&measurer.measure_fn, font_scale),
+            };
+        }
+        if let GpuPipelineLabelFit::BuiltAt {
+            track_width: previous,
+            widths,
+            ..
+        } = &mut *label_fit
+        {
+            if let Err(error) = commands.set_tree(
+                entity,
+                build_gpu_pipeline_tree(&displayed, track_width, widths),
+            ) {
+                error!("failed to replace GPU pipeline panel tree: {error}");
+            } else {
+                *previous = track_width;
+            }
         }
     }
 }

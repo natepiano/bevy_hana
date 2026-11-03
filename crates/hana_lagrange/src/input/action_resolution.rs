@@ -48,9 +48,6 @@ pub(crate) struct CameraActionResolutionContext<'a, K: CameraActionResolutionKin
     pub slow_mode_active: bool,
 }
 
-#[derive(Component)]
-pub(crate) struct NoActionFrameState;
-
 pub(crate) fn resolve_actions_into_camera_input<K: CameraActionResolutionKind>(
     route: Res<ResolvedCameraInputRoute>,
     mut slow_latches: ResMut<CameraSlowModeLatches>,

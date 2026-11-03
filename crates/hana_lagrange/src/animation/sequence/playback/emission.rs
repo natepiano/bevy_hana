@@ -318,7 +318,7 @@ const fn camera_boundary_lifecycle(
 mod tests {
     use std::time::Duration;
 
-    use bevy::math::curve::easing::EaseFunction;
+    use bevy::curve::easing::EaseFunction;
     use bevy::prelude::Camera;
     use bevy::prelude::OrthographicProjection;
     use bevy::prelude::Projection;

@@ -115,6 +115,7 @@ use crate::contract::ErasedApplied;
 use crate::contract::SessionDatumArrivalReceiver;
 use crate::devices::DeviceRevision;
 use crate::devices::DeviceRevisionLookup;
+use crate::fault::ClearanceWaitBound;
 use crate::flow::EstablishedFlowExpiry;
 use crate::reconcile::FrameClockReading;
 use crate::registration::RegisteredReporter;
@@ -1276,6 +1277,7 @@ struct WaitingState {
     failures:             RoleApplyFailureRun,
     retry_pacing:         RetryPacing,
     revision_retry_bound: WaitBoundInput,
+    clearance_bound:      ClearanceWaitBound,
     condition:            WaitingCondition,
     wait_start:           WaitStart,
     bound_state:          WaitBoundState,
@@ -1288,6 +1290,7 @@ impl WaitingState {
             failures:             RoleApplyFailureRun::Clear,
             retry_pacing:         RetryPacing::Ready,
             revision_retry_bound: WaitBoundInput::Unbounded,
+            clearance_bound:      ClearanceWaitBound::Enforced,
             condition:            WaitingCondition::NewRegistration,
             wait_start:           WaitStart::BeforeFirstSchedule,
             bound_state:          WaitBoundState::Within,
@@ -1296,6 +1299,12 @@ impl WaitingState {
     }
 
     const fn published_bound(&self) -> WaitBoundInput {
+        if matches!(
+            self.clearance_bound,
+            ClearanceWaitBound::ExemptWhileHeldElsewhere
+        ) {
+            return WaitBoundInput::Unbounded;
+        }
         match (&self.condition, self.retry_pacing) {
             (
                 WaitingCondition::KernelRetry(_)
@@ -1633,6 +1642,7 @@ fn waiting_state_from_lifecycle(
             } else {
                 waiting_state.condition = condition;
                 waiting_state.revision_retry_bound = waiting_state.condition.bound();
+                waiting_state.clearance_bound = ClearanceWaitBound::Enforced;
                 waiting_state.wait_start = WaitStart::At(now);
                 waiting_state.bound_state = WaitBoundState::Within;
                 (waiting_state, WaitTransition::ReasonChanged)
@@ -1653,6 +1663,7 @@ fn waiting_state_from_lifecycle(
                     failures,
                     retry_pacing: RetryPacing::Ready,
                     revision_retry_bound: condition.bound(),
+                    clearance_bound: ClearanceWaitBound::Enforced,
                     condition,
                     wait_start: WaitStart::At(now),
                     bound_state: WaitBoundState::Within,
@@ -1672,6 +1683,7 @@ const fn cleared_wait(condition: WaitingCondition, now: Instant) -> WaitingState
         failures: RoleApplyFailureRun::Clear,
         retry_pacing: RetryPacing::Ready,
         revision_retry_bound: condition.bound(),
+        clearance_bound: ClearanceWaitBound::Enforced,
         condition,
         wait_start: WaitStart::At(now),
         bound_state: WaitBoundState::Within,
@@ -3030,6 +3042,16 @@ impl Bindings {
             RoleState::Waiting(waiting_state) => {
                 waiting_state.retry_pacing = retry_pacing;
                 waiting_state.revision_retry_bound = waiting_state.condition.bound();
+                waiting_state.clearance_bound = ClearanceWaitBound::Enforced;
+            },
+            RoleState::Applying(_) | RoleState::Established(_) | RoleState::Stopped(_) => {},
+        });
+    }
+
+    fn set_role_clearance_bound(&mut self, role: &RoleKey, clearance_bound: ClearanceWaitBound) {
+        let _ = self.mutate_status(role, |registered_role| match &mut registered_role.state {
+            RoleState::Waiting(waiting_state) => {
+                waiting_state.clearance_bound = clearance_bound;
             },
             RoleState::Applying(_) | RoleState::Established(_) | RoleState::Stopped(_) => {},
         });
@@ -3211,6 +3233,7 @@ impl Bindings {
                 ) {
                     waiting_state.condition = waiting_condition_for_work(waiting_work);
                     waiting_state.revision_retry_bound = waiting_state.condition.bound();
+                    waiting_state.clearance_bound = ClearanceWaitBound::Enforced;
                     waiting_state.bound_state = WaitBoundState::Within;
                 }
             },
@@ -3229,6 +3252,7 @@ impl Bindings {
                                 retry_pacing: RetryPacing::Ready,
                                 revision_retry_bound: waiting_condition_for_work(waiting_work)
                                     .bound(),
+                                clearance_bound: ClearanceWaitBound::Enforced,
                                 condition: waiting_condition_for_work(waiting_work),
                                 wait_start: WaitStart::At(active_apply.attempt.started_at),
                                 bound_state: WaitBoundState::Within,
@@ -3267,6 +3291,7 @@ impl Bindings {
                 failures,
                 retry_pacing: RetryPacing::Ready,
                 revision_retry_bound: condition.bound(),
+                clearance_bound: ClearanceWaitBound::Enforced,
                 condition,
                 wait_start: WaitStart::At(now),
                 bound_state: WaitBoundState::Within,
@@ -3384,7 +3409,7 @@ impl Bindings {
                         self.set_wait(role, schedule_now, WaitingCondition::NewRegistration);
                     }
                 },
-                ApplyFailureDisposition::AwaitClearance => {
+                ApplyFailureDisposition::AwaitClearance(clearance_bound) => {
                     if let Some(binding) = self.by_role.get(role) {
                         let retry_gate =
                             RetryGate::from_policy(binding.retry, device_revision, now);
@@ -3396,6 +3421,7 @@ impl Bindings {
                             );
                         }
                         self.set_role_retry_pacing(role, RetryPacing::Blocked(retry_gate));
+                        self.set_role_clearance_bound(role, clearance_bound);
                     }
                 },
                 ApplyFailureDisposition::Fault => {
@@ -4425,6 +4451,8 @@ pub enum DeviceNameDisambiguation {
     Distinguishing(DeviceNameDisambiguationText),
     /// This class has nothing that separates two identical units.
     Indistinguishable,
+    /// No other unit reports the same name, so the name alone tells this one apart.
+    Unshared,
 }
 
 /// A device name derived from current evidence. A person's name can never be observed.
@@ -5912,12 +5940,7 @@ mod tests {
             .clone();
 
         app.world_mut().resource_mut::<Bindings>().retire(&role)?;
-        assert!(
-            app.world()
-                .resource::<ObservedRoleRetirements>()
-                .0
-                .is_empty()
-        );
+        assert_eq!(app.world().resource::<ObservedRoleRetirements>().0, []);
 
         app.update();
 
@@ -6062,11 +6085,11 @@ mod tests {
         assert_eq!(observed_batches.0[0].len(), 1);
         // The batch survives every consumer inside the frame and is emptied by the clearing system
         // ordered after `crate::RiggingSystems::Apply`, so no later frame reads a stale transition.
-        assert!(
+        assert_eq!(
             app.world()
                 .resource::<BindingTransitionBatch>()
-                .transitions()
-                .is_empty()
+                .transitions(),
+            []
         );
 
         Ok(())
@@ -6125,7 +6148,7 @@ mod tests {
             .entity_mut(entity)
             .insert(<ResolvedToDevice as Relationship>::from(second_device));
 
-        assert!(resolved_binding_entities(app.world(), first_device).is_empty());
+        assert_eq!(resolved_binding_entities(app.world(), first_device), []);
         assert_eq!(
             resolved_binding_entities(app.world(), second_device),
             vec![entity]
@@ -6389,6 +6412,128 @@ mod tests {
         bindings.install_role_status_clock(crate::RiggingRuntimeClock::starting_at(now));
         bindings.register(binding(role.clone(), display_endpoint("studio-display")?))?;
         Ok((bindings, role, now))
+    }
+
+    fn interval_paced_bindings(
+        role_name: &str,
+    ) -> Result<(Bindings, RoleKey, Instant), Box<dyn Error>> {
+        let now = Instant::now();
+        let role = RoleKey::new(role_name)?;
+        let mut bindings = Bindings::default();
+        bindings.install_role_status_clock(crate::RiggingRuntimeClock::starting_at(now));
+        let mut configured_binding = binding(role.clone(), display_endpoint("studio-display")?);
+        configured_binding.retry = RetryOn::Interval(Duration::from_secs(2));
+        bindings.register(configured_binding)?;
+        Ok((bindings, role, now))
+    }
+
+    #[test]
+    fn a_contended_camera_retry_never_crosses_its_waiting_bound() -> Result<(), Box<dyn Error>> {
+        let (mut bindings, role, now) = interval_paced_bindings("camera-tool-contended")?;
+        let device_revision = DeviceRevisionLookup::Retained(crate::DeviceRevision::default());
+        bindings.record_attempt_ending(
+            &role,
+            generation_now(&bindings, &role),
+            DriverOutcomeStatus::Failed(DeviceAccessError::Contended {
+                detail: "held by another application".to_owned(),
+            }),
+            device_revision,
+            FrameClockReading::Measurable(now),
+        );
+
+        let after_retry = now + Duration::from_secs(3);
+        assert!(!bindings.wait_bound_requires_update(after_retry));
+        assert_eq!(bindings.cross_wait_bounds(after_retry), []);
+        assert!(
+            bindings
+                .retry_pacing(&role)
+                .permits_dispatch(device_revision, FrameClockReading::Measurable(after_retry))
+        );
+        assert!(matches!(
+            bindings.projected_status(&role)?,
+            RoleStatusView::Waiting(WaitingStatusView::KernelRetry { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn an_unresponsive_camera_retry_still_crosses_its_waiting_bound() -> Result<(), Box<dyn Error>>
+    {
+        let (mut bindings, role, now) = interval_paced_bindings("camera-tool-unresponsive")?;
+        bindings.record_attempt_ending(
+            &role,
+            generation_now(&bindings, &role),
+            DriverOutcomeStatus::Failed(DeviceAccessError::Unresponsive {
+                detail: "no first frame".to_owned(),
+            }),
+            DeviceRevisionLookup::Retained(crate::DeviceRevision::default()),
+            FrameClockReading::Measurable(now),
+        );
+
+        assert_eq!(
+            bindings.cross_wait_bounds(now + Duration::from_secs(3)),
+            [role]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_transport_fault_after_contention_restores_the_waiting_bound() -> Result<(), Box<dyn Error>>
+    {
+        let (mut bindings, role, now) = interval_paced_bindings("camera-tool-transport")?;
+        let device_revision = DeviceRevisionLookup::Retained(crate::DeviceRevision::default());
+        bindings.record_attempt_ending(
+            &role,
+            generation_now(&bindings, &role),
+            DriverOutcomeStatus::Failed(DeviceAccessError::Contended {
+                detail: "held by another application".to_owned(),
+            }),
+            device_revision,
+            FrameClockReading::Measurable(now),
+        );
+        bindings.record_attempt_ending(
+            &role,
+            generation_now(&bindings, &role),
+            DriverOutcomeStatus::Failed(transport_failure()),
+            device_revision,
+            FrameClockReading::Measurable(now + Duration::from_secs(1)),
+        );
+
+        assert_eq!(
+            bindings.cross_wait_bounds(now + Duration::from_secs(4)),
+            [role]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_new_wait_reason_clears_the_contention_exemption() -> Result<(), Box<dyn Error>> {
+        let (mut bindings, role, now) = interval_paced_bindings("camera-tool-reporter")?;
+        bindings.record_attempt_ending(
+            &role,
+            generation_now(&bindings, &role),
+            DriverOutcomeStatus::Failed(DeviceAccessError::Contended {
+                detail: "held by another application".to_owned(),
+            }),
+            DeviceRevisionLookup::Retained(crate::DeviceRevision::default()),
+            FrameClockReading::Measurable(now),
+        );
+        assert_eq!(
+            bindings.record_test_reporter_wait(
+                &role,
+                device_key("studio-display")?,
+                ReporterId(0),
+                now + Duration::from_secs(1),
+                now + Duration::from_secs(2),
+            ),
+            super::WaitTransition::ReasonChanged
+        );
+
+        assert_eq!(
+            bindings.cross_wait_bounds(now + Duration::from_secs(3)),
+            [role]
+        );
+        Ok(())
     }
 
     #[test]

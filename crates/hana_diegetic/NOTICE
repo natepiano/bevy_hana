@@ -10,3 +10,9 @@ This project's layout algorithm is inspired by Clay, a high-performance
 hana_diegetic is a clean-room reimplementation in Rust, not a fork or
 derivative of Clay's source code. This acknowledgment is provided
 voluntarily to credit the original work that inspired this project.
+
+Lucide 1.54.0
+https://lucide.dev
+General icons are licensed under the ISC license. The listed Feather-derived
+icons retain the MIT notice. The complete license and notices are in
+assets/fonts/Lucide-1.54.0.txt.

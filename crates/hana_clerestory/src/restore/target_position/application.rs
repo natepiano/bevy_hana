@@ -27,12 +27,13 @@ use hana_kana::ToI32;
 use hana_kana::ToU32;
 #[cfg(test)]
 use hana_rigging::prelude::AttemptRef;
+use hana_rigging::prelude::DeviceAccessError;
 
 use super::strategy::FullscreenRestoreState;
 use super::strategy::MonitorScaleStrategy;
 use super::strategy::NativeFullscreenState;
 use super::strategy::WindowRestoreState;
-use super::target::FullscreenMoveDeadline;
+use super::target::FullscreenRestoreDeadline;
 use super::target::FullscreenRestoreProgress;
 #[cfg(test)]
 use super::target::SavedWindowPlacementDecision;
@@ -41,6 +42,7 @@ use super::target::WindowSettleProgress;
 use crate::Platform;
 use crate::WindowRevealDisposition;
 use crate::constants::FULLSCREEN_MONITOR_MOVE_TIMEOUT_SECS;
+use crate::constants::FULLSCREEN_NATIVE_STATE_TIMEOUT_SECS;
 use crate::constants::MILLIS_PER_SECOND;
 use crate::constants::RESTORE_STRATEGY_APPLY_UNCHANGED;
 use crate::constants::RESTORE_STRATEGY_LOWER_TO_HIGHER;
@@ -50,6 +52,7 @@ use crate::constants::SETTLE_STABILITY_SECS;
 use crate::constants::SETTLE_TIMEOUT_SECS;
 use crate::deadline::OperatingSystemWorkDeadline;
 use crate::deadline::OperatingSystemWorkDeadlineStatus;
+use crate::driver::WindowRoleDriverState;
 use crate::events::ExpectedPhysicalPosition;
 use crate::monitors::CurrentMonitor;
 use crate::monitors::CurrentMonitorIndex;
@@ -69,6 +72,7 @@ use crate::visibility::PlacementAbandoned;
 enum SavedGeometryPlacementProgress {
     Complete,
     Waiting,
+    Failed,
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ObservedScaleInput {
@@ -324,15 +328,47 @@ fn advance_fullscreen_restore(
     current_monitor: Option<&CurrentMonitor>,
     native_fullscreen: NativeFullscreenState,
     delta: Duration,
+    platform: Platform,
 ) -> SavedGeometryPlacementProgress {
     let progress = std::mem::replace(
         &mut target_position.fullscreen_restore_progress,
         FullscreenRestoreProgress::ReadyForGeometry,
     );
-    let FullscreenRestoreProgress::Advancing(fullscreen_restore_state) = progress else {
-        return SavedGeometryPlacementProgress::Complete;
+    let fullscreen_restore_state = match progress {
+        FullscreenRestoreProgress::Advancing(state) => state,
+        FullscreenRestoreProgress::Failed => {
+            target_position.fullscreen_restore_progress = FullscreenRestoreProgress::Failed;
+            return SavedGeometryPlacementProgress::Failed;
+        },
+        FullscreenRestoreProgress::ReadyForGeometry | FullscreenRestoreProgress::Completed => {
+            return SavedGeometryPlacementProgress::Complete;
+        },
     };
-    let (placement_progress, next_fullscreen_progress) = match fullscreen_restore_state {
+    let (placement_progress, next_fullscreen_progress) = advance_fullscreen_state(
+        entity,
+        target_position,
+        window,
+        current_monitor,
+        native_fullscreen,
+        delta,
+        fullscreen_restore_state,
+        platform,
+    );
+    target_position.fullscreen_restore_progress = next_fullscreen_progress;
+    placement_progress
+}
+
+fn advance_fullscreen_state(
+    entity: Entity,
+    target_position: &TargetPosition,
+    window: &mut Window,
+    current_monitor: Option<&CurrentMonitor>,
+    native_fullscreen: NativeFullscreenState,
+    delta: Duration,
+    fullscreen_restore_state: FullscreenRestoreState,
+    platform: Platform,
+) -> (SavedGeometryPlacementProgress, FullscreenRestoreProgress) {
+    match fullscreen_restore_state {
         FullscreenRestoreState::LeaveFullscreen => {
             debug!(
                 "[place_window_at_saved_geometry] macOS fullscreen: leaving the current fullscreen Space"
@@ -340,32 +376,18 @@ fn advance_fullscreen_restore(
             window.mode = WindowMode::Windowed;
             (
                 SavedGeometryPlacementProgress::Waiting,
-                FullscreenRestoreProgress::Advancing(
-                    FullscreenRestoreState::MoveWindowedToTarget {
-                        deadline: FullscreenMoveDeadline::NotRequested,
-                    },
-                ),
+                FullscreenRestoreProgress::Advancing(FullscreenRestoreState::WaitForWindowed {
+                    deadline: FullscreenRestoreDeadline::Awaiting(
+                        OperatingSystemWorkDeadline::new(FULLSCREEN_NATIVE_STATE_TIMEOUT_SECS),
+                    ),
+                }),
             )
         },
-        FullscreenRestoreState::MoveWindowedToTarget { mut deadline } => {
-            let progress = advance_move_windowed_to_target(
-                target_position.monitor_index,
-                target_position.physical_position(),
-                window,
-                current_monitor,
-                native_fullscreen,
-                &mut deadline,
-                delta,
-            );
-            let next_state = if matches!(progress, SavedGeometryPlacementProgress::Complete) {
-                FullscreenRestoreState::ApplyMode
-            } else {
-                FullscreenRestoreState::MoveWindowedToTarget { deadline }
-            };
-            (
-                SavedGeometryPlacementProgress::Waiting,
-                FullscreenRestoreProgress::Advancing(next_state),
-            )
+        FullscreenRestoreState::WaitForWindowed { deadline } => {
+            advance_native_windowed_wait(entity, native_fullscreen, deadline, delta)
+        },
+        FullscreenRestoreState::MoveWindowedToTarget { deadline } => {
+            advance_windowed_monitor_move(target_position, window, current_monitor, deadline, delta)
         },
         FullscreenRestoreState::MoveToMonitor => {
             if let ExpectedPhysicalPosition::Specified(position) =
@@ -399,10 +421,7 @@ fn advance_fullscreen_restore(
                 FullscreenRestoreProgress::Advancing(FullscreenRestoreState::ApplyMode),
             )
         },
-        FullscreenRestoreState::ApplyMode => (
-            SavedGeometryPlacementProgress::Complete,
-            FullscreenRestoreProgress::Completed,
-        ),
+        FullscreenRestoreState::ApplyMode => apply_mode_step(target_position, window, platform),
         FullscreenRestoreState::ActivateWindow => {
             native_window::activate_fullscreen_window(entity);
             debug!(
@@ -410,33 +429,192 @@ fn advance_fullscreen_restore(
             );
             (
                 SavedGeometryPlacementProgress::Waiting,
-                FullscreenRestoreProgress::Advancing(FullscreenRestoreState::WaitForTarget),
+                FullscreenRestoreProgress::Advancing(FullscreenRestoreState::WaitForTarget {
+                    deadline: FullscreenRestoreDeadline::Awaiting(
+                        OperatingSystemWorkDeadline::new(FULLSCREEN_NATIVE_STATE_TIMEOUT_SECS),
+                    ),
+                }),
             )
         },
-        FullscreenRestoreState::WaitForTarget => advance_fullscreen_target_wait(
+        FullscreenRestoreState::WaitForTarget { mut deadline } => advance_fullscreen_target_wait(
+            entity,
             target_position.monitor_index,
             current_monitor,
             native_fullscreen,
+            &mut deadline,
+            delta,
         ),
+        FullscreenRestoreState::WaitForBorderlessTarget { deadline } => {
+            advance_borderless_target_wait(
+                entity,
+                target_position,
+                window,
+                current_monitor,
+                deadline,
+                delta,
+            )
+        },
+    }
+}
+
+fn advance_windowed_monitor_move(
+    target_position: &TargetPosition,
+    window: &mut Window,
+    current_monitor: Option<&CurrentMonitor>,
+    mut deadline: FullscreenRestoreDeadline,
+    delta: Duration,
+) -> (SavedGeometryPlacementProgress, FullscreenRestoreProgress) {
+    let progress = advance_move_windowed_to_target(
+        target_position.monitor_index,
+        target_position.physical_position(),
+        window,
+        current_monitor,
+        &mut deadline,
+        delta,
+    );
+    let next_state = if matches!(progress, SavedGeometryPlacementProgress::Complete) {
+        FullscreenRestoreState::ApplyMode
+    } else {
+        FullscreenRestoreState::MoveWindowedToTarget { deadline }
     };
-    target_position.fullscreen_restore_progress = next_fullscreen_progress;
-    placement_progress
+    (
+        SavedGeometryPlacementProgress::Waiting,
+        FullscreenRestoreProgress::Advancing(next_state),
+    )
+}
+
+fn advance_native_windowed_wait(
+    entity: Entity,
+    native_fullscreen: NativeFullscreenState,
+    mut deadline: FullscreenRestoreDeadline,
+    delta: Duration,
+) -> (SavedGeometryPlacementProgress, FullscreenRestoreProgress) {
+    if native_fullscreen == NativeFullscreenState::Windowed {
+        return (
+            SavedGeometryPlacementProgress::Waiting,
+            FullscreenRestoreProgress::Advancing(FullscreenRestoreState::MoveWindowedToTarget {
+                deadline: FullscreenRestoreDeadline::NotRequested,
+            }),
+        );
+    }
+    if fullscreen_wait_expired(&mut deadline, delta) {
+        warn!(
+            "Window {entity:?} did not reach native windowed state before the fullscreen restore deadline"
+        );
+        return (
+            SavedGeometryPlacementProgress::Failed,
+            FullscreenRestoreProgress::Failed,
+        );
+    }
+    (
+        SavedGeometryPlacementProgress::Waiting,
+        FullscreenRestoreProgress::Advancing(FullscreenRestoreState::WaitForWindowed { deadline }),
+    )
+}
+
+fn apply_mode_step(
+    target_position: &TargetPosition,
+    window: &mut Window,
+    platform: Platform,
+) -> (SavedGeometryPlacementProgress, FullscreenRestoreProgress) {
+    if platform != Platform::MacOs
+        || !matches!(
+            target_position.saved_window_mode,
+            SavedWindowMode::BorderlessFullscreen
+        )
+    {
+        return (
+            SavedGeometryPlacementProgress::Complete,
+            FullscreenRestoreProgress::Completed,
+        );
+    }
+    apply_fullscreen_restore(target_position, window, platform);
+    (
+        SavedGeometryPlacementProgress::Waiting,
+        FullscreenRestoreProgress::Advancing(FullscreenRestoreState::WaitForBorderlessTarget {
+            deadline: FullscreenRestoreDeadline::Awaiting(OperatingSystemWorkDeadline::new(
+                FULLSCREEN_NATIVE_STATE_TIMEOUT_SECS,
+            )),
+        }),
+    )
+}
+
+fn advance_borderless_target_wait(
+    entity: Entity,
+    target_position: &TargetPosition,
+    window: &Window,
+    current_monitor: Option<&CurrentMonitor>,
+    mut deadline: FullscreenRestoreDeadline,
+    delta: Duration,
+) -> (SavedGeometryPlacementProgress, FullscreenRestoreProgress) {
+    let arrived = current_monitor
+        .is_some_and(|monitor| monitor.descriptor.index == target_position.monitor_index)
+        && window.mode
+            == target_position
+                .saved_window_mode
+                .to_window_mode(target_position.monitor_index);
+    if arrived {
+        return (
+            SavedGeometryPlacementProgress::Complete,
+            FullscreenRestoreProgress::ReadyForGeometry,
+        );
+    }
+    if fullscreen_wait_expired(&mut deadline, delta) {
+        warn!(
+            "Window {entity:?} did not reach borderless fullscreen on monitor {} before the restore deadline",
+            target_position.monitor_index
+        );
+        return (
+            SavedGeometryPlacementProgress::Failed,
+            FullscreenRestoreProgress::Failed,
+        );
+    }
+    (
+        SavedGeometryPlacementProgress::Waiting,
+        FullscreenRestoreProgress::Advancing(FullscreenRestoreState::WaitForBorderlessTarget {
+            deadline,
+        }),
+    )
+}
+
+fn fullscreen_wait_expired(deadline: &mut FullscreenRestoreDeadline, delta: Duration) -> bool {
+    let FullscreenRestoreDeadline::Awaiting(deadline) = deadline else {
+        return false;
+    };
+    matches!(
+        deadline.advance(delta),
+        OperatingSystemWorkDeadlineStatus::Expired
+    )
 }
 
 fn advance_fullscreen_target_wait(
+    entity: Entity,
     monitor_index: CurrentMonitorIndex,
     current_monitor: Option<&CurrentMonitor>,
     native_fullscreen: NativeFullscreenState,
+    deadline: &mut FullscreenRestoreDeadline,
+    delta: Duration,
 ) -> (SavedGeometryPlacementProgress, FullscreenRestoreProgress) {
     let target_monitor_reached = current_monitor
         .is_some_and(|current_monitor| current_monitor.descriptor.index == monitor_index);
     if native_fullscreen != NativeFullscreenState::Fullscreen || !target_monitor_reached {
+        if fullscreen_wait_expired(deadline, delta) {
+            warn!(
+                "Window {entity:?} did not reach native fullscreen on target monitor {monitor_index} before the restore deadline"
+            );
+            return (
+                SavedGeometryPlacementProgress::Failed,
+                FullscreenRestoreProgress::Failed,
+            );
+        }
         debug!(
             "[place_window_at_saved_geometry] macOS fullscreen: waiting for fullscreen on target monitor {monitor_index}"
         );
         return (
             SavedGeometryPlacementProgress::Waiting,
-            FullscreenRestoreProgress::Advancing(FullscreenRestoreState::WaitForTarget),
+            FullscreenRestoreProgress::Advancing(FullscreenRestoreState::WaitForTarget {
+                deadline: deadline.clone(),
+            }),
         );
     }
     debug!(
@@ -455,16 +633,9 @@ fn advance_move_windowed_to_target(
     physical_position: ExpectedPhysicalPosition,
     window: &mut Window,
     current_monitor: Option<&CurrentMonitor>,
-    native_fullscreen: NativeFullscreenState,
-    move_deadline: &mut FullscreenMoveDeadline,
+    move_deadline: &mut FullscreenRestoreDeadline,
     delta: Duration,
 ) -> SavedGeometryPlacementProgress {
-    if native_fullscreen != NativeFullscreenState::Windowed {
-        debug!(
-            "[place_window_at_saved_geometry] macOS fullscreen: waiting for AppKit to finish leaving fullscreen"
-        );
-        return SavedGeometryPlacementProgress::Waiting;
-    }
     let target_monitor_reached = current_monitor
         .is_some_and(|current_monitor| current_monitor.descriptor.index == monitor_index);
     if target_monitor_reached {
@@ -490,8 +661,8 @@ fn advance_move_windowed_to_target(
         monitor_index
     );
     window.position = move_position;
-    let FullscreenMoveDeadline::Awaiting(deadline) = move_deadline else {
-        *move_deadline = FullscreenMoveDeadline::Awaiting(OperatingSystemWorkDeadline::new(
+    let FullscreenRestoreDeadline::Awaiting(deadline) = move_deadline else {
+        *move_deadline = FullscreenRestoreDeadline::Awaiting(OperatingSystemWorkDeadline::new(
             FULLSCREEN_MONITOR_MOVE_TIMEOUT_SECS,
         ));
         return SavedGeometryPlacementProgress::Waiting;
@@ -533,6 +704,7 @@ pub(crate) fn place_window_at_saved_geometry(
     scale_inputs: Res<ObservedScaleInputs>,
     time: Option<Res<Time>>,
     mut fallback: ResMut<WindowFallbackRecoveryState>,
+    mut driver_state: ResMut<WindowRoleDriverState>,
     #[cfg(any(test, feature = "test"))] injected_windows: Option<Res<InjectedWinitWindows>>,
 ) {
     let delta = time.as_deref().map_or(Duration::ZERO, Time::delta);
@@ -570,6 +742,21 @@ pub(crate) fn place_window_at_saved_geometry(
             native_fullscreen,
             delta,
         );
+        if matches!(restore_status, SavedGeometryPlacementProgress::Failed) {
+            let _ = driver_state.fail_attempt(
+                restore_preparation.attempt(),
+                DeviceAccessError::Unresponsive {
+                    detail: format!(
+                        "fullscreen restore of window {entity:?} missed its state deadline"
+                    ),
+                },
+            );
+            commands
+                .entity(entity)
+                .remove::<(TargetPosition, WindowRestoreAttempt)>();
+            fullscreen_observations.stop(entity);
+            continue;
+        }
         if matches!(restore_status, SavedGeometryPlacementProgress::Complete)
             && !has_reveal_disposition
         {
@@ -590,7 +777,7 @@ pub(crate) fn place_window_at_saved_geometry(
 
 /// Stop observing native fullscreen if a restore is cancelled before it settles.
 pub(crate) fn clear_fullscreen_observation(
-    removed: On<Remove, TargetPosition>,
+    removed: On<Remove<TargetPosition>>,
     mut observations: NonSendMut<NativeFullscreenObservations>,
 ) {
     observations.stop(removed.entity);
@@ -704,20 +891,19 @@ fn restore_window(
 
     let macos_fullscreen =
         platform == Platform::MacOs && target_position.saved_window_mode.is_fullscreen();
-    if macos_fullscreen
-        && matches!(
-            advance_fullscreen_restore(
-                entity,
-                target_position,
-                window,
-                current_monitor,
-                native_fullscreen,
-                delta,
-            ),
-            SavedGeometryPlacementProgress::Waiting
-        )
-    {
-        return SavedGeometryPlacementProgress::Waiting;
+    if macos_fullscreen {
+        let progress = advance_fullscreen_restore(
+            entity,
+            target_position,
+            window,
+            current_monitor,
+            native_fullscreen,
+            delta,
+            platform,
+        );
+        if !matches!(progress, SavedGeometryPlacementProgress::Complete) {
+            return progress;
+        }
     }
 
     if !macos_fullscreen
@@ -749,6 +935,7 @@ fn restore_window(
                 current_monitor,
                 native_fullscreen,
                 delta,
+                platform,
             ),
             SavedGeometryPlacementProgress::Waiting
         )
@@ -1116,6 +1303,9 @@ mod tests {
     use bevy::window::WindowResolution;
 
     use super::*;
+    use crate::persistence::RequestedWindowPlacement;
+    use crate::persistence::SavedFullscreenVideoMode;
+    use crate::persistence::WindowPlacementConfiguration;
 
     const BORDERLESS_TARGET_POSITION: IVec2 = IVec2::new(-4_256, -2_249);
     const FALLBACK_MONITOR_INDEX: usize = 0;
@@ -1154,26 +1344,23 @@ mod tests {
         }
     }
 
-    const fn borderless_target() -> TargetPosition {
-        TargetPosition {
-            placement_decision:          SavedWindowPlacementDecision::Restorable {
-                physical_position: BORDERLESS_TARGET_POSITION,
-                logical_position:  BORDERLESS_TARGET_POSITION,
-            },
-            physical_size:               UVec2::new(3_440, 1_440),
-            logical_size:                UVec2::new(3_440, 1_440),
-            target_scale:                1.0,
-            starting_scale:              1.0,
-            monitor_scale_strategy:      MonitorScaleStrategy::ApplyUnchanged,
-            saved_window_mode:           SavedWindowMode::BorderlessFullscreen,
-            monitor_index:               CurrentMonitorIndex::from_current_enumeration(
-                TARGET_MONITOR_INDEX,
-            ),
-            fullscreen_restore_progress: FullscreenRestoreProgress::Advancing(
-                FullscreenRestoreState::LeaveFullscreen,
-            ),
-            window_settle_progress:      WindowSettleProgress::NotStarted,
-        }
+    fn borderless_target() -> TargetPosition {
+        let placement = WindowPlacementConfiguration::Requested(RequestedWindowPlacement {
+            logical_size:      UVec2::new(3_440, 1_440),
+            saved_window_mode: SavedWindowMode::BorderlessFullscreen,
+        });
+        let mut target = super::super::target::compute_established_target_position(
+            &placement,
+            &current_monitor(TARGET_MONITOR_INDEX, 1.0).descriptor,
+            UVec2::ZERO,
+            1.0,
+            Platform::MacOs,
+        );
+        target.placement_decision = SavedWindowPlacementDecision::Restorable {
+            physical_position: BORDERLESS_TARGET_POSITION,
+            logical_position:  BORDERLESS_TARGET_POSITION,
+        };
+        target
     }
 
     fn advance(
@@ -1198,15 +1385,6 @@ mod tests {
             native_fullscreen,
             Duration::ZERO,
         )
-    }
-
-    fn assert_windowed_move_pending(target: &TargetPosition) {
-        assert!(matches!(
-            &target.fullscreen_restore_progress,
-            FullscreenRestoreProgress::Advancing(
-                FullscreenRestoreState::MoveWindowedToTarget { .. }
-            )
-        ));
     }
 
     /// `set_physical_resolution` is interpreted at the scale the window is on when the request is
@@ -1261,10 +1439,48 @@ mod tests {
     }
 
     #[test]
-    fn macos_borderless_retarget_moves_windowed_to_target_before_fullscreen() {
-        let fallback = current_monitor(FALLBACK_MONITOR_INDEX, 2.0);
+    fn borderless_target_settles_without_leaving_fullscreen_or_becoming_windowed() {
         let target_monitor = current_monitor(TARGET_MONITOR_INDEX, 1.0);
         let mut target = borderless_target();
+        let mode = WindowMode::BorderlessFullscreen(MonitorSelection::Index(TARGET_MONITOR_INDEX));
+        let mut window = Window { mode, ..default() };
+
+        advance(
+            &mut target,
+            &mut window,
+            &target_monitor,
+            NativeFullscreenState::Unavailable,
+        );
+        assert_eq!(window.mode, mode);
+        assert!(matches!(
+            target.fullscreen_restore_progress,
+            FullscreenRestoreProgress::Advancing(
+                FullscreenRestoreState::WaitForBorderlessTarget { .. }
+            )
+        ));
+
+        advance(
+            &mut target,
+            &mut window,
+            &target_monitor,
+            NativeFullscreenState::Unavailable,
+        );
+        assert_eq!(window.mode, mode);
+        assert!(matches!(
+            target.window_settle_progress,
+            WindowSettleProgress::Settling(_)
+        ));
+    }
+
+    #[test]
+    fn native_fullscreen_waits_for_appkit_to_report_windowed_before_moving() {
+        let fallback = current_monitor(FALLBACK_MONITOR_INDEX, 2.0);
+        let mut target = borderless_target();
+        target.saved_window_mode = SavedWindowMode::Fullscreen {
+            video_mode: SavedFullscreenVideoMode::Current,
+        };
+        target.fullscreen_restore_progress =
+            FullscreenRestoreProgress::Advancing(FullscreenRestoreState::LeaveFullscreen);
         let mut window = Window {
             mode: WindowMode::BorderlessFullscreen(MonitorSelection::Index(FALLBACK_MONITOR_INDEX)),
             ..default()
@@ -1277,15 +1493,21 @@ mod tests {
             NativeFullscreenState::Fullscreen,
         );
         assert_eq!(window.mode, WindowMode::Windowed);
-        assert_windowed_move_pending(&target);
+        assert!(matches!(
+            target.fullscreen_restore_progress,
+            FullscreenRestoreProgress::Advancing(FullscreenRestoreState::WaitForWindowed { .. })
+        ));
 
         advance(
             &mut target,
             &mut window,
-            &target_monitor,
+            &fallback,
             NativeFullscreenState::Fullscreen,
         );
-        assert_windowed_move_pending(&target);
+        assert!(matches!(
+            target.fullscreen_restore_progress,
+            FullscreenRestoreProgress::Advancing(FullscreenRestoreState::WaitForWindowed { .. })
+        ));
         assert_eq!(window.position, WindowPosition::Automatic);
 
         advance(
@@ -1294,77 +1516,58 @@ mod tests {
             &fallback,
             NativeFullscreenState::Windowed,
         );
-        assert_windowed_move_pending(&target);
-        assert_eq!(
-            window.position,
-            WindowPosition::At(BORDERLESS_TARGET_POSITION)
-        );
-
-        advance(
-            &mut target,
-            &mut window,
-            &target_monitor,
-            NativeFullscreenState::Windowed,
-        );
         assert!(matches!(
-            &target.fullscreen_restore_progress,
-            FullscreenRestoreProgress::Advancing(FullscreenRestoreState::ApplyMode)
+            target.fullscreen_restore_progress,
+            FullscreenRestoreProgress::Advancing(
+                FullscreenRestoreState::MoveWindowedToTarget { .. }
+            )
         ));
+    }
 
-        advance(
-            &mut target,
-            &mut window,
-            &fallback,
-            NativeFullscreenState::Windowed,
-        );
-        assert_eq!(
-            window.mode,
-            WindowMode::BorderlessFullscreen(MonitorSelection::Index(TARGET_MONITOR_INDEX))
-        );
-        assert!(matches!(
-            &target.fullscreen_restore_progress,
-            FullscreenRestoreProgress::Advancing(FullscreenRestoreState::ActivateWindow)
-        ));
-        assert!(matches!(
-            &target.window_settle_progress,
-            WindowSettleProgress::NotStarted
-        ));
-
-        advance(
-            &mut target,
-            &mut window,
-            &fallback,
-            NativeFullscreenState::Windowed,
-        );
-        assert!(matches!(
-            &target.fullscreen_restore_progress,
-            FullscreenRestoreProgress::Advancing(FullscreenRestoreState::WaitForTarget)
-        ));
-
+    #[test]
+    fn unresolved_native_state_wait_fails_at_its_deadline() {
+        let fallback = current_monitor(FALLBACK_MONITOR_INDEX, 2.0);
+        let mut target = borderless_target();
+        target.saved_window_mode = SavedWindowMode::Fullscreen {
+            video_mode: SavedFullscreenVideoMode::Current,
+        };
+        target.fullscreen_restore_progress =
+            FullscreenRestoreProgress::Advancing(FullscreenRestoreState::LeaveFullscreen);
+        let mut window = Window::default();
         advance(
             &mut target,
             &mut window,
             &fallback,
             NativeFullscreenState::Fullscreen,
         );
-        assert!(matches!(
-            &target.window_settle_progress,
-            WindowSettleProgress::NotStarted
-        ));
 
-        advance(
+        let role = crate::persistence::primary_window_role().expect("primary role");
+        let preparation = WindowRestoreAttempt::for_test(role);
+        let progress = restore_window(
+            Entity::from_bits(1),
+            &preparation,
             &mut target,
             &mut window,
-            &target_monitor,
+            &ObservedScaleInputs::default(),
+            Platform::MacOs,
+            true,
+            Some(&fallback),
             NativeFullscreenState::Fullscreen,
+            Duration::from_secs_f32(FULLSCREEN_NATIVE_STATE_TIMEOUT_SECS),
         );
+        assert!(matches!(progress, SavedGeometryPlacementProgress::Failed));
         assert!(matches!(
-            &target.fullscreen_restore_progress,
-            FullscreenRestoreProgress::ReadyForGeometry
+            target.fullscreen_restore_progress,
+            FullscreenRestoreProgress::Failed
         ));
         assert!(matches!(
-            &target.window_settle_progress,
-            WindowSettleProgress::Settling(_)
+            advance(
+                &mut target,
+                &mut window,
+                &fallback,
+                NativeFullscreenState::Fullscreen
+            ),
+            SavedGeometryPlacementProgress::Failed
         ));
     }
 
@@ -1381,7 +1584,7 @@ mod tests {
         let mut target = borderless_target();
         target.fullscreen_restore_progress =
             FullscreenRestoreProgress::Advancing(FullscreenRestoreState::MoveWindowedToTarget {
-                deadline: FullscreenMoveDeadline::Awaiting(OperatingSystemWorkDeadline::new(
+                deadline: FullscreenRestoreDeadline::Awaiting(OperatingSystemWorkDeadline::new(
                     FULLSCREEN_MONITOR_MOVE_TIMEOUT_SECS,
                 )),
             });
@@ -1442,7 +1645,7 @@ mod tests {
         );
         assert!(matches!(
             restore_status,
-            SavedGeometryPlacementProgress::Complete
+            SavedGeometryPlacementProgress::Waiting
         ));
         assert!(
             !window.visible,
@@ -1456,7 +1659,7 @@ mod tests {
         let mut target = borderless_target();
         target.fullscreen_restore_progress =
             FullscreenRestoreProgress::Advancing(FullscreenRestoreState::MoveWindowedToTarget {
-                deadline: FullscreenMoveDeadline::NotRequested,
+                deadline: FullscreenRestoreDeadline::NotRequested,
             });
         let mut window = Window::default();
         let Ok(role) = crate::persistence::primary_window_role() else {
@@ -1484,7 +1687,7 @@ mod tests {
         assert!(matches!(
             &target.fullscreen_restore_progress,
             FullscreenRestoreProgress::Advancing(FullscreenRestoreState::MoveWindowedToTarget {
-                deadline: FullscreenMoveDeadline::Awaiting(_),
+                deadline: FullscreenRestoreDeadline::Awaiting(_),
             })
         ));
 

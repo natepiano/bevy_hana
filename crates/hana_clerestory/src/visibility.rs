@@ -78,7 +78,7 @@ pub(crate) struct SkipInitialWindowHide;
 /// added, `PrimaryWindow` may not exist yet, while a `PrimaryWindow` addition means the
 /// `Window` component is already on the entity.
 pub(crate) fn hide_window_on_creation(
-    add: On<Add, PrimaryWindow>,
+    add: On<Add<PrimaryWindow>>,
     mut commands: Commands,
     mut windows: Query<&mut Window, Without<SkipInitialWindowHide>>,
 ) {
@@ -170,8 +170,8 @@ impl PlacementAbandoned {
 /// evidence names this display", and that case must never match an arrival; `Option`'s derived
 /// equality would let two unnamed displays compare as one and restart a window on hardware it was
 /// never saved to. The two named variants exist because the save format carries two kinds of
-/// evidence: the current format writes a reporter key, while a record decoded from a v4 file holds
-/// only a fingerprint until a live association converts it.
+/// evidence: the current format writes a reporter key, while a saved record still holding v4
+/// evidence has only a fingerprint until a live association converts it.
 #[derive(Reflect)]
 pub(crate) enum WantedDisplay {
     /// Reporter evidence already named the saved display with this exact kernel key. An arriving
@@ -225,7 +225,8 @@ impl WantedDisplay {
     /// window on whichever unidentifiable display happened to be plugged in.
     ///
     /// The [`Self::Fingerprinted`] arm is the one place a [`DisplayIdentity`] is compared, and it
-    /// exists only for a record decoded from a v4 file that no live association has converted yet.
+    /// exists only for a saved record still holding v4 evidence that no live association has
+    /// converted yet.
     /// It is not a second way to recognise a live display: every current record carries a reporter
     /// key and takes the [`Self::Keyed`] arm, and once `resolve_pending_legacy_targets` converts a
     /// retained record this arm stops being reachable for it.
@@ -1764,8 +1765,8 @@ pub(crate) mod tests {
 
     /// The saved record a retry script starts from.
     ///
-    /// `NoUsableKey` seeds a retained v4 record with no durable evidence, which is the real shape
-    /// of a pre-v5 file that never carried a display identity. That record reaches
+    /// `NoUsableKey` seeds a retained v4 record with no durable evidence, the same record a saved
+    /// file holds when it never carried a display identity. That record reaches
     /// [`WantedDisplay::Unnamed`] through the persisted branch of
     /// [`WantedDisplay::for_role`], so it stays unnamed whether or not a binding exists.
     fn retry_window_state(

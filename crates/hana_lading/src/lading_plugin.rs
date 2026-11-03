@@ -207,7 +207,7 @@ fn check_set<T: DiskAssets>(
         SetResolution::Failed { index, error } => {
             let tracked_path = owned_tracked_path(&tracked.handles[index]);
             progress.resolve_failure();
-            tracing::error!(
+            tracing::debug!(
                 asset_set = type_name::<T>(),
                 path = %tracked_path,
                 error = %error,
@@ -234,7 +234,7 @@ fn check_set<T: DiskAssets>(
                 .iter()
                 .filter_map(UntypedHandle::path)
                 .collect();
-            tracing::warn!(
+            tracing::debug!(
                 asset_set = type_name::<T>(),
                 roots = ?root_paths,
                 "startup disk asset set is still loading"

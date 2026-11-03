@@ -9,7 +9,7 @@ use bevy::color::palettes::css::MEDIUM_PURPLE;
 use bevy::color::palettes::css::SEA_GREEN;
 use bevy::color::palettes::css::SKY_BLUE;
 use bevy::color::palettes::css::TURQUOISE;
-use bevy::math::curve::EaseFunction;
+use bevy::curve::EaseFunction;
 use bevy::prelude::Assets;
 use bevy::prelude::Color;
 use bevy::prelude::Commands;

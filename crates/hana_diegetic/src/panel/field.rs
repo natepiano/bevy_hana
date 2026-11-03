@@ -25,7 +25,7 @@ pub(crate) struct PanelFieldPresentation {
     pub(crate) padding:           Padding,
     pub(crate) align_x:           AlignX,
     pub(crate) align_y:           AlignY,
-    pub(crate) text_style:        Option<TextStyle>,
+    pub(crate) text_style:        TextStyle,
     pub(crate) editor_text:       Option<EditorPart>,
     pub(crate) editor_selection:  Option<EditorPart>,
     pub(crate) editor_caret:      Option<EditorPart>,
@@ -132,16 +132,19 @@ mod tests {
     #[test]
     fn collects_authored_field_record_text_and_bounds() {
         let mut builder = LayoutBuilder::new(100.0, 40.0);
-        builder.with(El::new().editable_field("name", field_spec()), |builder| {
-            builder.text(("Gain", TextStyle::new(10.0)));
-        });
+        builder.with(
+            El::new().editable_field("name", field_spec(), crate::TextStyle::new(10.0)),
+            |builder| {
+                builder.text(("Gain", TextStyle::new(10.0)));
+            },
+        );
         let tree = builder.build();
         let engine = LayoutEngine::new(Arc::new(measure));
         let result = engine.compute(&tree, 100.0, 40.0, 1.0);
 
         let (records, duplicates) = collect_panel_field_records(&tree, &result);
 
-        assert!(duplicates.is_empty());
+        assert_eq!(duplicates, []);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].field_id.as_str(), Some("name"));
         assert_eq!(records[0].display_text, "Gain");
@@ -151,8 +154,14 @@ mod tests {
     #[test]
     fn marks_duplicate_field_ids() {
         let mut builder = LayoutBuilder::new(100.0, 40.0);
-        builder.with(El::new().editable_field("value", field_spec()), |_| {});
-        builder.with(El::new().editable_field("value", field_spec()), |_| {});
+        builder.with(
+            El::new().editable_field("value", field_spec(), crate::TextStyle::new(10.0)),
+            |_| {},
+        );
+        builder.with(
+            El::new().editable_field("value", field_spec(), crate::TextStyle::new(10.0)),
+            |_| {},
+        );
         let tree = builder.build();
         let engine = LayoutEngine::new(Arc::new(measure));
         let result = engine.compute(&tree, 100.0, 40.0, 1.0);

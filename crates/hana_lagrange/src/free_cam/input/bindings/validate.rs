@@ -7,6 +7,7 @@
 //! lowered sets in the free-camera per-action newtypes.
 
 use super::FreeCamBindings;
+use super::FreeCamTrackpadLook;
 use super::action_set::FreeCamHomeActionBindings;
 use super::action_set::FreeCamLookActionBindings;
 use super::action_set::FreeCamRollActionBindings;
@@ -32,6 +33,7 @@ use crate::orbit_cam::CameraInputGamepadSelectionPolicy;
 pub(super) fn validate_free_cam_bindings(
     translate: &[HeldBindingDescriptor],
     look: &[HeldBindingDescriptor],
+    trackpad_look: &[FreeCamTrackpadLook],
     roll: &[HeldBindingDescriptor],
     look_pitch: FreeCamLookPitch,
     slow_mode: Option<CameraSlowMode>,
@@ -40,6 +42,9 @@ pub(super) fn validate_free_cam_bindings(
 ) -> Result<FreeCamBindings, BindingsError> {
     input::validate_held_entries(FREE_CAM_TRANSLATE_ACTION_NAME, translate)?;
     input::validate_held_entries(FREE_CAM_LOOK_ACTION_NAME, look)?;
+    for binding in trackpad_look {
+        binding.validate()?;
+    }
     input::validate_held_entries(FREE_CAM_ROLL_ACTION_NAME, roll)?;
     input::validate_impulse_entries(FREE_CAM_HOME_ACTION_NAME, home)?;
     input::validate_slow_mode(slow_mode.as_ref())?;
@@ -53,6 +58,7 @@ pub(super) fn validate_free_cam_bindings(
             FREE_CAM_LOOK_ACTION_NAME,
             look,
         )?),
+        trackpad_look: trackpad_look.to_vec(),
         roll: FreeCamRollActionBindings(input::held_descriptors_to_set(
             FREE_CAM_ROLL_ACTION_NAME,
             roll,

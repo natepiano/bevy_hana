@@ -15,6 +15,7 @@ use super::attachment_path_when_unreported;
 use crate::Platform;
 use crate::constants::CORE_GRAPHICS_SUCCESS;
 use crate::constants::MACOS_DISPLAY_UUID_BYTES;
+use crate::monitors::DisplayPhysicalSize;
 use crate::monitors::DisplayProductName;
 #[cfg(any(test, feature = "test"))]
 use crate::monitors::identity;
@@ -30,6 +31,13 @@ pub(in crate::monitors) enum QualifiedEvidence {
 }
 
 impl QualifiedEvidence {
+    #[expect(
+        clippy::unused_self,
+        reason = "same signature as the Linux and Windows arms, which read the EDID size"
+    )]
+    pub(in crate::monitors) const fn physical_size(&self) -> DisplayPhysicalSize {
+        DisplayPhysicalSize::NotReported
+    }
     /// Bytes that identify the physical display and nothing about this process or this boot.
     #[allow(
         clippy::missing_const_for_fn,

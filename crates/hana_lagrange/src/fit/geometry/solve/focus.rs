@@ -69,14 +69,17 @@ pub(super) fn refine_focus_anchoring(
         let camera_global = GlobalTransform::from(
             Transform::from_translation(camera_position).with_rotation(rotation),
         );
-        let Some((bounds, depths)) =
+        let Some((viewport_bounds, depths)) =
             ScreenSpaceBounds::from_points(points, &camera_global, projection, aspect_ratio)
         else {
             break;
         };
+        let bounds = parameters.region.bounds_within(&viewport_bounds);
+        let region_size = parameters
+            .viewport_size
+            .map(|size| parameters.region.pixel_size(size));
         let current_anchor = bounds_anchor_point(&bounds, anchor);
-        let target_anchor =
-            viewport_anchor_point(&bounds, parameters.viewport_size, anchor, offset_px);
+        let target_anchor = viewport_anchor_point(&bounds, region_size, anchor, offset_px);
         let delta = current_anchor - target_anchor;
         if delta.x.abs() < CENTERING_TOLERANCE && delta.y.abs() < CENTERING_TOLERANCE {
             break;
@@ -117,8 +120,8 @@ fn viewport_anchor_point(
     let (anchor_x, anchor_y) = anchor.offset_fraction();
     let viewport_width = bounds.half_extent_x * 2.0;
     let viewport_height = bounds.half_extent_y * 2.0;
-    let x = -bounds.half_extent_x + viewport_width * anchor_x;
-    let y = bounds.half_extent_y - viewport_height * anchor_y;
+    let x = viewport_width.mul_add(anchor_x, -bounds.half_extent_x);
+    let y = viewport_height.mul_add(-anchor_y, bounds.half_extent_y);
     let offset = normalized_pixel_offset(bounds, viewport_size, offset_px);
 
     Vec2::new(x + offset.x, y + offset.y)

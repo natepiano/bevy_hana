@@ -106,7 +106,7 @@ pub(in crate::debug) fn build_typography_overlay(
         despawn_overlay_children(&mut commands, &containers, container_entity);
 
         let font_id = FontId(computed.font_id);
-        let Some(font) = font_registry.font(font_id) else {
+        let Ok(font) = font_registry.font(font_id) else {
             continue;
         };
 

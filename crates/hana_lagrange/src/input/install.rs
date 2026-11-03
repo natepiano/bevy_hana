@@ -20,8 +20,10 @@
 
 use std::collections::HashMap;
 
+use bevy::prelude::ButtonInput;
 use bevy::prelude::Component;
 use bevy::prelude::Entity;
+use bevy::prelude::KeyCode;
 use bevy::prelude::Query;
 use bevy::prelude::Res;
 use bevy::prelude::World;
@@ -29,6 +31,7 @@ use bevy_enhanced_input::prelude::Accumulation;
 use bevy_enhanced_input::prelude::Action;
 use bevy_enhanced_input::prelude::ActionOf;
 use bevy_enhanced_input::prelude::ActionSettings;
+use bevy_enhanced_input::prelude::ActionSources;
 use bevy_enhanced_input::prelude::ActionValue;
 use bevy_enhanced_input::prelude::ActionsQuery;
 use bevy_enhanced_input::prelude::Binding;
@@ -61,9 +64,12 @@ use super::bindings::ImpulseActionBindingEntry;
 use super::bindings::InputAxisTransform;
 use super::bindings::InputBindingDescriptor;
 use super::bindings::InputBindingEntry;
+use super::bindings::InputBindingModifiers;
 use super::bindings::InputDeadZone;
 use super::bindings::InputDeltaScale;
 use super::mode_reconciliation::CameraInputInstallationOf;
+use super::pointer_motion::CursorDragInput;
+use super::pointer_motion::DragMotionSource;
 
 /// Per-camera hook that lets the shared install driver spawn action entities
 /// under the right enhanced-input context, tag them with the camera's
@@ -170,6 +176,116 @@ pub(crate) fn withhold_wheel_bindings_of_scroll_blocked_cameras(
         if condition.delivery != delivery {
             condition.delivery = delivery;
         }
+    }
+}
+
+/// Withholds mouse-button and mouse-motion bindings during a claimed drag.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CameraDragBindingCondition {
+    camera:   Entity,
+    delivery: DragDelivery,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DragDelivery {
+    Delivered,
+    Withheld,
+}
+
+impl InputCondition for CameraDragBindingCondition {
+    fn evaluate(&mut self, _: &ActionsQuery, _: &ContextTime, _: ActionValue) -> TriggerState {
+        match self.delivery {
+            DragDelivery::Delivered => TriggerState::Fired,
+            DragDelivery::Withheld => TriggerState::None,
+        }
+    }
+
+    fn kind(&self) -> ConditionKind { ConditionKind::Blocker }
+}
+
+pub(crate) fn withhold_drag_bindings_of_claimed_cameras(
+    route: Res<ResolvedCameraInputRoute>,
+    mut conditions: Query<&mut CameraDragBindingCondition>,
+) {
+    for mut condition in &mut conditions {
+        condition.delivery = if route
+            .blockers_for(condition.camera)
+            .is_some_and(CameraInputBlockers::blocks_pointer_drag)
+        {
+            DragDelivery::Withheld
+        } else {
+            DragDelivery::Delivered
+        };
+    }
+}
+
+/// Allows only the sibling binding selected for the current camera drag.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct CameraMotionSourceCondition {
+    camera:    Entity,
+    source:    DragMotionSource,
+    delivered: bool,
+}
+
+impl CameraMotionSourceCondition {
+    pub(super) const fn camera(&self) -> Entity { self.camera }
+
+    pub(super) fn select(&mut self, camera_is_routed: bool, source: DragMotionSource) {
+        self.delivered = if camera_is_routed {
+            match self.source {
+                DragMotionSource::RawMotion => source != DragMotionSource::CursorDelta,
+                DragMotionSource::CursorDelta => source == DragMotionSource::CursorDelta,
+                DragMotionSource::Undecided => false,
+            }
+        } else {
+            self.source == DragMotionSource::RawMotion
+        };
+    }
+}
+
+impl InputCondition for CameraMotionSourceCondition {
+    fn evaluate(&mut self, _: &ActionsQuery, _: &ContextTime, _: ActionValue) -> TriggerState {
+        if self.delivered {
+            TriggerState::Fired
+        } else {
+            TriggerState::None
+        }
+    }
+
+    fn kind(&self) -> ConditionKind { ConditionKind::Blocker }
+}
+
+/// Applies the same required-modifier test as native mouse motion.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct CameraCursorModifierCondition {
+    mod_keys: ModKeys,
+    pressed:  bool,
+}
+
+impl InputCondition for CameraCursorModifierCondition {
+    fn evaluate(&mut self, _: &ActionsQuery, _: &ContextTime, _: ActionValue) -> TriggerState {
+        if self.pressed {
+            TriggerState::Fired
+        } else {
+            TriggerState::None
+        }
+    }
+
+    fn kind(&self) -> ConditionKind { ConditionKind::Blocker }
+}
+
+pub(super) fn refresh_cursor_modifiers(
+    keyboard: Option<Res<ButtonInput<KeyCode>>>,
+    action_sources: Res<ActionSources>,
+    mut conditions: Query<&mut CameraCursorModifierCondition>,
+) {
+    for mut condition in &mut conditions {
+        condition.pressed = (condition.mod_keys.is_empty() || action_sources.keyboard)
+            && condition.mod_keys.iter_keys().all(|pair| {
+                keyboard
+                    .as_deref()
+                    .is_some_and(|keys| keys.any_pressed(pair))
+            });
     }
 }
 
@@ -286,13 +402,14 @@ pub(crate) fn spawn_binding<K: CameraInstallKind>(
 ) {
     let gate_entities = gate_condition_entities::<K>(world, camera, gates, gate_actions, entities);
     for entry in binding_descriptor.enabled_entries() {
-        let binding = spawn_binding_entry::<K>(world, action, camera, entry);
-        if !gate_entities.is_empty() {
-            world
-                .entity_mut(binding)
-                .insert(CameraBindingGateCondition::new(gate_entities.clone()));
+        for binding in spawn_binding_entry::<K>(world, action, camera, entry) {
+            if !gate_entities.is_empty() {
+                world
+                    .entity_mut(binding)
+                    .insert(CameraBindingGateCondition::new(gate_entities.clone()));
+            }
+            entities.push(binding);
         }
-        entities.push(binding);
     }
 }
 
@@ -301,9 +418,47 @@ fn spawn_binding_entry<K: CameraInstallKind>(
     action: Entity,
     camera: Entity,
     entry: &InputBindingEntry,
-) -> Entity {
-    let entity = spawn_single_binding::<K>(world, action, camera, entry.binding());
+) -> Vec<Entity> {
+    let binding = entry.binding();
+    let mut entities = vec![spawn_single_binding::<K>(world, action, camera, binding)];
+    if let Binding::MouseMotion { mod_keys } = binding {
+        let cursor_input = world.resource::<CursorDragInput>().0;
+        let cursor =
+            spawn_single_binding::<K>(world, action, camera, Binding::Custom(cursor_input));
+        world.entity_mut(cursor).insert((
+            CameraDragBindingCondition {
+                camera,
+                delivery: DragDelivery::Delivered,
+            },
+            CameraCursorModifierCondition {
+                mod_keys,
+                pressed: mod_keys.is_empty(),
+            },
+        ));
+        world
+            .entity_mut(entities[0])
+            .insert(CameraMotionSourceCondition {
+                camera,
+                source: DragMotionSource::RawMotion,
+                delivered: true,
+            });
+        world
+            .entity_mut(cursor)
+            .insert(CameraMotionSourceCondition {
+                camera,
+                source: DragMotionSource::CursorDelta,
+                delivered: false,
+            });
+        entities.push(cursor);
+    }
     let modifiers = entry.install_modifiers();
+    for &entity in &entities {
+        install_entry_modifiers(world, entity, modifiers);
+    }
+    entities
+}
+
+fn install_entry_modifiers(world: &mut World, entity: Entity, modifiers: InputBindingModifiers) {
     if let Some(dead_zone) = modifiers.dead_zone() {
         world
             .entity_mut(entity)
@@ -337,7 +492,6 @@ fn spawn_binding_entry<K: CameraInstallKind>(
                 .insert((SwizzleAxis::ZYX, Negate::all()));
         },
     }
-    entity
 }
 
 /// Spawns a single binding entity for one enhanced-input [`Binding`], tagged
@@ -357,6 +511,15 @@ pub(crate) fn spawn_single_binding<K: CameraInstallKind>(
         entity.insert(CameraWheelBindingCondition {
             camera,
             delivery: WheelDelivery::Delivered,
+        });
+    }
+    if matches!(
+        binding,
+        Binding::MouseButton { .. } | Binding::MouseMotion { .. }
+    ) {
+        entity.insert(CameraDragBindingCondition {
+            camera,
+            delivery: DragDelivery::Delivered,
         });
     }
     entity.id()
@@ -439,4 +602,58 @@ where
         .fold(InteractionSources::NONE, |sources, entry| {
             sources.union(entry.sources())
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy::prelude::*;
+    use bevy_enhanced_input::prelude::ActionSources;
+    use bevy_enhanced_input::prelude::ModKeys;
+
+    use super::CameraCursorModifierCondition;
+    use super::refresh_cursor_modifiers;
+
+    #[test]
+    fn keyboard_source_controls_required_cursor_modifiers() {
+        let mut app = App::new();
+        app.init_resource::<ActionSources>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .add_systems(Update, refresh_cursor_modifiers);
+        let required = app
+            .world_mut()
+            .spawn(CameraCursorModifierCondition {
+                mod_keys: ModKeys::SHIFT,
+                pressed:  false,
+            })
+            .id();
+        let unmodified = app
+            .world_mut()
+            .spawn(CameraCursorModifierCondition {
+                mod_keys: ModKeys::empty(),
+                pressed:  false,
+            })
+            .id();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::ShiftLeft);
+        app.update();
+        assert!(
+            app.world()
+                .get::<CameraCursorModifierCondition>(required)
+                .is_some_and(|condition| condition.pressed)
+        );
+
+        app.world_mut().resource_mut::<ActionSources>().keyboard = false;
+        app.update();
+        assert!(
+            !app.world()
+                .get::<CameraCursorModifierCondition>(required)
+                .is_some_and(|condition| condition.pressed)
+        );
+        assert!(
+            app.world()
+                .get::<CameraCursorModifierCondition>(unmodified)
+                .is_some_and(|condition| condition.pressed)
+        );
+    }
 }

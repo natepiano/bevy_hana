@@ -255,7 +255,7 @@ mod tests {
             .expect("a point-sized panel still has valid point attachment sites");
 
         assert_eq!(geometry.frames().count(), EXPECTED_POINT_COUNT);
-        assert!(geometry.edges().is_empty());
+        assert_eq!(geometry.edges(), []);
     }
 
     #[test]

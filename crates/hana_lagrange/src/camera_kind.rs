@@ -130,7 +130,7 @@ mod tests {
     }
 
     fn registration_test_app() -> App {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.add_plugins((MinimalPlugins, AnimationPlugin, InputPlugin))
             .init_resource::<Assets<Mesh>>()
             .init_resource::<HigherCameraRequestRejections>()

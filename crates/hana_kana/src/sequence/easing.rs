@@ -1,4 +1,5 @@
 use bevy::reflect::Reflect;
+use bevy::reflect::ReflectSerialize;
 use thiserror::Error;
 
 use super::stages::SequenceScope;
@@ -66,8 +67,8 @@ pub enum SequenceEasingSample {
 }
 
 /// Reasons an external curve cannot ease a scope.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq, Reflect)]
-#[reflect(opaque)]
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq, Reflect, serde::Serialize)]
+#[reflect(opaque, Serialize)]
 pub enum SequenceEasingError {
     /// The scope remaps progress onto the sequence position axis, so the curve
     /// must map the unit interval onto itself without reversing or
@@ -170,7 +171,7 @@ const fn scope_remaps_progress(scope: SequenceScope) -> bool {
 mod tests {
     use std::time::Duration;
 
-    use bevy::math::curve::EaseFunction;
+    use bevy::curve::EaseFunction;
 
     use super::*;
     use crate::easing::EasingCurve;

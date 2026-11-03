@@ -49,6 +49,7 @@ mod font_features;
 mod geometry;
 mod line;
 mod render;
+mod rich_text;
 mod shape_cache;
 mod sizing;
 mod text_props;
@@ -85,10 +86,19 @@ pub use draw::PanelDraw;
 pub(crate) use element::FieldDisplayTextUpdate;
 pub use element::LayoutTree;
 pub use element::LayoutTreeChange;
+pub use element::WidgetInteractivityOverrideOutcome;
+pub(crate) use engine::CapHeightMeasurement;
+pub(crate) use engine::CapHeightMeasurer;
+pub(crate) use engine::CapHeightMetrics;
 pub use engine::LayoutEngine;
 pub use engine::LayoutResult;
+pub(crate) use engine::MeasureCapHeightFn;
 pub use engine::MeasureTextFn;
+pub(crate) use engine::RichMeasurement;
+pub(crate) use engine::ScrollSolveInput;
+pub(crate) use engine::ScrollViewSolve;
 pub use engine::SolvedScroll;
+pub use engine::SolvedScrollIndicator;
 pub use engine::VisibleScrollRegion;
 pub use font_features::FontFeatureFlags;
 pub use font_features::FontFeatures;
@@ -134,6 +144,8 @@ pub use text_props::ShadowCasting;
 pub use text_props::Sidedness;
 pub use text_props::TextAlign;
 pub use text_props::TextDimensions;
+pub use text_props::TextInk;
+pub use text_props::TextInkMeasurement;
 pub use text_props::TextMeasure;
 pub use text_props::TextStyle;
 pub use text_props::TextWrap;
@@ -174,3 +186,21 @@ pub(crate) fn set_root_fit_width(tree: &mut LayoutTree, min: Dimension, max: Dim
 pub(crate) fn set_root_fit_height(tree: &mut LayoutTree, min: Dimension, max: Dimension) {
     tree.set_root_fit_height(min, max);
 }
+
+pub use rich_text::RichParagraph;
+pub use rich_text::RichRun;
+pub use rich_text::RichText;
+pub use rich_text::RichTextBuilder;
+pub use rich_text::Span;
+pub use rich_text::SpanStyle;
+pub(crate) type MeasureRichTextFn =
+    Arc<dyn Fn(&RichParagraph, f32) -> TextDimensions + Send + Sync>;
+
+use std::sync::Arc;
+
+pub(crate) use element::ScrollDrive;
+pub use element::ScrollRestEdge;
+pub(crate) use shape_cache::RichGlyphCluster;
+pub(crate) use shape_cache::RichShapeCacheLookup;
+pub(crate) use shape_cache::RichShapedCacheKey;
+pub(crate) use shape_cache::ShapedRichParagraph;

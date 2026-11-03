@@ -1,7 +1,7 @@
 //! Stages adapter-side custom input values from raw `bevy::input` resources.
 //!
-//! Each frame [`inject_adapter_actions`] reads `AccumulatedMouseScroll`,
-//! `AccumulatedMouseMotion`, `PinchGesture` events, the keyboard / mouse-button state, and
+//! Each frame [`inject_adapter_actions`] reads the shared frame scroll input,
+//! the routed drag motion, `PinchGesture` events, the keyboard / mouse-button state, and
 //! the touch tracker, then writes [`ActionValue`]s into the camera's custom inputs
 //! (`OrbitCamAdapterOrbitAction`, `OrbitCamAdapterPanAction`, the two adapter zoom actions).
 //!
@@ -19,7 +19,6 @@
 //! logic for pinch.
 
 use bevy::input::gestures::PinchGesture;
-use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::input::mouse::AccumulatedMouseScroll;
 use bevy::input::mouse::MouseScrollUnit;
 use bevy::prelude::ButtonInput;
@@ -46,12 +45,14 @@ use crate::input::BUTTON_ZOOM_SCALE;
 use crate::input::CameraInputBlockers;
 use crate::input::CameraInputContextGated;
 use crate::input::CameraInstalledBindings;
+use crate::input::FrameScrollInput;
 use crate::input::InputGain;
 use crate::input::InteractionSources;
 use crate::input::LiveInputs;
 use crate::input::OrbitCamInputInstallationOf;
 use crate::input::PINCH_GESTURE_AMPLIFICATION;
 use crate::input::ResolvedCameraInputRoute;
+use crate::input::RoutedDragMotion;
 use crate::input::TOUCH_PINCH_SCALE;
 use crate::input::TouchGestures;
 use crate::input::TouchTracker;
@@ -64,8 +65,8 @@ use crate::orbit_cam::ZoomInversion;
 
 pub(super) fn inject_adapter_actions(
     route: Res<ResolvedCameraInputRoute>,
-    scroll: Option<Res<AccumulatedMouseScroll>>,
-    motion: Option<Res<AccumulatedMouseMotion>>,
+    scroll: Res<FrameScrollInput>,
+    motion: Option<Res<RoutedDragMotion>>,
     keyboard: Option<Res<ButtonInput<KeyCode>>>,
     mouse_buttons: Option<Res<ButtonInput<MouseButton>>>,
     mut pinch_events: MessageReader<PinchGesture>,
@@ -81,7 +82,7 @@ pub(super) fn inject_adapter_actions(
     mut custom_inputs: ResMut<CustomInputs>,
     #[cfg(test)] touch_override: Option<Res<OrbitCamTouchAdapterOverride>>,
 ) {
-    let scroll = scroll.as_deref().copied().unwrap_or_default();
+    let scroll = scroll.accumulated();
     let motion = motion
         .as_deref()
         .map(|motion| motion.delta)
@@ -126,6 +127,14 @@ pub(super) fn inject_adapter_actions(
         } else {
             scroll
         };
+        let drag_claimed = blockers.is_some_and(CameraInputBlockers::blocks_pointer_drag);
+        let motion = if drag_claimed { Vec2::ZERO } else { motion };
+        let touch_gestures =
+            if drag_claimed && matches!(touch_gestures, TouchGestures::OneFinger(_)) {
+                &TouchGestures::None
+            } else {
+                &touch_gestures
+            };
         let trackpad_selection =
             selected_trackpad_binding(&bindings.0, scroll, keyboard.as_deref());
         refresh_trackpad_conditions(camera, trackpad_selection, &mut trackpad_conditions);
@@ -134,7 +143,7 @@ pub(super) fn inject_adapter_actions(
             scroll,
             motion,
             pinch,
-            &touch_gestures,
+            touch_gestures,
             trackpad_selection,
             keyboard.as_deref(),
             mouse_buttons.as_deref(),

@@ -781,7 +781,7 @@ mod tests {
             .set_waiting_work(&repaired_role, WaitingWork::Nothing);
         app.update();
         let changed_entities = &app.world().resource::<ChangedRoleEntities>().0;
-        assert!(!changed_entities.is_empty());
+        assert_ne!(changed_entities.len(), 0);
         assert!(
             changed_entities
                 .iter()

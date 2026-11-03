@@ -15,8 +15,4 @@ pub(super) const BACKUP_MAX_ATTEMPTS: u32 = 100;
 pub(super) const BACKUP_SUFFIX: &str = "bak";
 
 // state versions
-pub(super) const PERSISTED_STATE_VERSION_V1: u8 = 1;
-pub(super) const PERSISTED_STATE_VERSION_V2: u8 = 2;
-pub(super) const PERSISTED_STATE_VERSION_V3: u8 = 3;
-pub(super) const PERSISTED_STATE_VERSION_V4: u8 = 4;
 pub(super) const PERSISTED_STATE_VERSION_V5: u8 = 5;

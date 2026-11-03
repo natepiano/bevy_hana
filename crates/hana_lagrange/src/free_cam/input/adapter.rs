@@ -37,10 +37,12 @@ use crate::input;
 use crate::input::BindingGates;
 use crate::input::CameraActionResolutionContext;
 use crate::input::CameraActionResolutionKind;
+use crate::input::CameraInputBlockers;
 use crate::input::CameraInstallKind;
 use crate::input::CameraInstalledBindings;
 use crate::input::CameraSlowMode;
 use crate::input::ControlSpeed;
+use crate::input::FrameScrollInput;
 use crate::input::FreeCamActiveDirections;
 use crate::input::FreeCamControlDirection;
 use crate::input::FreeCamGateAction;
@@ -62,8 +64,8 @@ use crate::input::HeldCameraAction;
 use crate::input::InteractionSources;
 use crate::input::LiveInputs;
 use crate::input::MotionActions;
-use crate::input::NoActionFrameState;
 use crate::input::ResetFreeCamToHome;
+use crate::input::ResolvedCameraInputRoute;
 use crate::orbit_cam::CameraInputGamepadSelectionPolicy;
 use crate::system_sets::CameraInputInternalSet;
 
@@ -80,6 +82,10 @@ impl Plugin for FreeCamInputAdapterPlugin {
             )
                 .chain()
                 .in_set(CameraInputInternalSet::Installation),
+        )
+        .add_systems(
+            PreUpdate,
+            inject_trackpad_look.in_set(CameraInputInternalSet::AdapterInjection),
         )
         .add_systems(
             PreUpdate,
@@ -127,6 +133,11 @@ pub(crate) struct FreeCamInputActionEntities {
     home_state:           HomeActionState,
 }
 
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct FreeCamAdapterFrameState {
+    trackpad_look: Vec2,
+}
+
 fn clear_replaced_or_manual_installations(world: &mut World) {
     let mut query = world.query_filtered::<Entity, With<FreeCamInputContext>>();
     let cameras = query.iter(world).collect::<Vec<_>>();
@@ -150,6 +161,7 @@ fn clear_enhanced_input_components(world: &mut World, camera: Entity) {
         .remove::<GamepadDevice>()
         .remove::<Actions<FreeCamInputContext>>()
         .remove::<FreeCamInputActionEntities>()
+        .remove::<FreeCamAdapterFrameState>()
         .remove::<CameraInstalledBindings<FreeCamKind>>();
 }
 
@@ -181,6 +193,7 @@ fn install_enhanced_input_entities(world: &mut World) {
             gamepad_device_for(&bindings),
             CameraInstalledBindings::<FreeCamKind>(bindings),
             installation.actions,
+            FreeCamAdapterFrameState::default(),
         ));
         input::replace_installed_input_entities_for::<FreeCamKind>(
             world,
@@ -320,9 +333,40 @@ fn spawn_engagement_action<A: InputAction>(world: &mut World, camera: Entity) ->
     action
 }
 
+fn inject_trackpad_look(
+    route: Res<ResolvedCameraInputRoute>,
+    scroll: Res<FrameScrollInput>,
+    mut cameras: Query<(
+        Entity,
+        &CameraInstalledBindings<FreeCamKind>,
+        &mut FreeCamAdapterFrameState,
+    )>,
+) {
+    let scroll = scroll.smooth_delta();
+    for (camera, bindings, mut frame) in &mut cameras {
+        frame.trackpad_look = Vec2::ZERO;
+        if scroll == Vec2::ZERO
+            || route.routed_camera() != Some(camera)
+            || route.metrics_for(camera).is_none()
+            || route
+                .blockers_for(camera)
+                .is_some_and(CameraInputBlockers::blocks_scroll)
+        {
+            continue;
+        }
+
+        let orbit_signed_scroll = Vec2::new(scroll.x, -scroll.y);
+        frame.trackpad_look = bindings
+            .0
+            .enabled_trackpad_look()
+            .map(|binding| orbit_signed_scroll * binding.input_gain().value())
+            .sum();
+    }
+}
+
 impl CameraActionResolutionKind for FreeCamKind {
     type ActionEntities = FreeCamInputActionEntities;
-    type FrameState = NoActionFrameState;
+    type FrameState = FreeCamAdapterFrameState;
     type ActionQueries<'w, 's> = FreeCamActionQueries<'w, 's>;
 
     fn slow_mode_toggle_action(actions: &Self::ActionEntities) -> Option<Entity> {
@@ -338,6 +382,10 @@ impl CameraActionResolutionKind for FreeCamKind {
         let input_speed = input_speed(context.bindings.0.slow_mode(), context.slow_mode_active);
         let scale = scale_factor(&context.bindings.0, context.slow_mode_active);
         let look_pitch = context.bindings.0.look_pitch();
+        let trackpad_look = context
+            .frame_state
+            .map(|frame| frame.trackpad_look)
+            .filter(|look| *look != Vec2::ZERO);
         let actions = context.actions;
         let input = context.input;
         let translate_active = bool_action_active(
@@ -362,6 +410,10 @@ impl CameraActionResolutionKind for FreeCamKind {
         if look_active {
             let look = pitched_look(action_value(actions.look, &action_queries.look), look_pitch);
             input.add_look_with_sources(look * scale, actions.look_sources);
+            input.set_look_speed(input_speed);
+        }
+        if let Some(trackpad_look) = trackpad_look {
+            input.add_look_with_sources(trackpad_look * scale, InteractionSources::SMOOTH_SCROLL);
             input.set_look_speed(input_speed);
         }
         if roll_active {
@@ -556,7 +608,11 @@ fn action_value<A: InputAction>(action: Entity, actions: &Query<&Action<A>>) -> 
 #[cfg(test)]
 mod tests {
     use bevy::camera::RenderTarget;
+    use bevy::input::InputPlugin as BevyInputPlugin;
     use bevy::input::mouse::AccumulatedMouseMotion;
+    use bevy::input::mouse::MouseScrollUnit;
+    use bevy::input::mouse::MouseWheel;
+    use bevy::input::touch::TouchPhase;
     use bevy::prelude::Camera;
     use bevy::prelude::GamepadAxis;
     use bevy::prelude::GamepadButton;
@@ -564,9 +620,14 @@ mod tests {
     use bevy::prelude::On;
     use bevy::prelude::ResMut;
     use bevy::prelude::Resource;
+    use bevy::prelude::Window;
+    use bevy::window::CursorMoved;
+    use bevy::window::CursorOptions;
+    use bevy::window::PrimaryWindow;
     use bevy::window::WindowRef;
-    use bevy_enhanced_input::prelude::EnhancedInputPlugin;
+    use bevy::window::WindowResolution;
     use bevy_enhanced_input::prelude::InputContextAppExt;
+    use bevy_enhanced_input::prelude::ModKeys;
 
     use super::*;
     use crate::FreeCamPreset;
@@ -575,11 +636,12 @@ mod tests {
     use crate::free_cam::FreeCamInputGain;
     use crate::free_cam::FreeCamKeyboardMousePreset;
     use crate::free_cam::FreeCamLookPitch;
+    use crate::free_cam::FreeCamTrackpadLook;
     use crate::input::CameraHomed;
-    use crate::input::CameraInputModesPlugin;
     use crate::input::CameraInputRoutingConfig;
-    use crate::input::CameraInputRoutingPlugin;
+    use crate::input::CameraInputScalePolicy;
     use crate::input::FreeCamInputMode;
+    use crate::input::InputPlugin;
     use crate::operation::LookAngles;
     use crate::operation::Position;
     use crate::operation::Roll;
@@ -595,22 +657,46 @@ mod tests {
     const SCALE_COMPOSITION_TOLERANCE: f32 = 1e-6;
 
     fn test_app() -> App {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.add_plugins((
             MinimalPlugins,
-            EnhancedInputPlugin,
             LagrangeSystemSetsPlugin,
-            CameraInputModesPlugin,
-            CameraInputRoutingPlugin,
+            InputPlugin,
             FreeCamInputAdapterPlugin,
         ))
         .add_input_context::<FreeCamInputContext>();
         app.init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<ButtonInput<MouseButton>>()
-            .init_resource::<AccumulatedMouseMotion>();
+            .init_resource::<AccumulatedMouseMotion>()
+            .add_message::<CursorMoved>();
         crate::camera_home::add_free_cam_home_reset_systems(&mut app);
         app.finish();
         app
+    }
+
+    fn mouse_wheel_test_app() -> App {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            BevyInputPlugin,
+            LagrangeSystemSetsPlugin,
+            InputPlugin,
+            FreeCamInputAdapterPlugin,
+        ))
+        .add_input_context::<FreeCamInputContext>();
+        crate::camera_home::add_free_cam_home_reset_systems(&mut app);
+        app.finish();
+        app
+    }
+
+    fn send_mouse_wheel(app: &mut App, unit: MouseScrollUnit, delta: Vec2) {
+        app.world_mut().write_message(MouseWheel {
+            unit,
+            x: delta.x,
+            y: delta.y,
+            window: Entity::PLACEHOLDER,
+            phase: TouchPhase::Moved,
+        });
     }
 
     fn spawn_camera(app: &mut App) -> Entity {
@@ -633,6 +719,48 @@ mod tests {
     }
 
     type TestResult = Result<(), &'static str>;
+
+    #[test]
+    fn cursor_only_right_drag_looks_with_free_camera() -> TestResult {
+        let mut app = test_app();
+        let mut resolution = WindowResolution::new(800, 600);
+        resolution.set_scale_factor_override(Some(1.0));
+        let window = app
+            .world_mut()
+            .spawn((
+                Window {
+                    resolution,
+                    ..Default::default()
+                },
+                CursorOptions::default(),
+                PrimaryWindow,
+            ))
+            .id();
+        let camera = spawn_camera(&mut app);
+        app.insert_resource(CameraInputRoutingConfig::explicit(camera));
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Right);
+        app.world_mut().write_message(CursorMoved {
+            window,
+            position: Vec2::new(402.5, 300.0),
+            delta: Some(Vec2::new(2.5, 0.0)),
+        });
+        app.update();
+        app.world_mut().write_message(CursorMoved {
+            window,
+            position: Vec2::new(405.0, 300.0),
+            delta: Some(Vec2::new(2.5, 0.0)),
+        });
+        app.update();
+
+        let input = app
+            .world()
+            .get::<FreeCamInput>(camera)
+            .ok_or("free camera input")?;
+        assert_eq!(input.look().pixels(), Vec2::new(5.0, 0.0));
+        Ok(())
+    }
 
     #[test]
     fn keyboard_bindings_resolve_translate_and_roll() -> TestResult {
@@ -750,6 +878,74 @@ mod tests {
             .get::<FreeCamInput>(camera)
             .ok_or("camera should have input")?;
         assert_eq!(input.look().pixels(), Vec2::new(2.0, 3.0));
+        Ok(())
+    }
+
+    #[test]
+    fn trackpad_look_accepts_pixel_scroll_rejects_line_scroll_and_obeys_slow_mode() -> TestResult {
+        let mut app = mouse_wheel_test_app();
+        let input_gain = 0.5;
+        let slow_scale = 0.25;
+        let bindings = FreeCamBindings::builder()
+            .look(FreeCamTrackpadLook::default().with_input_gain(input_gain))
+            .slow_mode(CameraSlowMode {
+                toggle_key: KeyCode::KeyS,
+                mod_keys:   ModKeys::ALT,
+                scale:      CameraInputScalePolicy {
+                    normal: 1.0,
+                    slow:   slow_scale,
+                },
+            })
+            .build()
+            .map_err(|_| "bindings should build")?;
+        let camera = spawn_camera_with_mode(&mut app, FreeCamInputMode::Bindings(bindings));
+        app.insert_resource(CameraInputRoutingConfig::explicit(camera));
+        app.update();
+
+        let delta = Vec2::new(4.0, 6.0);
+        send_mouse_wheel(&mut app, MouseScrollUnit::Pixel, delta);
+        app.update();
+        let input = app
+            .world()
+            .get::<FreeCamInput>(camera)
+            .ok_or("free camera input after pixel scroll")?;
+        assert_eq!(
+            input.look().pixels(),
+            Vec2::new(delta.x, -delta.y) * input_gain
+        );
+        assert_eq!(input.look_sources(), InteractionSources::SMOOTH_SCROLL);
+        assert_eq!(input.look_speed(), ControlSpeed::Normal);
+
+        send_mouse_wheel(&mut app, MouseScrollUnit::Line, delta);
+        app.update();
+        let input = app
+            .world()
+            .get::<FreeCamInput>(camera)
+            .ok_or("free camera input after line scroll")?;
+        assert!(!input.has_look());
+
+        {
+            let mut keyboard = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            keyboard.press(KeyCode::AltLeft);
+            keyboard.press(KeyCode::KeyS);
+        }
+        app.update();
+        {
+            let mut keyboard = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            keyboard.release(KeyCode::AltLeft);
+            keyboard.release(KeyCode::KeyS);
+        }
+        send_mouse_wheel(&mut app, MouseScrollUnit::Pixel, delta);
+        app.update();
+        let input = app
+            .world()
+            .get::<FreeCamInput>(camera)
+            .ok_or("free camera input in slow mode")?;
+        assert_eq!(
+            input.look().pixels(),
+            Vec2::new(delta.x, -delta.y) * input_gain * slow_scale
+        );
+        assert_eq!(input.look_speed(), ControlSpeed::Slow);
         Ok(())
     }
 

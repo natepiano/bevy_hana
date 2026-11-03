@@ -39,13 +39,13 @@ use hana_lagrange::OrbitCamPreset;
 
 const HEADLINE_TEXT: &str = "Typography";
 const HEADLINE_SIZE: f32 = 0.48;
-const HEADLINE_Y: f32 = 0.85;
+const HEADLINE_Y: f32 = 1.05;
 const SMALL_TEXT: &str = "slug renders glyphs as quadratic Bézier contours";
 const SMALL_SIZE: f32 = 0.07;
 const SMALL_Y: f32 = 0.18;
 const CJK_TEXT: &str = "漢字 かな 한글";
 const CJK_SIZE: f32 = 0.34;
-const CJK_Y: f32 = 0.52;
+const CJK_Y: f32 = 0.58;
 const PUNCH_OUT_TEXT: &str = "PunchOut";
 const PUNCH_OUT_SIZE: f32 = 0.13;
 const PUNCH_OUT_Y: f32 = 0.30;
@@ -93,7 +93,7 @@ impl TitleChipActivation for SmaaState {
 
 /// Seed SMAA on the orbit camera when it spawns so the example opens with edge
 /// anti-aliasing on (matching [`SmaaState`]'s default).
-fn seed_smaa(trigger: On<Add, OrbitCam>, mut commands: Commands) {
+fn seed_smaa(trigger: On<Add<OrbitCam>>, mut commands: Commands) {
     commands.entity(trigger.entity).insert(Smaa::default());
 }
 
@@ -208,7 +208,7 @@ fn on_font_registered(
     if trigger.name != CJK_FONT_FAMILY {
         return;
     }
-    let Some(font_id) = font_registry.font_id_by_name(CJK_FONT_FAMILY) else {
+    let Ok(font_id) = font_registry.font_id_by_name(CJK_FONT_FAMILY) else {
         return;
     };
     commands.spawn((

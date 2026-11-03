@@ -1,4 +1,5 @@
 use bevy::core_pipeline::prepass::DepthPrepass;
+use bevy::extract::extract_component::ExtractComponent;
 use bevy::prelude::Add;
 use bevy::prelude::Camera3d;
 use bevy::prelude::Component;
@@ -6,8 +7,8 @@ use bevy::prelude::On;
 use bevy::prelude::Query;
 use bevy::prelude::Reflect;
 use bevy::prelude::ReflectComponent;
+use bevy::render::RenderApp;
 use bevy::render::render_resource::TextureUsages;
-use bevy_render::extract_component::ExtractComponent;
 use bevy_render::view::NoIndirectDrawing;
 
 /// Marker component for enabling a 3D camera to render mesh outlines.
@@ -18,6 +19,7 @@ use bevy_render::view::NoIndirectDrawing;
 /// the GPU and keeps its bins private, so the parallel buffer can only stay aligned
 /// when the outline camera draws meshes directly with CPU-assigned indices.
 #[derive(Debug, Component, Reflect, Clone, ExtractComponent)]
+#[extract_app(RenderApp)]
 #[reflect(Component)]
 #[require(DepthPrepass, NoIndirectDrawing)]
 pub struct OutlineCamera;
@@ -33,7 +35,7 @@ pub struct OutlineCamera;
 ///
 /// See `bevy_pbr::atmosphere::configure_camera_depth_usages` for the same pattern in Bevy.
 pub(crate) fn configure_outline_camera_depth_texture(
-    added: On<Add, OutlineCamera>,
+    added: On<Add<OutlineCamera>>,
     mut cameras: Query<&mut Camera3d>,
 ) {
     if let Ok(mut camera_3d) = cameras.get_mut(added.entity) {

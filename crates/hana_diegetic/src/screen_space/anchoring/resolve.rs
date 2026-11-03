@@ -173,6 +173,7 @@ mod tests {
     use crate::panel::ResolvedScreenPanelPosition;
     use crate::screen_space::ScreenSpacePlugin;
     use crate::screen_space::ScreenSpaceSystems;
+    use crate::screen_space::anchoring::ScreenAttachmentResolveRuns;
     use crate::text::DiegeticTextMeasurer;
     use crate::widgets::ScreenWidgetAnchorProxy;
     use crate::widgets::ScreenWidgetAnchoredHere;
@@ -261,6 +262,30 @@ mod tests {
             PrimaryWindow,
         ));
         app
+    }
+
+    #[test]
+    fn screen_attachment_resolver_sleeps_until_an_input_changes() {
+        let mut app = app_with_window();
+        for _ in 0..4 {
+            app.update();
+        }
+        app.update();
+        assert_eq!(app.world().resource::<ScreenAttachmentResolveRuns>().0, 0);
+
+        let window = app
+            .world_mut()
+            .query_filtered::<Entity, With<PrimaryWindow>>()
+            .single(app.world())
+            .expect("primary window should exist");
+        app.world_mut()
+            .get_mut::<Window>(window)
+            .expect("primary window should have a Window")
+            .resolution
+            .set(801.0, 600.0);
+        app.update();
+
+        assert_eq!(app.world().resource::<ScreenAttachmentResolveRuns>().0, 1);
     }
 
     fn fixed_screen_panel(size: Vec2, anchor: Anchor, screen_position: Vec2) -> DiegeticPanel {

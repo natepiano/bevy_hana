@@ -42,7 +42,11 @@ pub use command::CommandInfo;
 pub use command::CommandInvocationOutcome;
 pub use command::CommandLookup;
 pub use command::CommandRegistry;
+pub use command::CommandToggleState;
 pub use command::HeldCommandLookupOutcome;
+pub use command::HeldShortcut;
+pub use command::HeldShortcutPlugin;
+pub use command::HoldLatch;
 pub use command::HoldPhase;
 pub use command::Keybindings;
 pub use command::KeymapCommand;
@@ -100,7 +104,30 @@ pub use palette::CommandPaletteQueryResult;
 pub use palette::CommandPaletteRow;
 pub use palette::PaletteBinding;
 pub use palette::PaletteSelectionOutcome;
+pub use palette::PaletteTitleMatch;
 pub use palette::query_command_palette;
 pub use palette_cursor::PaletteRowCursor;
 pub use palette_cursor::PaletteRowList;
 pub use palette_cursor::PaletteRowStep;
+
+/// Keeps repairable shortcut notices plain while retaining their source details.
+fn log_keymap_diagnostic(diagnostic: &Diagnostic) {
+    let shortcut_file_problem = matches!(
+        &diagnostic.origin,
+        DiagnosticOrigin::KeymapFile(_) | DiagnosticOrigin::KeymapDirectory(_)
+    ) && diagnostic.kind != DiagnosticKind::Companion;
+    if shortcut_file_problem {
+        match diagnostic.severity {
+            DiagnosticSeverity::Failure => bevy::log::error!(
+                diagnostic = ?diagnostic,
+                "Your keyboard shortcut settings need attention."
+            ),
+            DiagnosticSeverity::Advisory => bevy::log::warn!(
+                diagnostic = ?diagnostic,
+                "Your keyboard shortcut settings need attention."
+            ),
+        }
+    } else {
+        bevy::log::debug!(diagnostic = ?diagnostic, "{}", diagnostic.message);
+    }
+}

@@ -144,7 +144,7 @@ pub trait Limit<V> {
 
 /// A camera's orbit/look angles in radians: rotation about the up axis (`yaw`)
 /// and about the right axis (`pitch`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Reflect)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Reflect, serde::Serialize)]
 pub struct OrbitAngles {
     /// Rotation about the up axis, in radians.
     pub yaw:   f32,
@@ -172,7 +172,7 @@ impl From<(f32, f32)> for LookAngles {
 
 /// The orbit distance from the focus (perspective) or projection scale
 /// (orthographic).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Reflect)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Reflect, serde::Serialize)]
 pub struct Radius(pub f32);
 
 impl Mul<f32> for Radius {
@@ -194,7 +194,7 @@ impl From<Radius> for f32 {
 }
 
 /// A free-flight camera's roll angle in radians.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Reflect)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Reflect, serde::Serialize)]
 pub struct Roll(pub f32);
 
 impl Add<f32> for Roll {
@@ -216,7 +216,7 @@ impl From<Roll> for f32 {
 }
 
 /// The world-space point a camera orbits around and looks at.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Reflect)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Reflect, serde::Serialize)]
 pub struct Focus(pub Vec3);
 
 impl Add<Vec3> for Focus {
@@ -238,7 +238,7 @@ impl From<Focus> for Vec3 {
 }
 
 /// A free-flight camera's world-space position.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Reflect)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Reflect, serde::Serialize)]
 pub struct Position(pub Vec3);
 
 impl Add<Vec3> for Position {

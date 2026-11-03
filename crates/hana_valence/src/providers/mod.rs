@@ -11,10 +11,15 @@
 //! cover the rectangular cases every consumer needs; anything else is an
 //! ordinary implementation of the same public trait.
 
+mod cell;
 mod quad;
 mod sheet;
 mod triangle;
 
+pub use cell::CellFoldGroupSelection;
+pub use cell::CellSheet;
+pub use cell::CellSheetError;
+pub(crate) use cell::StackFoldDirection;
 pub use quad::QuadCell;
 pub use quad::QuadFoldGroupSelection;
 pub use quad::QuadSheet;

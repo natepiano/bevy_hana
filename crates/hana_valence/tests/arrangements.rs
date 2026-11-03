@@ -26,6 +26,7 @@ use bevy::app::PostUpdate;
 use bevy::app::TaskPoolPlugin;
 use bevy::app::Update;
 use bevy::asset::AssetPlugin;
+use bevy::curve::EaseFunction;
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::event::EntityEvent as _;
@@ -55,7 +56,6 @@ use bevy::log::tracing_subscriber::layer::Context;
 use bevy::log::tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
 use bevy::math::Quat;
 use bevy::math::Vec3;
-use bevy::math::curve::EaseFunction;
 use bevy::scene::ScenePlugin;
 use bevy::scene::bsn;
 use bevy::time::Time;
@@ -2014,7 +2014,7 @@ fn a_crease_free_sheet_rejects_a_recipe_and_writes_no_hinge() {
         Accordion::default(),
     );
 
-    assert!(chain_creases(&mut app, arrangement).is_empty());
+    assert_eq!(chain_creases(&mut app, arrangement), []);
 }
 
 #[test]

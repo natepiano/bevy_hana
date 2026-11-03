@@ -1,27 +1,31 @@
-use bevy::prelude::Add;
+use bevy::ecs::world::DeferredWorld;
 use bevy::prelude::ChildOf;
-use bevy::prelude::Commands;
-use bevy::prelude::EntityEvent;
-use bevy::prelude::On;
+use bevy::prelude::Entity;
 use bevy::prelude::World;
 
+use super::PanelTextLayout;
 use crate::cascade::Cascade;
 use crate::cascade::CascadeFrom;
 use crate::cascade::TextAlpha;
-use crate::render::world_text::TextContent;
 
 /// Connects a panel label to its panel's text-alpha cascade.
 ///
 /// A panel label (a `TextContent` run) is depth-2 under its panel. This
-/// observer fires when a label first gains [`TextContent`] and queues explicit
+/// bridge skips the complete reification bundle. For manually constructed
+/// labels it fires when a label first gains [`TextContent`](crate::TextContent) and queues explicit
 /// [`CascadeFrom`] construction. After the surrounding construction commands
 /// apply, it inserts inheriting `Cascade<TextAlpha>` only when the label still
 /// has no authored value, so `TextStyle::with_alpha_mode` always wins. The standalone
 /// `seed_world_text_overrides` bridge skips labels (its `Without<TextContent>`
 /// filter), so labels participate only through this bridge.
-pub(super) fn seed_panel_text_child_alpha(trigger: On<Add, TextContent>, mut commands: Commands) {
-    let entity = trigger.event_target();
-    commands.queue(move |world: &mut World| {
+pub(super) fn seed_panel_text_child_alpha(world: &mut DeferredWorld, entity: Entity) {
+    if world.get::<PanelTextLayout>(entity).is_some()
+        && world.get::<CascadeFrom>(entity).is_some()
+        && world.get::<Cascade<TextAlpha>>(entity).is_some()
+    {
+        return;
+    }
+    world.commands().queue(move |world: &mut World| {
         let Some(panel) = world.get::<ChildOf>(entity).map(ChildOf::parent) else {
             return;
         };
@@ -44,6 +48,7 @@ mod tests {
 
     use bevy::prelude::AlphaMode;
     use bevy::prelude::App;
+    use bevy::prelude::Commands;
     use bevy::prelude::Entity;
     use bevy::prelude::IntoScheduleConfigs;
     use bevy::prelude::MinimalPlugins;
@@ -72,6 +77,7 @@ mod tests {
     use crate::panel::DiegeticPanel;
     use crate::panel::DiegeticPanelCommands;
     use crate::panel::HeadlessLayoutPlugin;
+    use crate::render::panel_text::PanelTextCascadeBridgePlugin;
     use crate::render::panel_text::reify;
     use crate::text::DiegeticTextMeasurer;
 
@@ -140,7 +146,7 @@ mod tests {
             .insert_resource(measurer())
             .add_plugins(HeadlessLayoutPlugin)
             .add_plugins(cascade::cascade_plugin::<TextAlpha>())
-            .add_observer(seed_panel_text_child_alpha)
+            .add_plugins(PanelTextCascadeBridgePlugin)
             .init_resource::<SeenLabelAlpha>();
 
         // Panel override is `Add`; the global default stays `Blend`, so the
@@ -177,6 +183,41 @@ mod tests {
     }
 
     #[test]
+    fn supplied_default_cache_resolves_after_post_update_text_bridge() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(cascade::cascade_plugin::<TextAlpha>())
+            .add_plugins(PanelTextCascadeBridgePlugin)
+            .init_resource::<SeenLabelAlpha>();
+        let panel = app
+            .world_mut()
+            .spawn(Cascade::Override(TextAlpha(AlphaMode::Add)))
+            .id();
+        app.add_systems(
+            PostUpdate,
+            (
+                move |mut commands: Commands, labels: Query<(), With<TextContent>>| {
+                    if labels.is_empty() {
+                        commands.spawn((
+                            ChildOf(panel),
+                            TextContent::new("label"),
+                            Cascade::<TextAlpha>::Inherit,
+                            Resolved(TextAlpha(AlphaMode::Blend)),
+                        ));
+                    }
+                },
+                read_label_alpha,
+            )
+                .chain(),
+        );
+        app.update();
+        assert_eq!(
+            app.world().resource::<SeenLabelAlpha>().0,
+            Some(AlphaMode::Add)
+        );
+    }
+
+    #[test]
     fn panel_inheritance_survives_layout_tree_replacement() {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
@@ -184,7 +225,7 @@ mod tests {
             .add_plugins(HeadlessLayoutPlugin)
             .add_plugins(cascade::cascade_plugin::<TextAlpha>())
             .insert_resource(TextAlpha(AlphaMode::Blend))
-            .add_observer(seed_panel_text_child_alpha)
+            .add_plugins(PanelTextCascadeBridgePlugin)
             .add_systems(PostUpdate, reify::reify_text_entities);
 
         let panel = app
@@ -264,7 +305,7 @@ mod tests {
             .add_plugins(HeadlessLayoutPlugin)
             .add_plugins(cascade::cascade_plugin::<TextAlpha>())
             .insert_resource(TextAlpha(AlphaMode::Multiply))
-            .add_observer(seed_panel_text_child_alpha);
+            .add_plugins(PanelTextCascadeBridgePlugin);
 
         // Panel authors no `text_alpha_mode`, so it carries no `Cascade<TextAlpha>`.
         let panel = DiegeticPanel::world()
@@ -303,7 +344,7 @@ mod tests {
             .add_plugins(HeadlessLayoutPlugin)
             .add_plugins(cascade::cascade_plugin::<TextAlpha>())
             .insert_resource(TextAlpha(AlphaMode::AlphaToCoverage))
-            .add_observer(seed_panel_text_child_alpha);
+            .add_plugins(PanelTextCascadeBridgePlugin);
 
         let panel = DiegeticPanel::screen()
             .size(Fit, Fit)
@@ -342,7 +383,7 @@ mod tests {
             .insert_resource(measurer())
             .add_plugins(HeadlessLayoutPlugin)
             .add_plugins(cascade::cascade_plugin::<TextAlpha>())
-            .add_observer(seed_panel_text_child_alpha)
+            .add_plugins(PanelTextCascadeBridgePlugin)
             .add_systems(PostUpdate, reify::reify_text_entities);
 
         // Panel sets `Add` for its labels; the one label authors its own
@@ -386,7 +427,7 @@ mod tests {
             .insert_resource(measurer())
             .add_plugins(HeadlessLayoutPlugin)
             .add_plugins(cascade::cascade_plugin::<TextAlpha>())
-            .add_observer(seed_panel_text_child_alpha)
+            .add_plugins(PanelTextCascadeBridgePlugin)
             .add_systems(PostUpdate, reify::reify_text_entities);
 
         // Panel inherits `Add`; the label initially authors its own `Multiply`.

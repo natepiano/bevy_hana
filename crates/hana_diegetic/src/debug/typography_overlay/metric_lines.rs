@@ -4,8 +4,6 @@ use bevy::prelude::Transform;
 
 use super::GlyphMetricVisibility;
 use super::TypographyOverlay;
-use super::constants::LEFT_OUTER_ARROW_SLOT;
-use super::constants::METRIC_RECT_WIDTH_SLOTS;
 use super::glyph;
 use super::labels;
 use super::pipeline::FontContext;
@@ -14,6 +12,7 @@ use super::pipeline::OverlayAssets;
 use super::pipeline::OverlayContext;
 use super::pipeline::TextServices;
 use super::scaling;
+use super::scaling::MetricArrowColumns;
 use crate::callouts;
 use crate::callouts::CalloutCap;
 use crate::debug::constants::BASELINE_COLOR;
@@ -64,11 +63,31 @@ pub(super) fn spawn_font_metric_guides(
         arrow_spacing: first_glyph.map_or(0.0, |glyph| scaling::arrow_spacing(glyph.advance_x)),
     };
 
-    spawn_metric_guide_panel(ctx, font_context, computed, &extents, assets);
+    let label_size =
+        scaling::font_scale(ctx.font_size, ctx.scale) * crate::debug::constants::LABEL_SIZE_RATIO;
+    let gap = scaling::label_gap(ctx.font_size, ctx.scale);
+    let left_label_width = [LABEL_ASCENT, LABEL_DESCENT]
+        .into_iter()
+        .map(|label| {
+            labels::measure_overlay_label_width(text_services, label, label_size, ctx.scale)
+        })
+        .fold(0.0, f32::max);
+    let right_label_width =
+        labels::measure_overlay_label_width(text_services, LABEL_X_HEIGHT, label_size, ctx.scale);
+    let columns = scaling::metric_arrow_columns(
+        extents.first_left,
+        extents.last_right,
+        extents.arrow_spacing,
+        left_label_width,
+        right_label_width,
+        gap,
+    );
+
+    spawn_metric_guide_panel(ctx, font_context, computed, &columns, assets);
 
     if ctx.overlay.labels == GlyphMetricVisibility::Shown {
         let metric_lines = metric_line_labels(font_context.font, font_context.line);
-        labels::spawn_metric_labels(ctx, font_name, font_context, &metric_lines, &extents);
+        labels::spawn_metric_labels(ctx, font_name, font_context, &metric_lines, &columns);
     }
 
     labels::spawn_overlay_bounds_target(
@@ -76,6 +95,7 @@ pub(super) fn spawn_font_metric_guides(
         font_name,
         font_context,
         &extents,
+        &columns,
         text_services,
         assets,
     );
@@ -88,7 +108,7 @@ fn spawn_metric_guide_panel(
     ctx: &mut OverlayContext<'_, '_, '_>,
     font_context: &FontContext<'_>,
     computed: &ComputedWorldText,
-    extents: &GlyphExtents,
+    columns: &MetricArrowColumns,
     assets: &mut OverlayAssets<'_>,
 ) {
     let line_specs = metric_line_specs(
@@ -102,10 +122,7 @@ fn spawn_metric_guide_panel(
         return;
     }
 
-    let width = METRIC_RECT_WIDTH_SLOTS.mul_add(
-        extents.arrow_spacing,
-        extents.last_right - extents.first_left,
-    );
+    let width = columns.right_outer - columns.left_outer;
     if width <= 0.0 {
         return;
     }
@@ -118,7 +135,7 @@ fn spawn_metric_guide_panel(
 
     let line_width = scaling::metric_line_border_width(ctx.overlay, ctx.font_size, ctx.scale);
     let mut lines = metric_guide_lines(width, &line_specs, line_width);
-    lines.extend(metric_arrow_lines(ctx, font_context, extents, width));
+    lines.extend(metric_arrow_lines(ctx, font_context, columns));
 
     let mut material = default_panel_material();
     material.base_color = Color::NONE;
@@ -126,7 +143,7 @@ fn spawn_metric_guide_panel(
     material.unlit = true;
     let material = assets.materials.add(material);
 
-    let x = LEFT_OUTER_ARROW_SLOT.mul_add(-extents.arrow_spacing, extents.first_left);
+    let x = columns.left_outer;
     let line_metrics = font_context.line;
     let top_layout =
         if (line_metrics.top - (line_metrics.baseline - line_metrics.ascent)).abs() > 0.5 {
@@ -259,8 +276,7 @@ const fn solid_arrow_cap(head: f32, tint: Option<Color>) -> CalloutCap {
 fn metric_arrow_lines(
     ctx: &OverlayContext<'_, '_, '_>,
     font_context: &FontContext<'_>,
-    extents: &GlyphExtents,
-    width: f32,
+    columns: &MetricArrowColumns,
 ) -> Vec<PanelLine> {
     let line_metrics = font_context.line;
     let font_metrics = font_context.font;
@@ -283,11 +299,10 @@ fn metric_arrow_lines(
     let x_height = local_y(baseline_y - font_metrics.x_height);
     let cap_height = local_y(baseline_y - font_metrics.cap_height);
 
-    let spacing = extents.arrow_spacing;
-    let left_1 = 2.0 * spacing;
+    let left_1 = columns.left_inner - columns.left_outer;
     let left_2 = 0.0;
-    let right_1 = width - spacing;
-    let right_2 = width;
+    let right_1 = columns.right_inner - columns.left_outer;
+    let right_2 = columns.right_outer - columns.left_outer;
     let head = scaling::arrowhead_size(ctx.font_size, ctx.scale);
     let gap = scaling::arrow_gap(ctx.font_size, ctx.scale);
     let thickness = scaling::callout_line_thickness(ctx.overlay, ctx.font_size, ctx.scale);
@@ -406,4 +421,62 @@ fn metric_line_labels(
         metric_lines.push((LABEL_BOTTOM, bottom_y));
     }
     metric_lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::ShapedTextCache;
+    use crate::layout::Unit;
+    use crate::text;
+    use crate::text::FontRegistry;
+
+    #[test]
+    fn metric_labels_keep_readable_gaps_on_both_sides() -> Result<(), &'static str> {
+        let mut registry = FontRegistry::new().map_err(|_| "embedded font unavailable")?;
+        let noto = registry
+            .register_font(
+                "Noto Sans",
+                include_bytes!("../../../assets/fonts/NotoSans-Regular.ttf"),
+            )
+            .map_err(|_| "Noto Sans unavailable")?;
+        let measure_text =
+            text::create_parley_measurer(registry.font_context(), registry.family_names());
+        let cache = ShapedTextCache::default();
+        let services = TextServices {
+            measure_text: &measure_text,
+            cache:        &cache,
+        };
+        let scale = Unit::Points.meters_per_unit();
+        let font_size = 6.0;
+        let size =
+            scaling::font_scale(font_size, scale) * crate::debug::constants::LABEL_SIZE_RATIO;
+        let right_width =
+            labels::measure_overlay_label_width(&services, LABEL_X_HEIGHT, size, scale);
+        let left_width = [LABEL_ASCENT, LABEL_DESCENT]
+            .into_iter()
+            .map(|label| labels::measure_overlay_label_width(&services, label, size, scale))
+            .fold(0.0, f32::max);
+        let first_advance = measure_text(
+            "f",
+            &crate::layout::TextStyle::new(font_size)
+                .with_font(noto.0)
+                .as_measure(),
+        )
+        .width
+            * scale;
+        let spacing = scaling::arrow_spacing(first_advance);
+        let gap = scaling::label_gap(font_size, scale);
+        let columns =
+            scaling::metric_arrow_columns(0.0, 20.0, spacing, left_width, right_width, gap);
+        let min_gap = scaling::font_scale(font_size, scale) * 0.064;
+        let right_near = (columns.right_inner + gap) - columns.right_inner;
+        let right_far = columns.right_outer - (columns.right_inner + gap + right_width);
+        let left_near = columns.left_inner - (columns.left_inner - gap);
+        let left_far = (columns.left_inner - gap - left_width) - columns.left_outer;
+        for measured_gap in [right_near, right_far, left_near, left_far] {
+            assert!(measured_gap >= min_gap, "gap {measured_gap} < {min_gap}");
+        }
+        Ok(())
+    }
 }

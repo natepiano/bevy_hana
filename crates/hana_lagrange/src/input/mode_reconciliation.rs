@@ -549,7 +549,10 @@ mod tests {
                 .get::<OrbitCamResolvedBindings>(camera)
                 .is_none()
         );
-        assert!(installed_input_entities_for::<OrbitCamKind>(app.world(), camera).is_empty());
+        assert_eq!(
+            installed_input_entities_for::<OrbitCamKind>(app.world(), camera),
+            []
+        );
     }
 
     #[test]
@@ -838,7 +841,7 @@ mod tests {
     fn reflect_input_mode_types_are_registered() {
         use crate::*;
 
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.add_plugins((MinimalPlugins, LagrangePlugin));
 
         assert!(type_is_registered::<ActionBindingDescriptor>(&app));

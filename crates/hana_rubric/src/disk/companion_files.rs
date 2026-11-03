@@ -221,7 +221,7 @@ mod tests {
 
         let diagnostics = publish_companion_files(&paths, DEFAULT_BYTES, Some(SCHEMA_BYTES));
 
-        assert!(diagnostics.is_empty());
+        assert_eq!(diagnostics, []);
         assert_eq!(
             fs::read(paths.default_keymap()).expect("default is readable"),
             DEFAULT_BYTES
@@ -277,7 +277,7 @@ mod tests {
         let diagnostics = publish_companion_files(&paths, DEFAULT_BYTES, Some(SCHEMA_BYTES));
         let after = fs::metadata(paths.default_keymap()).expect("default metadata exists");
 
-        assert!(diagnostics.is_empty());
+        assert_eq!(diagnostics, []);
         assert_eq!(after.ino(), before.ino());
         assert_eq!(after.permissions().mode() & 0o777, 0o640);
 
@@ -308,7 +308,7 @@ mod tests {
 
         let diagnostics = publish_companion_files(&paths, DEFAULT_BYTES, Some(SCHEMA_BYTES));
 
-        assert!(!diagnostics.is_empty());
+        assert_ne!(diagnostics, []);
         assert!(
             diagnostics
                 .iter()
@@ -345,7 +345,7 @@ mod tests {
 
         let diagnostics = publish_companion_files(&paths, DEFAULT_BYTES, Some(SCHEMA_BYTES));
 
-        assert!(diagnostics.is_empty());
+        assert_eq!(diagnostics, []);
         assert_eq!(
             fs::read(&linked_file).expect("linked file is readable"),
             b"linked file contents"

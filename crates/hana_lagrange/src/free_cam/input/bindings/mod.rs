@@ -5,7 +5,7 @@
 //! Submodules:
 //! - [`preset`] — built-in [`FreeCamPreset`] keymaps plus the [`FreeCamLookPitch`] setting.
 //! - [`builder`] — [`FreeCamBindingsBuilder`], the per-action binding wrappers, and the user-facing
-//!   source types (translate keys, mouse look).
+//!   source types (translate keys, mouse look, trackpad look).
 //! - [`action_set`] — per-action binding-set newtypes written by the validator and read by the
 //!   adapter.
 //! - [`input_gain`] — the [`FreeCamInputGain`] per-action gain layered over
@@ -30,6 +30,7 @@ pub use builder::FreeCamBindingsBuilder;
 pub use builder::FreeCamLookBinding;
 pub use builder::FreeCamMouseLook;
 pub use builder::FreeCamRollBinding;
+pub use builder::FreeCamTrackpadLook;
 pub use builder::FreeCamTranslateBinding;
 pub use builder::FreeCamTranslateKeys;
 pub use input_gain::FreeCamInputGain;
@@ -49,13 +50,14 @@ use crate::orbit_cam::CameraInputGamepadSelectionPolicy;
 #[derive(Clone, Debug, PartialEq, Reflect)]
 #[reflect(opaque)]
 pub struct FreeCamBindings {
-    pub(super) translate:  FreeCamTranslateActionBindings,
-    pub(super) look:       FreeCamLookActionBindings,
-    pub(super) roll:       FreeCamRollActionBindings,
-    pub(super) look_pitch: FreeCamLookPitch,
-    pub(super) slow_mode:  Option<CameraSlowMode>,
-    pub(super) gamepad:    CameraInputGamepadSelectionPolicy,
-    pub(super) home:       FreeCamHomeActionBindings,
+    pub(super) translate:     FreeCamTranslateActionBindings,
+    pub(super) look:          FreeCamLookActionBindings,
+    pub(super) trackpad_look: Vec<FreeCamTrackpadLook>,
+    pub(super) roll:          FreeCamRollActionBindings,
+    pub(super) look_pitch:    FreeCamLookPitch,
+    pub(super) slow_mode:     Option<CameraSlowMode>,
+    pub(super) gamepad:       CameraInputGamepadSelectionPolicy,
+    pub(super) home:          FreeCamHomeActionBindings,
 }
 
 impl FreeCamBindings {
@@ -70,6 +72,13 @@ impl FreeCamBindings {
     /// Returns look action bindings.
     #[must_use]
     pub const fn look(&self) -> &FreeCamLookActionBindings { &self.look }
+
+    pub(crate) fn enabled_trackpad_look(&self) -> impl Iterator<Item = FreeCamTrackpadLook> + '_ {
+        self.trackpad_look
+            .iter()
+            .copied()
+            .filter(|binding| binding.input_gain().is_enabled())
+    }
 
     /// Returns roll action bindings.
     #[must_use]
@@ -314,6 +323,26 @@ mod tests {
             assert_eq!(engagement.input_gain(), InputGain::DEFAULT);
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn builder_validates_trackpad_look_input_gain() -> Result<(), BindingsError> {
+        let bindings = FreeCamBindings::builder()
+            .look(FreeCamTrackpadLook::default().with_input_gain(CUSTOM_LOOK_INPUT_GAIN))
+            .build()?;
+
+        assert_eq!(bindings.trackpad_look.len(), 1);
+        assert_eq!(
+            bindings.trackpad_look[0].input_gain(),
+            InputGain(CUSTOM_LOOK_INPUT_GAIN)
+        );
+        assert_eq!(
+            FreeCamBindings::builder()
+                .look(FreeCamTrackpadLook::default().with_input_gain(-1.0))
+                .build(),
+            Err(BindingsError::InvalidScale)
+        );
         Ok(())
     }
 

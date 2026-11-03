@@ -1,5 +1,5 @@
 //! Display state: mirrors the per-kind interaction sources, speed, and live
-//! zoom direction the panel highlights. lagrange debounces the reported sources
+//! last known zoom direction the panel highlights. lagrange debounces the reported sources
 //! (see `hana_lagrange::CameraInputReportingDebounce`), and the panel holds
 //! released sources briefly so highlights can fade after input ends.
 
@@ -27,26 +27,57 @@ pub(super) enum RenderState {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum HighlightRelease {
+    #[default]
+    NotFading,
+    Fading(Duration),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum ActionSpeed {
+    #[default]
+    Unsettled,
+    At(ControlSpeed),
+}
+
+impl From<Option<ControlSpeed>> for ActionSpeed {
+    fn from(speed: Option<ControlSpeed>) -> Self { speed.map_or(Self::Unsettled, Self::At) }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum LastZoomDirection {
+    #[default]
+    Unknown,
+    Known(ZoomDirection),
+}
+
+impl From<Option<ZoomDirection>> for LastZoomDirection {
+    fn from(direction: Option<ZoomDirection>) -> Self {
+        direction.map_or(Self::Unknown, Self::Known)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ReleaseCountdowns {
-    orbit:     Option<Duration>,
-    pan:       Option<Duration>,
-    zoom:      Option<Duration>,
-    look:      Option<Duration>,
-    translate: Option<Duration>,
-    roll:      Option<Duration>,
-    home:      Option<Duration>,
+    orbit:     HighlightRelease,
+    pan:       HighlightRelease,
+    zoom:      HighlightRelease,
+    look:      HighlightRelease,
+    translate: HighlightRelease,
+    roll:      HighlightRelease,
+    home:      HighlightRelease,
 }
 
 impl ReleaseCountdowns {
     const fn empty() -> Self {
         Self {
-            orbit:     None,
-            pan:       None,
-            zoom:      None,
-            look:      None,
-            translate: None,
-            roll:      None,
-            home:      None,
+            orbit:     HighlightRelease::NotFading,
+            pan:       HighlightRelease::NotFading,
+            zoom:      HighlightRelease::NotFading,
+            look:      HighlightRelease::NotFading,
+            translate: HighlightRelease::NotFading,
+            roll:      HighlightRelease::NotFading,
+            home:      HighlightRelease::NotFading,
         }
     }
 }
@@ -60,13 +91,13 @@ pub(super) struct CameraGuidanceDisplayState {
     translate:               InteractionSources,
     roll:                    InteractionSources,
     home:                    InteractionSources,
-    orbit_speed:             Option<ControlSpeed>,
-    pan_speed:               Option<ControlSpeed>,
-    zoom_speed:              Option<ControlSpeed>,
-    look_speed:              Option<ControlSpeed>,
-    translate_speed:         Option<ControlSpeed>,
-    roll_speed:              Option<ControlSpeed>,
-    zoom_direction:          Option<ZoomDirection>,
+    orbit_speed:             ActionSpeed,
+    pan_speed:               ActionSpeed,
+    zoom_speed:              ActionSpeed,
+    look_speed:              ActionSpeed,
+    translate_speed:         ActionSpeed,
+    roll_speed:              ActionSpeed,
+    zoom_direction:          LastZoomDirection,
     free_directions:         FreeCamActiveDirections,
     slow_mode_active:        bool,
     releases:                ReleaseCountdowns,
@@ -139,7 +170,7 @@ impl CameraGuidanceDisplayState {
 
         if sources.is_empty() {
             if !slot.is_empty() {
-                *release = Some(HIGHLIGHT_RELEASE_HOLD);
+                *release = HighlightRelease::Fading(HIGHLIGHT_RELEASE_HOLD);
             }
             return;
         }
@@ -148,7 +179,7 @@ impl CameraGuidanceDisplayState {
             *slot = sources;
             self.render_state = RenderState::Pending;
         }
-        *release = None;
+        *release = HighlightRelease::NotFading;
     }
 
     /// Lights the home row and holds it for [`HOME_HIGHLIGHT_HOLD`], re-arming on
@@ -160,7 +191,7 @@ impl CameraGuidanceDisplayState {
             return;
         }
         self.home = sources;
-        self.releases.home = Some(HOME_HIGHLIGHT_HOLD);
+        self.releases.home = HighlightRelease::Fading(HOME_HIGHLIGHT_HOLD);
         self.render_state = RenderState::Pending;
     }
 
@@ -168,14 +199,14 @@ impl CameraGuidanceDisplayState {
     /// re-derives every interaction row from live camera state, but the home
     /// pulse is panel-side and has no camera-state source, so it is carried
     /// across the rebuild explicitly with [`Self::restore_home_highlight`].
-    pub(super) const fn home_highlight(&self) -> (InteractionSources, Option<Duration>) {
+    pub(super) const fn home_highlight(&self) -> (InteractionSources, HighlightRelease) {
         (self.home, self.releases.home)
     }
 
     pub(super) const fn restore_home_highlight(
         &mut self,
         home: InteractionSources,
-        release: Option<Duration>,
+        release: HighlightRelease,
     ) {
         self.home = home;
         self.releases.home = release;
@@ -204,16 +235,17 @@ impl CameraGuidanceDisplayState {
         }
     }
 
-    /// Records the live zoom direction read from the camera input when a zoom
+    /// Records the last known zoom direction read from the camera input when a zoom
     /// interaction begins or changes. A `None` argument (zero-delta frame) keeps
     /// the last direction so the highlighted row stays correct while the zoom is
     /// reported.
     pub(super) fn set_zoom_direction(&mut self, zoom_direction: Option<ZoomDirection>) {
-        let Some(zoom_direction) = zoom_direction else {
+        let zoom_direction = LastZoomDirection::from(zoom_direction);
+        let LastZoomDirection::Known(zoom_direction) = zoom_direction else {
             return;
         };
-        if self.zoom_direction != Some(zoom_direction) {
-            self.zoom_direction = Some(zoom_direction);
+        if self.zoom_direction != LastZoomDirection::Known(zoom_direction) {
+            self.zoom_direction = LastZoomDirection::Known(zoom_direction);
             self.render_state = RenderState::Pending;
         }
     }
@@ -244,6 +276,7 @@ impl CameraGuidanceDisplayState {
             CameraGuidanceAction::Roll => &mut self.roll_speed,
             CameraGuidanceAction::Home | CameraGuidanceAction::Other => return,
         };
+        let speed = ActionSpeed::from(speed);
         if *slot != speed {
             *slot = speed;
             self.render_state = RenderState::Pending;
@@ -271,19 +304,19 @@ pub(super) struct CameraGuidanceDisplay {
     pub(super) translate:        InteractionSources,
     pub(super) roll:             InteractionSources,
     pub(super) home:             InteractionSources,
-    pub(super) orbit_speed:      Option<ControlSpeed>,
-    pub(super) pan_speed:        Option<ControlSpeed>,
-    pub(super) zoom_speed:       Option<ControlSpeed>,
-    pub(super) look_speed:       Option<ControlSpeed>,
-    pub(super) translate_speed:  Option<ControlSpeed>,
-    pub(super) roll_speed:       Option<ControlSpeed>,
-    pub(super) zoom_direction:   Option<ZoomDirection>,
+    pub(super) orbit_speed:      ActionSpeed,
+    pub(super) pan_speed:        ActionSpeed,
+    pub(super) zoom_speed:       ActionSpeed,
+    pub(super) look_speed:       ActionSpeed,
+    pub(super) translate_speed:  ActionSpeed,
+    pub(super) roll_speed:       ActionSpeed,
+    pub(super) zoom_direction:   LastZoomDirection,
     pub(super) free_directions:  FreeCamActiveDirections,
     pub(super) slow_mode_active: bool,
 }
 
 impl CameraGuidanceDisplay {
-    pub(super) const fn from_orbit_camera_state(
+    pub(super) fn from_orbit_camera_state(
         state: OrbitCamInteractionState,
         slow_mode_active: bool,
     ) -> Self {
@@ -295,19 +328,19 @@ impl CameraGuidanceDisplay {
             translate: InteractionSources::NONE,
             roll: InteractionSources::NONE,
             home: InteractionSources::NONE,
-            orbit_speed: state.speed(OrbitCamInteractionKind::Orbit),
-            pan_speed: state.speed(OrbitCamInteractionKind::Pan),
-            zoom_speed: state.speed(OrbitCamInteractionKind::Zoom),
-            look_speed: None,
-            translate_speed: None,
-            roll_speed: None,
-            zoom_direction: state.zoom_direction(),
+            orbit_speed: ActionSpeed::from(state.speed(OrbitCamInteractionKind::Orbit)),
+            pan_speed: ActionSpeed::from(state.speed(OrbitCamInteractionKind::Pan)),
+            zoom_speed: ActionSpeed::from(state.speed(OrbitCamInteractionKind::Zoom)),
+            look_speed: ActionSpeed::Unsettled,
+            translate_speed: ActionSpeed::Unsettled,
+            roll_speed: ActionSpeed::Unsettled,
+            zoom_direction: LastZoomDirection::from(state.zoom_direction()),
             free_directions: FreeCamActiveDirections::NONE,
             slow_mode_active,
         }
     }
 
-    pub(super) const fn from_free_camera_state(
+    pub(super) fn from_free_camera_state(
         state: FreeCamInteractionState,
         slow_mode_active: bool,
     ) -> Self {
@@ -319,13 +352,13 @@ impl CameraGuidanceDisplay {
             translate: state.translate_sources(),
             roll: state.roll_sources(),
             home: InteractionSources::NONE,
-            orbit_speed: None,
-            pan_speed: None,
-            zoom_speed: None,
-            look_speed: state.speed(FreeCamInteractionKind::Look),
-            translate_speed: state.speed(FreeCamInteractionKind::Translate),
-            roll_speed: state.speed(FreeCamInteractionKind::Roll),
-            zoom_direction: None,
+            orbit_speed: ActionSpeed::Unsettled,
+            pan_speed: ActionSpeed::Unsettled,
+            zoom_speed: ActionSpeed::Unsettled,
+            look_speed: ActionSpeed::from(state.speed(FreeCamInteractionKind::Look)),
+            translate_speed: ActionSpeed::from(state.speed(FreeCamInteractionKind::Translate)),
+            roll_speed: ActionSpeed::from(state.speed(FreeCamInteractionKind::Roll)),
+            zoom_direction: LastZoomDirection::Unknown,
             free_directions: state.directions(),
             slow_mode_active,
         }
@@ -346,13 +379,13 @@ impl CameraGuidanceDisplay {
         }
     }
 
-    pub(super) const fn zoom_direction(self) -> Option<ZoomDirection> { self.zoom_direction }
+    pub(super) const fn zoom_direction(self) -> LastZoomDirection { self.zoom_direction }
 
     pub(super) const fn free_directions(self) -> FreeCamActiveDirections { self.free_directions }
 
     pub(super) const fn slow_mode_active(self) -> bool { self.slow_mode_active }
 
-    pub(super) const fn speed(self, action: CameraGuidanceAction) -> Option<ControlSpeed> {
+    pub(super) const fn speed(self, action: CameraGuidanceAction) -> ActionSpeed {
         match action {
             CameraGuidanceAction::Orbit => self.orbit_speed,
             CameraGuidanceAction::Pan => self.pan_speed,
@@ -364,24 +397,24 @@ impl CameraGuidanceDisplay {
             CameraGuidanceAction::Roll => self.roll_speed,
             // Home has no slow variant; report Normal so its row is never gated
             // out of the Normal speed block when the home pulse lights it.
-            CameraGuidanceAction::Home => Some(ControlSpeed::Normal),
-            CameraGuidanceAction::Other => None,
+            CameraGuidanceAction::Home => ActionSpeed::At(ControlSpeed::Normal),
+            CameraGuidanceAction::Other => ActionSpeed::Unsettled,
         }
     }
 }
 
 fn tick_release_countdown(
     sources: &mut InteractionSources,
-    release: &mut Option<Duration>,
+    release: &mut HighlightRelease,
     delta: Duration,
 ) -> bool {
-    let Some(remaining) = release.as_mut() else {
+    let HighlightRelease::Fading(remaining) = release else {
         return false;
     };
     let next = remaining.saturating_sub(delta);
     if next == Duration::ZERO {
         *sources = InteractionSources::NONE;
-        *release = None;
+        *release = HighlightRelease::NotFading;
         return true;
     }
 
@@ -398,20 +431,29 @@ mod tests {
         let mut display = CameraGuidanceDisplayState::default();
 
         display.set_zoom_direction(Some(ZoomDirection::In));
-        assert_eq!(display.display().zoom_direction, Some(ZoomDirection::In));
+        assert_eq!(
+            display.display().zoom_direction,
+            LastZoomDirection::Known(ZoomDirection::In)
+        );
         assert_eq!(display.render_state, RenderState::Pending);
 
         // A zero-delta frame reports `None` and must keep the captured direction
         // so the highlighted row stays correct while the zoom is reported.
         display.render_state = RenderState::Idle;
         display.set_zoom_direction(None);
-        assert_eq!(display.display().zoom_direction, Some(ZoomDirection::In));
+        assert_eq!(
+            display.display().zoom_direction,
+            LastZoomDirection::Known(ZoomDirection::In)
+        );
         assert_eq!(display.render_state, RenderState::Idle);
 
         // Reversing direction (release zoom-in, press zoom-out) flips the tag and
         // requests a rebuild even though the source bit is unchanged.
         display.set_zoom_direction(Some(ZoomDirection::Out));
-        assert_eq!(display.display().zoom_direction, Some(ZoomDirection::Out));
+        assert_eq!(
+            display.display().zoom_direction,
+            LastZoomDirection::Known(ZoomDirection::Out)
+        );
         assert_eq!(display.render_state, RenderState::Pending);
     }
 
@@ -420,7 +462,7 @@ mod tests {
         let mut display = CameraGuidanceDisplayState::default();
 
         display.set_sources(CameraGuidanceAction::Orbit, InteractionSources::NONE);
-        assert_eq!(display.releases.orbit, None);
+        assert_eq!(display.releases.orbit, HighlightRelease::NotFading);
         assert_eq!(display.render_state, RenderState::Idle);
 
         display.set_sources(CameraGuidanceAction::Orbit, InteractionSources::MOUSE);
@@ -436,12 +478,15 @@ mod tests {
         // countdown elapses.
         display.set_sources(CameraGuidanceAction::Orbit, InteractionSources::NONE);
         assert_eq!(display.display().orbit, InteractionSources::MOUSE);
-        assert_eq!(display.releases.orbit, Some(HIGHLIGHT_RELEASE_HOLD));
+        assert_eq!(
+            display.releases.orbit,
+            HighlightRelease::Fading(HIGHLIGHT_RELEASE_HOLD)
+        );
         assert_eq!(display.render_state, RenderState::Idle);
 
         display.set_sources(CameraGuidanceAction::Orbit, InteractionSources::MOUSE);
         assert_eq!(display.display().orbit, InteractionSources::MOUSE);
-        assert_eq!(display.releases.orbit, None);
+        assert_eq!(display.releases.orbit, HighlightRelease::NotFading);
         assert_eq!(display.render_state, RenderState::Idle);
     }
 
@@ -458,13 +503,13 @@ mod tests {
         assert_eq!(display.display().pan, InteractionSources::KEYBOARD);
         assert_eq!(
             display.releases.pan,
-            Some(HIGHLIGHT_RELEASE_HOLD.saturating_sub(partial_delta)),
+            HighlightRelease::Fading(HIGHLIGHT_RELEASE_HOLD.saturating_sub(partial_delta)),
         );
         assert_eq!(display.render_state, RenderState::Idle);
 
         display.tick_highlight_release(HIGHLIGHT_RELEASE_HOLD);
         assert!(display.display().pan.is_empty());
-        assert_eq!(display.releases.pan, None);
+        assert_eq!(display.releases.pan, HighlightRelease::NotFading);
         assert_eq!(display.render_state, RenderState::Pending);
     }
 

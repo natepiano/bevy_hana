@@ -39,7 +39,7 @@ pub(crate) fn install(app: &mut App) {
         .add_systems(Startup, spawn_atmosphere);
 }
 
-fn insert_atmosphere_settings(trigger: On<Add, FairyDustOrbitCam>, mut commands: Commands) {
+fn insert_atmosphere_settings(trigger: On<Add<FairyDustOrbitCam>>, mut commands: Commands) {
     commands
         .entity(trigger.entity)
         .insert(AtmosphereSettings::default());

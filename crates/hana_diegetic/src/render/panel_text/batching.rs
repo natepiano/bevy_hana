@@ -10,23 +10,40 @@
 //! `CheckVisibility`; [`commit_batch_buffers`] uploads dirty record buffers
 //! last, so extraction sees this frame's data.
 
+use std::collections::HashMap;
 use std::time::Instant;
 
+use bevy::asset::AssetId;
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::primitives::Aabb;
 use bevy::camera::visibility::NoAutoAabb;
 use bevy::camera::visibility::RenderLayers;
+use bevy::core_pipeline::core_3d::AlphaMask3d;
+use bevy::core_pipeline::core_3d::Opaque3d;
+use bevy::core_pipeline::core_3d::Transparent3d;
 use bevy::ecs::entity::EntityHashSet;
 use bevy::ecs::system::SystemParam;
+use bevy::ecs::world::World;
+use bevy::extract::Extract;
+use bevy::extract::sync_world::MainEntity;
+use bevy::extract::sync_world::MainEntityHashSet;
 use bevy::light::NotShadowCaster;
+use bevy::material::key::ErasedMaterialPipelineKey;
 use bevy::math::Vec3A;
 use bevy::mesh::Indices;
+use bevy::pbr::MeshPipelineKey;
+use bevy::pbr::PreparedMaterial;
+use bevy::pbr::RenderMaterialInstances;
+use bevy::pbr::RenderMeshInstances;
+use bevy::pbr::ViewKeyCache;
+use bevy::pbr::alpha_mode_pipeline_key;
 use bevy::picking::Pickable;
 use bevy::prelude::AlphaMode;
 use bevy::prelude::AssetServer;
 use bevy::prelude::Assets;
 use bevy::prelude::Changed;
 use bevy::prelude::ChildOf;
+use bevy::prelude::Children;
 use bevy::prelude::Color;
 use bevy::prelude::Commands;
 use bevy::prelude::Component;
@@ -34,6 +51,7 @@ use bevy::prelude::DetectChanges;
 use bevy::prelude::Entity;
 use bevy::prelude::GlobalTransform;
 use bevy::prelude::Handle;
+use bevy::prelude::Has;
 use bevy::prelude::Mat4;
 use bevy::prelude::Mesh;
 use bevy::prelude::Mesh3d;
@@ -43,16 +61,33 @@ use bevy::prelude::Query;
 use bevy::prelude::Ref;
 use bevy::prelude::Reflect;
 use bevy::prelude::ReflectComponent;
+use bevy::prelude::RelationshipTarget;
 use bevy::prelude::RemovedComponents;
 use bevy::prelude::Res;
 use bevy::prelude::ResMut;
+use bevy::prelude::Resource;
 use bevy::prelude::StandardMaterial;
 use bevy::prelude::Transform;
 use bevy::prelude::Vec2;
 use bevy::prelude::Visibility;
 use bevy::prelude::With;
+use bevy::render::camera::ExtractedCamera;
+use bevy::render::erased_render_asset::ErasedRenderAssets;
+use bevy::render::mesh::RenderMesh;
+use bevy::render::render_asset::RenderAssets;
+use bevy::render::render_phase::BinnedPhaseItem;
+use bevy::render::render_phase::BinnedRenderPhase;
+use bevy::render::render_phase::CachedRenderPipelinePhaseItem;
+use bevy::render::render_phase::SortedPhaseItem;
+use bevy::render::render_phase::SortedRenderPhase;
+use bevy::render::render_phase::ViewBinnedRenderPhases;
+use bevy::render::render_phase::ViewSortedRenderPhases;
+use bevy::render::render_resource::CachedRenderPipelineId;
 use bevy::render::render_resource::PrimitiveTopology;
 use bevy::render::storage::ShaderBuffer;
+use bevy::render::view::ExtractedView;
+use bevy::render::view::Msaa;
+use bevy::render::view::RenderVisibleEntities;
 use hana_kana::ToU32;
 use hana_kana::ToUsize;
 
@@ -60,6 +95,7 @@ use super::PanelTextLayout;
 use super::PreparedPanelText;
 use super::layout::PanelTextDrawZIndex;
 use super::layout::PanelTextDrawZIndexRank;
+use crate::cascade::Cascade;
 use crate::cascade::HdrTextCoverageBias;
 use crate::cascade::Resolved;
 use crate::cascade::TextAlpha;
@@ -73,6 +109,7 @@ use crate::layout::Sidedness;
 use crate::panel::DiegeticPanel;
 use crate::panel::DiegeticPerfStats;
 use crate::render;
+use crate::render::AncestorVisibility;
 use crate::render::AntiAlias;
 use crate::render::BatchRenderLayers;
 use crate::render::PathBatchKey;
@@ -82,12 +119,20 @@ use crate::render::PathMaterialBuffers;
 use crate::render::PathQuadRecord;
 use crate::render::PathRenderRecord;
 use crate::render::RenderMode;
+use crate::render::TextFitMode;
+use crate::render::TooltipDepthPriority;
 use crate::render::VisualShadow;
+use crate::render::analytic_paths::AtlasPublication;
 use crate::render::analytic_paths::PathAtlasHandles;
+use crate::render::analytic_paths::PostOitResolveText3d;
 use crate::render::batch_key;
 use crate::render::batch_key::PipelineCompatibility;
 use crate::render::batch_key::ResourceCompatibility;
+use crate::render::constants::TEXT_Z_OFFSET;
+use crate::render::display_compensation::DisplayCompensationTextures;
 use crate::render::draw_order::DrawOrderIndex;
+use crate::render::fill_batch::WorldPanelPlane;
+use crate::render::material::PanelDisplayTarget;
 use crate::render::material_table;
 use crate::render::material_table::FrameMaterialSlotAppend;
 use crate::render::material_table::FrameMaterialTableBuild;
@@ -110,15 +155,387 @@ use crate::widgets::VisualSlotOverride;
 #[reflect(Component)]
 pub struct DiegeticTextBatch;
 
-/// Cascade inputs feeding [`PathBatchKey`] fields: each run's resolved
-/// alpha / lighting / sidedness (with the global defaults for runs the
-/// cascade has not seeded) plus the changed-this-frame run set that triggers
-/// re-routing.
+/// Pipeline requested ahead of Bevy's material queue for a visible text batch.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum QueuedTextPipelineCandidate {
+    /// No text pipeline has been requested early.
+    #[default]
+    NotQueued,
+    /// A pipeline was requested for this render view.
+    Queued {
+        /// The render-world camera entity.
+        view:     Entity,
+        /// The extracted camera's HDR, MSAA, and OIT specialization key.
+        view_key: MeshPipelineKey,
+        /// Bevy's cached pipeline ID.
+        id:       CachedRenderPipelineId,
+    },
+}
+
+/// Pipeline on the first visible text draw in a render phase.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FirstTextBatchPipeline {
+    /// No visible text draw has entered a render phase.
+    #[default]
+    NotObserved,
+    /// A visible text draw has entered this view's phase.
+    Queued {
+        /// The render-world camera entity.
+        view: Entity,
+        /// The phase item's actual pipeline ID.
+        id:   CachedRenderPipelineId,
+    },
+}
+
+/// One exact pipeline requested for an extracted camera and text material.
+struct QueuedTextViewPipeline {
+    batch:    MainEntity,
+    view:     Entity,
+    view_key: MeshPipelineKey,
+    id:       CachedRenderPipelineId,
+}
+
+/// Startup pipeline IDs shared with the widgets timing probe.
+#[derive(Resource, Default)]
+pub struct TextPipelineStartup {
+    /// Pipeline requested ahead of the regular material queue.
+    pub candidate:     QueuedTextPipelineCandidate,
+    /// Pipeline carried by the first visible queued text draw.
+    pub first_batch:   FirstTextBatchPipeline,
+    queued_candidates: Vec<QueuedTextViewPipeline>,
+}
+
+#[derive(Resource, Default)]
+pub(in crate::render) struct TextBatchPhaseMembership(MainEntityHashSet);
+
+impl TextBatchPhaseMembership {
+    fn refresh_before_first_batch(
+        &mut self,
+        first_batch: FirstTextBatchPipeline,
+        batches: impl IntoIterator<Item = MainEntity>,
+    ) {
+        if matches!(first_batch, FirstTextBatchPipeline::NotObserved) {
+            self.0.clear();
+            self.0.extend(batches);
+        }
+    }
+}
+
+pub(in crate::render) fn extract_text_batch_entities(
+    batches: Extract<Query<Entity, With<DiegeticTextBatch>>>,
+    startup: Res<TextPipelineStartup>,
+    mut entities: ResMut<TextBatchPhaseMembership>,
+) {
+    entities.refresh_before_first_batch(startup.first_batch, batches.iter().map(MainEntity::from));
+}
+
+/// Queues a text material's exact mesh layout and view key before the regular
+/// material specializer reaches it. The phase lookup below verifies the ID.
+pub(in crate::render) fn warm_text_pipeline(world: &mut World) {
+    if !world
+        .resource::<TextPipelineStartup>()
+        .queued_candidates
+        .is_empty()
+    {
+        return;
+    }
+    let mut views = world.query::<(Entity, &ExtractedView, &RenderVisibleEntities)>();
+    let request = {
+        let entities = world.resource::<TextBatchPhaseMembership>();
+        let materials = world.resource::<RenderMaterialInstances>();
+        let meshes = world.resource::<RenderMeshInstances>();
+        let mesh_assets = world.resource::<RenderAssets<RenderMesh>>();
+        let material_assets = world.resource::<ErasedRenderAssets<PreparedMaterial>>();
+        let view_keys = world.resource::<ViewKeyCache>();
+        let mut selected = Vec::new();
+        for (view_entity, view, visible) in views.iter(world) {
+            let Some(view_key) = view_keys.get(&view.retained_view_entity) else {
+                continue;
+            };
+            let Some(visible_meshes) = visible.get::<Mesh3d>() else {
+                continue;
+            };
+            for batch in &entities.0 {
+                if !visible_meshes
+                    .entities_cpu_culling
+                    .iter()
+                    .any(|(_, main)| main == batch)
+                {
+                    continue;
+                }
+                let Some(material_instance) = materials.instances.get(batch) else {
+                    continue;
+                };
+                let Some(mesh_instance) = meshes.render_mesh_queue_data(*batch) else {
+                    continue;
+                };
+                let Some(mesh) = mesh_assets.get(mesh_instance.mesh_asset_id()) else {
+                    continue;
+                };
+                let Some(material) = material_assets.get(material_instance.asset_id) else {
+                    continue;
+                };
+                let properties = material.properties.clone();
+                let mut material_key: MeshPipelineKey =
+                    properties.mesh_pipeline_key_bits.downcast();
+                material_key.insert(alpha_mode_pipeline_key(
+                    properties.alpha_mode,
+                    &Msaa::from_samples(view_key.msaa_samples()),
+                ));
+                let key = *view_key
+                    | MeshPipelineKey::from_bits_retain(mesh.key_bits.bits())
+                    | material_key;
+                selected.push((
+                    *batch,
+                    view_entity,
+                    *view_key,
+                    material_instance.asset_id.type_id(),
+                    key,
+                    mesh.layout.clone(),
+                    properties,
+                ));
+            }
+        }
+        selected
+    };
+    for (batch, view, view_key, type_id, mesh_key, layout, properties) in request {
+        let Some(specialize) = properties.base_specialize else {
+            continue;
+        };
+        let key = ErasedMaterialPipelineKey {
+            type_id,
+            mesh_key: bevy::material::key::ErasedMeshPipelineKey::new(mesh_key),
+            material_key: properties.material_key.clone(),
+        };
+        match specialize(world, key, &layout, &properties) {
+            Ok(id) => {
+                let mut startup = world.resource_mut::<TextPipelineStartup>();
+                if matches!(startup.candidate, QueuedTextPipelineCandidate::NotQueued) {
+                    startup.candidate = QueuedTextPipelineCandidate::Queued { view, view_key, id };
+                }
+                if !startup
+                    .queued_candidates
+                    .iter()
+                    .any(|candidate| candidate.view == view && candidate.id == id)
+                {
+                    startup.queued_candidates.push(QueuedTextViewPipeline {
+                        batch,
+                        view,
+                        view_key,
+                        id,
+                    });
+                    bevy::log::debug!(
+                        "warmed text pipeline {id:?} for view {view:?}, view key {view_key:?}"
+                    );
+                }
+            },
+            Err(error) => bevy::log::debug!("text pipeline warmup failed: {error}"),
+        }
+    }
+}
+
+pub(in crate::render) fn observe_first_text_phase_item(
+    transparent_phases: Res<ViewSortedRenderPhases<Transparent3d>>,
+    post_resolve_phases: Res<ViewSortedRenderPhases<PostOitResolveText3d>>,
+    opaque_phases: Res<ViewBinnedRenderPhases<Opaque3d>>,
+    alpha_mask_phases: Res<ViewBinnedRenderPhases<AlphaMask3d>>,
+    views: Query<(Entity, &ExtractedView, &ExtractedCamera)>,
+    entities: Res<TextBatchPhaseMembership>,
+    mesh_instances: Res<RenderMeshInstances>,
+    material_instances: Res<RenderMaterialInstances>,
+    view_keys: Res<ViewKeyCache>,
+    mut startup: ResMut<TextPipelineStartup>,
+) {
+    if !matches!(startup.first_batch, FirstTextBatchPipeline::NotObserved) {
+        return;
+    }
+    let mut ordered_views: Vec<_> = views.iter().collect();
+    ordered_views.sort_by_key(|(entity, _, camera)| (camera.order, entity.index()));
+    for (view_entity, view, camera) in ordered_views {
+        let first_binned = opaque_phases
+            .get(&view.retained_view_entity)
+            .and_then(|phase| {
+                first_binned_text_batch(
+                    phase,
+                    &entities.0,
+                    view_entity,
+                    &startup.queued_candidates,
+                    |key| key.pipeline,
+                )
+            })
+            .or_else(|| {
+                alpha_mask_phases
+                    .get(&view.retained_view_entity)
+                    .and_then(|phase| {
+                        first_binned_text_batch(
+                            phase,
+                            &entities.0,
+                            view_entity,
+                            &startup.queued_candidates,
+                            |key| key.pipeline,
+                        )
+                    })
+            });
+        let first_transparent = transparent_phases
+            .get(&view.retained_view_entity)
+            .and_then(|phase| first_sorted_text_batch(phase, &entities.0));
+        let first_post_resolve = post_resolve_phases
+            .get(&view.retained_view_entity)
+            .and_then(|phase| first_sorted_text_batch(phase, &entities.0));
+        if let Some((batch, pipeline)) = first_binned.or(first_transparent).or(first_post_resolve) {
+            let queued_view_key = startup
+                .queued_candidates
+                .iter()
+                .find(|candidate| candidate.view == view_entity && candidate.id == pipeline)
+                .map(|candidate| candidate.view_key);
+            if let Some(view_key) = queued_view_key {
+                startup.candidate = QueuedTextPipelineCandidate::Queued {
+                    view: view_entity,
+                    view_key,
+                    id: pipeline,
+                };
+            }
+            startup.first_batch = FirstTextBatchPipeline::Queued {
+                view: view_entity,
+                id:   pipeline,
+            };
+            bevy::log::debug!(
+                "first visible queued text batch {:?}: view {view_entity:?}, camera order {}, view key {:?}, queued view key {queued_view_key:?}, pipeline {:?}, mesh {:?}, material {:?}, layers {:?}, warmed {:?}",
+                batch,
+                camera.order,
+                view_keys.get(&view.retained_view_entity),
+                pipeline,
+                mesh_instances.mesh_asset_id(batch),
+                material_instances
+                    .instances
+                    .get(&batch)
+                    .map(|instance| instance.asset_id),
+                mesh_instances
+                    .render_mesh_queue_data(batch)
+                    .map(|instance| instance.render_layers),
+                startup.candidate
+            );
+            return;
+        }
+    }
+}
+
+fn first_sorted_text_batch<P>(
+    phase: &SortedRenderPhase<P>,
+    entities: &MainEntityHashSet,
+) -> Option<(MainEntity, CachedRenderPipelineId)>
+where
+    P: SortedPhaseItem + CachedRenderPipelinePhaseItem,
+{
+    phase
+        .items
+        .values()
+        .find(|item| entities.contains(&item.main_entity()))
+        .map(|item| (item.main_entity(), item.cached_pipeline()))
+}
+
+fn first_binned_text_batch<BPI>(
+    phase: &BinnedRenderPhase<BPI>,
+    entities: &MainEntityHashSet,
+    view: Entity,
+    candidates: &[QueuedTextViewPipeline],
+    pipeline: impl Fn(&BPI::BatchSetKey) -> CachedRenderPipelineId,
+) -> Option<(MainEntity, CachedRenderPipelineId)>
+where
+    BPI: BinnedPhaseItem,
+{
+    for (key, _) in &phase.multidrawable_meshes {
+        let id = pipeline(key);
+        if let Some(candidate) = candidates.iter().find(|candidate| {
+            candidate.view == view && candidate.id == id && entities.contains(&candidate.batch)
+        }) {
+            return Some((candidate.batch, id));
+        }
+    }
+    for ((key, _), bin) in &phase.batchable_meshes {
+        if let Some(&batch) = bin
+            .entities()
+            .keys()
+            .find(|batch| entities.contains(*batch))
+        {
+            return Some((batch, pipeline(key)));
+        }
+    }
+    for ((key, _), bin) in &phase.unbatchable_meshes {
+        if let Some(&batch) = bin.entities.keys().find(|batch| entities.contains(*batch)) {
+            return Some((batch, pipeline(key)));
+        }
+    }
+    for ((key, _), bin) in &phase.non_mesh_items {
+        if let Some(&batch) = bin.entities.keys().find(|batch| entities.contains(*batch)) {
+            return Some((batch, pipeline(key)));
+        }
+    }
+    None
+}
+
+#[derive(Clone, Copy)]
+enum TextDepthBand {
+    Panel,
+    Tooltip,
+}
+
+impl TextDepthBand {
+    const fn shader_flag(self) -> u32 {
+        match self {
+            Self::Panel => 0,
+            Self::Tooltip => 1,
+        }
+    }
+}
+
+impl From<bool> for TextDepthBand {
+    fn from(has_tooltip_depth_priority: bool) -> Self {
+        if has_tooltip_depth_priority {
+            Self::Tooltip
+        } else {
+            Self::Panel
+        }
+    }
+}
+
+/// The panel that owns each text run, and whether that panel is hidden this
+/// frame through any ancestor.
+#[derive(SystemParam)]
+pub(super) struct TextRunPanels<'w, 's> {
+    display_textures: Res<'w, DisplayCompensationTextures>,
+    panels: Query<
+        'w,
+        's,
+        (
+            &'static DiegeticPanel,
+            Option<&'static RenderLayers>,
+            &'static GlobalTransform,
+            Has<TooltipDepthPriority>,
+        ),
+    >,
+    visibility:       AncestorVisibility<'w, 's>,
+}
+
+impl TextRunPanels<'_, '_> {
+    /// Whether a run draws nothing this frame. The run's own `Visibility`
+    /// decides first; `Inherited` or none defers to its panel and every
+    /// ancestor above it.
+    fn run_is_hidden(&mut self, run_visibility: Option<&Visibility>, panel: Entity) -> bool {
+        match run_visibility {
+            Some(Visibility::Hidden) => true,
+            Some(Visibility::Visible) => false,
+            Some(Visibility::Inherited) | None => self.visibility.is_hidden(panel),
+        }
+    }
+}
+
+/// Resolved per-run pipeline and record inputs, with defaults for runs whose
+/// cascades have not been seeded.
 #[derive(SystemParam)]
 pub(super) struct PathBatchKeyCascades<'w, 's> {
     alphas:                         Query<'w, 's, &'static Resolved<TextAlpha>, With<TextContent>>,
     lightings:                      Query<'w, 's, &'static Resolved<Lighting>, With<TextContent>>,
-    sidednesses:                    Query<'w, 's, &'static Resolved<Sidedness>, With<TextContent>>,
     shadow_castings: Query<'w, 's, &'static Resolved<ShadowCasting>, With<TextContent>>,
     glyph_shadow_modes: Query<'w, 's, &'static Resolved<GlyphShadowMode>, With<TextContent>>,
     anti_aliases:                   Query<'w, 's, &'static Resolved<AntiAlias>, With<TextContent>>,
@@ -127,53 +544,13 @@ pub(super) struct PathBatchKeyCascades<'w, 's> {
         Query<'w, 's, &'static Resolved<HdrTextCoverageBias>, With<TextContent>>,
     alpha_default:                  Res<'w, TextAlpha>,
     lighting_default:               Res<'w, Lighting>,
-    sidedness_default:              Res<'w, Sidedness>,
     shadow_casting_default:         Res<'w, ShadowCasting>,
     glyph_shadow_mode_default:      Res<'w, GlyphShadowMode>,
     anti_alias_default:             Res<'w, AntiAlias>,
     hdr_text_coverage_bias_default: Res<'w, HdrTextCoverageBias>,
-    placement_changed: Query<
-        'w,
-        's,
-        Entity,
-        (
-            With<TextContent>,
-            With<PreparedPanelText>,
-            Or<(
-                Changed<Resolved<TextAlpha>>,
-                Changed<Resolved<Lighting>>,
-                Changed<Resolved<Sidedness>>,
-                Changed<Resolved<ShadowCasting>>,
-                Changed<Resolved<GlyphShadowMode>>,
-                Changed<Resolved<AntiAlias>>,
-            )>,
-        ),
-    >,
-    record_changed: Query<
-        'w,
-        's,
-        Entity,
-        (
-            With<TextContent>,
-            With<PreparedPanelText>,
-            Changed<Resolved<HdrTextCoverageBias>>,
-        ),
-    >,
 }
 
 impl PathBatchKeyCascades<'_, '_> {
-    /// Runs whose resolved placement or pipeline cascade value transitioned
-    /// this frame. `Resolved<TextMaterial>` is excluded because
-    /// `text_material_candidate_for_frame` recomputes table rows and
-    /// compatibility every frame; scalar-only material changes are material
-    /// row updates, while texture/pipeline changes are detected through
-    /// `PathBatchKey` comparison.
-    fn placement_changed_set(&self) -> EntityHashSet { self.placement_changed.iter().collect() }
-
-    /// Runs whose per-record cascade value changed without changing glyph
-    /// geometry or batch routing.
-    fn record_changed_set(&self) -> EntityHashSet { self.record_changed.iter().collect() }
-
     fn alpha(&self, label: Entity) -> AlphaMode {
         self.alphas
             .get(label)
@@ -184,12 +561,6 @@ impl PathBatchKeyCascades<'_, '_> {
         self.lightings
             .get(label)
             .map_or(*self.lighting_default, |resolved| resolved.0)
-    }
-
-    fn sidedness(&self, label: Entity) -> Sidedness {
-        self.sidednesses
-            .get(label)
-            .map_or(*self.sidedness_default, |resolved| resolved.0)
     }
 
     fn visual_shadow(&self, label: Entity) -> VisualShadow {
@@ -224,6 +595,420 @@ impl PathBatchKeyCascades<'_, '_> {
             .get(label)
             .map_or_else(|_| default.0.clone(), |resolved| resolved.0.0.clone())
     }
+
+    fn defaults_changed(&self) -> bool {
+        self.alpha_default.is_changed()
+            || self.lighting_default.is_changed()
+            || self.shadow_casting_default.is_changed()
+            || self.glyph_shadow_mode_default.is_changed()
+            || self.anti_alias_default.is_changed()
+            || self.hdr_text_coverage_bias_default.is_changed()
+    }
+
+    fn default_changed_for_run(&self, run: Entity, material_default_changed: bool) -> bool {
+        (self.alpha_default.is_changed() && self.alphas.get(run).is_err())
+            || (self.lighting_default.is_changed() && self.lightings.get(run).is_err())
+            || (self.shadow_casting_default.is_changed() && self.shadow_castings.get(run).is_err())
+            || (self.glyph_shadow_mode_default.is_changed()
+                && self.glyph_shadow_modes.get(run).is_err())
+            || (self.anti_alias_default.is_changed() && self.anti_aliases.get(run).is_err())
+            || (self.hdr_text_coverage_bias_default.is_changed()
+                && self.hdr_text_coverage_biases.get(run).is_err())
+            || (material_default_changed && self.materials.get(run).is_err())
+    }
+}
+
+type ChangedTextRunInput = Or<(
+    Changed<PreparedPanelText>,
+    Changed<PanelTextLayout>,
+    Changed<PanelTextDrawZIndex>,
+    Changed<PanelTextDrawZIndexRank>,
+    Changed<ChildOf>,
+    Changed<GlobalTransform>,
+    Changed<Visibility>,
+    Changed<Resolved<TextAlpha>>,
+    Changed<Resolved<Lighting>>,
+    Changed<Resolved<ShadowCasting>>,
+    Changed<Resolved<GlyphShadowMode>>,
+    Changed<Resolved<AntiAlias>>,
+    Changed<Resolved<TextMaterial>>,
+    Changed<Resolved<HdrTextCoverageBias>>,
+)>;
+
+type ChangedTextPanelInput = Or<(
+    Changed<DiegeticPanel>,
+    Changed<Transform>,
+    Changed<RenderLayers>,
+    Changed<GlobalTransform>,
+    Changed<TooltipDepthPriority>,
+)>;
+
+type PanelTextEntityFilter = (
+    With<TextContent>,
+    Or<(With<PanelTextLayout>, With<PreparedPanelText>)>,
+);
+type PanelTextEntities<'w, 's> = Query<'w, 's, Entity, PanelTextEntityFilter>;
+
+#[cfg(test)]
+#[derive(Debug, Default, Eq, PartialEq, Resource)]
+pub(super) struct TextBatchRouteCounts {
+    runs:   usize,
+    visits: usize,
+}
+
+#[cfg(test)]
+pub(super) fn reset_text_batch_route_counts(mut counts: ResMut<TextBatchRouteCounts>) {
+    *counts = TextBatchRouteCounts::default();
+}
+
+#[derive(SystemParam)]
+pub(super) struct TextBatchWakeInputs<'w, 's> {
+    changed_runs:       Query<'w, 's, Entity, (PanelTextEntityFilter, ChangedTextRunInput)>,
+    changed_panels:     Query<'w, 's, &'static Children, ChangedTextPanelInput>,
+    changed_visibility: Query<'w, 's, Entity, Or<(Changed<Visibility>, Changed<ChildOf>)>>,
+    subtree_children:   Query<'w, 's, &'static Children>,
+    text_entities:      PanelTextEntities<'w, 's>,
+    removed_visibility: RemovedComponents<'w, 's, Visibility>,
+    removed_parents:    RemovedComponents<'w, 's, ChildOf>,
+    removed_runs:       RemovedTextRunInputs<'w, 's>,
+    removed_panels:     RemovedTextPanelInputs<'w, 's>,
+    emptied_runs:       RemovedComponents<'w, 's, PreparedPanelText>,
+}
+
+/// Removed direct run inputs, including caches whose absence restores a default.
+#[derive(SystemParam)]
+struct RemovedTextRunInputs<'w, 's> {
+    content:      RemovedComponents<'w, 's, TextContent>,
+    layout:       RemovedComponents<'w, 's, PanelTextLayout>,
+    z_index:      RemovedComponents<'w, 's, PanelTextDrawZIndex>,
+    z_rank:       RemovedComponents<'w, 's, PanelTextDrawZIndexRank>,
+    transform:    RemovedComponents<'w, 's, GlobalTransform>,
+    alpha:        RemovedComponents<'w, 's, Resolved<TextAlpha>>,
+    lighting:     RemovedComponents<'w, 's, Resolved<Lighting>>,
+    shadow:       RemovedComponents<'w, 's, Resolved<ShadowCasting>>,
+    glyph_shadow: RemovedComponents<'w, 's, Resolved<GlyphShadowMode>>,
+    anti_alias:   RemovedComponents<'w, 's, Resolved<AntiAlias>>,
+    material:     RemovedComponents<'w, 's, Resolved<TextMaterial>>,
+    coverage:     RemovedComponents<'w, 's, Resolved<HdrTextCoverageBias>>,
+}
+
+impl RemovedTextRunInputs<'_, '_> {
+    fn has_removals(&mut self) -> bool {
+        [
+            self.content.read().count(),
+            self.layout.read().count(),
+            self.z_index.read().count(),
+            self.z_rank.read().count(),
+            self.transform.read().count(),
+            self.alpha.read().count(),
+            self.lighting.read().count(),
+            self.shadow.read().count(),
+            self.glyph_shadow.read().count(),
+            self.anti_alias.read().count(),
+            self.material.read().count(),
+            self.coverage.read().count(),
+        ]
+        .into_iter()
+        .any(|count| count != 0)
+    }
+
+    fn take_runs(&mut self) -> EntityHashSet {
+        let mut runs = EntityHashSet::default();
+        runs.extend(self.content.read());
+        runs.extend(self.layout.read());
+        runs.extend(self.z_index.read());
+        runs.extend(self.z_rank.read());
+        runs.extend(self.transform.read());
+        runs.extend(self.alpha.read());
+        runs.extend(self.lighting.read());
+        runs.extend(self.shadow.read());
+        runs.extend(self.glyph_shadow.read());
+        runs.extend(self.anti_alias.read());
+        runs.extend(self.material.read());
+        runs.extend(self.coverage.read());
+        runs
+    }
+}
+
+/// Removed owner-panel inputs; only that panel's direct text children depend on them.
+#[derive(SystemParam)]
+struct RemovedTextPanelInputs<'w, 's> {
+    role:            RemovedComponents<'w, 's, DiegeticPanel>,
+    transform:       RemovedComponents<'w, 's, Transform>,
+    world_transform: RemovedComponents<'w, 's, GlobalTransform>,
+    layers:          RemovedComponents<'w, 's, RenderLayers>,
+    tooltip:         RemovedComponents<'w, 's, TooltipDepthPriority>,
+}
+
+impl RemovedTextPanelInputs<'_, '_> {
+    fn has_removals(&mut self) -> bool {
+        [
+            self.role.read().count(),
+            self.transform.read().count(),
+            self.world_transform.read().count(),
+            self.layers.read().count(),
+            self.tooltip.read().count(),
+        ]
+        .into_iter()
+        .any(|count| count != 0)
+    }
+
+    fn take_panels(&mut self) -> EntityHashSet {
+        let mut panels = EntityHashSet::default();
+        panels.extend(self.role.read());
+        panels.extend(self.transform.read());
+        panels.extend(self.world_transform.read());
+        panels.extend(self.layers.read());
+        panels.extend(self.tooltip.read());
+        panels
+    }
+}
+
+#[derive(SystemParam)]
+pub(super) struct TextBatchRouteResources<'w, 's> {
+    invalidation:          ResMut<'w, TextBatchInvalidation>,
+    anti_alias:            Res<'w, AntiAlias>,
+    backend:               ResMut<'w, GlyphCache>,
+    meshes:                ResMut<'w, Assets<Mesh>>,
+    materials:             ResMut<'w, Assets<PathExtendedMaterial>>,
+    standard_materials:    Res<'w, Assets<StandardMaterial>>,
+    asset_server:          Res<'w, AssetServer>,
+    text_material_default: Res<'w, TextMaterial>,
+    storage_buffers:       ResMut<'w, Assets<ShaderBuffer>>,
+    material_table:        ResMut<'w, FrameMaterialTableBuild>,
+    visual_overrides:      Res<'w, VisualOverrideIndex>,
+    perf:                  ResMut<'w, DiegeticPerfStats>,
+    commands:              Commands<'w, 's>,
+}
+
+/// Retained material dependencies and runs awaiting publishable input.
+#[derive(Default, Resource)]
+pub(super) struct TextBatchInvalidation {
+    materials:       HashMap<AssetId<StandardMaterial>, TextMaterialUsers>,
+    run_materials:   HashMap<Entity, AssetId<StandardMaterial>>,
+    visual_bindings: HashMap<Entity, TextVisualBinding>,
+    pending:         EntityHashSet,
+}
+
+struct TextVisualBinding {
+    panel:     Entity,
+    element:   usize,
+    published: TextVisualPresentation,
+}
+
+/// Only the override fields that can change text's row, key or placement.
+#[derive(Default, PartialEq)]
+struct TextVisualPresentation {
+    color:    Cascade<Color>,
+    offset:   Vec2,
+    material: Cascade<Handle<StandardMaterial>>,
+}
+
+impl TextVisualPresentation {
+    fn for_slot(slot: Option<&VisualSlotOverride>) -> Self {
+        Self {
+            color:    slot
+                .and_then(|value| value.text_color)
+                .map_or(Cascade::Inherit, Cascade::Override),
+            offset:   slot.and_then(|value| value.offset).unwrap_or(Vec2::ZERO),
+            material: slot
+                .and_then(|value| value.material.as_ref())
+                .map_or(Cascade::Inherit, |handle| Cascade::Override(handle.clone())),
+        }
+    }
+}
+
+struct TextMaterialUsers {
+    handle:    Handle<StandardMaterial>,
+    published: TextMaterialReadiness,
+    runs:      EntityHashSet,
+}
+
+/// Text-relevant values after stripping maps that need glyph tangents and
+/// replacing the fields authored by the run's cascades.
+#[derive(PartialEq)]
+enum TextMaterialReadiness {
+    Unavailable,
+    Ready(Box<MaterialSlotCandidate>),
+}
+
+impl TextMaterialReadiness {
+    fn for_frame(
+        handle: &Handle<StandardMaterial>,
+        materials: &Assets<StandardMaterial>,
+        server: &AssetServer,
+        default: &TextMaterial,
+    ) -> Self {
+        match text_material_candidate_for_frame(
+            handle,
+            Color::WHITE,
+            AlphaMode::Opaque,
+            Lighting::Lit,
+            materials,
+            server,
+            default,
+        ) {
+            Some(candidate) => Self::Ready(Box::new(candidate)),
+            None => Self::Unavailable,
+        }
+    }
+}
+
+impl TextBatchInvalidation {
+    fn forget_run(&mut self, run: Entity) {
+        self.pending.remove(&run);
+        self.visual_bindings.remove(&run);
+        if let Some(material) = self.run_materials.remove(&run)
+            && let Some(users) = self.materials.get_mut(&material)
+        {
+            users.runs.remove(&run);
+            if users.runs.is_empty() {
+                self.materials.remove(&material);
+            }
+        }
+    }
+
+    fn track_run(
+        &mut self,
+        run: Entity,
+        handle: &Handle<StandardMaterial>,
+        materials: &Assets<StandardMaterial>,
+        server: &AssetServer,
+        default: &TextMaterial,
+    ) {
+        if self.run_materials.get(&run) == Some(&handle.id()) {
+            return;
+        }
+        self.forget_run(run);
+        self.run_materials.insert(run, handle.id());
+        self.materials
+            .entry(handle.id())
+            .or_insert_with(|| TextMaterialUsers {
+                handle:    handle.clone(),
+                published: TextMaterialReadiness::for_frame(handle, materials, server, default),
+                runs:      EntityHashSet::default(),
+            })
+            .runs
+            .insert(run);
+    }
+
+    fn changed_material_runs(
+        &mut self,
+        materials: &Assets<StandardMaterial>,
+        server: &AssetServer,
+        default: &TextMaterial,
+    ) -> EntityHashSet {
+        let mut changed = EntityHashSet::default();
+        for users in self.materials.values_mut() {
+            let current =
+                TextMaterialReadiness::for_frame(&users.handle, materials, server, default);
+            if current != users.published {
+                changed.extend(users.runs.iter().copied());
+                users.published = current;
+            }
+        }
+        changed
+    }
+
+    fn track_visual_run(
+        &mut self,
+        run: Entity,
+        panel: Entity,
+        element: usize,
+        index: &VisualOverrideIndex,
+    ) {
+        self.visual_bindings.insert(
+            run,
+            TextVisualBinding {
+                panel,
+                element,
+                published: TextVisualPresentation::for_slot(index.get(panel, element)),
+            },
+        );
+    }
+
+    fn changed_visual_runs(&mut self, index: &VisualOverrideIndex) -> EntityHashSet {
+        let mut changed = EntityHashSet::default();
+        for (&run, binding) in &mut self.visual_bindings {
+            let current =
+                TextVisualPresentation::for_slot(index.get(binding.panel, binding.element));
+            if current != binding.published {
+                changed.insert(run);
+                binding.published = current;
+            }
+        }
+        changed
+    }
+}
+
+fn collect_dirty_text_runs(
+    changed_runs: impl Iterator<Item = Entity>,
+    changed_panels: impl Iterator<Item = Entity>,
+) -> EntityHashSet {
+    let mut dirty: EntityHashSet = changed_runs.collect();
+    dirty.extend(changed_panels);
+    dirty
+}
+
+/// Batched draws live outside the panel hierarchy. Visit only text below an
+/// authored visibility or parent transition, or a removed layer override.
+fn collect_changed_subtree_text_runs(
+    changed: impl Iterator<Item = Entity>,
+    children: &Query<&Children>,
+    texts: &PanelTextEntities,
+) -> EntityHashSet {
+    let mut pending: Vec<_> = changed.collect();
+    let mut visited = EntityHashSet::default();
+    let mut dirty = EntityHashSet::default();
+    while let Some(entity) = pending.pop() {
+        if !visited.insert(entity) {
+            continue;
+        }
+        if texts.contains(entity) {
+            dirty.insert(entity);
+        }
+        if let Ok(descendants) = children.get(entity) {
+            pending.extend(descendants.iter());
+        }
+    }
+    dirty
+}
+
+fn collect_owned_text_runs(
+    owners: impl Iterator<Item = Entity>,
+    children: &Query<&Children>,
+    texts: &PanelTextEntities,
+) -> EntityHashSet {
+    owners
+        .filter_map(|owner| children.get(owner).ok())
+        .flat_map(RelationshipTarget::iter)
+        .filter(|&entity| texts.contains(entity))
+        .collect()
+}
+
+pub(super) fn panel_text_batch_inputs_changed(
+    mut wake: TextBatchWakeInputs,
+    standard_materials: Res<Assets<StandardMaterial>>,
+    text_material_default: Res<TextMaterial>,
+    anti_alias: Res<AntiAlias>,
+    visual_overrides: Res<VisualOverrideIndex>,
+    invalidation: Res<TextBatchInvalidation>,
+    cascades: PathBatchKeyCascades,
+) -> bool {
+    !wake.changed_runs.is_empty()
+        || !wake.changed_panels.is_empty()
+        || !wake.changed_visibility.is_empty()
+        || standard_materials.is_changed()
+        || text_material_default.is_changed()
+        || anti_alias.is_changed()
+        || visual_overrides.is_changed()
+        || !invalidation.pending.is_empty()
+        || cascades.defaults_changed()
+        || wake.removed_visibility.read().next().is_some()
+        || wake.removed_parents.read().next().is_some()
+        || wake.removed_runs.has_removals()
+        || wake.removed_panels.has_removals()
+        || wake.emptied_runs.read().next().is_some()
 }
 
 /// Builds changed runs' glyph records, routes them through the batch store,
@@ -231,64 +1016,156 @@ impl PathBatchKeyCascades<'_, '_> {
 /// on a key's first run, despawn on its last, mesh growth on a capacity
 /// crossing — created, written, and swapped in the same frame).
 ///
-/// The query walks every run but touches only those whose text changed, whose
-/// resolved cascade value changed (alpha / lighting / sidedness are batch-key
+/// The query addresses only runs whose text changed, whose
+/// resolved cascade value changed (alpha / lighting are batch-key
 /// fields, so the run re-routes through `upsert_run` and moves batches when the
 /// key differs), whose layout ordering changed, or that are not yet routed. A
 /// run skipped on one frame (a glyph not yet packed, say) is picked up again on
 /// the next pass.
+type PanelTextBatchRuns<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        Ref<'static, PreparedPanelText>,
+        Ref<'static, PanelTextLayout>,
+        Ref<'static, PanelTextDrawZIndex>,
+        Ref<'static, PanelTextDrawZIndexRank>,
+        &'static ChildOf,
+        &'static GlobalTransform,
+        Option<&'static Visibility>,
+    ),
+    With<TextContent>,
+>;
+
 pub(super) fn update_panel_text_batches(
-    runs: Query<
-        (
-            Entity,
-            Ref<PreparedPanelText>,
-            Ref<PanelTextLayout>,
-            Ref<PanelTextDrawZIndex>,
-            Ref<PanelTextDrawZIndexRank>,
-            &ChildOf,
-            &GlobalTransform,
-            Option<&Visibility>,
-        ),
-        With<TextContent>,
-    >,
-    mut emptied_runs: RemovedComponents<PreparedPanelText>,
-    panels: Query<(
-        &DiegeticPanel,
-        Option<&RenderLayers>,
-        Option<&Visibility>,
-        &GlobalTransform,
-    )>,
+    runs: PanelTextBatchRuns,
+    mut wake: TextBatchWakeInputs,
+    mut run_panels: TextRunPanels,
     cascades: PathBatchKeyCascades,
-    anti_alias: Res<AntiAlias>,
-    mut backend: ResMut<GlyphCache>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<PathExtendedMaterial>>,
-    standard_materials: Res<Assets<StandardMaterial>>,
-    asset_server: Res<AssetServer>,
-    text_material_default: Res<TextMaterial>,
-    mut storage_buffers: ResMut<Assets<ShaderBuffer>>,
-    mut material_table: ResMut<FrameMaterialTableBuild>,
-    visual_overrides: Res<VisualOverrideIndex>,
-    mut perf: ResMut<DiegeticPerfStats>,
-    mut commands: Commands,
+    mut route: TextBatchRouteResources,
+    #[cfg(test)] mut counts: Option<ResMut<TextBatchRouteCounts>>,
 ) {
+    #[cfg(test)]
+    if let Some(counts) = counts.as_deref_mut() {
+        counts.runs += 1;
+    }
     let mesh_build_start = Instant::now();
 
     // An emptied or despawned run leaves its batch; the rebuild
     // re-derives the survivors' ranges.
-    remove_emptied_panel_text_runs(&mut emptied_runs, &mut backend);
-
-    // Cascade changes are inequality-guarded at the propagation pass, so this
-    // set holds only real transitions; membership re-routes the run below.
-    let cascade_changed = cascades.placement_changed_set();
-    let record_changed = cascades.record_changed_set();
+    remove_emptied_panel_text_runs(
+        &mut wake.emptied_runs,
+        &mut route.backend,
+        route.material_table.builder_mut(),
+        &mut route.invalidation,
+    );
 
     // Upload the shared glyph atlas once before the run loop. A frame with no
     // glyph changes reuses existing handles, while live runs still append
     // current-frame material rows below.
-    let atlas = backend.commit_glyph_atlas(&mut storage_buffers, &mut materials);
+    let atlas = match route
+        .backend
+        .commit_glyph_atlas(&mut route.storage_buffers, &mut route.materials)
+    {
+        Ok(atlas) => atlas,
+        Err(error) => {
+            bevy::log::error!("cannot publish glyph atlas: {error}");
+            return;
+        },
+    };
 
-    for (
+    let dirty_runs = collect_routed_text_changes(&runs, &mut wake, &cascades, &mut route);
+    for label_entity in dirty_runs {
+        #[cfg(test)]
+        if let Some(counts) = counts.as_deref_mut() {
+            counts.visits += 1;
+        }
+        route_changed_text_run(label_entity, &runs, &mut run_panels, &cascades, &mut route);
+    }
+
+    reconcile_batch_entities(ReconcileBatchEntities {
+        atlas,
+        display_textures: &run_panels.display_textures,
+        anti_alias: *route.anti_alias,
+        backend: &mut route.backend,
+        meshes: &mut route.meshes,
+        materials: &mut route.materials,
+        storage_buffers: &mut route.storage_buffers,
+        commands: &mut route.commands,
+    });
+
+    record_panel_text_batch_perf(&mut route.perf, mesh_build_start);
+}
+
+fn collect_routed_text_changes(
+    runs: &PanelTextBatchRuns,
+    wake: &mut TextBatchWakeInputs,
+    cascades: &PathBatchKeyCascades,
+    route: &mut TextBatchRouteResources,
+) -> EntityHashSet {
+    let mut dirty_runs = collect_dirty_text_runs(
+        wake.changed_runs.iter(),
+        wake.changed_panels
+            .iter()
+            .flat_map(RelationshipTarget::iter)
+            .filter(|&entity| wake.text_entities.contains(entity)),
+    );
+    dirty_runs.extend(collect_changed_subtree_text_runs(
+        wake.changed_visibility
+            .iter()
+            .chain(wake.removed_visibility.read())
+            .chain(wake.removed_parents.read()),
+        &wake.subtree_children,
+        &wake.text_entities,
+    ));
+    dirty_runs.extend(collect_owned_text_runs(
+        wake.removed_panels.take_panels().into_iter(),
+        &wake.subtree_children,
+        &wake.text_entities,
+    ));
+    dirty_runs.extend(wake.removed_runs.take_runs().into_iter().filter(|entity| {
+        wake.text_entities.contains(*entity)
+            || route.invalidation.run_materials.contains_key(entity)
+    }));
+    if route.visual_overrides.is_changed() {
+        dirty_runs.extend(
+            route
+                .invalidation
+                .changed_visual_runs(&route.visual_overrides),
+        );
+    }
+    if cascades.defaults_changed() || route.text_material_default.is_changed() {
+        dirty_runs.extend(runs.iter().filter_map(|(entity, ..)| {
+            cascades
+                .default_changed_for_run(entity, route.text_material_default.is_changed())
+                .then_some(entity)
+        }));
+    }
+    if route.standard_materials.is_changed() || route.text_material_default.is_changed() {
+        dirty_runs.extend(route.invalidation.changed_material_runs(
+            &route.standard_materials,
+            &route.asset_server,
+            &route.text_material_default,
+        ));
+    }
+    dirty_runs.extend(route.invalidation.pending.drain());
+    dirty_runs
+}
+
+fn route_changed_text_run(
+    label_entity: Entity,
+    runs: &PanelTextBatchRuns,
+    run_panels: &mut TextRunPanels,
+    cascades: &PathBatchKeyCascades,
+    route: &mut TextBatchRouteResources,
+) {
+    let storage_key = RunStorageKey::from(label_entity);
+    route
+        .material_table
+        .builder_mut()
+        .refresh_text_run(storage_key);
+    let Ok((
         label_entity,
         prepared,
         panel_text_child,
@@ -297,92 +1174,124 @@ pub(super) fn update_panel_text_batches(
         child_of,
         label_transform,
         label_visibility,
-    ) in &runs
-    {
-        let storage_key = RunStorageKey::from(label_entity);
-        let Ok((_panel, panel_layers, panel_visibility, panel_transform)) =
-            panels.get(child_of.parent())
-        else {
-            backend.batch_store_mut().remove_run(storage_key);
-            continue;
-        };
-        let hidden = is_hidden(label_visibility) || is_hidden(panel_visibility);
-
-        let alpha_mode = cascades.alpha(label_entity);
-        let lighting = cascades.lighting(label_entity);
-        let sidedness = cascades.sidedness(label_entity);
-        let shadow = cascades.visual_shadow(label_entity);
-        let material = cascades.material(label_entity, &text_material_default);
-        let slot_override = visual_overrides.get(child_of.parent(), panel_text_child.element_idx);
-        let (fill_color, material) =
-            apply_text_visual_override(slot_override, prepared.fill_color, material);
-        let record_transform =
-            text_run_record_transform(label_transform, panel_transform, slot_override);
-        let Some(material_candidate) = text_material_candidate_for_frame(
-            &material,
-            fill_color,
-            alpha_mode,
-            lighting,
-            sidedness,
-            &standard_materials,
-            &asset_server,
-            &text_material_default,
-        ) else {
-            backend.batch_store_mut().remove_run(storage_key);
-            continue;
-        };
-        if hidden {
-            update_hidden_text_run(
-                &mut backend,
-                material_table.builder_mut(),
-                storage_key,
-                &prepared,
-                &panel_text_child,
-                material_candidate,
-            );
-            continue;
-        }
-        let batch_key = batch_key_for_run(
-            panel_layers,
-            *z_index,
-            *z_index_rank,
-            shadow,
-            material_candidate.pipeline_compatibility,
-            material_candidate.resource_compatibility.clone(),
-        );
-        apply_routed_text_run_update(
-            RebuiltTextRunInput {
-                backend: &mut backend,
-                builder: material_table.builder_mut(),
-                storage_key,
-                batch_key,
-                prepared: &prepared,
-                panel_text_child: &panel_text_child,
-                record_transform,
-                anti_alias: cascades.anti_alias(label_entity),
-                hdr_text_coverage_bias: cascades.hdr_text_coverage_bias(label_entity),
-                material_candidate,
-            },
+    )) = runs.get(label_entity)
+    else {
+        route.backend.batch_store_mut().remove_run(storage_key);
+        route.invalidation.forget_run(label_entity);
+        return;
+    };
+    let hidden = run_panels.run_is_hidden(label_visibility, child_of.parent());
+    let Ok((panel, panel_layers, panel_transform, tooltip_depth_priority)) =
+        run_panels.panels.get(child_of.parent())
+    else {
+        route.backend.batch_store_mut().remove_run(storage_key);
+        route.invalidation.forget_run(label_entity);
+        return;
+    };
+    let alpha_mode = cascades.alpha(label_entity);
+    let lighting = cascades.lighting(label_entity);
+    let shadow = cascades.visual_shadow(label_entity);
+    let material = cascades.material(label_entity, &route.text_material_default);
+    let slot_override = route
+        .visual_overrides
+        .get(child_of.parent(), panel_text_child.element_idx);
+    let (fill_color, material) =
+        apply_text_visual_override(slot_override, prepared.fill_color, material);
+    let placement = text_run_placement(label_transform, panel_transform, slot_override);
+    track_text_run_dependencies(
+        label_entity,
+        child_of.parent(),
+        panel_text_child.element_idx,
+        &material,
+        route,
+    );
+    let Some(material_candidate) = text_material_candidate_for_frame(
+        &material,
+        fill_color,
+        alpha_mode,
+        lighting,
+        &route.standard_materials,
+        &route.asset_server,
+        &route.text_material_default,
+    ) else {
+        route.backend.batch_store_mut().remove_run(storage_key);
+        route.invalidation.pending.insert(label_entity);
+        return;
+    };
+    retain_unpacked_text_run_retry(label_entity, &prepared, route);
+    if hidden {
+        update_hidden_text_run(
+            &mut route.backend,
+            route.material_table.builder_mut(),
+            storage_key,
             &prepared,
             &panel_text_child,
-            &z_index,
-            &z_index_rank,
-            cascade_changed.contains(&label_entity),
-            record_changed.contains(&label_entity),
+            material_candidate,
         );
+        return;
     }
+    let batch_key = batch_key_for_run(
+        render::material::PanelDisplayTarget::from(panel.coordinate_space()),
+        panel_layers,
+        *z_index,
+        *z_index_rank,
+        shadow,
+        material_candidate.pipeline_compatibility,
+        material_candidate.resource_compatibility.clone(),
+    );
+    apply_routed_text_run_update(
+        TextRunUpdate {
+            backend: &mut route.backend,
+            builder: route.material_table.builder_mut(),
+            storage_key,
+            batch_key,
+            prepared: &prepared,
+            panel_text_child: &panel_text_child,
+            placement,
+            depth_band: TextDepthBand::from(tooltip_depth_priority),
+            anti_alias: cascades.anti_alias(label_entity),
+            hdr_text_coverage_bias: cascades.hdr_text_coverage_bias(label_entity),
+            material_candidate,
+        },
+        &prepared,
+        &panel_text_child,
+    );
+}
 
-    reconcile_batch_entities(ReconcileBatchEntities {
-        atlas:           atlas.as_ref(),
-        anti_alias:      *anti_alias,
-        backend:         &mut backend,
-        meshes:          &mut meshes,
-        materials:       &mut materials,
-        storage_buffers: &mut storage_buffers,
-        commands:        &mut commands,
-    });
+fn track_text_run_dependencies(
+    run: Entity,
+    panel: Entity,
+    element: usize,
+    material: &Handle<StandardMaterial>,
+    route: &mut TextBatchRouteResources,
+) {
+    route.invalidation.track_run(
+        run,
+        material,
+        &route.standard_materials,
+        &route.asset_server,
+        &route.text_material_default,
+    );
+    route
+        .invalidation
+        .track_visual_run(run, panel, element, &route.visual_overrides);
+}
 
-    record_panel_text_batch_perf(&mut perf, mesh_build_start);
+/// Invisible outlines are omitted during preparation; only visible instances
+/// whose packed atlas input is still unavailable keep the router awake.
+fn retain_unpacked_text_run_retry(
+    label_entity: Entity,
+    prepared: &PreparedPanelText,
+    route: &mut TextBatchRouteResources,
+) {
+    if prepared
+        .prepared
+        .glyphs()
+        .iter()
+        .any(|glyph| route.backend.packed_path_index(glyph.key()).is_none())
+    {
+        route.invalidation.pending.insert(label_entity);
+    }
 }
 
 /// Records the completed text-batching duration and recomputes its total.
@@ -395,11 +1304,14 @@ fn record_panel_text_batch_perf(perf: &mut DiegeticPerfStats, mesh_build_start: 
 fn remove_emptied_panel_text_runs(
     emptied_runs: &mut RemovedComponents<PreparedPanelText>,
     backend: &mut GlyphCache,
+    material_table: &mut FrameMaterialTableBuilder,
+    invalidation: &mut TextBatchInvalidation,
 ) {
     for label_entity in emptied_runs.read() {
-        backend
-            .batch_store_mut()
-            .remove_run(RunStorageKey::from(label_entity));
+        invalidation.forget_run(label_entity);
+        let storage_key = RunStorageKey::from(label_entity);
+        material_table.refresh_text_run(storage_key);
+        backend.batch_store_mut().remove_run(storage_key);
     }
 }
 
@@ -442,27 +1354,24 @@ fn update_existing_text_run_material(
         .update_run_material(storage_key, material_slot);
 }
 
-struct RebuiltTextRunInput<'a> {
+struct TextRunUpdate<'a> {
     backend:                &'a mut GlyphCache,
     builder:                &'a mut FrameMaterialTableBuilder,
     storage_key:            RunStorageKey,
     batch_key:              PathBatchKey,
     prepared:               &'a PreparedPanelText,
     panel_text_child:       &'a PanelTextLayout,
-    record_transform:       Mat4,
+    placement:              TextRunPlacement,
+    depth_band:             TextDepthBand,
     anti_alias:             AntiAlias,
     hdr_text_coverage_bias: HdrTextCoverageBias,
     material_candidate:     MaterialSlotCandidate,
 }
 
 fn apply_routed_text_run_update(
-    input: RebuiltTextRunInput<'_>,
+    input: TextRunUpdate<'_>,
     prepared: &Ref<'_, PreparedPanelText>,
     panel_text_child: &Ref<'_, PanelTextLayout>,
-    z_index: &Ref<'_, PanelTextDrawZIndex>,
-    z_index_rank: &Ref<'_, PanelTextDrawZIndexRank>,
-    cascade_changed: bool,
-    render_record_changed: bool,
 ) {
     let key_changed = input
         .backend
@@ -473,18 +1382,16 @@ fn apply_routed_text_run_update(
     // signal here re-derives the quads.
     let geometry_changed = (prepared.is_changed() && !prepared.render_only)
         || panel_text_child.is_changed()
-        || z_index.is_changed()
-        || z_index_rank.is_changed()
-        || cascade_changed
         || key_changed;
-    let render_only_changed = prepared.is_changed() || render_record_changed;
-    apply_text_run_update(input, geometry_changed, render_only_changed);
+    // Every selected run can change placement, coverage or a material row.
+    // Refresh its record once while retaining quads for an unchanged key.
+    apply_text_run_update(input, geometry_changed, true);
 }
 
 /// Routes one run by what changed: a full glyph rebuild, a render-only record
 /// refresh that reuses the existing quads, or a material-row write.
 fn apply_text_run_update(
-    input: RebuiltTextRunInput<'_>,
+    input: TextRunUpdate<'_>,
     geometry_changed: bool,
     render_only_changed: bool,
 ) {
@@ -499,7 +1406,8 @@ fn apply_text_run_update(
             storage_key:            input.storage_key,
             prepared:               input.prepared,
             panel_text_child:       input.panel_text_child,
-            record_transform:       input.record_transform,
+            placement:              input.placement,
+            depth_band:             input.depth_band,
             anti_alias:             input.anti_alias,
             hdr_text_coverage_bias: input.hdr_text_coverage_bias,
             material_candidate:     input.material_candidate,
@@ -514,15 +1422,16 @@ fn apply_text_run_update(
     }
 }
 
-fn upsert_rebuilt_text_run(input: RebuiltTextRunInput<'_>) {
-    let RebuiltTextRunInput {
+fn upsert_rebuilt_text_run(input: TextRunUpdate<'_>) {
+    let TextRunUpdate {
         backend,
         builder,
         storage_key,
         batch_key,
         prepared,
         panel_text_child,
-        record_transform,
+        placement,
+        depth_band,
         anti_alias,
         hdr_text_coverage_bias,
         material_candidate,
@@ -557,7 +1466,8 @@ fn upsert_rebuilt_text_run(input: RebuiltTextRunInput<'_>) {
     let record = run_record_for(
         prepared,
         panel_text_child,
-        record_transform,
+        placement,
+        depth_band,
         anti_alias,
         hdr_text_coverage_bias,
         material_slot,
@@ -577,7 +1487,8 @@ struct RenderOnlyTextRunInput<'a> {
     storage_key:            RunStorageKey,
     prepared:               &'a PreparedPanelText,
     panel_text_child:       &'a PanelTextLayout,
-    record_transform:       Mat4,
+    placement:              TextRunPlacement,
+    depth_band:             TextDepthBand,
     anti_alias:             AntiAlias,
     hdr_text_coverage_bias: HdrTextCoverageBias,
     material_candidate:     MaterialSlotCandidate,
@@ -592,7 +1503,8 @@ fn refresh_text_run_record(input: RenderOnlyTextRunInput<'_>) {
         storage_key,
         prepared,
         panel_text_child,
-        record_transform,
+        placement,
+        depth_band,
         anti_alias,
         hdr_text_coverage_bias,
         material_candidate,
@@ -605,7 +1517,8 @@ fn refresh_text_run_record(input: RenderOnlyTextRunInput<'_>) {
     let record = run_record_for(
         prepared,
         panel_text_child,
-        record_transform,
+        placement,
+        depth_band,
         anti_alias,
         hdr_text_coverage_bias,
         material_slot,
@@ -613,10 +1526,6 @@ fn refresh_text_run_record(input: RenderOnlyTextRunInput<'_>) {
     backend
         .batch_store_mut()
         .update_run_record(storage_key, record);
-}
-
-const fn is_hidden(visibility: Option<&Visibility>) -> bool {
-    matches!(visibility, Some(Visibility::Hidden))
 }
 
 /// Applies one widget visual-slot override to a routed text run.
@@ -627,7 +1536,7 @@ const fn is_hidden(visibility: Option<&Visibility>) -> bool {
 /// `PipelineCompatibility`/`ResourceCompatibility` changes the computed
 /// `PathBatchKey` and `TextRunBatchStore::upsert_run` moves the run to its
 /// compatible destination batch. A panel-local `offset` is applied to the
-/// run's `PathRenderRecord` matrix instead, by [`text_run_record_transform`]
+/// run's `PathRenderRecord` matrix instead, by [`text_run_placement`]
 /// at record build and by [`write_batch_run_transforms`] after propagation.
 fn apply_text_visual_override(
     slot_override: Option<&VisualSlotOverride>,
@@ -647,17 +1556,25 @@ fn apply_text_visual_override(
 /// `GlobalTransform` matrix plus any slot-override `offset` composed through
 /// the owning panel's global transform via [`offset_record_matrix`]. The
 /// text-run entity `Transform` and `PanelTextLayout` payload stay untouched.
-fn text_run_record_transform(
+struct TextRunPlacement {
+    transform:      Mat4,
+    physical_plane: WorldPanelPlane,
+}
+
+fn text_run_placement(
     label_transform: &GlobalTransform,
     panel_transform: &GlobalTransform,
     slot_override: Option<&VisualSlotOverride>,
-) -> Mat4 {
+) -> TextRunPlacement {
     let matrix = label_transform.to_matrix();
-    slot_override
-        .and_then(|slot_override| slot_override.offset)
-        .map_or(matrix, |offset| {
-            offset_record_matrix(matrix, panel_transform, offset)
-        })
+    TextRunPlacement {
+        transform:      slot_override
+            .and_then(|slot_override| slot_override.offset)
+            .map_or(matrix, |offset| {
+                offset_record_matrix(matrix, panel_transform, offset)
+            }),
+        physical_plane: WorldPanelPlane::from_panel(panel_transform, TEXT_Z_OFFSET),
+    }
 }
 
 /// Adds a panel-local `offset` to a world `matrix` by rotating and scaling
@@ -673,12 +1590,13 @@ fn offset_record_matrix(matrix: Mat4, panel_transform: &GlobalTransform, offset:
     matrix
 }
 
+// Every text path (including icons, rich runs and hand-built TextContent)
+// culls its back, independently of its panel or source paint's sidedness.
 fn text_material_candidate_for_frame(
     handle: &Handle<StandardMaterial>,
     fill_color: Color,
     alpha_mode: AlphaMode,
     lighting: Lighting,
-    sidedness: Sidedness,
     standard_materials: &Assets<StandardMaterial>,
     asset_server: &AssetServer,
     text_material_default: &TextMaterial,
@@ -691,7 +1609,11 @@ fn text_material_candidate_for_frame(
     )?;
     let base = strip_tangent_dependent_maps(base);
     Some(render::analytic_material_slot_candidate(
-        &base, fill_color, alpha_mode, lighting, sidedness,
+        &base,
+        fill_color,
+        alpha_mode,
+        lighting,
+        Sidedness::FrontOnly,
     ))
 }
 
@@ -718,6 +1640,7 @@ fn append_text_material_row(
 }
 
 fn batch_key_for_run(
+    display_target: PanelDisplayTarget,
     panel_layers: Option<&RenderLayers>,
     z_index: PanelTextDrawZIndex,
     z_index_rank: PanelTextDrawZIndexRank,
@@ -726,6 +1649,7 @@ fn batch_key_for_run(
     resource_compatibility: ResourceCompatibility,
 ) -> PathBatchKey {
     PathBatchKey {
+        display_target,
         z_index: z_index.0,
         z_index_rank: z_index_rank.0,
         batch_family: DrawBatchFamily::Text,
@@ -739,34 +1663,38 @@ fn batch_key_for_run(
 fn run_record_for(
     prepared: &PreparedPanelText,
     panel_text_child: &PanelTextLayout,
-    record_transform: Mat4,
+    placement: TextRunPlacement,
+    depth_band: TextDepthBand,
     anti_alias: AntiAlias,
     hdr_text_coverage_bias: HdrTextCoverageBias,
     material: MaterialSlotId,
 ) -> PathRenderRecord {
     PathRenderRecord {
+        panel_plane:            placement.physical_plane.coefficients,
         // Pre-propagation value; `write_batch_run_transforms` overwrites it
         // after `TransformSystems::Propagate` the same frame.
-        transform:          record_transform,
-        material:           material.into(),
-        render_mode:        u32::from(RenderMode::from(prepared.render_mode)),
-        clip_depth_nudge:   panel_text_child.clip_depth_nudge,
-        oit_depth_offset:   panel_text_child.oit_depth_offset,
-        aa_flags:           anti_alias.aa_flags(),
-        text_coverage_bias: hdr_text_coverage_bias.shader_value(),
-        text_em_height:     prepared.em_height,
+        transform:              placement.transform,
+        material:               material.into(),
+        render_mode:            u32::from(RenderMode::from(prepared.render_mode)),
+        clip_depth_nudge:       panel_text_child.clip_depth_nudge,
+        oit_paint_order:        panel_text_child.oit_paint_order,
+        aa_flags:               anti_alias.aa_flags(),
+        text_coverage_bias:     hdr_text_coverage_bias.shader_value(),
+        padding:                0,
+        tooltip_depth_priority: depth_band.shader_flag(),
     }
 }
 
 /// Inputs for [`reconcile_batch_entities`].
 struct ReconcileBatchEntities<'a, 'w, 's> {
-    atlas:           Option<&'a PathAtlasHandles>,
-    anti_alias:      AntiAlias,
-    backend:         &'a mut GlyphCache,
-    meshes:          &'a mut Assets<Mesh>,
-    materials:       &'a mut Assets<PathExtendedMaterial>,
-    storage_buffers: &'a mut Assets<ShaderBuffer>,
-    commands:        &'a mut Commands<'w, 's>,
+    atlas:            AtlasPublication,
+    display_textures: &'a DisplayCompensationTextures,
+    anti_alias:       AntiAlias,
+    backend:          &'a mut GlyphCache,
+    meshes:           &'a mut Assets<Mesh>,
+    materials:        &'a mut Assets<PathExtendedMaterial>,
+    storage_buffers:  &'a mut Assets<ShaderBuffer>,
+    commands:         &'a mut Commands<'w, 's>,
 }
 
 /// Reconciles batch entities and GPU assets to the store's state: despawns
@@ -775,6 +1703,7 @@ struct ReconcileBatchEntities<'a, 'w, 's> {
 fn reconcile_batch_entities(input: ReconcileBatchEntities<'_, '_, '_>) {
     let ReconcileBatchEntities {
         atlas,
+        display_textures,
         anti_alias,
         backend,
         meshes,
@@ -799,11 +1728,12 @@ fn reconcile_batch_entities(input: ReconcileBatchEntities<'_, '_, '_>) {
             Some(_) => {},
         }
     }
-    if let Some(atlas) = atlas {
+    if let AtlasPublication::Unchanged(atlas) | AtlasPublication::Replaced(atlas) = atlas {
         for key in to_create {
             spawn_batch_entity(SpawnBatchEntity {
                 key: &key,
-                atlas,
+                display_textures,
+                atlas: &atlas,
                 anti_alias,
                 backend: &mut *backend,
                 meshes: &mut *meshes,
@@ -816,7 +1746,6 @@ fn reconcile_batch_entities(input: ReconcileBatchEntities<'_, '_, '_>) {
     for key in to_grow {
         grow_batch_assets(&key, backend, meshes, materials, storage_buffers, commands);
     }
-    refresh_batch_material_depth_biases(backend, materials);
 }
 
 /// Copies each routed label's propagated `GlobalTransform` into its
@@ -839,17 +1768,19 @@ pub(super) fn write_batch_run_transforms(
         if !transform.is_changed() && !overrides_changed {
             continue;
         }
-        let mut matrix = transform.to_matrix();
-        if let Some(offset) = visual_overrides
-            .get(child_of.parent(), panel_text_child.element_idx)
-            .and_then(|slot_override| slot_override.offset)
-            && let Ok(panel_transform) = panels.get(child_of.parent())
-        {
-            matrix = offset_record_matrix(matrix, panel_transform, offset);
-        }
-        backend
-            .batch_store_mut()
-            .update_run_transform(RunStorageKey::from(label_entity), matrix);
+        let Ok(panel_transform) = panels.get(child_of.parent()) else {
+            continue;
+        };
+        let placement = text_run_placement(
+            &transform,
+            panel_transform,
+            visual_overrides.get(child_of.parent(), panel_text_child.element_idx),
+        );
+        backend.batch_store_mut().update_run_transform(
+            RunStorageKey::from(label_entity),
+            placement.transform,
+            placement.physical_plane.coefficients,
+        );
     }
 }
 
@@ -892,7 +1823,7 @@ pub(super) fn update_batch_bounds(
     }
 }
 
-/// Uploads each batch's dirty record buffers — one `set_data` per dirty
+/// Uploads each batch's dirty record buffers — one same-size retained write per dirty
 /// buffer per batch — and publishes the batch counters. The split dirty flags
 /// keep the uploads minimal: a transform-only frame uploads only the run
 /// table, a same-count text edit only the instance buffer, an unchanged frame
@@ -914,6 +1845,7 @@ pub(super) fn commit_batch_buffers(
     let mut instance_uploads = 0_usize;
     let mut run_table_uploads = 0_usize;
     perf.text_breakdown.clear();
+    let atlas_is_current = backend.atlas_is_current();
     for (key, batch) in backend.batch_store_mut().batches_mut() {
         batches += 1;
         runs += batch.run_count();
@@ -926,7 +1858,13 @@ pub(super) fn commit_batch_buffers(
             &key.resource_compatibility,
             batch.path_record_count(),
         ));
-        if batch.gpu.is_none() {
+        let Some(gpu) = &batch.gpu else {
+            continue;
+        };
+        if !atlas_is_current
+            || batch.path_record_count() > gpu.capacity
+            || batch.run_count().to_u32() > gpu.run_capacity
+        {
             continue;
         }
         let instances_payload = batch.path_quads_are_dirty().then(|| {
@@ -937,6 +1875,10 @@ pub(super) fn commit_batch_buffers(
             let run_capacity = batch.gpu.as_ref().map_or(0, |gpu| gpu.run_capacity);
             padded_run_records(batch.run_records(), run_capacity)
         });
+        let instances_payload =
+            instances_payload.map(|records| bytemuck::cast_slice(&records).to_vec());
+        let run_table_payload =
+            run_table_payload.map(|records| bytemuck::cast_slice(&records).to_vec());
         batch.clear_path_quad_dirty();
         batch.clear_render_record_dirty();
         let Some(gpu) = &batch.gpu else {
@@ -944,20 +1886,12 @@ pub(super) fn commit_batch_buffers(
         };
         if let Some(data) = instances_payload {
             let handle = gpu.instances.clone();
-            material_table::stage_retained_batch_buffer_upload(
-                &mut staged_uploads,
-                &handle,
-                ShaderBuffer::from(data),
-            );
+            material_table::stage_retained_batch_buffer_upload(&mut staged_uploads, &handle, data);
             instance_uploads += 1;
         }
         if let Some(data) = run_table_payload {
             let handle = gpu.run_table.clone();
-            material_table::stage_retained_batch_buffer_upload(
-                &mut staged_uploads,
-                &handle,
-                ShaderBuffer::from(data),
-            );
+            material_table::stage_retained_batch_buffer_upload(&mut staged_uploads, &handle, data);
             run_table_uploads += 1;
         }
     }
@@ -977,15 +1911,19 @@ fn padded_glyph_records(records: &[PathQuadRecord], capacity: u32) -> Vec<PathQu
     padded.resize(
         capacity.to_usize().max(records.len()),
         PathQuadRecord {
-            rect_min:          Vec2::ZERO,
-            rect_size:         Vec2::ZERO,
-            uv_min:            Vec2::ZERO,
-            uv_size:           Vec2::ZERO,
-            box_uv_min:        Vec2::ZERO,
-            box_uv_size:       Vec2::ZERO,
-            packed_path_index: 0,
-            render_index:      0,
-            box_uv_flip_x:     0,
+            rect_min:           Vec2::ZERO,
+            rect_size:          Vec2::ZERO,
+            uv_min:             Vec2::ZERO,
+            uv_size:            Vec2::ZERO,
+            box_uv_min:         Vec2::ZERO,
+            box_uv_size:        Vec2::ZERO,
+            packed_path_index:  0,
+            render_index:       0,
+            box_uv_flip_x:      0,
+            clip_edges:         0,
+            text_fit_mode:      TextFitMode::SmallGlyph.shader_value(),
+            padding_before_fit: 0,
+            text_fit_offset:    Vec2::ZERO,
         },
     );
     padded
@@ -1001,14 +1939,16 @@ fn padded_run_records(records: &[PathRenderRecord], run_capacity: u32) -> Vec<Pa
     padded.resize(
         run_capacity.to_usize().max(records.len()),
         PathRenderRecord {
-            transform:          Mat4::ZERO,
-            material:           SdfPaintMaterial::NotAuthored.to_gpu(),
-            render_mode:        0,
-            clip_depth_nudge:   0.0,
-            oit_depth_offset:   0.0,
-            aa_flags:           0,
-            text_coverage_bias: 0.0,
-            text_em_height:     0.0,
+            panel_plane:            bevy::math::Vec4::ZERO,
+            transform:              Mat4::ZERO,
+            material:               SdfPaintMaterial::NotAuthored.to_gpu(),
+            render_mode:            0,
+            clip_depth_nudge:       0.0,
+            oit_paint_order:        0.0,
+            aa_flags:               0,
+            text_coverage_bias:     0.0,
+            padding:                0,
+            tooltip_depth_priority: 0,
         },
     );
     padded
@@ -1045,6 +1985,10 @@ fn build_glyph_records(
             packed_path_index,
             render_index: 0,
             box_uv_flip_x: 0,
+            clip_edges: extents.clip_edges,
+            text_fit_mode: TextFitMode::SmallGlyph.shader_value(),
+            padding_before_fit: 0,
+            text_fit_offset: Vec2::ZERO,
         });
     }
     Some(records)
@@ -1102,14 +2046,15 @@ fn inert_batch_mesh(capacity: u32) -> Mesh {
 
 /// Inputs for [`spawn_batch_entity`].
 struct SpawnBatchEntity<'a, 'w, 's> {
-    key:             &'a PathBatchKey,
-    atlas:           &'a PathAtlasHandles,
-    anti_alias:      AntiAlias,
-    backend:         &'a mut GlyphCache,
-    meshes:          &'a mut Assets<Mesh>,
-    materials:       &'a mut Assets<PathExtendedMaterial>,
-    storage_buffers: &'a mut Assets<ShaderBuffer>,
-    commands:        &'a mut Commands<'w, 's>,
+    key:              &'a PathBatchKey,
+    display_textures: &'a DisplayCompensationTextures,
+    atlas:            &'a PathAtlasHandles,
+    anti_alias:       AntiAlias,
+    backend:          &'a mut GlyphCache,
+    meshes:           &'a mut Assets<Mesh>,
+    materials:        &'a mut Assets<PathExtendedMaterial>,
+    storage_buffers:  &'a mut Assets<ShaderBuffer>,
+    commands:         &'a mut Commands<'w, 's>,
 }
 
 /// Spawns one batch's render entity with its GPU assets: record buffers
@@ -1118,6 +2063,7 @@ struct SpawnBatchEntity<'a, 'w, 's> {
 fn spawn_batch_entity(input: SpawnBatchEntity<'_, '_, '_>) {
     let SpawnBatchEntity {
         key,
+        display_textures,
         atlas,
         anti_alias,
         backend,
@@ -1134,16 +2080,23 @@ fn spawn_batch_entity(input: SpawnBatchEntity<'_, '_, '_>) {
     let glyph_records = padded_glyph_records(batch.path_records(), capacity);
     let run_records = padded_run_records(batch.run_records(), run_capacity);
 
-    let instances = storage_buffers.add(ShaderBuffer::from(glyph_records));
-    let run_table = storage_buffers.add(ShaderBuffer::from(run_records));
+    let instances = ShaderBuffer::from(glyph_records);
+    let run_table = ShaderBuffer::from(run_records);
+    let instances = storage_buffers.add(instances);
+    let run_table = storage_buffers.add(run_table);
     let mesh = meshes.add(inert_batch_mesh(capacity));
-    let material = materials.add(batch_material(BatchMaterialInput {
+    let mut material = batch_material(BatchMaterialInput {
         key,
         atlas,
         instances: instances.clone(),
         run_table: run_table.clone(),
         anti_alias,
-    }));
+    });
+    render::analytic_paths::set_path_display_table(
+        &mut material,
+        key.display_target.table(display_textures),
+    );
+    let material = materials.add(material);
 
     let mut batch_entity = commands.spawn((
         DiegeticTextBatch,
@@ -1217,14 +2170,10 @@ fn grow_batch_assets(
         run_capacity *= 2;
     }
 
-    let instances = storage_buffers.add(ShaderBuffer::from(padded_glyph_records(
-        batch.path_records(),
-        capacity,
-    )));
-    let run_table = storage_buffers.add(ShaderBuffer::from(padded_run_records(
-        batch.run_records(),
-        run_capacity,
-    )));
+    let instances = ShaderBuffer::from(padded_glyph_records(batch.path_records(), capacity));
+    let run_table = ShaderBuffer::from(padded_run_records(batch.run_records(), run_capacity));
+    let instances = storage_buffers.add(instances);
+    let run_table = storage_buffers.add(run_table);
     let mesh = meshes.add(inert_batch_mesh(capacity));
     commands.entity(entity).insert(Mesh3d(mesh.clone()));
 
@@ -1278,11 +2227,12 @@ fn batch_material(input: BatchMaterialInput<'_>) -> PathExtendedMaterial {
         key.pipeline_compatibility,
     );
     base.alpha_mode = batch_gpu_alpha_mode(key.pipeline_compatibility.alpha.into());
-    base.depth_bias = key.z_index_rank.screen_depth_bias().get();
+    base.depth_bias = key.z_index_rank.screen_text_depth_bias().get();
+    let alpha_mode = base.alpha_mode;
     PathExtendedMaterial {
         base,
-        extension: render::analytic_paths::vertex_pull(
-            RenderMode::Text,
+        extension: render::analytic_paths::text_vertex_pull(
+            alpha_mode,
             0.0,
             anti_alias,
             PathMaterialBuffers {
@@ -1293,24 +2243,6 @@ fn batch_material(input: BatchMaterialInput<'_>) -> PathExtendedMaterial {
                 run_records: run_table,
             },
         ),
-    }
-}
-
-fn refresh_batch_material_depth_biases(
-    backend: &mut GlyphCache,
-    materials: &mut Assets<PathExtendedMaterial>,
-) {
-    for (key, batch) in backend.batch_store_mut().batches_mut() {
-        let Some(gpu) = &batch.gpu else {
-            continue;
-        };
-        let Some(mut material) = materials.get_mut(&gpu.material) else {
-            continue;
-        };
-        let depth_bias = key.z_index_rank.screen_depth_bias().get();
-        if material.base.depth_bias.to_bits() != depth_bias.to_bits() {
-            material.base.depth_bias = depth_bias;
-        }
     }
 }
 
@@ -1350,6 +2282,7 @@ mod tests {
 
     use bevy::asset::AssetPlugin;
     use bevy::ecs::change_detection::Tick;
+    use bevy::ecs::system::RunSystemOnce;
     use bevy::image::Image;
     use bevy::picking::hover::PickingInteraction;
     use bevy::prelude::App;
@@ -1362,22 +2295,119 @@ mod tests {
     use bevy::prelude::TransformSystems;
     use bevy::prelude::Vec3;
     use bevy::prelude::Vec4;
+    use bevy::prelude::Window;
+    use bevy::window::PrimaryWindow;
     use hana_kana::ToF32;
 
     use super::*;
+
+    #[test]
+    fn opaque_text_batch_is_observed_in_alpha_mask_phase() {
+        assert_eq!(
+            batch_gpu_alpha_mode(AlphaMode::Opaque),
+            AlphaMode::Mask(0.0)
+        );
+        let view = Entity::from_bits(1);
+        let batch = MainEntity::from(Entity::from_bits(2));
+        let retained = RetainedViewEntity::new(view.into(), None, 0);
+        let mut phases = ViewBinnedRenderPhases::<AlphaMask3d>::default();
+        phases.prepare_for_new_frame(retained, GpuPreprocessingMode::None);
+        let id = CachedRenderPipelineId::new(7);
+        phases.get_mut(&retained).expect("prepared phase").add(
+            OpaqueNoLightmap3dBatchSetKey {
+                pipeline:                  id,
+                draw_function:             DrawFunctionId(0),
+                material_bind_group_index: None,
+                slabs:                     MeshSlabs::default(),
+            },
+            OpaqueNoLightmap3dBinKey {
+                asset_id: Handle::<Mesh>::default().id().untyped(),
+            },
+            (Entity::PLACEHOLDER, batch),
+            InputUniformIndex::default(),
+            BinnedRenderPhaseType::BatchableMesh,
+        );
+        let membership = MainEntityHashSet::from_iter([batch]);
+        assert_eq!(
+            first_binned_text_batch(
+                phases.get(&retained).expect("prepared phase"),
+                &membership,
+                view,
+                &[],
+                |key| key.pipeline,
+            ),
+            Some((batch, id)),
+        );
+    }
+
+    #[test]
+    fn first_text_batch_can_live_only_in_post_resolve_phase() {
+        let batch = MainEntity::from(Entity::from_bits(2));
+        let pipeline = CachedRenderPipelineId::new(7);
+        let mut phase = SortedRenderPhase::<PostOitResolveText3d>::default();
+        phase.add_retained(PostOitResolveText3d::from_transparent(
+            Transparent3d {
+                sorting_info: TransparentSortingInfo3d::AlwaysOnTop,
+                distance: 0.0,
+                pipeline,
+                entity: (Entity::from_bits(3), batch),
+                draw_function: DrawFunctionId(0),
+                batch_range: 0..1,
+                extra_index: PhaseItemExtraIndex::None,
+                indexed: false,
+            },
+            DrawFunctionId(1),
+        ));
+        assert_eq!(
+            first_sorted_text_batch(&phase, &MainEntityHashSet::from_iter([batch])),
+            Some((batch, pipeline)),
+        );
+    }
+
+    #[test]
+    fn observed_first_batch_freezes_text_batch_membership() {
+        let first = MainEntity::from(Entity::from_bits(1));
+        let later = MainEntity::from(Entity::from_bits(2));
+        let mut membership = TextBatchPhaseMembership::default();
+        membership.refresh_before_first_batch(FirstTextBatchPipeline::NotObserved, [first]);
+        membership.refresh_before_first_batch(
+            FirstTextBatchPipeline::Queued {
+                view: Entity::PLACEHOLDER,
+                id:   CachedRenderPipelineId::new(3),
+            },
+            [later],
+        );
+        assert!(membership.0.contains(&first));
+        assert!(!membership.0.contains(&later));
+    }
+    use bevy::core_pipeline::core_3d::TransparentSortingInfo3d;
+    use bevy::core_pipeline::prepass::OpaqueNoLightmap3dBatchSetKey;
+    use bevy::core_pipeline::prepass::OpaqueNoLightmap3dBinKey;
+    use bevy::material::labels::DrawFunctionId;
+    use bevy::render::batching::gpu_preprocessing::GpuPreprocessingMode;
+    use bevy::render::mesh::allocator::MeshSlabs;
+    use bevy::render::render_phase::BinnedRenderPhaseType;
+    use bevy::render::render_phase::InputUniformIndex;
+    use bevy::render::render_phase::PhaseItemExtraIndex;
+    use bevy::render::view::RetainedViewEntity;
+
     use crate::Appearance;
     use crate::Border;
     use crate::Mm;
     use crate::PanelWidget;
+    use crate::Px;
     use crate::cascade;
     use crate::cascade::CascadeEntityCommandsExt;
     use crate::cascade::TextMaterial;
     use crate::constants::MONOSPACE_WIDTH_RATIO;
+    use crate::layout::BoundingBox;
     use crate::layout::DrawZIndex;
     use crate::layout::El;
     use crate::layout::GlyphShadowMode;
     use crate::layout::LayoutBuilder;
     use crate::layout::LayoutTree;
+    use crate::layout::ResolvedFontFace;
+    use crate::layout::ShapedGlyph;
     use crate::layout::Text;
     use crate::layout::TextDimensions;
     use crate::layout::TextMeasure;
@@ -1385,18 +2415,24 @@ mod tests {
     use crate::panel::ComputedDiegeticPanel;
     use crate::panel::DiegeticPanelCommands;
     use crate::panel::HeadlessLayoutPlugin;
+    use crate::render::PackedPathRecord;
     use crate::render::constants;
+    use crate::render::display_compensation::DisplayCompensationPlugin;
+    use crate::render::display_compensation::DisplayCompensationTextures;
+    use crate::render::material::PanelDisplayTarget;
     use crate::render::material_table::BatchAssetWrites;
     use crate::render::material_table::MaterialSlotValues;
     use crate::render::material_table::MaterialTableAppendReady;
     use crate::render::material_table::MaterialTablePlugin;
-    use crate::render::panel_text::alpha;
-    use crate::render::panel_text::glyph_cascade;
+    use crate::render::panel_text::PanelTextCascadeBridgePlugin;
     use crate::render::panel_text::reify;
     use crate::render::panel_text::shaping;
     use crate::render::text_shaping::TextShapingContext;
+    use crate::screen_space::ScreenSpacePlugin;
     use crate::text::DiegeticTextMeasurer;
+    use crate::text::Font;
     use crate::text::FontRegistry;
+    use crate::text::PositionedGlyph;
     use crate::widgets::VisualElementCapabilities;
     use crate::widgets::VisualSlotId;
     use crate::widgets::VisualSlotOverride;
@@ -1412,6 +2448,96 @@ mod tests {
     /// Panel-local offset with distinct axis values so a rotated panel maps
     /// it to a visibly different world delta.
     const TEXT_SLOT_OFFSET: Vec2 = Vec2::new(4.0, -2.0);
+
+    #[test]
+    fn real_glyph_vertex_margin_uses_layout_em_at_world_and_screen_scales() {
+        const FONT_DATA: &[u8] = include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf");
+        let vertex_shader = include_str!("../analytic_paths/analytic_path_vertex_pull.wesl");
+        assert!(
+            vertex_shader
+                .contains("let pixels_per_em = layout_em / max(units_per_pixel, LINE_AA_EPSILON);")
+        );
+        let face = ttf_parser::Face::parse(FONT_DATA, 0).expect("embedded mono face");
+        let glyph_id = face.glyph_index('H').expect("embedded H glyph");
+        let em = f32::from(face.units_per_em());
+        let font = Font::from_bytes("Vertex margin fixture", FONT_DATA).expect("embedded font");
+        let shaped = ShapedGlyph {
+            font_face: ResolvedFontFace {
+                requested_font_id: 0,
+                blob_id:           31,
+                collection_index:  0,
+            },
+            id:        glyph_id.0,
+            x:         0.0,
+            y:         0.0,
+            baseline:  0.0,
+            advance:   f32::from(face.glyph_hor_advance(glyph_id).expect("H advance")),
+        };
+        let positioned = [PositionedGlyph {
+            glyph:            &shaped,
+            font:             &font,
+            collection_index: 0,
+        }];
+        let layout = PanelTextLayout {
+            id:               crate::PanelElementId::named("vertex margin fixture"),
+            line_index:       0,
+            element_idx:      0,
+            draw_ordinal:     0,
+            clip_depth_nudge: 0.0,
+            oit_paint_order:  0.0,
+            bounds:           BoundingBox {
+                x:      0.0,
+                y:      0.0,
+                width:  1.0,
+                height: 1.0,
+            },
+            scale_x:          1.0,
+            scale_y:          1.0,
+            anchor_x:         0.0,
+            anchor_y:         0.0,
+            clip_rect:        None,
+        };
+
+        for layout_font_size in [0.05, 50.0] {
+            let mut cache = GlyphCache::default();
+            let prepared = cache
+                .prepare_positioned_run_with_scale(
+                    &positioned,
+                    Vec2::ZERO,
+                    layout_font_size,
+                    Vec2::ONE,
+                    render::DEFAULT_BAND_COUNT,
+                )
+                .expect("fixture run");
+            let records = build_glyph_records(&cache, &prepared, None, &layout)
+                .expect("packed glyph records");
+            let quad = *records.first().expect("H quad");
+            let glyph = *prepared.glyphs().first().expect("H instance");
+            let path = PackedPathRecord::new(glyph.bounds(), 0, 1, 1, 1, 0.0).with_text_em_size(em);
+            let design_span =
+                quad.uv_size * Vec2::new(path.bounds_min_size.z, path.bounds_min_size.w);
+            let layout_per_design = quad.rect_size / design_span;
+            assert!((layout_per_design.x - layout_per_design.y).abs() < 1.0e-6);
+
+            for (expected_pixels_per_em, expected_margin) in
+                [(1.5, 0.0), (2.9, 0.0), (4.9, 0.5), (12.0, 0.5)]
+            {
+                let projected_units_per_pixel =
+                    Vec2::splat(layout_font_size / expected_pixels_per_em);
+                let vertex = quad.vertex_text_margin(path, projected_units_per_pixel);
+                let design_units_per_pixel = projected_units_per_pixel / layout_per_design;
+                let fragment_pixels_per_em = em / design_units_per_pixel.max_element();
+                assert!(
+                    (vertex.pixels_per_em - fragment_pixels_per_em).abs()
+                        < expected_pixels_per_em * 0.03,
+                    "{layout_font_size} layout units/em at {expected_pixels_per_em} px/em: vertex {}, fragment {}",
+                    vertex.pixels_per_em,
+                    fragment_pixels_per_em,
+                );
+                assert!((vertex.margin_px - expected_margin).abs() < 1.0e-5);
+            }
+        }
+    }
 
     fn monospace_measurer() -> DiegeticTextMeasurer {
         DiegeticTextMeasurer {
@@ -1438,6 +2564,7 @@ mod tests {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
             .add_plugins(AssetPlugin::default())
+            .add_plugins(DisplayCompensationPlugin)
             .add_plugins(MaterialTablePlugin)
             .add_plugins(TransformPlugin)
             .insert_resource(monospace_measurer())
@@ -1450,19 +2577,22 @@ mod tests {
             .insert_resource(FontRegistry::new().expect("embedded font should parse"))
             .init_resource::<TextShapingContext>()
             .init_resource::<GlyphCache>()
+            .init_resource::<TextBatchInvalidation>()
             .init_resource::<AntiAlias>()
             .init_resource::<VisualOverrideIndex>()
+            .init_resource::<TextBatchRouteCounts>()
             .init_asset::<Mesh>()
             .init_asset::<ShaderBuffer>()
             .init_asset::<PathExtendedMaterial>()
-            .add_observer(alpha::seed_panel_text_child_alpha)
-            .add_observer(glyph_cascade::seed_panel_text_child_glyph)
+            .add_plugins(PanelTextCascadeBridgePlugin)
             .add_systems(
                 PostUpdate,
                 (
                     reify::reify_text_entities,
                     shaping::shape_panel_text_children.after(reify::reify_text_entities),
+                    reset_text_batch_route_counts.before(update_panel_text_batches),
                     update_panel_text_batches
+                        .run_if(panel_text_batch_inputs_changed)
                         .after(shaping::shape_panel_text_children)
                         .after(MaterialTableAppendReady)
                         .in_set(BatchAssetWrites)
@@ -1488,6 +2618,12 @@ mod tests {
     fn one_text_tree() -> LayoutTree {
         let mut builder = LayoutBuilder::new(100.0, 50.0);
         builder.text(("Alpha", TextStyle::new(10.0)));
+        builder.build()
+    }
+
+    fn route_wake_text_tree() -> LayoutTree {
+        let mut builder = LayoutBuilder::new(100.0, 50.0);
+        builder.text(crate::layout::Text::new("Alpha", TextStyle::new(10.0)).id("route-wake-text"));
         builder.build()
     }
 
@@ -1526,6 +2662,719 @@ mod tests {
                     .expect("panel should build"),
             )
             .id()
+    }
+
+    #[test]
+    fn panel_text_batch_route_sleeps_and_visits_only_one_changed_panel() {
+        let mut app = pipeline_app();
+        let panels: Vec<_> = (0..30)
+            .map(|_| spawn_panel(&mut app, route_wake_text_tree()))
+            .collect();
+        settle(&mut app);
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<TextBatchRouteCounts>(),
+            &TextBatchRouteCounts::default()
+        );
+
+        let changed_panel = panels[0];
+        let changed = app
+            .world_mut()
+            .run_system_once(move |mut text: crate::PanelText| {
+                text.set_text(
+                    changed_panel,
+                    &crate::PanelElementId::named("route-wake-text"),
+                    "Changed",
+                )
+            })
+            .expect("PanelText setter should run");
+        assert!(changed, "the named text run should resolve");
+        app.update();
+
+        let counts = app.world().resource::<TextBatchRouteCounts>();
+        assert_eq!(counts.runs, 1);
+        assert_eq!(counts.visits, 1);
+
+        app.update();
+        app.world_mut()
+            .entity_mut(changed_panel)
+            .get_mut::<Transform>()
+            .expect("panel should carry a transform")
+            .translation
+            .x += 1.0;
+        app.update();
+
+        let counts = app.world().resource::<TextBatchRouteCounts>();
+        assert_eq!(counts.runs, 1, "an authored panel move wakes the route");
+        assert_eq!(counts.visits, 1, "only the moved panel's run is visited");
+
+        app.update();
+        app.world_mut()
+            .entity_mut(changed_panel)
+            .remove::<DiegeticPanel>();
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<TextBatchRouteCounts>().runs,
+            1,
+            "removing the panel role wakes text retirement in the same update",
+        );
+    }
+
+    #[test]
+    fn panel_text_batch_route_sleeps_with_space_and_empty_outline_glyph() {
+        const FONT_DATA: &[u8] = include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf");
+        let face = ttf_parser::Face::parse(FONT_DATA, 0).expect("embedded mono face");
+        let space = face.glyph_index(' ').expect("space glyph");
+        let nonbreaking_space = face
+            .glyph_index('\u{00a0}')
+            .expect("nonbreaking space glyph");
+        assert_ne!(
+            space, nonbreaking_space,
+            "exercise two distinct blank glyphs"
+        );
+        assert!(face.glyph_bounding_box(space).is_none());
+        assert!(face.glyph_bounding_box(nonbreaking_space).is_none());
+
+        let mut app = pipeline_app();
+        let mut builder = LayoutBuilder::new(100.0, 50.0);
+        builder.text(("A \u{00a0}B", TextStyle::new(10.0)));
+        spawn_panel(&mut app, builder.build());
+        settle(&mut app);
+
+        let labels = label_entities(&mut app);
+        assert_eq!(labels.len(), 1);
+        let prepared = app
+            .world()
+            .entity(labels[0])
+            .get::<PreparedPanelText>()
+            .expect("mixed visible and blank text should prepare");
+        assert_eq!(
+            prepared.prepared.glyph_count(),
+            2,
+            "blank outlines never become instances"
+        );
+        assert!(prepared.prepared.glyphs().iter().all(|glyph| {
+            app.world()
+                .resource::<GlyphCache>()
+                .packed_path_index(glyph.key())
+                .is_some()
+        }));
+        assert!(
+            app.world()
+                .resource::<TextBatchInvalidation>()
+                .pending
+                .is_empty()
+        );
+
+        for _ in 0..4 {
+            app.update();
+            assert!(
+                app.world()
+                    .resource::<TextBatchInvalidation>()
+                    .pending
+                    .is_empty()
+            );
+            assert_eq!(
+                app.world().resource::<TextBatchRouteCounts>(),
+                &TextBatchRouteCounts::default()
+            );
+        }
+    }
+
+    #[test]
+    fn text_material_changes_visit_only_users_and_retain_same_key_geometry() {
+        let mut app = pipeline_app();
+        let authored = material_with_metallic(&mut app, 0.21);
+        spawn_panel(
+            &mut app,
+            one_text_tree_with_style(TextStyle::new(10.0).with_material(authored.clone())),
+        );
+        for _ in 0..20 {
+            spawn_panel(&mut app, one_text_tree());
+        }
+        settle(&mut app);
+        let retained = retained_text_geometry(&app);
+
+        let unrelated = material_with_metallic(&mut app, 0.42);
+        app.update();
+        assert_eq!(app.world().resource::<TextBatchRouteCounts>().visits, 0);
+        app.world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .get_mut(&unrelated)
+            .expect("unrelated asset")
+            .metallic = 0.9;
+        app.update();
+        assert_eq!(app.world().resource::<TextBatchRouteCounts>().visits, 0);
+
+        app.world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .get_mut(&authored)
+            .expect("authored asset")
+            .metallic = 0.73;
+        app.update();
+        assert_eq!(
+            app.world().resource::<TextBatchRouteCounts>().visits,
+            1,
+            "same-frame scalar changes select only users"
+        );
+        assert_eq!(retained_text_geometry(&app), retained);
+        assert_eq!(text_material_user_count(&app, 0.73), 1);
+
+        app.world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .get_mut(&authored)
+            .expect("authored asset")
+            .base_color_texture = Some(Handle::default());
+        app.update();
+        assert_eq!(
+            app.world().resource::<TextBatchRouteCounts>().visits,
+            1,
+            "resource changes rekey only users"
+        );
+        assert_eq!(store_stats(&app).0, 2);
+        settle(&mut app);
+        app.update();
+        assert_eq!(
+            app.world().resource::<TextBatchRouteCounts>(),
+            &TextBatchRouteCounts::default()
+        );
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct RetainedTextGeometry {
+        mesh:      Handle<Mesh>,
+        instances: Handle<ShaderBuffer>,
+        run_table: Handle<ShaderBuffer>,
+        glyphs:    Vec<PathQuadRecord>,
+    }
+
+    fn retained_text_geometry(app: &App) -> RetainedTextGeometry {
+        let cache = app.world().resource::<GlyphCache>();
+        let (_, batch) = cache.batch_store().batches().next().expect("shared batch");
+        let gpu = batch.gpu.as_ref().expect("retained assets");
+        RetainedTextGeometry {
+            mesh:      gpu.mesh.clone(),
+            instances: gpu.instances.clone(),
+            run_table: gpu.run_table.clone(),
+            glyphs:    batch.path_records().to_vec(),
+        }
+    }
+
+    fn text_material_user_count(app: &App, metallic: f32) -> usize {
+        let cache = app.world().resource::<GlyphCache>();
+        let rows = app
+            .world()
+            .resource::<FrameMaterialTableBuild>()
+            .table()
+            .rows();
+        cache
+            .batch_store()
+            .batches()
+            .flat_map(|(_, batch)| batch.run_records())
+            .filter(|record| {
+                rows[record.material.as_u32().to_usize()].metallic.to_bits() == metallic.to_bits()
+            })
+            .count()
+    }
+
+    #[test]
+    fn text_material_fallback_retries_and_despawn_retires_dependencies() {
+        let mut app = pipeline_app();
+        let missing = app
+            .world()
+            .resource::<Assets<StandardMaterial>>()
+            .reserve_handle();
+        let panel = spawn_panel(
+            &mut app,
+            one_text_tree_with_style(TextStyle::new(10.0).with_material(missing.clone())),
+        );
+        settle(&mut app);
+        let fallback = material_with_metallic(&mut app, 0.36);
+        app.world_mut().resource_mut::<TextMaterial>().0 = fallback.clone();
+        app.update();
+        assert_eq!(app.world().resource::<TextBatchRouteCounts>().visits, 1);
+        assert_eq!(
+            first_text_run_material_values(&app).metallic.to_bits(),
+            0.36_f32.to_bits()
+        );
+
+        app.world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .remove(&fallback);
+        app.update();
+        assert_eq!(store_stats(&app).1, 0);
+        assert_eq!(
+            app.world()
+                .resource::<TextBatchInvalidation>()
+                .pending
+                .len(),
+            1
+        );
+        app.update();
+        assert_eq!(
+            app.world().resource::<TextBatchRouteCounts>().visits,
+            1,
+            "unavailable input remains a wake input"
+        );
+        app.world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .insert(
+                &missing,
+                StandardMaterial {
+                    metallic: 0.82,
+                    ..Default::default()
+                },
+            )
+            .expect("reserved material insertion");
+        app.update();
+        assert_eq!(
+            first_text_run_material_values(&app).metallic.to_bits(),
+            0.82_f32.to_bits()
+        );
+        assert!(
+            app.world()
+                .resource::<TextBatchInvalidation>()
+                .pending
+                .is_empty()
+        );
+
+        app.world_mut().despawn(panel);
+        app.update();
+        let invalidation = app.world().resource::<TextBatchInvalidation>();
+        assert!(invalidation.materials.is_empty());
+        assert!(invalidation.run_materials.is_empty());
+        assert!(invalidation.pending.is_empty());
+        assert_eq!(
+            app.world()
+                .resource::<FrameMaterialTableBuild>()
+                .table()
+                .live_row_count(),
+            0
+        );
+        assert_eq!(store_stats(&app).1, 0);
+        app.world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .get_mut(&missing)
+            .expect("remaining material")
+            .metallic = 0.4;
+        app.update();
+        assert_eq!(app.world().resource::<TextBatchRouteCounts>().visits, 0);
+    }
+
+    #[test]
+    fn text_batch_required_run_input_removals_retire_only_that_run() {
+        assert_removed_run_input_retires::<PreparedPanelText>();
+        assert_removed_run_input_retires::<TextContent>();
+        assert_removed_run_input_retires::<PanelTextLayout>();
+        assert_removed_run_input_retires::<PanelTextDrawZIndex>();
+        assert_removed_run_input_retires::<PanelTextDrawZIndexRank>();
+        assert_removed_run_input_retires::<GlobalTransform>();
+        assert_removed_run_input_retires::<ChildOf>();
+    }
+
+    fn removal_fixture() -> (App, Entity, Entity) {
+        let mut app = pipeline_app();
+        let panel = spawn_panel(&mut app, one_text_tree());
+        app.world_mut()
+            .entity_mut(panel)
+            .insert(RenderLayers::layer(31));
+        for _ in 0..20 {
+            spawn_panel(&mut app, one_text_tree());
+        }
+        settle(&mut app);
+        let run = label_entities(&mut app)
+            .into_iter()
+            .find(|&entity| {
+                app.world()
+                    .get::<ChildOf>(entity)
+                    .is_some_and(|owner| owner.parent() == panel)
+            })
+            .expect("fixture panel owns one run");
+        (app, panel, run)
+    }
+
+    fn assert_removed_run_input_retires<T: Component>() {
+        let (mut app, _, run) = removal_fixture();
+        let rows = app
+            .world()
+            .resource::<FrameMaterialTableBuild>()
+            .table()
+            .live_row_count();
+        app.world_mut().entity_mut(run).remove::<T>();
+        app.update();
+        assert_eq!(
+            store_stats(&app),
+            (1, 20, 100),
+            "{} removal retires exactly one run",
+            core::any::type_name::<T>()
+        );
+        assert_eq!(app.world().resource::<TextBatchRouteCounts>().runs, 1);
+        assert!(app.world().resource::<TextBatchRouteCounts>().visits <= 1);
+        assert!(
+            !app.world()
+                .resource::<TextBatchInvalidation>()
+                .run_materials
+                .contains_key(&run)
+        );
+        assert_eq!(
+            app.world()
+                .resource::<FrameMaterialTableBuild>()
+                .table()
+                .live_row_count(),
+            rows - 1
+        );
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct TextRunPresentation {
+        key:      PathBatchKey,
+        record:   PathRenderRecord,
+        material: MaterialSlotValues,
+    }
+
+    fn isolated_text_presentation(app: &App) -> TextRunPresentation {
+        let cache = app.world().resource::<GlyphCache>();
+        let (key, batch) = cache
+            .batch_store()
+            .batches()
+            .find(|(key, _)| key.layers.0 == RenderLayers::layer(31))
+            .expect("isolated text batch");
+        assert_eq!(batch.run_count(), 1);
+        let record = batch.run_records()[0];
+        TextRunPresentation {
+            key: key.clone(),
+            record,
+            material: app
+                .world()
+                .resource::<FrameMaterialTableBuild>()
+                .table()
+                .rows()[record.material.as_u32().to_usize()],
+        }
+    }
+
+    fn assert_removed_resolved_input_restores_default<
+        A: crate::cascade::CascadeAttribute + Resource,
+    >(
+        make_override: impl Fn(&mut App) -> A,
+    ) {
+        for remove_authored in [false, true] {
+            let mut app = pipeline_app();
+            let authored = make_override(&mut app);
+            let panel = spawn_panel(&mut app, one_text_tree());
+            app.world_mut()
+                .entity_mut(panel)
+                .insert(RenderLayers::layer(31));
+            for _ in 0..20 {
+                spawn_panel(&mut app, one_text_tree());
+            }
+            settle(&mut app);
+            let run = label_entities(&mut app)
+                .into_iter()
+                .find(|&entity| {
+                    app.world()
+                        .get::<ChildOf>(entity)
+                        .is_some_and(|owner| owner.parent() == panel)
+                })
+                .expect("isolated run");
+            let baseline = isolated_text_presentation(&app);
+            app.world_mut().entity_mut(run).insert((
+                Cascade::Override(authored.clone()),
+                Resolved(authored.clone()),
+            ));
+            app.update();
+            assert_ne!(
+                isolated_text_presentation(&app),
+                baseline,
+                "{} override must exercise a rendered difference",
+                core::any::type_name::<A>()
+            );
+            if remove_authored {
+                app.world_mut()
+                    .entity_mut(run)
+                    .remove::<(Cascade<A>, Resolved<A>)>();
+            } else {
+                app.world_mut().entity_mut(run).remove::<Resolved<A>>();
+            }
+            app.update();
+            assert_eq!(
+                app.world().resource::<TextBatchRouteCounts>().visits,
+                1,
+                "{} removal selects only its run",
+                core::any::type_name::<A>()
+            );
+            assert_eq!(
+                isolated_text_presentation(&app),
+                baseline,
+                "{} removal restores its resource default",
+                core::any::type_name::<A>()
+            );
+
+            // Pin the other runs before changing the default: only the run
+            // whose cache/authored cascade was removed should follow it.
+            for other in label_entities(&mut app)
+                .into_iter()
+                .filter(|&entity| entity != run)
+            {
+                let value = app
+                    .world()
+                    .get::<Resolved<A>>(other)
+                    .expect("other resolved input")
+                    .0
+                    .clone();
+                app.world_mut()
+                    .entity_mut(other)
+                    .insert(Cascade::Override(value));
+            }
+            app.update();
+            app.insert_resource(authored);
+            app.update();
+            assert_eq!(app.world().resource::<TextBatchRouteCounts>().visits, 1);
+            assert_ne!(
+                isolated_text_presentation(&app),
+                baseline,
+                "fallback must follow later root-default edits"
+            );
+        }
+    }
+
+    #[test]
+    fn text_batch_resolved_input_removals_restore_only_their_run_defaults() {
+        assert_removed_resolved_input_restores_default(|_| TextAlpha(AlphaMode::Add));
+        assert_removed_resolved_input_restores_default(|app| {
+            match *app.world().resource::<Lighting>() {
+                Lighting::Lit => Lighting::Unlit,
+                Lighting::Unlit => Lighting::Lit,
+            }
+        });
+        assert_removed_resolved_input_restores_default(|app| {
+            app.insert_resource(GlyphShadowMode::Cast);
+            ShadowCasting::Off
+        });
+        assert_removed_resolved_input_restores_default(|_| GlyphShadowMode::Cast);
+        assert_removed_resolved_input_restores_default(|_| AntiAlias::Off);
+        assert_removed_resolved_input_restores_default(|app| {
+            TextMaterial(material_with_metallic(app, 0.79))
+        });
+        assert_removed_resolved_input_restores_default(|_| HdrTextCoverageBias(2.0));
+    }
+
+    #[test]
+    fn text_ignores_surface_sidedness_and_its_removal() {
+        let (mut app, _, run) = removal_fixture();
+        let baseline = isolated_text_presentation(&app);
+        for sidedness in [
+            Sidedness::BothSides,
+            Sidedness::BackOnly,
+            Sidedness::FrontOnly,
+        ] {
+            app.world_mut()
+                .entity_mut(run)
+                .insert((Cascade::Override(sidedness), Resolved(sidedness)));
+            app.insert_resource(sidedness);
+            app.update();
+            assert_eq!(isolated_text_presentation(&app), baseline);
+            assert_eq!(app.world().resource::<TextBatchRouteCounts>().visits, 0);
+        }
+        app.world_mut()
+            .entity_mut(run)
+            .remove::<(Cascade<Sidedness>, Resolved<Sidedness>)>();
+        app.update();
+        assert_eq!(isolated_text_presentation(&app), baseline);
+        assert_eq!(app.world().resource::<TextBatchRouteCounts>().visits, 0);
+    }
+
+    #[test]
+    fn text_batch_panel_role_and_world_transform_removals_retire_owned_runs() {
+        let remove_inputs: [fn(&mut App, Entity); 2] = [
+            |app, panel| {
+                app.world_mut().entity_mut(panel).remove::<DiegeticPanel>();
+            },
+            |app, panel| {
+                app.world_mut()
+                    .entity_mut(panel)
+                    .remove::<GlobalTransform>();
+            },
+        ];
+        for remove in remove_inputs {
+            let (mut app, panel, _) = removal_fixture();
+            remove(&mut app, panel);
+            app.update();
+            assert_eq!(store_stats(&app), (1, 20, 100));
+            assert!(app.world().resource::<TextBatchRouteCounts>().visits <= 1);
+        }
+    }
+
+    #[test]
+    fn text_batch_tooltip_and_local_transform_removals_select_only_owned_runs() {
+        let (mut app, panel, _) = removal_fixture();
+        let baseline = isolated_text_presentation(&app);
+        app.world_mut()
+            .entity_mut(panel)
+            .insert(TooltipDepthPriority);
+        app.update();
+        assert_ne!(isolated_text_presentation(&app), baseline);
+        app.world_mut()
+            .entity_mut(panel)
+            .remove::<TooltipDepthPriority>();
+        app.update();
+        assert_eq!(app.world().resource::<TextBatchRouteCounts>().visits, 1);
+        assert_eq!(isolated_text_presentation(&app), baseline);
+        app.world_mut().entity_mut(panel).remove::<Transform>();
+        app.update();
+        assert_eq!(app.world().resource::<TextBatchRouteCounts>().visits, 1);
+        assert_eq!(isolated_text_presentation(&app), baseline);
+    }
+
+    #[test]
+    fn text_batch_run_visibility_removal_restores_owned_drawing() {
+        let (mut app, _, run) = removal_fixture();
+        app.world_mut().entity_mut(run).insert(Visibility::Hidden);
+        app.update();
+        assert_eq!(store_stats(&app), (1, 20, 100));
+        app.world_mut().entity_mut(run).remove::<Visibility>();
+        app.update();
+        assert_eq!(app.world().resource::<TextBatchRouteCounts>().visits, 1);
+        assert_eq!(store_stats(&app), (2, 21, 105));
+    }
+
+    #[test]
+    fn text_batch_render_layer_removal_rekeys_only_its_runs() {
+        let mut app = pipeline_app();
+        let changed_panel = spawn_panel(&mut app, one_text_tree());
+        app.world_mut()
+            .entity_mut(changed_panel)
+            .insert(RenderLayers::layer(31));
+        for _ in 0..20 {
+            spawn_panel(&mut app, one_text_tree());
+        }
+        settle(&mut app);
+        assert_eq!(store_stats(&app), (2, 21, 105));
+
+        app.world_mut()
+            .entity_mut(changed_panel)
+            .remove::<RenderLayers>();
+        app.update();
+        let counts = app.world().resource::<TextBatchRouteCounts>();
+        assert_eq!(counts.runs, 1);
+        assert_eq!(
+            counts.visits, 1,
+            "removing a panel's override visits only its run"
+        );
+        assert_eq!(store_stats(&app), (1, 21, 105));
+        assert!(
+            app.world()
+                .resource::<GlyphCache>()
+                .batch_store()
+                .batches()
+                .all(|(key, _)| key.layers.0 == RenderLayers::layer(0)),
+            "removed overrides restore default-layer drawing in the same update"
+        );
+
+        app.world_mut()
+            .entity_mut(changed_panel)
+            .insert(RenderLayers::layer(31));
+        app.update();
+        assert_eq!(app.world().resource::<TextBatchRouteCounts>().visits, 1);
+        assert_eq!(store_stats(&app), (2, 21, 105));
+        settle(&mut app);
+        app.update();
+        assert_eq!(
+            app.world().resource::<TextBatchRouteCounts>(),
+            &TextBatchRouteCounts::default()
+        );
+    }
+
+    #[test]
+    fn text_batch_visibility_selects_only_the_changed_subtree() {
+        let mut app = pipeline_app();
+        let parent = app.world_mut().spawn(Visibility::Inherited).id();
+        let panel = spawn_panel(&mut app, one_text_tree());
+        app.world_mut().entity_mut(panel).insert(ChildOf(parent));
+        for _ in 0..20 {
+            spawn_panel(&mut app, one_text_tree());
+        }
+        settle(&mut app);
+        app.world_mut().spawn(Visibility::Inherited);
+        app.update();
+        assert_eq!(app.world().resource::<TextBatchRouteCounts>().visits, 0);
+        spawn_panel(&mut app, one_text_tree());
+        app.update();
+        assert_eq!(
+            app.world().resource::<TextBatchRouteCounts>().visits,
+            1,
+            "new tool text leaves retained runs untouched"
+        );
+        settle(&mut app);
+
+        app.world_mut()
+            .entity_mut(parent)
+            .insert(Visibility::Hidden);
+        app.update();
+        assert_eq!(app.world().resource::<TextBatchRouteCounts>().visits, 1);
+        assert_eq!(store_stats(&app).1, 21);
+        app.world_mut().entity_mut(parent).remove::<Visibility>();
+        app.update();
+        assert_eq!(app.world().resource::<TextBatchRouteCounts>().visits, 1);
+        assert_eq!(store_stats(&app).1, 22);
+
+        let hidden = app.world_mut().spawn(Visibility::Hidden).id();
+        app.world_mut().entity_mut(panel).insert(ChildOf(hidden));
+        app.update();
+        assert_eq!(app.world().resource::<TextBatchRouteCounts>().visits, 1);
+        assert_eq!(store_stats(&app).1, 21);
+        app.world_mut().entity_mut(panel).remove::<ChildOf>();
+        app.update();
+        assert_eq!(app.world().resource::<TextBatchRouteCounts>().visits, 1);
+        assert_eq!(store_stats(&app).1, 22);
+    }
+
+    #[test]
+    fn screen_text_batches_bind_identity_and_world_text_batches_bind_world_table() {
+        let mut app = pipeline_app();
+        app.add_plugins(ScreenSpacePlugin);
+        let (identity, world) = {
+            let textures = app.world().resource::<DisplayCompensationTextures>();
+            (textures.identity.clone(), textures.world.clone())
+        };
+        for handle in [&identity, &world] {
+            let image = app.world().resource::<Assets<Image>>().get(handle);
+            assert!(image.is_some_and(|image| image.texture_descriptor.dimension
+                == bevy::render::render_resource::TextureDimension::D3));
+        }
+        let window = app
+            .world_mut()
+            .spawn((Window::default(), PrimaryWindow))
+            .id();
+        spawn_panel(&mut app, one_text_tree());
+        app.world_mut().spawn(
+            DiegeticPanel::screen()
+                .size(Px(320.0), Px(180.0))
+                .window_entity(window)
+                .with_tree(one_text_tree())
+                .build()
+                .expect("screen panel should build"),
+        );
+        settle(&mut app);
+
+        let store = app.world().resource::<GlyphCache>();
+        let materials = app.world().resource::<Assets<PathExtendedMaterial>>();
+        for (target, expected) in [
+            (PanelDisplayTarget::World, world),
+            (PanelDisplayTarget::Screen, identity),
+        ] {
+            let (_, batch) = store
+                .batch_store()
+                .batches()
+                .find(|(key, _)| key.display_target == target)
+                .expect("panel should have a text batch");
+            let gpu = batch.gpu.as_ref().expect("batch should have GPU assets");
+            let material = materials
+                .get(&gpu.material)
+                .expect("batch material should be retained");
+            assert_eq!(material.extension.display_table, expected);
+        }
     }
 
     fn settle(app: &mut App) {
@@ -1614,8 +3463,11 @@ mod tests {
         frame_material_row_count(&app)
     }
 
-    fn drop_cached_glyph_paths(mut backend: ResMut<GlyphCache>) {
-        *backend = GlyphCache::default();
+    fn drop_cached_glyph_paths(
+        mut backend: ResMut<GlyphCache>,
+        mut storage_buffers: ResMut<Assets<ShaderBuffer>>,
+    ) {
+        backend.reset_to_post_startup(&mut storage_buffers);
     }
 
     fn clip_prepared_runs_outside_glyphs(mut prepared_runs: Query<&mut PreparedPanelText>) {
@@ -1756,6 +3608,11 @@ mod tests {
         let store = app.world().resource::<GlyphCache>().batch_store();
         let (_, batch) = store.batches().next().expect("one batch should exist");
         for record in batch.run_records() {
+            assert_eq!(
+                record.panel_plane,
+                Vec4::new(0.0, 0.0, 1.0, -1.0),
+                "all text runs retain their owning panel's physical plane"
+            );
             // Labels sit at panel-local offsets, so only the propagated panel
             // translation is asserted exactly: the records' w-axis carries it.
             assert!(
@@ -1798,7 +3655,7 @@ mod tests {
             (0, 0, 0),
             "a hidden panel's text should not enter the batch store"
         );
-        assert!(batch_entities(&mut app).is_empty());
+        assert_eq!(batch_entities(&mut app), []);
         assert_eq!(
             hidden_material_sources, 2,
             "hidden text should retain one live material source per prepared run",
@@ -1834,7 +3691,7 @@ mod tests {
             (0, 0, 0),
             "hiding the panel again removes its text from the batch store"
         );
-        assert!(batch_entities(&mut app).is_empty());
+        assert_eq!(batch_entities(&mut app), []);
         let hidden_again = app.world().resource::<FrameMaterialTableBuild>().table();
         assert_eq!(hidden_again.row_count(), hidden_material_rows);
         assert_eq!(hidden_again.live_row_count(), hidden_material_sources);
@@ -1850,6 +3707,42 @@ mod tests {
         assert_eq!(
             reshown_material_slots, visible_material_slots,
             "showing the same text again should restore the same material rows",
+        );
+    }
+
+    #[test]
+    fn a_hidden_ancestor_removes_panel_text_the_frame_it_hides() {
+        let mut app = pipeline_app();
+        let panel = spawn_panel(&mut app, two_text_tree());
+        let tool = app
+            .world_mut()
+            .spawn((Transform::default(), Visibility::Inherited))
+            .id();
+        let holder = app
+            .world_mut()
+            .spawn((Transform::default(), ChildOf(tool)))
+            .id();
+        app.world_mut().entity_mut(panel).insert(ChildOf(holder));
+        settle(&mut app);
+        assert_eq!(store_stats(&app), (1, 2, 9));
+
+        app.world_mut().entity_mut(tool).insert(Visibility::Hidden);
+        app.update();
+        assert_eq!(
+            store_stats(&app),
+            (0, 0, 0),
+            "hiding a grandparent removes the panel's text in the same frame"
+        );
+        assert_eq!(batch_entities(&mut app), []);
+
+        app.world_mut()
+            .entity_mut(tool)
+            .insert(Visibility::Inherited);
+        app.update();
+        assert_eq!(
+            store_stats(&app),
+            (1, 2, 9),
+            "showing the grandparent routes the text again in the same frame"
         );
     }
 
@@ -1894,8 +3787,8 @@ mod tests {
             .resource::<Assets<ShaderBuffer>>()
             .get(&instance_buffer)
             .expect("the text instance buffer should exist")
-            .data
-            .clone();
+            .cast_slice::<u8>()
+            .map(<[u8]>::to_vec);
         app.update();
         let mut builder = LayoutBuilder::new(100.0, 50.0);
         builder.text(("Alphas", TextStyle::new(10.0)));
@@ -2068,19 +3961,27 @@ mod tests {
             .resource::<FrameMaterialTableBuild>()
             .table()
             .rows();
-        let metallic_values: Vec<u32> = batch
+        let mut materials_by_glyph_count: Vec<(usize, u32)> = batch
             .run_records()
             .iter()
-            .map(|record| {
-                table[record.material.as_u32().to_usize()]
+            .enumerate()
+            .map(|(index, record)| {
+                let glyph_count = batch
+                    .path_records()
+                    .iter()
+                    .filter(|glyph| glyph.render_index.to_usize() == index)
+                    .count();
+                let metallic = table[record.material.as_u32().to_usize()]
                     .metallic
-                    .to_bits()
+                    .to_bits();
+                (glyph_count, metallic)
             })
             .collect();
+        materials_by_glyph_count.sort_unstable();
         assert_eq!(
-            metallic_values,
-            vec![0.21_f32.to_bits(), 0.84_f32.to_bits()],
-            "each run keeps its own frame material row"
+            materials_by_glyph_count,
+            vec![(4, 0.84_f32.to_bits()), (5, 0.21_f32.to_bits())],
+            "Beta's four glyphs and Alpha's five glyphs keep their authored material rows"
         );
     }
 
@@ -2108,7 +4009,7 @@ mod tests {
             .next()
             .expect("one texture batch should exist");
         assert!(
-            key.resource_compatibility.base_color_texture.is_some(),
+            key.resource_compatibility.base_color_texture.is_bound(),
             "the texture resource remains a batch-key splitter"
         );
         let before: Vec<(Vec2, Vec2)> = batch
@@ -2191,7 +4092,7 @@ mod tests {
         assert_eq!(layout_hash(&first_style), layout_hash(&second_style));
     }
 
-    /// Per-batch (`depth_bias`, OIT depth offset) read off the single live
+    /// Per-batch (`depth_bias`, OIT paint order) read off the single live
     /// batch's material asset.
     fn batch_material_values(app: &App) -> (f32, f32) {
         let store = app.world().resource::<GlyphCache>().batch_store();
@@ -2204,7 +4105,7 @@ mod tests {
             .expect("batch material asset should exist");
         (
             material.base.depth_bias,
-            text::text_material_oit_depth_offset(material),
+            text::text_material_oit_paint_order(material),
         )
     }
 
@@ -2298,8 +4199,8 @@ mod tests {
         assert_eq!(batches, 2);
         assert_eq!(runs, 2);
 
-        let lowered_depth_bias = 0.0_f32;
-        let raised_depth_bias = constants::LAYER_DEPTH_BIAS;
+        let lowered_depth_bias = 0.5 * constants::LAYER_DEPTH_BIAS;
+        let raised_depth_bias = 1.5 * constants::LAYER_DEPTH_BIAS;
         assert_eq!(
             batch_material_depth_biases(&app),
             vec![
@@ -2311,14 +4212,17 @@ mod tests {
     }
 
     #[test]
-    fn default_text_batch_material_uses_z_index_rank() {
+    fn default_text_batch_material_sorts_after_its_fills() {
         let mut app = pipeline_app();
         spawn_panel(&mut app, two_text_tree());
         settle(&mut app);
 
-        let (depth_bias, oit_depth_offset) = batch_material_values(&app);
-        assert_eq!(depth_bias.to_bits(), 0.0_f32.to_bits());
-        assert_eq!(oit_depth_offset.to_bits(), 0.0f32.to_bits());
+        let (depth_bias, oit_paint_order) = batch_material_values(&app);
+        assert_eq!(
+            depth_bias.to_bits(),
+            (0.5 * constants::LAYER_DEPTH_BIAS).to_bits()
+        );
+        assert_eq!(oit_paint_order.to_bits(), 0.0f32.to_bits());
     }
 
     fn run_record_depths(app: &App) -> Vec<(f32, f32)> {
@@ -2326,10 +4230,74 @@ mod tests {
         let mut records: Vec<_> = store
             .batches()
             .flat_map(|(_, batch)| batch.run_records())
-            .map(|record| (record.clip_depth_nudge, record.oit_depth_offset))
+            .map(|record| (record.clip_depth_nudge, record.oit_paint_order))
             .collect();
         records.sort_by(|left, right| left.0.total_cmp(&right.0));
         records
+    }
+
+    #[test]
+    fn tooltip_text_lift_precedes_opaque_occlusion_once() {
+        let mut app = pipeline_app();
+        spawn_panel(&mut app, one_text_tree());
+        settle(&mut app);
+        let host_record = *text_run_records(&app)
+            .first()
+            .expect("host text run should be routed");
+        assert_eq!(host_record.tooltip_depth_priority, 0);
+
+        let tooltip = spawn_panel(&mut app, one_text_tree());
+        app.world_mut()
+            .entity_mut(tooltip)
+            .insert(TooltipDepthPriority);
+        settle(&mut app);
+        let tooltip_record = *text_run_records(&app)
+            .iter()
+            .find(|record| record.tooltip_depth_priority == 1)
+            .expect("tooltip text run should carry its vertex lift flag");
+
+        // The layout offsets contain only panel-local ordering. The vertex
+        // stage adds the tooltip band once in either render path; OIT then adds
+        // the ordinary per-run offset after its opaque-prepass comparison.
+        assert_eq!(
+            tooltip_record.clip_depth_nudge.to_bits(),
+            host_record.clip_depth_nudge.to_bits()
+        );
+        assert_eq!(
+            tooltip_record.oit_paint_order.to_bits(),
+            host_record.oit_paint_order.to_bits()
+        );
+        let vertex_shader = include_str!("../analytic_paths/analytic_path_vertex_pull.wesl");
+        assert!(vertex_shader.contains("if run.tooltip_depth_priority != 0u"));
+        assert!(vertex_shader.contains(
+            "clip.z += (TOOLTIP_NDC_DEPTH_PRIORITY + TOOLTIP_TEXT_DEPTH_SEPARATION) * clip.w"
+        ));
+
+        let panel_depth = 0.5_f32;
+        let background_depth = panel_depth + render::TOOLTIP_NDC_DEPTH_PRIORITY;
+        let text_depth_separation = 0.000_001_f32;
+        let text_before_oit_offset = panel_depth
+            + if tooltip_record.tooltip_depth_priority == 1 {
+                render::TOOLTIP_NDC_DEPTH_PRIORITY + text_depth_separation
+            } else {
+                0.0
+            };
+        assert!(
+            text_before_oit_offset > background_depth + constants::OIT_PAINT_STEP,
+            "tooltip text must survive the opaque comparison against its own banded background"
+        );
+        assert!(
+            text_before_oit_offset + tooltip_record.oit_paint_order
+                > background_depth + host_record.oit_paint_order,
+            "the tooltip's text remains in front of its opaque surface in OIT"
+        );
+        let host_before_oit_offset = panel_depth
+            + if host_record.tooltip_depth_priority == 1 {
+                render::TOOLTIP_NDC_DEPTH_PRIORITY
+            } else {
+                0.0
+            };
+        assert_eq!(host_before_oit_offset.to_bits(), panel_depth.to_bits());
     }
 
     #[test]
@@ -2341,10 +4309,69 @@ mod tests {
         assert_eq!(
             run_record_depths(&app),
             vec![
-                (0.0, constants::OIT_DEPTH_STEP),
-                (1.0, 2.0 * constants::OIT_DEPTH_STEP),
+                (0.0, constants::OIT_PAINT_STEP),
+                (1.0, constants::OIT_PAINT_STEP),
             ],
         );
+    }
+
+    #[test]
+    fn distant_log_text_oit_offset_stays_behind_an_opaque_group_plate() {
+        const ORBIT_RADIUS: f32 = 6.0;
+        const LOG_BEHIND_GROUP: f32 = 0.9;
+        const LOG_ROWS: usize = 160;
+
+        let mut app = pipeline_app();
+        let mut builder = LayoutBuilder::new(100.0, 2000.0);
+        for _ in 0..LOG_ROWS {
+            builder.text(("Log row", TextStyle::new(10.0)));
+        }
+        app.world_mut().spawn(
+            DiegeticPanel::world()
+                .size(Mm(100.0), Mm(2000.0))
+                .with_tree(builder.build())
+                .build()
+                .expect("world log panel"),
+        );
+        settle(&mut app);
+
+        let store = app.world().resource::<GlyphCache>().batch_store();
+        let (key, batch) = store.batches().next().expect("drawn text batch");
+        let gpu = batch.gpu.as_ref().expect("drawn text material");
+        let material = app
+            .world()
+            .resource::<Assets<PathExtendedMaterial>>()
+            .get(&gpu.material)
+            .expect("text material asset");
+        assert_eq!(material.base.alpha_mode, AlphaMode::Blend);
+        assert_eq!(
+            material.base.depth_bias.to_bits(),
+            key.z_index_rank.screen_text_depth_bias().get().to_bits()
+        );
+        assert_eq!(
+            key.z_index_rank.screen_depth_bias().get().to_bits(),
+            0.0_f32.to_bits()
+        );
+
+        let near = ORBIT_RADIUS * 0.001;
+        let plate_depth = near / ORBIT_RADIUS;
+        let log_depth = near / (ORBIT_RADIUS + LOG_BEHIND_GROUP);
+        let largest_authored_offset = batch
+            .run_records()
+            .iter()
+            .map(|record| record.oit_paint_order)
+            .reduce(f32::max)
+            .expect("drawn log runs");
+        assert!(largest_authored_offset > 0.0);
+        let physical = log_depth.to_bits();
+        let quanta = (largest_authored_offset * crate::render::constants::OIT_PACKED_PAINT_RANGE)
+            .round()
+            .to_u32();
+        let key = (physical, quanta);
+        assert!(key < (plate_depth.to_bits(), 0));
+        assert_eq!(key.0, log_depth.to_bits());
+        let shader = include_str!("../analytic_paths/analytic_path.wesl");
+        assert!(shader.contains("oit_draw_layer(oit_pos, out.color, run_oit_paint_order(in))"));
     }
 
     /// Mirrors `text_alpha`'s `apply_state_and_rebuild_hud`: one frame both
@@ -2479,16 +4506,23 @@ mod tests {
     }
 
     #[test]
-    fn shadow_mode_change_rekeys_into_a_not_shadow_caster_batch() {
+    fn default_text_casts_no_shadow_and_cast_text_does() {
         let mut app = pipeline_app();
         let panel = spawn_panel(&mut app, two_text_tree());
         settle(&mut app);
         assert_eq!(store_stats(&app).0, 1);
+        let entities = batch_entities(&mut app);
+        assert!(
+            entities
+                .iter()
+                .all(|&entity| app.world().get::<NotShadowCaster>(entity).is_some()),
+            "default panel text casts no 3D shadow",
+        );
 
         let mut builder = LayoutBuilder::new(100.0, 50.0);
         builder.text((
             "Alpha",
-            TextStyle::new(10.0).with_shadow_mode(GlyphShadowMode::None),
+            TextStyle::new(10.0).with_shadow_mode(GlyphShadowMode::Cast),
         ));
         builder.text(("Beta", TextStyle::new(10.0)));
         assert!(
@@ -2510,7 +4544,7 @@ mod tests {
         assert_eq!(
             (non_casters, entities.len() - non_casters),
             (1, 1),
-            "the GlyphShadowMode::None batch entity opts out of shadow casting"
+            "only the default-text batch opts out; the Cast batch casts"
         );
     }
 
@@ -2532,7 +4566,7 @@ mod tests {
         settle(&mut app);
 
         assert_eq!(store_stats(&app), (0, 0, 0));
-        assert!(batch_entities(&mut app).is_empty());
+        assert_eq!(batch_entities(&mut app), []);
         assert!(
             !app.world()
                 .resource::<GlyphCache>()
@@ -2544,31 +4578,37 @@ mod tests {
 
     /// The `PathBatchResources` doc contract: every commit payload is padded to the
     /// buffer's capacity, so its byte length never changes between growths —
-    /// a constant-length `set_data` writes the existing wgpu buffer in place
+    /// a constant-length retained write updates the existing wgpu buffer in place
     /// and live material bind groups keep reading it. A refactor that drops
     /// the padding fails here instead of at a parity screenshot.
     #[test]
     fn commit_payloads_keep_a_constant_length_between_growths() {
         let glyph = PathQuadRecord {
-            rect_min:          Vec2::ZERO,
-            rect_size:         Vec2::ONE,
-            uv_min:            Vec2::ZERO,
-            uv_size:           Vec2::ONE,
-            box_uv_min:        Vec2::ZERO,
-            box_uv_size:       Vec2::ONE,
-            packed_path_index: 0,
-            render_index:      0,
-            box_uv_flip_x:     0,
+            rect_min:           Vec2::ZERO,
+            rect_size:          Vec2::ONE,
+            uv_min:             Vec2::ZERO,
+            uv_size:            Vec2::ONE,
+            box_uv_min:         Vec2::ZERO,
+            box_uv_size:        Vec2::ONE,
+            packed_path_index:  0,
+            render_index:       0,
+            box_uv_flip_x:      0,
+            clip_edges:         0,
+            text_fit_mode:      TextFitMode::SmallGlyph.shader_value(),
+            padding_before_fit: 0,
+            text_fit_offset:    Vec2::ZERO,
         };
         let record = PathRenderRecord {
-            transform:          Mat4::IDENTITY,
-            material:           SdfPaintMaterial::NotAuthored.to_gpu(),
-            render_mode:        1,
-            clip_depth_nudge:   0.0,
-            oit_depth_offset:   0.0,
-            aa_flags:           AntiAlias::Both.aa_flags(),
-            text_coverage_bias: 0.0,
-            text_em_height:     0.0,
+            panel_plane:            bevy::math::Vec4::ZERO,
+            transform:              Mat4::IDENTITY,
+            material:               SdfPaintMaterial::NotAuthored.to_gpu(),
+            render_mode:            1,
+            clip_depth_nudge:       0.0,
+            oit_paint_order:        0.0,
+            aa_flags:               AntiAlias::Both.aa_flags(),
+            text_coverage_bias:     0.0,
+            padding:                0,
+            tooltip_depth_priority: 0,
         };
 
         for count in 0..=8_usize {
@@ -3037,6 +5077,38 @@ mod tests {
             snapshot.computed_tick,
             "an override must not fire Changed<ComputedDiegeticPanel>",
         );
+    }
+
+    #[test]
+    fn text_batch_visual_override_removal_restores_only_bound_runs() {
+        for remove_widget_role in [false, true] {
+            let mut app = widget_pipeline_app();
+            spawn_panel(&mut app, slotted_text_tree());
+            for _ in 0..20 {
+                spawn_panel(&mut app, one_text_tree());
+            }
+            settle(&mut app);
+            let baseline = text_run_records(&app);
+            let widget = styled_widget(&mut app);
+            set_text_slot_override(
+                &mut app,
+                widget,
+                VisualSlotOverride::default().with_offset(TEXT_SLOT_OFFSET),
+            );
+            app.update();
+            assert_eq!(app.world().resource::<TextBatchRouteCounts>().visits, 1);
+            assert_ne!(text_run_records(&app), baseline);
+            if remove_widget_role {
+                app.world_mut().entity_mut(widget).remove::<PanelWidget>();
+            } else {
+                app.world_mut()
+                    .entity_mut(widget)
+                    .remove::<WidgetVisualOverrides>();
+            }
+            app.update();
+            assert_eq!(app.world().resource::<TextBatchRouteCounts>().visits, 1);
+            assert_eq!(text_run_records(&app), baseline);
+        }
     }
 
     #[test]

@@ -14,7 +14,7 @@ use std::time::Duration;
 use bevy::anti_alias::fxaa::Fxaa;
 use bevy::anti_alias::smaa::Smaa;
 use bevy::anti_alias::taa::TemporalAntiAliasing;
-use bevy::math::curve::easing::EaseFunction;
+use bevy::curve::easing::EaseFunction;
 use bevy::prelude::AlphaMode;
 use bevy::prelude::Assets;
 use bevy::prelude::Camera;

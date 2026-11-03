@@ -153,6 +153,12 @@ pub enum DeviceChange {
     },
 }
 
+/// An authored inventory entry or its passive connection conclusion changed.
+///
+/// Applications can refresh device-backed tool presentation from this edge.
+#[derive(Debug, Event, Reflect)]
+pub struct HardwareInventoryChanged;
+
 /// A durable key entered the reconciled device set and now has a device entity behind it.
 ///
 /// This is what lets an integration say "*my* Stream Deck came back" by observing one entity

@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
+use bevy::camera::primitives::Aabb;
 use bevy::math::Vec4;
 use bevy::prelude::Changed;
 use bevy::prelude::ChildOf;
@@ -13,10 +14,14 @@ use bevy::prelude::Ref;
 use bevy::prelude::Res;
 use bevy::prelude::ResMut;
 use bevy::prelude::Vec2;
+use bevy::prelude::Vec3;
 use bevy::prelude::With;
 
 use super::PanelTextLayout;
 use super::PreparedPanelText;
+use super::reify::PanelGlyphSource;
+use super::reify::RichRunGlyphs;
+use crate::constants::DIAGNOSTIC_LOG_TARGET;
 use crate::constants::MILLISECONDS_PER_SECOND;
 use crate::layout::Anchor;
 use crate::layout::BoundingBox;
@@ -31,9 +36,12 @@ use crate::render::text_shaping::GlyphReadiness;
 use crate::render::text_shaping::TextBuildStats;
 use crate::render::text_shaping::TextShapingContext;
 use crate::render::world_text::AwaitingReady;
+use crate::render::world_text::DrawnTextBounds;
 use crate::render::world_text::TextContent;
+use crate::text;
 use crate::text::FontRegistry;
 use crate::text::GlyphCache;
+use crate::text::PreparedTextRun;
 
 /// Shapes text for panel [`TextContent`] children that are changed or pending.
 pub(super) fn shape_panel_text_children(
@@ -45,6 +53,7 @@ pub(super) fn shape_panel_text_children(
                 Changed<TextContent>,
                 Changed<TextStyle>,
                 Changed<PanelTextLayout>,
+                Changed<RichRunGlyphs>,
             )>,
         ),
     >,
@@ -54,6 +63,7 @@ pub(super) fn shape_panel_text_children(
         Ref<PanelTextLayout>,
         &ChildOf,
         Option<&mut PreparedPanelText>,
+        Option<Ref<RichRunGlyphs>>,
     )>,
     font_registry: Res<FontRegistry>,
     shaping_cx: Res<TextShapingContext>,
@@ -77,7 +87,8 @@ pub(super) fn shape_panel_text_children(
     }
 
     for entity in to_process {
-        let Ok((world_text, style, panel_text_child, child_of, prepared)) = texts.get_mut(entity)
+        let Ok((world_text, style, panel_text_child, child_of, prepared, rich_glyphs)) =
+            texts.get_mut(entity)
         else {
             continue;
         };
@@ -89,6 +100,7 @@ pub(super) fn shape_panel_text_children(
 
         let config = style.for_shaping(Anchor::Center);
         if let Some(mut prepared) = prepared
+            && !rich_glyphs.as_ref().is_some_and(DetectChanges::is_changed)
             && text_render_only_refresh(
                 &world_text,
                 &style,
@@ -114,6 +126,9 @@ pub(super) fn shape_panel_text_children(
             &font_registry,
             &shaping_cx,
             &cache,
+            rich_glyphs
+                .as_deref()
+                .map_or(PanelGlyphSource::Plain, PanelGlyphSource::Rich),
         );
         aggregate.accumulate(&stats);
         shaped_panels.insert(child_of.parent());
@@ -168,7 +183,7 @@ struct QuadPlacement {
 fn clear_panel_text_output(entity: Entity, commands: &mut Commands) {
     commands
         .entity(entity)
-        .remove::<(PreparedPanelText, AwaitingReady)>();
+        .remove::<(PreparedPanelText, DrawnTextBounds, AwaitingReady)>();
 }
 
 fn build_panel_text(
@@ -179,18 +194,25 @@ fn build_panel_text(
     font_registry: &FontRegistry,
     shaping_cx: &TextShapingContext,
     cache: &ShapedTextCache,
+    glyph_source: PanelGlyphSource<&RichRunGlyphs>,
 ) -> (Option<PreparedPanelText>, TextBuildStats) {
     let mut stats = TextBuildStats {
         texts: 1,
         ..Default::default()
     };
     let layout_start = Instant::now();
-    let layout_run =
-        text_shaping::shape_text_cached(text, config, font_registry, shaping_cx, cache);
-    stats.shape_ms = layout_start.elapsed().as_secs_f32() * MILLISECONDS_PER_SECOND;
-    stats.glyphs = layout_run.glyphs.len();
-    let positioned_glyphs =
-        text_shaping::positioned_glyphs(&layout_run.glyphs, font_registry, &mut stats);
+    let plain_run;
+    let glyphs = match glyph_source {
+        PanelGlyphSource::Plain => {
+            plain_run =
+                text_shaping::shape_text_cached(text, config, font_registry, shaping_cx, cache);
+            stats.shape_ms = layout_start.elapsed().as_secs_f32() * MILLISECONDS_PER_SECOND;
+            &plain_run.glyphs[..]
+        },
+        PanelGlyphSource::Rich(run) => &run.glyphs[..],
+    };
+    stats.glyphs = glyphs.len();
+    let positioned_glyphs = text_shaping::positioned_glyphs(glyphs, font_registry, &mut stats);
     if stats.failed_glyphs > 0 {
         return (None, stats);
     }
@@ -206,7 +228,7 @@ fn build_panel_text(
     ) {
         Ok(prepared) => prepared,
         Err(err) => {
-            bevy::log::warn!("panel text unsupported: {err}");
+            bevy::log::warn!(target: DIAGNOSTIC_LOG_TARGET, "panel text unsupported: {err}");
             stats.failed_glyphs += positioned_glyphs.len().max(1);
             stats.atlas_ms = run_start.elapsed().as_secs_f32() * MILLISECONDS_PER_SECOND;
             return (None, stats);
@@ -237,7 +259,6 @@ fn build_panel_text(
             render_mode: config.render_mode(),
             shadow_mode: config.shadow_mode(),
             fill_color: config.color(),
-            em_height: config.size() * placement.scale.y.abs(),
             clip_rect,
             render_only: false,
         }),
@@ -285,14 +306,114 @@ fn apply_panel_result(
             let Some(panel_text) = panel_text else {
                 return;
             };
+            let bounds = drawn_text_bounds(&panel_text.prepared, panel_text.clip_rect);
             commands
                 .entity(entity)
                 .insert(panel_text)
                 .insert(AwaitingReady);
+            if let Some(bounds) = bounds {
+                commands.entity(entity).insert(bounds);
+            } else {
+                commands.entity(entity).remove::<DrawnTextBounds>();
+            }
         },
         GlyphReadiness::Invisible | GlyphReadiness::Failed => {
             clear_panel_text_output(entity, commands);
         },
         GlyphReadiness::Idle => {},
+    }
+}
+
+/// Unites exactly the clipped quads emitted into the text batch for this run.
+fn drawn_text_bounds(
+    prepared: &PreparedTextRun,
+    clip_rect: Option<[f32; 4]>,
+) -> Option<DrawnTextBounds> {
+    let mut minimum = Vec3::splat(f32::INFINITY);
+    let mut maximum = Vec3::splat(f32::NEG_INFINITY);
+    let mut has_quad = false;
+    for glyph in prepared.glyphs() {
+        let Some(quad) = text::glyph_quad_extents(*glyph, 1.0, clip_rect) else {
+            continue;
+        };
+        minimum = minimum.min(Vec3::new(quad.left, quad.bottom, 0.0));
+        maximum = maximum.max(Vec3::new(quad.right, quad.top, 0.0));
+        has_quad = true;
+    }
+    has_quad.then(|| DrawnTextBounds::new(Aabb::from_min_max(minimum, maximum)))
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "tests fail loudly when their glyph fixture is missing"
+)]
+mod bounds_tests {
+    use super::*;
+
+    #[test]
+    fn drawn_bounds_follow_the_prepared_glyph_quads() {
+        const TOLERANCE: f32 = 1.0e-5;
+
+        let registry = FontRegistry::new().expect("embedded fonts");
+        let placement = QuadPlacement {
+            bounds:    BoundingBox {
+                x:      0.0,
+                y:      0.0,
+                width:  200.0,
+                height: 40.0,
+            },
+            scale:     Vec2::splat(0.008),
+            anchor:    Vec2::ZERO,
+            clip_rect: None,
+        };
+        let (prepared, stats) = build_panel_text(
+            "Info",
+            &TextStyle::new(28.0).for_shaping(Anchor::Center),
+            &placement,
+            &mut GlyphCache::default(),
+            &registry,
+            &TextShapingContext::default(),
+            &ShapedTextCache::default(),
+            PanelGlyphSource::Plain,
+        );
+        assert_eq!(stats.failed_glyphs, 0);
+        let prepared = prepared.expect("prepared text");
+        let bounds = drawn_text_bounds(&prepared.prepared, prepared.clip_rect)
+            .expect("visible glyph bounds")
+            .local_aabb();
+        let minimum = bounds.min();
+        let maximum = bounds.max();
+        let quads = prepared
+            .prepared
+            .glyphs()
+            .iter()
+            .filter_map(|glyph| text::glyph_quad_extents(*glyph, 1.0, prepared.clip_rect))
+            .collect::<Vec<_>>();
+        assert!(!quads.is_empty());
+        for quad in &quads {
+            assert!(quad.left >= minimum.x - TOLERANCE && quad.right <= maximum.x + TOLERANCE);
+            assert!(quad.bottom >= minimum.y - TOLERANCE && quad.top <= maximum.y + TOLERANCE);
+        }
+        assert!(
+            quads
+                .iter()
+                .any(|quad| (quad.left - minimum.x).abs() <= TOLERANCE)
+        );
+        assert!(
+            quads
+                .iter()
+                .any(|quad| (quad.right - maximum.x).abs() <= TOLERANCE)
+        );
+        assert!(
+            quads
+                .iter()
+                .any(|quad| (quad.bottom - minimum.y).abs() <= TOLERANCE)
+        );
+        assert!(
+            quads
+                .iter()
+                .any(|quad| (quad.top - maximum.y).abs() <= TOLERANCE)
+        );
     }
 }

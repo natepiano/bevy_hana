@@ -32,6 +32,7 @@ use crate::FreeCamKind;
 use crate::OrbitCam;
 use crate::OrbitCamKind;
 use crate::animation::CameraSequencePlayback;
+use crate::input::CameraDragClaim;
 use crate::input::CameraInputDisabled;
 use crate::input::CameraInputSurfaceMetrics;
 use crate::input::CameraManual;
@@ -122,6 +123,7 @@ bitflags::bitflags! {
         const ANIMATION_IGNORE = 1 << 3;
         const CURSOR_HIT = 1 << 4;
         const SCROLL_DISABLED = 1 << 5;
+        const DRAG_CLAIMED = 1 << 6;
     }
 }
 
@@ -145,6 +147,7 @@ struct CameraSnapshotInputs<'a> {
     manual:           bool,
     disabled:         Option<&'a CameraInputDisabled>,
     scroll_disabled:  bool,
+    drag_claimed:     bool,
     playback:         Option<&'a CameraSequencePlayback>,
     interrupt:        Option<&'a CameraInputInterruptBehavior>,
     explicit_metrics: Option<&'a CameraInputSurfaceMetrics>,
@@ -171,6 +174,10 @@ pub(super) fn collect_camera_snapshots(
     windows: &WindowSnapshots,
 ) -> Vec<CameraRoutingSnapshot> {
     let mut snapshots = Vec::new();
+    let drag_claimed = matches!(
+        world.get_resource::<CameraDragClaim>(),
+        Some(CameraDragClaim::Claimed)
+    );
 
     let mut orbit_query = world.query_filtered::<(
         Entity,
@@ -204,6 +211,7 @@ pub(super) fn collect_camera_snapshots(
                     manual: manual.is_some(),
                     disabled,
                     scroll_disabled,
+                    drag_claimed,
                     playback,
                     interrupt,
                     explicit_metrics,
@@ -245,6 +253,7 @@ pub(super) fn collect_camera_snapshots(
                     manual: manual.is_some(),
                     disabled,
                     scroll_disabled,
+                    drag_claimed,
                     playback,
                     interrupt,
                     explicit_metrics,
@@ -268,6 +277,7 @@ fn camera_snapshot(
         manual,
         disabled,
         scroll_disabled,
+        drag_claimed,
         playback,
         interrupt,
         explicit_metrics,
@@ -284,6 +294,7 @@ fn camera_snapshot(
     flags.set(CameraRoutingSnapshotFlags::MANUAL, manual);
     flags.set(CameraRoutingSnapshotFlags::DISABLED, disabled.is_some());
     flags.set(CameraRoutingSnapshotFlags::SCROLL_DISABLED, scroll_disabled);
+    flags.set(CameraRoutingSnapshotFlags::DRAG_CLAIMED, drag_claimed);
     flags.set(CameraRoutingSnapshotFlags::ANIMATION_IGNORE, animation);
     flags.set(CameraRoutingSnapshotFlags::CURSOR_HIT, cursor_hit);
 

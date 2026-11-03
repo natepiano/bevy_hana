@@ -12,6 +12,7 @@ use bevy::prelude::debug;
 use bevy::prelude::warn;
 use hana_kana::Position;
 
+use super::fit_region::FitRegion;
 use super::fit_solution::FitError;
 use super::fit_solution::FitSolution;
 use super::focus;
@@ -27,6 +28,7 @@ use crate::fit::geometry::anchor::FitAnchor;
 use crate::fit::geometry::projection;
 use crate::fit::geometry::projection::ProjectionMode;
 use crate::fit::geometry::projection::ScreenSpaceBounds;
+use crate::fit::geometry::viewport_insets::FitViewportInsets;
 
 /// Tracks whether the binary search ever saw projectable bounds.
 #[derive(Debug, Clone, Copy)]
@@ -43,6 +45,7 @@ pub(super) struct FitParameters {
     pub(super) projection_mode:             ProjectionMode,
     pub(super) zoom_multiplier:             f32,
     pub(super) viewport_size:               Option<Vec2>,
+    pub(super) region:                      FitRegion,
 }
 
 /// Calculates the optimal radius and centered focus to fit pre-extracted vertices in the camera
@@ -63,6 +66,7 @@ pub fn calculate_fit(
     margin: f32,
     anchor: FitAnchor,
     offset_px: Vec2,
+    viewport_insets: FitViewportInsets,
     projection: &Projection,
     camera: &Camera,
 ) -> Result<FitSolution, FitError> {
@@ -100,6 +104,7 @@ pub fn calculate_fit(
 
     let aspect_ratio = projection::projection_aspect_ratio(projection, viewport_size)
         .ok_or(FitError::NoViewport)?;
+    let region = FitRegion::from_insets(viewport_insets, viewport_size)?;
 
     let parameters = FitParameters {
         rotation: Quat::from_euler(EulerRot::YXZ, yaw, -pitch, 0.0),
@@ -108,6 +113,7 @@ pub fn calculate_fit(
         projection_mode,
         zoom_multiplier: margins::zoom_margin_multiplier(clamped_margin),
         viewport_size,
+        region,
     };
 
     let object_radius = points
@@ -147,6 +153,7 @@ fn binary_search_for_fit(
     let mut best_radius = object_radius * INITIAL_RADIUS_MULTIPLIER;
     let mut best_focus = Position(geometric_center);
     let mut best_error = f32::INFINITY;
+    let mut best_fits = false;
     let mut bounds_search = BoundsSearch::NeverProjectable;
     let mut converged = false;
 
@@ -173,12 +180,13 @@ fn binary_search_for_fit(
             Transform::from_translation(camera_position).with_rotation(parameters.rotation),
         );
 
-        let Some((bounds, _)) = ScreenSpaceBounds::from_points(
+        let Some(bounds) = ScreenSpaceBounds::from_points(
             points,
             &camera_global,
             &test_projection,
             parameters.aspect_ratio,
-        ) else {
+        )
+        .map(|(bounds, _)| parameters.region.bounds_within(&bounds)) else {
             debug!(
                 "Iteration {iteration}: Points behind camera at radius {test_radius:.1}, searching higher"
             );
@@ -199,10 +207,12 @@ fn binary_search_for_fit(
         );
 
         let margin_error = (current_margin - target_margin).abs();
-        if margin_error < best_error {
+        let fits = current_margin >= target_margin;
+        if (fits && !best_fits) || (fits == best_fits && margin_error < best_error) {
             best_error = margin_error;
             best_radius = test_radius;
             best_focus = Position(centered_focus);
+            best_fits = fits;
         }
 
         if current_margin > target_margin {
@@ -285,6 +295,7 @@ fn build_test_projection(projection: &Projection, test_radius: f32) -> Projectio
     reason = "expect is idiomatic for test assertions"
 )]
 mod tests {
+    use bevy::camera::RenderTargetInfo;
     use bevy::prelude::Camera;
     use bevy::prelude::EulerRot;
     use bevy::prelude::GlobalTransform;
@@ -294,11 +305,14 @@ mod tests {
     use bevy::prelude::Quat;
     use bevy::prelude::Rect;
     use bevy::prelude::Transform;
+    use bevy::prelude::UVec2;
     use bevy::prelude::Vec2;
     use bevy::prelude::Vec3;
+    use hana_kana::ToF32;
 
     use super::calculate_fit;
     use crate::fit::FitAnchor;
+    use crate::fit::FitViewportInsets;
     use crate::fit::constants::CENTERING_TOLERANCE;
     use crate::fit::constants::DEFAULT_FIT_MARGIN;
     use crate::fit::geometry::projection;
@@ -348,6 +362,7 @@ mod tests {
             DEFAULT_FIT_MARGIN,
             FitAnchor::Center,
             Vec2::ZERO,
+            FitViewportInsets::NONE,
             &projection,
             &camera,
         );
@@ -369,6 +384,7 @@ mod tests {
             DEFAULT_FIT_MARGIN,
             FitAnchor::Center,
             Vec2::ZERO,
+            FitViewportInsets::NONE,
             &projection,
             &camera,
         );
@@ -395,6 +411,7 @@ mod tests {
             5.0,
             FitAnchor::Center,
             Vec2::ZERO,
+            FitViewportInsets::NONE,
             &projection,
             &camera,
         );
@@ -423,6 +440,7 @@ mod tests {
             f32::NAN,
             FitAnchor::Center,
             Vec2::ZERO,
+            FitViewportInsets::NONE,
             &projection,
             &camera,
         );
@@ -449,6 +467,7 @@ mod tests {
             DEFAULT_FIT_MARGIN,
             FitAnchor::TopLeft,
             Vec2::ZERO,
+            FitViewportInsets::NONE,
             &projection,
             &camera,
         )
@@ -484,6 +503,7 @@ mod tests {
             DEFAULT_FIT_MARGIN,
             FitAnchor::TopLeft,
             Vec2::new(16.0, 16.0),
+            FitViewportInsets::NONE,
             &projection,
             &camera,
         );
@@ -519,6 +539,7 @@ mod tests {
             DEFAULT_FIT_MARGIN,
             FitAnchor::Center,
             Vec2::ZERO,
+            FitViewportInsets::NONE,
             &projection,
             &camera,
         )
@@ -558,6 +579,7 @@ mod tests {
             DEFAULT_FIT_MARGIN,
             FitAnchor::Center,
             Vec2::ZERO,
+            FitViewportInsets::NONE,
             &projection,
             &camera,
         )
@@ -588,6 +610,7 @@ mod tests {
             DEFAULT_FIT_MARGIN,
             FitAnchor::Center,
             Vec2::ZERO,
+            FitViewportInsets::NONE,
             &projection,
             &camera,
         )
@@ -599,5 +622,128 @@ mod tests {
             fit.radius,
             object_radius,
         );
+    }
+
+    fn camera_with_viewport(width: u32, height: u32) -> Camera {
+        let mut camera = Camera::default();
+        camera.computed.target_info = Some(RenderTargetInfo {
+            physical_size: UVec2::new(width, height),
+            scale_factor:  1.0,
+        });
+        camera
+    }
+
+    fn unit_quad() -> [Vec3; 4] {
+        [
+            Vec3::new(-1.0, -1.0, 0.0),
+            Vec3::new(1.0, -1.0, 0.0),
+            Vec3::new(-1.0, 1.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+        ]
+    }
+
+    #[test]
+    fn calculate_fit_keeps_bounds_inside_viewport_insets() {
+        let projection = default_perspective();
+        let points = unit_quad();
+        for (width, height) in [(1280_u32, 720_u32), (1269, 1006)] {
+            let camera = camera_with_viewport(width, height);
+            let insets = FitViewportInsets::new(0.0, 40.0, 320.0, 260.0);
+            let fit = calculate_fit(
+                &points,
+                Vec3::ZERO,
+                0.0,
+                0.0,
+                DEFAULT_FIT_MARGIN,
+                FitAnchor::Center,
+                Vec2::ZERO,
+                insets,
+                &projection,
+                &camera,
+            )
+            .expect("fit inside insets should succeed");
+            let bounds = projected_bounds(&points, fit, 0.0, 0.0, &projection, &camera);
+            let size = Vec2::new(width.to_f32(), height.to_f32());
+            let free_min_x =
+                -bounds.half_extent_x + 2.0 * bounds.half_extent_x * insets.left() / size.x;
+            let free_max_x =
+                bounds.half_extent_x - 2.0 * bounds.half_extent_x * insets.right() / size.x;
+            let free_min_y =
+                -bounds.half_extent_y + 2.0 * bounds.half_extent_y * insets.bottom() / size.y;
+            let free_max_y =
+                bounds.half_extent_y - 2.0 * bounds.half_extent_y * insets.top() / size.y;
+            let tolerance = 1e-3;
+            assert!(
+                bounds.min_normalized_x >= free_min_x - tolerance,
+                "{width}x{height}: left edge enters the reserved space"
+            );
+            assert!(
+                bounds.max_normalized_x <= free_max_x + tolerance,
+                "{width}x{height}: right edge enters the reserved space"
+            );
+            assert!(
+                bounds.min_normalized_y >= free_min_y - tolerance,
+                "{width}x{height}: bottom edge enters the reserved space"
+            );
+            assert!(
+                bounds.max_normalized_y <= free_max_y + tolerance,
+                "{width}x{height}: top edge enters the reserved space"
+            );
+            let center_x = f32::midpoint(bounds.min_normalized_x, bounds.max_normalized_x);
+            let center_y = f32::midpoint(bounds.min_normalized_y, bounds.max_normalized_y);
+            assert!(
+                (center_x - f32::midpoint(free_min_x, free_max_x)).abs()
+                    < CENTERING_TOLERANCE * 10.0
+            );
+            assert!(
+                (center_y - f32::midpoint(free_min_y, free_max_y)).abs()
+                    < CENTERING_TOLERANCE * 10.0
+            );
+        }
+    }
+
+    #[test]
+    fn calculate_fit_ignores_insets_that_leave_too_little_viewport() {
+        let projection = default_perspective();
+        let camera = camera_with_viewport(1280, 720);
+        let points = unit_quad();
+        let fit = |insets| {
+            calculate_fit(
+                &points,
+                Vec3::ZERO,
+                0.0,
+                0.0,
+                DEFAULT_FIT_MARGIN,
+                FitAnchor::Center,
+                Vec2::ZERO,
+                insets,
+                &projection,
+                &camera,
+            )
+            .expect("fit should succeed")
+        };
+        let whole = fit(FitViewportInsets::NONE);
+        let crowded = fit(FitViewportInsets::new(640.0, 0.0, 600.0, 0.0));
+        assert!((whole.radius - crowded.radius).abs() < 1e-4);
+    }
+
+    #[test]
+    fn calculate_fit_requires_viewport_for_insets() {
+        let projection = default_perspective();
+        let camera = Camera::default();
+        let points = unit_quad();
+        let result = calculate_fit(
+            &points,
+            Vec3::ZERO,
+            0.0,
+            0.0,
+            DEFAULT_FIT_MARGIN,
+            FitAnchor::Center,
+            Vec2::ZERO,
+            FitViewportInsets::new(0.0, 0.0, 100.0, 0.0),
+            &projection,
+            &camera,
+        );
+        assert!(matches!(result, Err(FitError::NoViewport)));
     }
 }

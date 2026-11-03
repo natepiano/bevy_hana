@@ -4,9 +4,9 @@
 //! Types:
 //! - [`FreeCamTranslateKeys`] — the six-key WASD/Space/Ctrl translate helper.
 //! - [`FreeCamMouseLook`] — mouse-motion look binding gated by a mouse button.
+//! - [`FreeCamTrackpadLook`] — button-free smooth-scroll look binding.
 //! - [`FreeCamTranslateBinding`] / [`FreeCamLookBinding`] / [`FreeCamRollBinding`] — per-action
-//!   wrappers over a [`HeldBinding`] accepted by the builder's `.translate()` / `.look()` /
-//!   `.roll()` methods.
+//!   wrappers accepted by the builder's `.translate()` / `.look()` / `.roll()` methods.
 //! - [`FreeCamBindingsBuilder`] — accumulates per-action [`HeldBindingDescriptor`]s and validates
 //!   them into [`super::FreeCamBindings`].
 
@@ -26,6 +26,7 @@ use crate::input::CameraSlowMode;
 use crate::input::HeldBinding;
 use crate::input::HeldBindingDescriptor;
 use crate::input::InputBinding;
+use crate::input::InputGain;
 use crate::input::InteractionSources;
 use crate::orbit_cam::CameraInputGamepadSelectionPolicy;
 
@@ -154,6 +155,25 @@ impl From<FreeCamMouseLook> for HeldBinding {
     }
 }
 
+/// Button-free trackpad smooth-scroll binding that produces look intent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Reflect)]
+pub struct FreeCamTrackpadLook {
+    input_gain: InputGain,
+}
+
+impl FreeCamTrackpadLook {
+    /// Sets the authored input gain for this trackpad-look binding.
+    #[must_use]
+    pub const fn with_input_gain(mut self, input_gain: f32) -> Self {
+        self.input_gain = InputGain(input_gain);
+        self
+    }
+
+    pub(in crate::free_cam::input) const fn input_gain(self) -> InputGain { self.input_gain }
+
+    pub(super) fn validate(self) -> Result<(), BindingsError> { self.input_gain.validate() }
+}
+
 /// Binding that produces `FreeCam` translate intent.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FreeCamTranslateBinding(HeldBinding);
@@ -181,27 +201,48 @@ impl From<FreeCamTranslateKeys> for FreeCamTranslateBinding {
 
 /// Binding that produces `FreeCam` look intent.
 #[derive(Clone, Debug, PartialEq)]
-pub struct FreeCamLookBinding(HeldBinding);
+pub struct FreeCamLookBinding(FreeCamLookBindingKind);
+
+#[derive(Clone, Debug, PartialEq)]
+enum FreeCamLookBindingKind {
+    Held(HeldBinding),
+    Trackpad(FreeCamTrackpadLook),
+}
 
 impl FreeCamLookBinding {
     /// Sets the authored input gain for this look binding.
     #[must_use]
-    pub fn with_input_gain(mut self, input_gain: f32) -> Self {
-        self.0 = self.0.with_input_gain(input_gain);
-        self
+    pub fn with_input_gain(self, input_gain: f32) -> Self {
+        let kind = match self.0 {
+            FreeCamLookBindingKind::Held(binding) => {
+                FreeCamLookBindingKind::Held(binding.with_input_gain(input_gain))
+            },
+            FreeCamLookBindingKind::Trackpad(binding) => {
+                FreeCamLookBindingKind::Trackpad(binding.with_input_gain(input_gain))
+            },
+        };
+        Self(kind)
     }
+
+    fn into_kind(self) -> FreeCamLookBindingKind { self.0 }
 }
 
 impl From<HeldBinding> for FreeCamLookBinding {
-    fn from(binding: HeldBinding) -> Self { Self(binding) }
+    fn from(binding: HeldBinding) -> Self { Self(FreeCamLookBindingKind::Held(binding)) }
 }
 
 impl From<InputBinding> for FreeCamLookBinding {
-    fn from(binding: InputBinding) -> Self { Self(HeldBinding::same(binding)) }
+    fn from(binding: InputBinding) -> Self { HeldBinding::same(binding).into() }
 }
 
 impl From<FreeCamMouseLook> for FreeCamLookBinding {
-    fn from(look: FreeCamMouseLook) -> Self { Self(look.into()) }
+    fn from(look: FreeCamMouseLook) -> Self { HeldBinding::from(look).into() }
+}
+
+impl From<FreeCamTrackpadLook> for FreeCamLookBinding {
+    fn from(binding: FreeCamTrackpadLook) -> Self {
+        Self(FreeCamLookBindingKind::Trackpad(binding))
+    }
 }
 
 /// Binding that produces `FreeCam` roll intent.
@@ -228,13 +269,14 @@ impl From<InputBinding> for FreeCamRollBinding {
 /// Builder for validated `FreeCam` bindings.
 #[derive(Clone, Debug, Default)]
 pub struct FreeCamBindingsBuilder {
-    translate:  Vec<HeldBindingDescriptor>,
-    look:       Vec<HeldBindingDescriptor>,
-    roll:       Vec<HeldBindingDescriptor>,
-    look_pitch: FreeCamLookPitch,
-    slow_mode:  Option<CameraSlowMode>,
-    gamepad:    CameraInputGamepadSelectionPolicy,
-    home:       Vec<ActionBindingDescriptor>,
+    translate:     Vec<HeldBindingDescriptor>,
+    look:          Vec<HeldBindingDescriptor>,
+    trackpad_look: Vec<FreeCamTrackpadLook>,
+    roll:          Vec<HeldBindingDescriptor>,
+    look_pitch:    FreeCamLookPitch,
+    slow_mode:     Option<CameraSlowMode>,
+    gamepad:       CameraInputGamepadSelectionPolicy,
+    home:          Vec<ActionBindingDescriptor>,
 }
 
 impl FreeCamBindingsBuilder {
@@ -248,7 +290,10 @@ impl FreeCamBindingsBuilder {
     /// Adds a binding that produces look intent.
     #[must_use]
     pub fn look(mut self, binding: impl Into<FreeCamLookBinding>) -> Self {
-        self.look.push(binding.into().0.into());
+        match binding.into().into_kind() {
+            FreeCamLookBindingKind::Held(binding) => self.look.push(binding.into()),
+            FreeCamLookBindingKind::Trackpad(binding) => self.trackpad_look.push(binding),
+        }
         self
     }
 
@@ -303,6 +348,7 @@ impl FreeCamBindingsBuilder {
         let Self {
             translate,
             look,
+            trackpad_look,
             roll,
             look_pitch,
             slow_mode,
@@ -310,7 +356,14 @@ impl FreeCamBindingsBuilder {
             home,
         } = self;
         validate::validate_free_cam_bindings(
-            &translate, &look, &roll, look_pitch, slow_mode, gamepad, &home,
+            &translate,
+            &look,
+            &trackpad_look,
+            &roll,
+            look_pitch,
+            slow_mode,
+            gamepad,
+            &home,
         )
     }
 }

@@ -37,6 +37,7 @@ pub use input::FreeCamPreset;
 pub use input::FreeCamPresetKind;
 pub use input::FreeCamRollActionBindings;
 pub use input::FreeCamRollBinding;
+pub use input::FreeCamTrackpadLook;
 pub use input::FreeCamTranslateActionBindings;
 pub use input::FreeCamTranslateBinding;
 pub use input::FreeCamTranslateKeys;
@@ -346,7 +347,7 @@ impl FreeCamHomePose {
             home.zoom.0,
             home.pan.0,
             projection,
-            basis.axes(),
+            basis,
         );
         Self::from_transform(&transform, basis)
     }

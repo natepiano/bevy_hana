@@ -6,6 +6,22 @@ use winit::monitor::MonitorHandle;
 use super::identity;
 use crate::Platform;
 
+/// Physical image dimensions read from a display's EDID, when reported.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Reflect)]
+#[type_path = "hana_clerestory::monitors"]
+pub enum DisplayPhysicalSize {
+    /// EDID image width and height in millimetres.
+    Reported {
+        /// Physical image width in millimetres.
+        width_mm:  u32,
+        /// Physical image height in millimetres.
+        height_mm: u32,
+    },
+    /// No trustworthy EDID image dimensions were reported.
+    #[default]
+    NotReported,
+}
+
 /// The product name the operating system shows the user for a display.
 ///
 /// This presentation metadata is not device identity evidence and must not be used to derive a

@@ -329,28 +329,35 @@ above are checked by these named tests:
 
 ### State File Format
 
-The state file uses a versioned v5 schema:
+The state file uses a versioned v6 schema:
 
-- `version: 5`
-- `entries: [{ key, state }, ...]`
+- `version: 6`
+- `entries: [{ key, state, policy }, ...]`
+
+`policy` holds the complete binding policy for the window's role. It is optional: an entry without
+it takes its policy from the window's recovery markers when the window spawns.
 
 All spatial values are stored in **logical pixels**. Current window positions are offsets from a
-monitor's top-left corner and are converted with that monitor's live scale during restore. A v5
+monitor's top-left corner and are converted with that monitor's live scale during restore. A
 target is either `Classified(DeviceKey)`, which names the exact reporter-classified display, or
 `AwaitingLegacyEvidence`, which preserves v4 display evidence until a later reporter scan can resolve
 it. Clerestory never applies an unmatched target to an arbitrary primary display.
 
-The v5 writer persists neither winit's current monitor-enumeration index nor a native display
+The writer persists neither winit's current monitor-enumeration index nor a native display
 handle. Both are runtime adapter values whose numbers may change across restarts. `key` is typed
 (`Primary` or `Managed("<name>")`), so the primary window and a managed window named `"primary"`
 remain distinct.
 
-Unversioned and v1 through v4 files remain readable and are written as v5 on their next save. Their
-legacy `monitor_index` is parsed only for wire compatibility and never selects a live display.
-Pre-v3 absolute coordinates retain the scale that wrote them. Restore reconstructs the saved
-window center and rebases the coordinate only when exactly one current monitor's physical bounds
-contain that center. No match or overlapping matches discard the coordinate safely. A migrated v3
-`Unrebased` coordinate receives the same conservative treatment.
+v5 files are still read and are written as v6 on their next save. Files older than v5 (v1 through
+v4, and the unversioned single-window format) are not read. Such a file is copied to
+`windows.ron.bak.v<N>` (an unversioned file to `windows.ron.bak.corrupt`), and the app starts with
+no saved placement. The next save writes a v6 file in its place.
+
+A v5 or v6 file may still carry values converted from an older file: an `AwaitingLegacyEvidence`
+target, or an `Unrebased` position, which is a pre-v3 absolute coordinate kept with the scale that
+wrote it. Restore reconstructs the saved window center and rebases the coordinate only when
+exactly one current monitor's physical bounds contain that center. No match or overlapping matches
+discard the coordinate safely.
 
 ## Version Compatibility
 

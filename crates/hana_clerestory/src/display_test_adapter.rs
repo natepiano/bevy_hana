@@ -68,6 +68,27 @@ pub struct DisplayTestDescriptor {
     name:                   String,
     identity:               DisplayTestIdentity,
     platform_device_handle: PlatformDeviceHandle,
+    geometry:               DisplayTestGeometry,
+}
+
+/// Where a scripted display sits on the desktop, in physical pixels.
+///
+/// A display left at the default is one pixel at the desktop origin, which is enough for a test
+/// that only follows identity. A test that follows a window from one display to another places
+/// each display at its own position, so a window position names exactly one of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DisplayTestGeometry {
+    physical_position: IVec2,
+    physical_size:     UVec2,
+}
+
+impl Default for DisplayTestGeometry {
+    fn default() -> Self {
+        Self {
+            physical_position: IVec2::ZERO,
+            physical_size:     UVec2::ONE,
+        }
+    }
 }
 
 /// Whether a scripted display publishes identity material the reporter can key it by.
@@ -95,6 +116,7 @@ impl DisplayTestDescriptor {
             name: name.into(),
             identity: DisplayTestIdentity::Published(display_evidence.into()),
             platform_device_handle,
+            geometry: DisplayTestGeometry::default(),
         }
     }
 
@@ -108,7 +130,18 @@ impl DisplayTestDescriptor {
             name: name.into(),
             identity: DisplayTestIdentity::Unpublished,
             platform_device_handle,
+            geometry: DisplayTestGeometry::default(),
         }
+    }
+
+    /// Places this display on the desktop at `physical_position` with `physical_size`.
+    #[must_use]
+    pub const fn placed_at(mut self, physical_position: IVec2, physical_size: UVec2) -> Self {
+        self.geometry = DisplayTestGeometry {
+            physical_position,
+            physical_size,
+        };
+        self
     }
 
     fn device_evidence(&self) -> DisplayDeviceEvidence {
@@ -418,8 +451,16 @@ impl PublishedDisplayTopology {
     }
 }
 
-const fn scripted_monitor_descriptor(index: usize) -> MonitorDescriptor {
-    MonitorDescriptor::for_current_enumeration(index, 1.0, IVec2::ZERO, UVec2::ONE)
+const fn scripted_monitor_descriptor(
+    index: usize,
+    geometry: DisplayTestGeometry,
+) -> MonitorDescriptor {
+    MonitorDescriptor::for_current_enumeration(
+        index,
+        1.0,
+        geometry.physical_position,
+        geometry.physical_size,
+    )
 }
 
 /// Publish the current script as the topology and winit enumeration the display reporter reads.
@@ -494,7 +535,7 @@ fn publish_scripted_display_topology(
             .iter()
             .enumerate()
             .map(|(index, display)| {
-                let descriptor = scripted_monitor_descriptor(index);
+                let descriptor = scripted_monitor_descriptor(index, display.geometry);
                 let monitor = Monitor {
                     name:                    Some(display.name.clone()),
                     physical_height:         descriptor.physical_size.y,

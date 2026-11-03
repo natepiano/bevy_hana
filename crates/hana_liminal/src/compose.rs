@@ -171,6 +171,7 @@ impl FromWorld for ComposeOutputPipeline {
                 .clone()
                 .to_vertex_state(),
             fragment:                         Some(FragmentState {
+                constants:   Vec::default(),
                 shader:      COMPOSE_SHADER_HANDLE,
                 shader_defs: vec![],
                 entry_point: Some(FRAGMENT_SHADER_ENTRY_POINT.into()),

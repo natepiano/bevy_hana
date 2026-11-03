@@ -1,3 +1,6 @@
+use bevy::extract::Extract;
+use bevy::extract::sync_world::MainEntity;
+use bevy::extract::sync_world::MainEntityHashMap;
 use bevy::prelude::Added;
 use bevy::prelude::Changed;
 use bevy::prelude::ColorToComponents;
@@ -13,9 +16,6 @@ use bevy::prelude::ResMut;
 use bevy::prelude::Resource;
 use bevy::prelude::Vec4;
 use bevy::prelude::With;
-use bevy_render::Extract;
-use bevy_render::sync_world::MainEntity;
-use bevy_render::sync_world::MainEntityHashMap;
 use hana_kana::ToF32;
 
 use super::constants::DEFAULT_OUTLINE_DRAW_PRIORITY;

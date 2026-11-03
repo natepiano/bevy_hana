@@ -20,6 +20,7 @@ use bevy::prelude::Color;
 use bevy::prelude::Commands;
 use bevy::prelude::Component;
 use bevy::prelude::Entity;
+use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::Name;
 use bevy::prelude::PostStartup;
 use bevy::prelude::Query;
@@ -65,9 +66,7 @@ use hana_diegetic::Padding;
 use hana_diegetic::Sizing;
 use hana_diegetic::TextAlign;
 use hana_diegetic::TextStyle;
-use hana_lagrange::CameraInputRoutingConfig;
 use hana_lagrange::ControlSpeed;
-use hana_lagrange::NoPositionFallback;
 use hana_lagrange::OrbitCam;
 use hana_lagrange::OrbitCamControlSummary;
 use hana_lagrange::OrbitCamInputMode;
@@ -82,10 +81,6 @@ const EXAMPLE_TITLE: &str = "Gamepad";
 
 fn main() {
     fairy_dust::sprinkle_example()
-        .insert_resource(
-            CameraInputRoutingConfig::cursor_hit_test()
-                .with_no_position_fallback(NoPositionFallback::OnlyEligibleCamera),
-        )
         .with_brp_extras()
         .with_save_window_position()
         .with_studio_lighting()
@@ -120,7 +115,7 @@ fn main() {
         .add_systems(
             Update,
             (
-                update_gamepad_connection,
+                update_gamepad_connection.in_set(fairy_dust::TitleBarStateWriters),
                 update_face_labels,
                 toggle_spin_on_gamepad_west,
             ),
@@ -554,8 +549,8 @@ fn idle_grid_tree(kind: GamepadFaceLabel, summary: &OrbitCamControlSummary) -> L
             .width(Sizing::fixed(style.size))
             .height(Sizing::fixed(style.size))
             .alignment(AlignX::Center, AlignY::Center)
-            .gap(style.row_gap)
-            .padding(Padding::all(style.padding))
+            .gap(style.row_gap())
+            .padding(Padding::all(style.padding()))
             .clip(),
     );
     builder.text((kind.title(), title_style));
@@ -578,7 +573,7 @@ fn idle_grid_tree(kind: GamepadFaceLabel, summary: &OrbitCamControlSummary) -> L
                     El::column()
                         .width(Sizing::GROW)
                         .alignment(AlignX::Left, AlignY::Center)
-                        .gap(style.row_gap),
+                        .gap(style.row_gap()),
                     |column| {
                         for control in &controls {
                             column.text((control.clone(), label_style.clone()));
@@ -612,17 +607,17 @@ fn idle_speed_groups(
 }
 
 /// Spells out a gamepad control abbreviation for the cube faces. Compound labels
-/// like `rb+rs` expand each token: `right bumper + right stick`.
+/// like `RB+RS` expand each token: `right bumper + right stick`.
 fn spell_out_control(label: &str) -> String {
     label
         .split('+')
         .map(|token| match token {
-            "ls" => "left stick",
-            "rs" => "right stick",
-            "lb" => "left bumper",
-            "rb" => "right bumper",
-            "lt" => "left trigger",
-            "rt" => "right trigger",
+            "LS" => "left stick",
+            "RS" => "right stick",
+            "LB" => "left bumper",
+            "RB" => "right bumper",
+            "LT" => "left trigger",
+            "RT" => "right trigger",
             other => other,
         })
         .collect::<Vec<_>>()

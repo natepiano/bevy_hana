@@ -15,16 +15,15 @@ use bevy::prelude::Visibility;
 use bevy::prelude::default;
 
 use super::OverlayBoundingBox;
-use super::constants::LEFT_OUTER_ARROW_SLOT;
 use super::constants::NO_LINE_GAP_LABEL_PREFIX;
 use super::constants::OVERLAY_BOUNDING_BOX_NAME;
-use super::constants::RIGHT_OUTER_ARROW_SLOT;
 use super::pipeline::FontContext;
 use super::pipeline::GlyphExtents;
 use super::pipeline::OverlayAssets;
 use super::pipeline::OverlayContext;
 use super::pipeline::TextServices;
 use super::scaling;
+use super::scaling::MetricArrowColumns;
 use crate::debug::constants::CALLOUT_Z_OFFSET;
 use crate::debug::constants::LABEL_ADVANCEMENT;
 use crate::debug::constants::LABEL_ASCENT;
@@ -73,7 +72,7 @@ pub(super) fn spawn_metric_labels(
     font_name: &str,
     font_context: &FontContext<'_>,
     metric_lines: &[(&str, f32)],
-    extents: &GlyphExtents,
+    columns: &MetricArrowColumns,
 ) {
     let style = LabelStyle {
         size:     scaling::font_scale(ctx.font_size, ctx.scale) * LABEL_SIZE_RATIO,
@@ -92,11 +91,10 @@ pub(super) fn spawn_metric_labels(
         descent:    line_metrics.baseline + line_metrics.descent,
     };
 
-    let left_1 = extents.first_left - extents.arrow_spacing;
-    let left_2 = LEFT_OUTER_ARROW_SLOT.mul_add(-extents.arrow_spacing, extents.first_left);
-
-    let right_1 = extents.last_right + extents.arrow_spacing;
-    let right_2 = RIGHT_OUTER_ARROW_SLOT.mul_add(extents.arrow_spacing, extents.last_right);
+    let left_1 = columns.left_inner;
+    let left_2 = columns.left_outer;
+    let right_1 = columns.right_inner;
+    let right_2 = columns.right_outer;
 
     spawn_line_edge_labels(ctx, metric_lines, &style, left_2);
     spawn_left_arrow_labels(
@@ -139,11 +137,30 @@ fn measure_overlay_label(
     }
 }
 
+pub(super) fn measure_overlay_label_width(
+    text_services: &TextServices<'_>,
+    label: &str,
+    size: f32,
+    scale: f32,
+) -> f32 {
+    let boost = 1.0 / Unit::Points.meters_per_unit();
+    measure_overlay_label(
+        text_services.cache,
+        text_services.measure_text,
+        label,
+        size,
+        boost,
+        scale,
+    )
+    .width
+}
+
 pub(super) fn spawn_overlay_bounds_target(
     ctx: &mut OverlayContext<'_, '_, '_>,
     font_name: &str,
     font_context: &FontContext<'_>,
     extents: &GlyphExtents,
+    columns: &MetricArrowColumns,
     text_services: &TextServices<'_>,
     assets: &mut OverlayAssets<'_>,
 ) -> Entity {
@@ -184,13 +201,8 @@ pub(super) fn spawn_overlay_bounds_target(
     let baseline_y = line_metrics.baseline;
     let ascent_y = baseline_y - line_metrics.ascent;
     let top_y = line_metrics.top;
-    let left_2 = LEFT_OUTER_ARROW_SLOT.mul_add(-extents.arrow_spacing, extents.first_left);
-    let right_2 = RIGHT_OUTER_ARROW_SLOT.mul_add(extents.arrow_spacing, extents.last_right);
-
-    let line_height_anchor_x = left_2 - gap;
-    let cap_height_anchor_x = right_2 + gap;
-    let line_height_left = line_height_anchor_x - line_height_dims.width;
-    let cap_height_right = cap_height_anchor_x + cap_height_dims.width;
+    let (line_height_left, cap_height_right) =
+        overlay_horizontal_bounds(columns, line_height_dims.width, cap_height_dims.width, gap);
 
     let descent_world =
         scaling::layout_to_world_y(baseline_y + line_metrics.descent, ctx.anchor_y, ctx.scale);
@@ -212,8 +224,9 @@ pub(super) fn spawn_overlay_bounds_target(
             boost,
             ctx.scale,
         );
-        let no_gap_top =
-            scaling::layout_to_world_y(ascent_y, ctx.anchor_y, ctx.scale) + no_gap_dims.height;
+        let no_gap_top = scaling::layout_to_world_y(ascent_y, ctx.anchor_y, ctx.scale)
+            + gap
+            + no_gap_dims.height;
         top_extent = top_extent.max(no_gap_top);
     }
 
@@ -250,6 +263,18 @@ pub(super) fn spawn_overlay_bounds_target(
             ChildOf(ctx.entity),
         ))
         .id()
+}
+
+fn overlay_horizontal_bounds(
+    columns: &MetricArrowColumns,
+    line_height_width: f32,
+    cap_height_width: f32,
+    gap: f32,
+) -> (f32, f32) {
+    (
+        columns.left_outer - gap - line_height_width,
+        columns.right_outer + gap + cap_height_width,
+    )
 }
 
 /// Spawns Top/Bottom line-edge labels.
@@ -344,6 +369,8 @@ fn spawn_left_arrow_labels(
     let has_line_gap =
         (line_metrics.top - (line_metrics.baseline - line_metrics.ascent)).abs() > 0.5;
     if !has_line_gap {
+        // Lifted by the label gap so its descenders clear the ascent line and
+        // the arrow tip beneath it.
         let ascent_world = scaling::layout_to_world_y(guides.ascent, ctx.anchor_y, ctx.scale);
         let no_gap_label = format!("{NO_LINE_GAP_LABEL_PREFIX}{font_name}");
         super::spawn_overlay_label(
@@ -354,7 +381,7 @@ fn spawn_left_arrow_labels(
                 .with_color(style.color)
                 .with_anchor(Anchor::BottomLeft)
                 .with_shadow_mode(ctx.overlay.label_shadow_mode()),
-            Transform::from_xyz(left_2, ascent_world, style.z_offset),
+            Transform::from_xyz(left_2, ascent_world + style.gap, style.z_offset),
         );
     }
 }
@@ -392,4 +419,113 @@ fn spawn_right_arrow_labels(
             .with_shadow_mode(ctx.overlay.label_shadow_mode()),
         Transform::from_xyz(right_2 + style.gap, cap_mid_world, style.z_offset),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::text;
+    use crate::text::FontId;
+    use crate::text::FontRegistry;
+
+    #[test]
+    fn metric_labels_reach_readable_cap_height_at_home_fit() -> Result<(), &'static str> {
+        let mut registry = FontRegistry::new().map_err(|_| "embedded font unavailable")?;
+        let noto = registry
+            .register_font(
+                "Noto Sans",
+                include_bytes!("../../../assets/fonts/NotoSans-Regular.ttf"),
+            )
+            .map_err(|_| "Noto Sans unavailable")?;
+        let measure_text =
+            text::create_parley_measurer(registry.font_context(), registry.family_names());
+        let cache = ShapedTextCache::default();
+        let services = TextServices {
+            measure_text: &measure_text,
+            cache:        &cache,
+        };
+        let scale = Unit::Points.meters_per_unit();
+        let font_size = 0.48 / scale;
+        let label_size = scaling::font_scale(font_size, scale) * LABEL_SIZE_RATIO;
+        let gap = scaling::label_gap(font_size, scale);
+        let left_width = [LABEL_ASCENT, LABEL_DESCENT]
+            .into_iter()
+            .map(|label| measure_overlay_label_width(&services, label, label_size, scale))
+            .fold(0.0, f32::max);
+        let right_width = measure_overlay_label_width(&services, LABEL_X_HEIGHT, label_size, scale);
+        let outer_left_width =
+            measure_overlay_label_width(&services, LABEL_LINE_HEIGHT, label_size, scale);
+        let outer_right_width =
+            measure_overlay_label_width(&services, LABEL_CAP_HEIGHT, label_size, scale);
+        let label_cap_height = registry
+            .font(FontId::MONOSPACE)
+            .map_err(|_| "label font unavailable")?
+            .metrics(font_size * LABEL_SIZE_RATIO)
+            .cap_height
+            * scale;
+        for (word, font_name, font_id) in [
+            ("Typography", "JetBrains Mono", FontId::MONOSPACE),
+            ("fly", "Noto Sans", noto),
+        ] {
+            let style = TextStyle::new(font_size).with_font(font_id.0).as_measure();
+            let word_line_height = registry
+                .font(font_id)
+                .map_err(|_| "display font unavailable")?
+                .metrics(font_size)
+                .line_height
+                * scale;
+            let word_width = (measure_text)(word, &style).width * scale;
+            let first_width = (measure_text)(&word[..1], &style).width * scale;
+            let spacing = scaling::arrow_spacing(first_width);
+            let columns = scaling::metric_arrow_columns(
+                0.0,
+                word_width,
+                spacing,
+                left_width,
+                right_width,
+                gap,
+            );
+            let (left, right) =
+                overlay_horizontal_bounds(&columns, outer_left_width, outer_right_width, gap);
+            let width = right - left;
+            let advancement_height = measure_overlay_label(
+                &cache,
+                &measure_text,
+                LABEL_ADVANCEMENT,
+                label_size,
+                1.0 / scale,
+                scale,
+            )
+            .height;
+            let no_gap_height = measure_overlay_label(
+                &cache,
+                &measure_text,
+                &format!("{NO_LINE_GAP_LABEL_PREFIX}{font_name}"),
+                label_size,
+                1.0 / scale,
+                scale,
+            )
+            .height;
+            let height_upper_bound = 1.5_f32.mul_add(spacing, word_line_height)
+                + advancement_height
+                + gap
+                + no_gap_height;
+            assert!(
+                width / height_upper_bound > 1280.0 / 720.0,
+                "{word} home fit must be width-limited"
+            );
+            let pixels_per_meter = 1280.0 * (1.0 - 0.05) / width;
+            assert!(
+                label_cap_height * pixels_per_meter >= 7.2,
+                "{word} cap height: {}",
+                label_cap_height * pixels_per_meter
+            );
+            assert!(
+                gap * pixels_per_meter >= 8.0,
+                "{word} label gap: {}",
+                gap * pixels_per_meter
+            );
+        }
+        Ok(())
+    }
 }

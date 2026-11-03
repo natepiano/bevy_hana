@@ -159,12 +159,6 @@ pub struct ScriptedRig {
     role:     RoleKey,
 }
 
-impl ScriptedRig {
-    /// Borrow the role whose established-session state the headless behavior test reads.
-    #[cfg(test)]
-    pub const fn role(&self) -> &RoleKey { &self.role }
-}
-
 /// Marks the panel this example rewrites as the register changes.
 #[derive(Component)]
 struct RegisterStatusPanel;
@@ -198,49 +192,17 @@ struct PanelAttemptStore {
     completion_queued: HashMap<AttemptRef, PanelPlacement>,
 }
 
-/// Number of panel attempts in each driver-owned lifecycle state.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PanelAttemptStoreCounts {
-    /// Attempts whose one-use completion authority has not been resolved yet.
-    pub applying:          usize,
-    /// Attempts whose dispatched configuration is waiting for establishment.
-    pub completion_queued: usize,
-}
-
 /// Lease and established configuration retained for one panel role.
 struct EstablishedPanelSession {
     lease:         SessionLease<PanelPlacement>,
     configuration: PanelPlacement,
 }
 
-/// Result of pairing a kernel session lease with its dispatched panel configuration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PanelSessionEstablishment {
-    /// The driver retained the lease and established configuration in one role-keyed entry.
-    LeaseAndConfigurationRetained,
-    /// The attempt configuration was missing, so the lease reported loss and was not retained.
-    MissingAttemptReported,
-}
-
-/// Test observation of the most recent session-establishment callback result.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PanelSessionEstablishmentObservation {
-    /// No session-establishment callback has run.
-    #[default]
-    NotObserved,
-    /// The callback returned this establishment result.
-    Observed(PanelSessionEstablishment),
-}
-
 /// Driver-owned authorities and configurations for the role shown by the walkthrough.
 #[derive(Default, Resource)]
 pub struct ConvergingDriverState {
-    attempts:                  PanelAttemptStore,
-    established:               HashMap<RoleKey, EstablishedPanelSession>,
-    #[cfg(test)]
-    establishment_observation: PanelSessionEstablishmentObservation,
+    attempts:    PanelAttemptStore,
+    established: HashMap<RoleKey, EstablishedPanelSession>,
 }
 
 impl ConvergingDriverState {
@@ -249,8 +211,8 @@ impl ConvergingDriverState {
         role: RoleKey,
         attempt: AttemptRef,
         lease: SessionLease<PanelPlacement>,
-    ) -> PanelSessionEstablishment {
-        let establishment = match self.attempts.completion_queued.remove(&attempt) {
+    ) {
+        match self.attempts.completion_queued.remove(&attempt) {
             None => {
                 lease.report_loss(DeviceAccessError::Transport {
                     detail: format!(
@@ -258,7 +220,6 @@ impl ConvergingDriverState {
                         attempt.get()
                     ),
                 });
-                PanelSessionEstablishment::MissingAttemptReported
             },
             Some(configuration) => {
                 if let Some(replaced) = self.established.insert(
@@ -276,15 +237,8 @@ impl ConvergingDriverState {
                         .lease
                         .report_loss(DeviceAccessError::Transport { detail });
                 }
-                PanelSessionEstablishment::LeaseAndConfigurationRetained
             },
-        };
-        #[cfg(test)]
-        {
-            self.establishment_observation =
-                PanelSessionEstablishmentObservation::Observed(establishment);
         }
-        establishment
     }
 }
 
@@ -396,43 +350,6 @@ pub fn finish_converging_applies(mut state: ResMut<ConvergingDriverState>) {
     }
 }
 
-/// Remove configurations after their completions are queued so the next callback reports loss.
-#[cfg(test)]
-pub fn discard_completed_panel_attempts(world: &mut World) {
-    world
-        .resource_mut::<ConvergingDriverState>()
-        .attempts
-        .completion_queued
-        .clear();
-}
-
-/// Read the most recent establishment callback result for the headless behavior test.
-#[cfg(test)]
-pub fn establishment_observation(world: &World) -> PanelSessionEstablishmentObservation {
-    world
-        .resource::<ConvergingDriverState>()
-        .establishment_observation
-}
-
-/// Count attempts in each driver-owned lifecycle state for headless failure diagnostics.
-#[cfg(test)]
-pub fn attempt_store_counts(world: &World) -> PanelAttemptStoreCounts {
-    let attempts = &world.resource::<ConvergingDriverState>().attempts;
-    PanelAttemptStoreCounts {
-        applying:          attempts.applying.len(),
-        completion_queued: attempts.completion_queued.len(),
-    }
-}
-
-/// Report whether one role retains its session lease and established configuration together.
-#[cfg(test)]
-pub fn retains_lease_and_configuration(world: &World, role: &RoleKey) -> bool {
-    world
-        .resource::<ConvergingDriverState>()
-        .established
-        .contains_key(role)
-}
-
 fn main() -> Result<(), Box<dyn Error>> {
     let mut example = fairy_dust::sprinkle_example().with_brp_extras();
     let rig = install_kernel(example.app_mut())?;
@@ -479,10 +396,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Keep the interactive entry reachable when this example is included by an integration test.
-#[cfg(test)]
-pub fn interactive_example_entry() -> Result<(), Box<dyn Error>> { main() }
-
 /// Install the kernel, the scripted reporter, and the one role the walkthrough drives.
 ///
 /// Registration happens against `&mut App` rather than through a Fairy Dust helper so the calls
@@ -504,17 +417,6 @@ pub fn install_kernel(app: &mut App) -> Result<ScriptedRig, Box<dyn Error>> {
             ScriptedScan::Complete(vec![at_shared_attachment(candidate)?]),
             ScriptedScan::Complete(vec![at_shared_attachment(third)?]),
         ],
-    )
-}
-
-/// Install the example driver with a reporter that keeps the saved panel present.
-#[cfg(test)]
-pub fn install_saved_panel_kernel(app: &mut App) -> Result<ScriptedRig, Box<dyn Error>> {
-    let saved = reported_key(DeviceKind::ControlSurface, PANEL_SCHEME, SAVED_PANEL)?;
-    install_kernel_with_reporter_scans(
-        app,
-        saved.clone(),
-        vec![ScriptedScan::Complete(vec![at_shared_attachment(saved)?])],
     )
 }
 

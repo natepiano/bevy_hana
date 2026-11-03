@@ -1,5 +1,5 @@
 (
-    version: 3,
+    version: 6,
     entries: [
         (
             key: Primary,
@@ -7,7 +7,7 @@
                 position: MonitorOffset((50, 50)),
                 logical_width: 400,
                 logical_height: 300,
-                monitor_index: 0,
+                target: AwaitingLegacyEvidence(Anonymous),
                 mode: Windowed,
                 app_name: "restore_window",
             )

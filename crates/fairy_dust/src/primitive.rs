@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use std::sync::PoisonError;
 
 use bevy::ecs::system::EntityCommands;
+use bevy::light::NotShadowCaster;
 use bevy::prelude::Alpha;
 use bevy::prelude::AlphaMode;
 use bevy::prelude::App;
@@ -33,6 +34,7 @@ use bevy::prelude::warn;
 use hana_diegetic::AlignX;
 use hana_diegetic::AlignY;
 use hana_diegetic::Anchor;
+use hana_diegetic::ControlMetrics;
 use hana_diegetic::DiegeticPanel;
 use hana_diegetic::DiegeticPanelCommands;
 use hana_diegetic::DiegeticText;
@@ -42,7 +44,6 @@ use hana_diegetic::LayoutBuilder;
 use hana_diegetic::LayoutTree;
 use hana_diegetic::Padding;
 use hana_diegetic::PanelBuildError;
-use hana_diegetic::Sidedness;
 use hana_diegetic::Sizing;
 use hana_diegetic::TextAlign;
 use hana_diegetic::TextStyle;
@@ -55,8 +56,6 @@ use crate::constants::CUBE_FACE_LABEL_SIZE;
 use crate::constants::CUBE_FACE_PANEL_ACTIVE_BODY_SIZE;
 use crate::constants::CUBE_FACE_PANEL_BLUE;
 use crate::constants::CUBE_FACE_PANEL_BODY_SIZE;
-use crate::constants::CUBE_FACE_PANEL_PADDING_FRACTION;
-use crate::constants::CUBE_FACE_PANEL_ROW_GAP_FRACTION;
 use crate::constants::CUBE_FACE_PANEL_SIZE_FRACTION;
 use crate::constants::CUBE_FACE_PANEL_TITLE_SIZE;
 use crate::constants::FACE_TEXT_Z_OFFSET;
@@ -159,15 +158,27 @@ impl CubeFacePanelContent {
     }
 }
 
+/// How a cube face spaces its content.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CubeFaceSpacing {
+    /// Padding and row gap follow `body_size` through the `ControlMetrics` spacing scale.
+    FollowsBodySize,
+    /// Fixed padding and row gap, in meters.
+    Fixed {
+        /// Panel inner padding in meters.
+        padding: f32,
+        /// Body row gap in meters.
+        row_gap: f32,
+    },
+}
+
 /// Visual sizing for canonical cube face panels.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CubeFacePanelStyle {
     /// Square panel edge length.
     pub size:             f32,
-    /// Panel inner padding.
-    pub padding:          f32,
-    /// Gap between title/body rows.
-    pub row_gap:          f32,
+    /// How panel padding and body row gap are resolved.
+    pub spacing:          CubeFaceSpacing,
     /// Title text size.
     pub title_size:       f32,
     /// Idle body text size.
@@ -184,12 +195,37 @@ impl CubeFacePanelStyle {
     pub const fn for_cube(cube_size: f32) -> Self {
         Self {
             size:             cube_size * CUBE_FACE_PANEL_SIZE_FRACTION,
-            padding:          cube_size * CUBE_FACE_PANEL_PADDING_FRACTION,
-            row_gap:          cube_size * CUBE_FACE_PANEL_ROW_GAP_FRACTION,
+            spacing:          CubeFaceSpacing::FollowsBodySize,
             title_size:       CUBE_FACE_PANEL_TITLE_SIZE,
             body_size:        CUBE_FACE_PANEL_BODY_SIZE,
             active_body_size: CUBE_FACE_PANEL_ACTIVE_BODY_SIZE,
             color:            CUBE_FACE_PANEL_BLUE,
+        }
+    }
+
+    /// Resolves panel inner padding in meters.
+    #[must_use]
+    pub fn padding(&self) -> f32 {
+        match self.spacing {
+            CubeFaceSpacing::FollowsBodySize => {
+                ControlMetrics::from_label_size(self.body_size * 0.001)
+                    .spacing
+                    .panel_padding
+            },
+            CubeFaceSpacing::Fixed { padding, .. } => padding,
+        }
+    }
+
+    /// Resolves body row gap in meters.
+    #[must_use]
+    pub fn row_gap(&self) -> f32 {
+        match self.spacing {
+            CubeFaceSpacing::FollowsBodySize => {
+                ControlMetrics::from_label_size(self.body_size * 0.001)
+                    .spacing
+                    .row_gap
+            },
+            CubeFaceSpacing::Fixed { row_gap, .. } => row_gap,
         }
     }
 }
@@ -303,7 +339,6 @@ pub fn cube_face_text(
         DiegeticText::world(text)
             .size(text_size)
             .color(color)
-            .sidedness(Sidedness::FrontOnly)
             .transform(face.local_transform(cube_size * 0.5))
             .build(),
     )
@@ -378,13 +413,14 @@ pub fn cube_face_panel_tree(
     style: CubeFacePanelStyle,
     content: CubeFacePanelContent,
 ) -> LayoutTree {
+    let spacing = ControlMetrics::from_label_size(style.body_size * 0.001).spacing;
     let mut builder = LayoutBuilder::with_root(
         El::column()
             .width(Sizing::fixed(style.size))
             .height(Sizing::fixed(style.size))
             .alignment(AlignX::Center, AlignY::Center)
-            .gap(style.row_gap)
-            .padding(Padding::all(style.padding))
+            .gap(spacing.title_gap)
+            .padding(Padding::all(style.padding()))
             .clip(),
     );
 
@@ -402,9 +438,17 @@ pub fn cube_face_panel_tree(
         .with_color(style.color)
         .with_align(TextAlign::Center)
         .with_shadow_mode(GlyphShadowMode::None);
-    for row in content.rows {
-        builder.text((row, body.clone()));
-    }
+    builder.with(
+        El::column()
+            .width(Sizing::GROW)
+            .height(Sizing::FIT)
+            .gap(style.row_gap()),
+        |builder| {
+            for row in content.rows {
+                builder.text((row, body.clone()));
+            }
+        },
+    );
 
     builder.build()
 }
@@ -467,8 +511,15 @@ fn spawn_primitive(
         MeshMaterial3d(materials.add(material)),
         transform,
     ));
-    if matches!(config.kind, PrimitiveKind::Cube) {
-        entity.insert(FairyDustCube);
+    match config.kind {
+        PrimitiveKind::GroundPlane => {
+            // The floor still receives object shadows without casting its own
+            // depth-map shadow back onto itself across the studio cascades.
+            entity.insert(NotShadowCaster);
+        },
+        PrimitiveKind::Cube => {
+            entity.insert(FairyDustCube);
+        },
     }
     for insert in inserts {
         insert(&mut entity);
@@ -504,5 +555,287 @@ fn default_material(kind: PrimitiveKind, color: Color) -> StandardMaterial {
             base_color: color,
             ..default()
         },
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "tests should panic on unexpected values"
+)]
+mod tests {
+    use bevy::light::NotShadowCaster;
+    use bevy::prelude::Assets;
+    use bevy::prelude::Mesh;
+    use bevy::prelude::MinimalPlugins;
+    use bevy::prelude::StandardMaterial;
+    use hana_diegetic::ComputedDiegeticPanel;
+    use hana_diegetic::ControlMetrics;
+    use hana_diegetic::DiegeticPanel;
+    use hana_diegetic::DiegeticTextMeasurer;
+    use hana_diegetic::HeadlessLayoutPlugin;
+
+    use super::CubeFacePanelContent;
+    use super::CubeFacePanelStyle;
+    use super::CubeFaceSpacing;
+    use super::PrimitiveConfig;
+    use super::cube_face_panel_tree;
+    use super::install;
+    use crate::constants::CUBE_FACE_PANEL_BODY_SIZE;
+
+    #[test]
+    fn ground_does_not_cast_its_own_shadow() {
+        let mut app = crate::test_app();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(Assets::<Mesh>::default())
+            .insert_resource(Assets::<StandardMaterial>::default());
+        install(&mut app, PrimitiveConfig::ground_plane(), Vec::new());
+        install(&mut app, PrimitiveConfig::cube(), Vec::new());
+        app.update();
+
+        let world = app.world_mut();
+        let ground_count = world.query::<&NotShadowCaster>().iter(world).count();
+        assert_eq!(ground_count, 1);
+    }
+
+    #[test]
+    fn cube_face_insets_and_row_gap_follow_body_text_scale() {
+        let style = CubeFacePanelStyle::for_cube(1.0);
+        let spacing = ControlMetrics::from_label_size(CUBE_FACE_PANEL_BODY_SIZE * 0.001).spacing;
+        assert!((style.padding() - spacing.panel_padding).abs() < 1e-6);
+        assert!((style.row_gap() - spacing.row_gap).abs() < 1e-6);
+        assert!(style.row_gap() < style.padding());
+        assert!(spacing.title_gap < style.padding());
+    }
+
+    #[test]
+    fn cube_face_spacing_accessors_follow_overridden_body_size() {
+        let style = CubeFacePanelStyle {
+            body_size: 66.0,
+            ..CubeFacePanelStyle::for_cube(1.0)
+        };
+        let spacing = ControlMetrics::from_label_size(style.body_size * 0.001).spacing;
+        assert!((style.padding() - spacing.panel_padding).abs() < 1e-6);
+        assert!((style.row_gap() - spacing.row_gap).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cube_face_tree_scales_padding_and_gaps_with_overridden_body_size() {
+        let mut style = CubeFacePanelStyle::for_cube(1.0);
+        style.body_size = 66.0;
+        let spacing = ControlMetrics::from_label_size(style.body_size * 0.001).spacing;
+        let tree = cube_face_panel_tree(
+            style,
+            CubeFacePanelContent::active("Title", ["First", "Second"]),
+        );
+        let [title, body] = tree.children_of(0) else {
+            panic!("face should contain title and body");
+        };
+        let (title, body) = (*title, *body);
+        let [first, second] = tree.children_of(body) else {
+            panic!("body should contain two rows");
+        };
+        let (first, second) = (*first, *second);
+        let mut app = crate::test_app();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(DiegeticTextMeasurer::default())
+            .add_plugins(HeadlessLayoutPlugin);
+        let panel = app
+            .world_mut()
+            .spawn(
+                DiegeticPanel::world()
+                    .size(style.size, style.size)
+                    .with_tree(tree)
+                    .build()
+                    .expect("face panel should build"),
+            )
+            .id();
+        app.update();
+        let solved = app
+            .world()
+            .get::<ComputedDiegeticPanel>(panel)
+            .and_then(|computed| computed.layout().solved())
+            .expect("face panel should solve");
+        let root = solved.computed[0].bounds;
+        let title = solved.computed[title].bounds;
+        let body = solved.computed[body].bounds;
+        let first = solved.computed[first].bounds;
+        let second = solved.computed[second].bounds;
+        let points_per_meter = root.width / style.size;
+        let close = |actual: f32, expected: f32| {
+            assert!((actual - expected).abs() < 0.5, "{actual} != {expected}");
+        };
+        close(body.x - root.x, spacing.panel_padding * points_per_meter);
+        close(
+            body.y - title.y - title.height,
+            spacing.title_gap * points_per_meter,
+        );
+        close(
+            second.y - first.y - first.height,
+            spacing.row_gap * points_per_meter,
+        );
+    }
+
+    #[test]
+    fn cube_face_tree_honors_fixed_spacing_equal_to_body_size_defaults() {
+        let style = CubeFacePanelStyle {
+            body_size: 66.0,
+            spacing: CubeFaceSpacing::Fixed {
+                padding: 0.066,
+                row_gap: 0.022,
+            },
+            ..CubeFacePanelStyle::for_cube(1.0)
+        };
+        let tree = cube_face_panel_tree(
+            style,
+            CubeFacePanelContent::idle("Title", ["First", "Second"]),
+        );
+        let [_, body] = tree.children_of(0) else {
+            panic!("face should contain title and body");
+        };
+        let body = *body;
+        let [first, second] = tree.children_of(body) else {
+            panic!("body should contain two rows");
+        };
+        let (first, second) = (*first, *second);
+        let mut app = crate::test_app();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(DiegeticTextMeasurer::default())
+            .add_plugins(HeadlessLayoutPlugin);
+        let panel = app
+            .world_mut()
+            .spawn(
+                DiegeticPanel::world()
+                    .size(style.size, style.size)
+                    .with_tree(tree)
+                    .build()
+                    .expect("face panel should build"),
+            )
+            .id();
+        app.update();
+        let solved = app
+            .world()
+            .get::<ComputedDiegeticPanel>(panel)
+            .and_then(|computed| computed.layout().solved())
+            .expect("face panel should solve");
+        let root = solved.computed[0].bounds;
+        let body = solved.computed[body].bounds;
+        let first = solved.computed[first].bounds;
+        let second = solved.computed[second].bounds;
+        let points_per_meter = root.width / style.size;
+        let close = |actual: f32, expected: f32| {
+            assert!((actual - expected).abs() < 0.5, "{actual} != {expected}");
+        };
+        close(body.x - root.x, 0.066 * points_per_meter);
+        close(second.y - first.y - first.height, 0.022 * points_per_meter);
+    }
+}
+
+#[cfg(test)]
+mod floor_pixel_tests {
+    use std::sync::mpsc;
+
+    use bevy::camera::Hdr;
+    use bevy::camera::RenderTarget;
+    use bevy::prelude::*;
+    use bevy::render::RenderPlugin;
+    use bevy::render::render_resource::PollType;
+    use bevy::render::render_resource::TextureFormat;
+    use bevy::render::renderer::RenderDevice;
+    use bevy::render::view::Tonemapping;
+    use bevy::render::view::screenshot::Screenshot;
+    use bevy::render::view::screenshot::ScreenshotCaptured;
+    use bevy::window::ExitCondition;
+    use bevy::winit::WinitPlugin;
+
+    use super::*;
+    use crate::lighting;
+
+    const SIZE: u32 = 256;
+
+    #[test]
+    fn studio_floor_draws_without_local_blue_streak() -> Result<(), String> {
+        let mut app = crate::test_app();
+        app.add_plugins(
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: None,
+                    exit_condition: ExitCondition::DontExit,
+                    ..default()
+                })
+                .set(RenderPlugin {
+                    synchronous_pipeline_compilation: true,
+                    ..default()
+                })
+                .disable::<WinitPlugin>(),
+        );
+        lighting::install(&mut app, lighting::StudioLightingConfig::default());
+        let mut ground = PrimitiveConfig::ground_plane();
+        ground.set_size(100.0);
+        install(&mut app, ground, Vec::new());
+        let target =
+            app.world_mut()
+                .resource_mut::<Assets<Image>>()
+                .add(Image::new_target_texture(
+                    SIZE,
+                    SIZE,
+                    TextureFormat::Rgba8UnormSrgb,
+                    None,
+                ));
+        app.world_mut().spawn((
+            Camera3d::default(),
+            RenderTarget::Image(target.clone().into()),
+            Hdr,
+            Tonemapping::KhronosPbrNeutral,
+            Msaa::Off,
+            Transform::from_xyz(0.0, 10.0, 0.0).looking_at(Vec3::ZERO, Vec3::Z),
+        ));
+        app.finish();
+        app.cleanup();
+        for _ in 0..12 {
+            app.update();
+        }
+        let (sender, receiver) = mpsc::channel();
+        app.world_mut().spawn(Screenshot::image(target)).observe(
+            move |event: On<ScreenshotCaptured>| {
+                let result = event
+                    .image
+                    .data
+                    .as_ref()
+                    .ok_or("screenshot has no pixels")
+                    .map(|pixels| {
+                        let blue =
+                            (32..224).map(|x| pixels[((SIZE / 2 * SIZE + x) * 4 + 2) as usize]);
+                        let minimum = blue.clone().min().unwrap_or_default();
+                        let maximum = blue.max().unwrap_or_default();
+                        let center = pixels[((SIZE / 2 * SIZE + SIZE / 2) * 4 + 2) as usize];
+                        (minimum, maximum, center)
+                    });
+                let _ = sender.send(result);
+            },
+        );
+        // Bevy finishes the readback on its async compute pool, which shader
+        // compilation can hold for many frames, so this waits on the capture itself.
+        loop {
+            app.update();
+            app.world()
+                .resource::<RenderDevice>()
+                .wgpu_device()
+                .poll(PollType::Wait {
+                    submission_index: None,
+                    timeout:          None,
+                })
+                .map_err(|error| format!("GPU screenshot readback failed: {error}"))?;
+            if let Ok(sample) = receiver.try_recv() {
+                let (minimum, maximum, center) = sample.map_err(str::to_string)?;
+                assert!(center > 20, "floor pixel was not drawn: {center}");
+                assert!(
+                    maximum.abs_diff(minimum) <= 5,
+                    "blue floor streak: {minimum}..{maximum}"
+                );
+                return Ok(());
+            }
+        }
     }
 }

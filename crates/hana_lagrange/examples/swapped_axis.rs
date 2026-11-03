@@ -27,7 +27,7 @@
 use std::f32::consts::PI;
 use std::time::Duration;
 
-use bevy::math::curve::easing::EaseFunction;
+use bevy::curve::easing::EaseFunction;
 use bevy::prelude::Alpha;
 use bevy::prelude::Assets;
 use bevy::prelude::ChildSpawnerCommands;

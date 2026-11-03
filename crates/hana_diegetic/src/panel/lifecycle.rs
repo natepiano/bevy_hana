@@ -1,27 +1,31 @@
+use std::collections::VecDeque;
 use std::marker::PhantomData;
 
 use bevy::camera::visibility::RenderLayers;
+use bevy::ecs::bundle::BundleScratch;
+use bevy::ecs::bundle::BundleWriter;
 use bevy::ecs::change_detection::Ref;
 use bevy::ecs::change_detection::Tick;
+use bevy::ecs::component::ComponentsRegistrator;
+use bevy::ecs::lifecycle::HookContext;
 use bevy::ecs::system::SystemParam;
 use bevy::ecs::world::DeferredWorld;
 use bevy::platform::collections::HashSet;
-use bevy::prelude::Add;
 use bevy::prelude::ChildOf;
+use bevy::prelude::Children;
 use bevy::prelude::Commands;
 use bevy::prelude::Component;
 use bevy::prelude::Despawn;
 use bevy::prelude::DetectChanges;
 use bevy::prelude::Entity;
-use bevy::prelude::Insert;
 use bevy::prelude::On;
 use bevy::prelude::Query;
 use bevy::prelude::Remove;
 use bevy::prelude::ResMut;
 use bevy::prelude::With;
 use bevy::prelude::World;
-use bevy::window::PrimaryWindow;
 use hana_kana::resolve_entity_cascade;
+use hana_kana::resolve_entity_cascade_with;
 use hana_valence::AnchoredHere;
 use hana_valence::AnchoredTo;
 use hana_valence::Member;
@@ -43,6 +47,8 @@ use super::SavedPanelWorldState;
 use super::anchoring::AnchoredWorldPanelPose;
 use super::diegetic_panel::PreparedPanelScreenConversion;
 use super::diegetic_panel::ScaledLayoutTreeCache;
+use super::scroll_view::PanelScrollViews;
+use super::scroll_view::ScrollViewsInMotion;
 use crate::cascade::Cascade;
 use crate::cascade::CascadeAttribute;
 use crate::cascade::CascadeRoot;
@@ -63,15 +69,11 @@ use crate::render::HairlineFade;
 use crate::render::PanelTextRuns;
 use crate::render::ResolvedSdfSurfaceRegistry;
 use crate::render::SurfaceEvictionCause;
-use crate::screen_space;
-use crate::screen_space::ScreenSpaceCamera;
-use crate::screen_space::ScreenSpaceLight;
 use crate::widgets;
 use crate::widgets::ButtonCaptures;
 use crate::widgets::ButtonPress;
 use crate::widgets::MaterializedTooltip;
 use crate::widgets::PanelPicking;
-use crate::widgets::PanelWidget;
 use crate::widgets::PanelWidgetIndex;
 use crate::widgets::PanelWidgets;
 use crate::widgets::ScreenWidgetAnchorProxy;
@@ -81,6 +83,7 @@ use crate::widgets::SliderCaptures;
 use crate::widgets::SliderDrag;
 use crate::widgets::TooltipControllerIndex;
 use crate::widgets::TooltipFor;
+use crate::widgets::Tooltips;
 use crate::widgets::WidgetDisabledAppearance;
 use crate::widgets::WidgetFocusAuthority;
 use crate::widgets::WidgetFocusedAppearance;
@@ -91,9 +94,14 @@ use crate::widgets::WidgetPressedAppearance;
 
 /// Identifies the panel role that created and owns one runtime entity.
 #[derive(Clone, Copy, Component)]
+#[component(on_add = finalize_orphaned_panel_owned)]
 pub(crate) struct PanelOwned {
     owner: Entity,
 }
+
+/// Enables the intrinsic ownership hook only after the panel plugin is present.
+#[derive(bevy::prelude::Resource, Default)]
+pub(super) struct PanelOwnershipTracking;
 
 impl PanelOwned {
     pub(crate) const fn owner(self) -> Entity { self.owner }
@@ -101,6 +109,78 @@ impl PanelOwned {
 
 impl From<Entity> for PanelOwned {
     fn from(owner: Entity) -> Self { Self { owner } }
+}
+
+/// The panel role has stopped producing; its remaining runtime entities are
+/// reclaimed individually before the panel entity itself can leave.
+#[derive(Component)]
+pub(super) struct PanelRetirement {
+    pending: VecDeque<Entity>,
+}
+
+impl DiegeticPanel {
+    /// Stops this panel's producers, then retires at most one owned entity per
+    /// call. Returns `true` when a teardown unit ran, and `false` when the panel
+    /// has no owned entities left and its entity can safely be removed.
+    ///
+    /// Attachment finalization and ownership-aware shared-state restoration
+    /// follow the ordinary panel teardown path. Child and tooltip links are
+    /// detached individually first, so their recursive despawn cannot bypass
+    /// the caller's allowance. The caller must flush pending producers before
+    /// beginning retirement, just as it would before despawning the panel.
+    pub fn retire_next_owned_entity(world: &mut World, panel: Entity) -> bool {
+        if world.get::<PanelRetirement>(panel).is_none() {
+            if world.get::<Self>(panel).is_none() {
+                return false;
+            }
+            let mut owned = world.query::<(Entity, &PanelOwned)>();
+            let pending = owned
+                .iter(world)
+                .filter(|(_, ownership)| ownership.owner() == panel)
+                .map(|(entity, _)| entity)
+                .collect();
+            world.entity_mut(panel).insert(PanelRetirement { pending });
+            world.entity_mut(panel).remove::<Self>();
+            world.flush();
+            return true;
+        }
+        let Some(entity) = world
+            .get::<PanelRetirement>(panel)
+            .and_then(|retirement| retirement.pending.front())
+            .copied()
+        else {
+            return false;
+        };
+        if entity != panel && Self::retire_next_owned_entity(world, entity) {
+            return true;
+        }
+        let child = world
+            .get::<Children>(entity)
+            .and_then(|children| children.first())
+            .copied();
+        let tooltip = world
+            .get::<Tooltips>(entity)
+            .and_then(|tooltips| tooltips.first())
+            .copied();
+        if let Some(child) = child.or(tooltip) {
+            if let Some(mut retirement) = world.get_mut::<PanelRetirement>(panel) {
+                // Stop the parent before its detached child can be reclaimed
+                // and regenerated by a still-live presentation producer.
+                retirement.pending.push_back(child);
+            }
+            world.entity_mut(child).remove::<(ChildOf, TooltipFor)>();
+        } else {
+            if let Some(mut retirement) = world.get_mut::<PanelRetirement>(panel) {
+                retirement.pending.pop_front();
+            }
+            if world.get_entity(entity).is_ok() {
+                finalize_owned_widget_anchor_state(world, panel, entity);
+                world.despawn(entity);
+                world.flush();
+            }
+        }
+        true
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -142,6 +222,47 @@ pub(super) struct PanelCascadeOwnership<A: CascadeAttribute> {
     owner:                 Entity,
     resolved_restore:      Option<Resolved<A>>,
     resolved_written_tick: Option<Tick>,
+}
+
+/// Builder-authored shared state installed when a panel role begins.
+pub(super) struct PanelSeedValues {
+    pub(super) font_unit:                  Cascade<FontUnit>,
+    pub(super) sdf_material:               Cascade<SdfMaterial>,
+    pub(super) text_material:              Cascade<TextMaterial>,
+    pub(super) shape_material:             Cascade<ShapeMaterial>,
+    pub(super) text_alpha:                 Cascade<TextAlpha>,
+    pub(super) hdr_text_coverage_bias:     Cascade<HdrTextCoverageBias>,
+    pub(super) shadow_casting:             Cascade<ShadowCasting>,
+    pub(super) widget_hovered_appearance:  Cascade<WidgetHoveredAppearance>,
+    pub(super) widget_pressed_appearance:  Cascade<WidgetPressedAppearance>,
+    pub(super) widget_focused_appearance:  Cascade<WidgetFocusedAppearance>,
+    pub(super) widget_disabled_appearance: Cascade<WidgetDisabledAppearance>,
+    pub(super) anti_alias:                 Cascade<AntiAlias>,
+    pub(super) hairline_fade:              Cascade<HairlineFade>,
+    pub(super) lighting:                   Cascade<Lighting>,
+    pub(super) sidedness:                  Cascade<Sidedness>,
+    pub(super) picking:                    PanelPicking,
+}
+
+#[cfg(test)]
+#[derive(bevy::prelude::Resource, Default)]
+pub(super) struct PanelSeedInsertCount(pub(super) usize);
+
+enum ResolvedSeedWrite<A: CascadeAttribute> {
+    Preserve,
+    Insert(Resolved<A>),
+}
+
+struct CascadeSeedInsertion<A: CascadeAttribute> {
+    cascade_ownership:   PanelCascadeOwnership<A>,
+    component_ownership: PanelComponentOwnership<Cascade<A>>,
+    authored:            Cascade<A>,
+    resolved:            ResolvedSeedWrite<A>,
+}
+
+enum CascadeSeedPlan<A: CascadeAttribute> {
+    Preserve,
+    Insert(CascadeSeedInsertion<A>),
 }
 
 #[derive(Component)]
@@ -248,38 +369,20 @@ pub(super) struct PanelOwnedTeardown<'w, 's> {
     materialized_tooltips: Query<'w, 's, &'static MaterializedTooltip>,
     parents:               Query<'w, 's, &'static ChildOf>,
     tooltip_targets:       Query<'w, 's, &'static TooltipFor>,
+    retiring:              Query<'w, 's, (), With<PanelRetirement>>,
+    world_demands:         Query<'w, 's, &'static AnchoredHere>,
+    screen_demands:        Query<'w, 's, &'static ScreenWidgetAnchoredHere>,
 }
 
 pub(super) fn teardown_panel_role(
-    trigger: On<Remove, DiegeticPanel>,
-    panels: Query<(Entity, &DiegeticPanel)>,
+    trigger: On<Remove<DiegeticPanel>>,
     panel_owned: PanelOwnedTeardown,
-    world_widget_demands: Query<&AnchoredHere, With<PanelWidget>>,
-    screen_widget_demands: Query<&ScreenWidgetAnchoredHere, With<PanelWidget>>,
-    authored_attachments: Query<&PanelAttachmentAuthored>,
-    world_attachments: Query<&AnchoredTo>,
-    screen_attachments: Query<&ScreenWidgetAnchoredTo>,
-    cameras: Query<(Entity, &ScreenSpaceCamera)>,
-    lights: Query<(Entity, &ScreenSpaceLight)>,
-    primary: Query<Entity, With<PrimaryWindow>>,
     mut resolved_surfaces: Option<ResMut<ResolvedSdfSurfaceRegistry>>,
     mut focus_authority: Option<ResMut<WidgetFocusAuthority>>,
     mut widget_captures: WidgetCaptureTeardown,
     mut commands: Commands,
 ) {
     let entity = trigger.entity;
-    let Ok((_, panel)) = panels.get(entity) else {
-        return;
-    };
-    screen_space::cleanup_screen_space_view(
-        entity,
-        panel,
-        &panels,
-        &cameras,
-        &lights,
-        &primary,
-        &mut commands,
-    );
     if let Some(resolved_surfaces) = resolved_surfaces.as_deref_mut() {
         resolved_surfaces.remove_panel(entity, SurfaceEvictionCause::PanelDespawned);
     }
@@ -289,29 +392,44 @@ pub(super) fn teardown_panel_role(
     }
     widget_captures.finalize(entity, &mut commands);
 
-    finalize_widget_anchor_state(
-        entity,
-        &panel_owned.owned_entities,
-        &world_widget_demands,
-        &screen_widget_demands,
-        &authored_attachments,
-        &world_attachments,
-        &screen_attachments,
-        &mut commands,
-    );
-
     let panel_removal = trigger
         .trigger()
         .new_archetype
         .map_or(PanelRemoval::Entity, |_| PanelRemoval::RoleOnly);
-    for owned_entity in panel_owned_despawn_roots(
-        entity,
-        panel_removal,
-        &panel_owned.owned_entities,
-        &panel_owned.parents,
-        &panel_owned.tooltip_targets,
-    ) {
-        commands.entity(owned_entity).despawn();
+    if panel_owned.retiring.get(entity).is_err() {
+        for (widget, ownership) in &panel_owned.owned_entities {
+            if ownership.owner() == entity {
+                // Recursive entity despawn can remove the widget before this
+                // command runs. Preserve its dependent ids at the hook.
+                let mut dependents = panel_owned
+                    .world_demands
+                    .get(widget)
+                    .ok()
+                    .into_iter()
+                    .flat_map(AnchoredHere::iter)
+                    .collect::<HashSet<_>>();
+                dependents.extend(
+                    panel_owned
+                        .screen_demands
+                        .get(widget)
+                        .ok()
+                        .into_iter()
+                        .flat_map(ScreenWidgetAnchoredHere::iter),
+                );
+                commands.queue(move |world: &mut World| {
+                    finalize_widget_anchor_dependents(world, entity, widget, dependents);
+                });
+            }
+        }
+        for owned_entity in panel_owned_despawn_roots(
+            entity,
+            panel_removal,
+            &panel_owned.owned_entities,
+            &panel_owned.parents,
+            &panel_owned.tooltip_targets,
+        ) {
+            commands.entity(owned_entity).despawn();
+        }
     }
     commands.queue(move |world: &mut World| teardown_owned_shared_state(world, entity));
 
@@ -324,6 +442,8 @@ pub(super) fn teardown_panel_role(
         widgets::remove_materialized_tooltip_state(&mut panel_entity, materialized);
     }
     panel_entity.remove::<(
+        PanelScrollViews,
+        ScrollViewsInMotion,
         ComputedDiegeticPanel,
         DiegeticPanelChangeClassification,
         LastPanelDimensions,
@@ -351,7 +471,7 @@ pub(super) fn teardown_panel_role(
 }
 
 pub(super) fn finalize_panel_widgets_before_despawn(
-    trigger: On<Despawn, DiegeticPanel>,
+    trigger: On<Despawn<DiegeticPanel>>,
     mut focus_authority: ResMut<WidgetFocusAuthority>,
     button_presses: Query<(Entity, &WidgetOf), With<ButtonPress>>,
     mut button_captures: ResMut<ButtonCaptures>,
@@ -374,78 +494,79 @@ pub(super) fn finalize_panel_widgets_before_despawn(
     );
 }
 
-fn finalize_widget_anchor_state(
-    panel: Entity,
-    owned_entities: &Query<(Entity, &PanelOwned)>,
-    world_widget_demands: &Query<&AnchoredHere, With<PanelWidget>>,
-    screen_widget_demands: &Query<&ScreenWidgetAnchoredHere, With<PanelWidget>>,
-    authored_attachments: &Query<&PanelAttachmentAuthored>,
-    world_attachments: &Query<&AnchoredTo>,
-    screen_attachments: &Query<&ScreenWidgetAnchoredTo>,
-    commands: &mut Commands<'_, '_>,
-) {
-    for (widget, ownership) in owned_entities {
-        if ownership.owner() != panel {
-            continue;
-        }
-        let mut dependents = world_widget_demands
-            .get(widget)
-            .ok()
+fn finalize_owned_widget_anchor_state(world: &mut World, panel: Entity, widget: Entity) {
+    let mut dependents = world
+        .get::<AnchoredHere>(widget)
+        .into_iter()
+        .flat_map(AnchoredHere::iter)
+        .collect::<HashSet<_>>();
+    dependents.extend(
+        world
+            .get::<ScreenWidgetAnchoredHere>(widget)
             .into_iter()
-            .flat_map(AnchoredHere::iter)
-            .collect::<HashSet<_>>();
-        dependents.extend(
-            screen_widget_demands
-                .get(widget)
-                .ok()
-                .into_iter()
-                .flat_map(ScreenWidgetAnchoredHere::iter),
-        );
-        for dependent in dependents {
-            let authored_targets_widget = authored_attachments
-                .get(dependent)
-                .is_ok_and(|attachment| attachment.target() == widget);
-            let world_targets_widget = world_attachments
-                .get(dependent)
-                .is_ok_and(|attachment| attachment.target() == widget);
-            let screen_targets_widget = screen_attachments
-                .get(dependent)
-                .is_ok_and(|attachment| attachment.target() == widget);
-            if authored_targets_widget {
-                commands
-                    .entity(dependent)
-                    .remove::<(PanelAttachmentAuthored, PanelAnchorOffset)>();
-            } else {
-                if world_targets_widget {
-                    commands.entity(dependent).remove::<AnchoredTo>();
-                }
-                if screen_targets_widget {
-                    commands
-                        .entity(dependent)
-                        .remove::<ScreenWidgetAnchoredTo>();
-                }
+            .flat_map(ScreenWidgetAnchoredHere::iter),
+    );
+    finalize_widget_anchor_dependents(world, panel, widget, dependents);
+}
+
+fn finalize_widget_anchor_dependents(
+    world: &mut World,
+    panel: Entity,
+    widget: Entity,
+    dependents: HashSet<Entity>,
+) {
+    for dependent in dependents {
+        let authored_targets_widget = world
+            .get::<PanelAttachmentAuthored>(dependent)
+            .is_some_and(|attachment| attachment.target() == widget);
+        let world_targets_widget = world
+            .get::<AnchoredTo>(dependent)
+            .is_some_and(|attachment| attachment.target() == widget);
+        let screen_targets_widget = world
+            .get::<ScreenWidgetAnchoredTo>(dependent)
+            .is_some_and(|attachment| attachment.target() == widget);
+        let Ok(mut dependent) = world.get_entity_mut(dependent) else {
+            continue;
+        };
+        if authored_targets_widget {
+            dependent.remove::<(PanelAttachmentAuthored, PanelAnchorOffset)>();
+        } else {
+            if world_targets_widget {
+                dependent.remove::<AnchoredTo>();
+            }
+            if screen_targets_widget {
+                dependent.remove::<ScreenWidgetAnchoredTo>();
             }
         }
-        remove_owned_component::<AnchoredTo>(commands, panel, widget);
-        remove_owned_component::<ResolvedAnchorGeometry>(commands, panel, widget);
-        remove_owned_component::<ScreenWidgetAnchorProxy>(commands, panel, widget);
     }
+    remove_owned_component_now::<AnchoredTo>(world, panel, widget);
+    remove_owned_component_now::<ResolvedAnchorGeometry>(world, panel, widget);
+    remove_owned_component_now::<ScreenWidgetAnchorProxy>(world, panel, widget);
 }
 
 /// Despawns a deferred runtime spawn when its recorded panel role no longer
 /// exists by the time `PanelOwned` is inserted.
-pub(super) fn finalize_orphaned_panel_owned(
-    trigger: On<Add, PanelOwned>,
-    ownership: Query<&PanelOwned>,
-    panels: Query<(), With<DiegeticPanel>>,
-    mut commands: Commands,
-) {
-    let entity = trigger.entity;
-    let Ok(ownership) = ownership.get(entity) else {
+pub(super) fn finalize_orphaned_panel_owned(mut world: DeferredWorld, context: HookContext) {
+    if !world.contains_resource::<PanelOwnershipTracking>() {
+        return;
+    }
+    let entity = context.entity;
+    let Some(panel) = world
+        .get::<PanelOwned>(entity)
+        .map(|ownership| ownership.owner())
+    else {
         return;
     };
-    if panels.get(ownership.owner()).is_err() {
-        commands.entity(entity).despawn();
+    if world.get::<PanelRetirement>(panel).is_some() {
+        world.commands().queue(move |world: &mut World| {
+            if let Some(mut retirement) = world.get_mut::<PanelRetirement>(panel) {
+                retirement.pending.push_back(entity);
+            } else if world.get_entity(entity).is_ok() {
+                world.despawn(entity);
+            }
+        });
+    } else if world.get::<DiegeticPanel>(panel).is_none() {
+        world.commands().entity(entity).despawn();
     }
 }
 
@@ -527,13 +648,148 @@ pub(super) fn seed_owned_component<T: Component>(
     insert_owned_component(world, owner, entity, value);
 }
 
+/// Installs every absent panel cascade and picking seed in one dynamic bundle.
+pub(super) fn seed_panel_bundle(world: &mut World, entity: Entity, seeds: PanelSeedValues) {
+    if world.get_entity(entity).is_err() {
+        return;
+    }
+
+    let written = world.change_tick();
+    let font_unit = prepare_cascade_seed(world, entity, seeds.font_unit, written);
+    let sdf_material = prepare_cascade_seed(world, entity, seeds.sdf_material, written);
+    let text_material = prepare_cascade_seed(world, entity, seeds.text_material, written);
+    let shape_material = prepare_cascade_seed(world, entity, seeds.shape_material, written);
+    let text_alpha = prepare_cascade_seed(world, entity, seeds.text_alpha, written);
+    let hdr_text_coverage_bias =
+        prepare_cascade_seed(world, entity, seeds.hdr_text_coverage_bias, written);
+    let shadow_casting = prepare_cascade_seed(world, entity, seeds.shadow_casting, written);
+    let widget_hovered_appearance =
+        prepare_cascade_seed(world, entity, seeds.widget_hovered_appearance, written);
+    let widget_pressed_appearance =
+        prepare_cascade_seed(world, entity, seeds.widget_pressed_appearance, written);
+    let widget_focused_appearance =
+        prepare_cascade_seed(world, entity, seeds.widget_focused_appearance, written);
+    let widget_disabled_appearance =
+        prepare_cascade_seed(world, entity, seeds.widget_disabled_appearance, written);
+    let anti_alias = prepare_cascade_seed(world, entity, seeds.anti_alias, written);
+    let hairline_fade = prepare_cascade_seed(world, entity, seeds.hairline_fade, written);
+    let lighting = prepare_cascade_seed(world, entity, seeds.lighting, written);
+    let sidedness = prepare_cascade_seed(world, entity, seeds.sidedness, written);
+    let seed_picking = world.get::<PanelPicking>(entity).is_none();
+
+    let mut scratch = BundleScratch::default();
+    let mut writer = scratch.writer();
+    {
+        let mut components = world.components_registrator();
+        push_cascade_seed(&mut writer, &mut components, font_unit);
+        push_cascade_seed(&mut writer, &mut components, sdf_material);
+        push_cascade_seed(&mut writer, &mut components, text_material);
+        push_cascade_seed(&mut writer, &mut components, shape_material);
+        push_cascade_seed(&mut writer, &mut components, text_alpha);
+        push_cascade_seed(&mut writer, &mut components, hdr_text_coverage_bias);
+        push_cascade_seed(&mut writer, &mut components, shadow_casting);
+        push_cascade_seed(&mut writer, &mut components, widget_hovered_appearance);
+        push_cascade_seed(&mut writer, &mut components, widget_pressed_appearance);
+        push_cascade_seed(&mut writer, &mut components, widget_focused_appearance);
+        push_cascade_seed(&mut writer, &mut components, widget_disabled_appearance);
+        push_cascade_seed(&mut writer, &mut components, anti_alias);
+        push_cascade_seed(&mut writer, &mut components, hairline_fade);
+        push_cascade_seed(&mut writer, &mut components, lighting);
+        push_cascade_seed(&mut writer, &mut components, sidedness);
+        if seed_picking {
+            // SAFETY: both values are registered through this world's
+            // registrar and this writer is consumed by the same world below.
+            unsafe {
+                writer.push_component(
+                    &mut components,
+                    PanelComponentOwnership::<PanelPicking>::new(entity, written),
+                );
+                writer.push_component(&mut components, seeds.picking);
+            }
+        }
+    }
+    if writer.is_empty() {
+        return;
+    }
+
+    let mut entity_mut = world.entity_mut(entity);
+    // SAFETY: `seed_panel_bundle` prepares and registers every component, then
+    // writes them without yielding or changing worlds; `entity_mut` therefore
+    // belongs to the same world as the registrations above.
+    unsafe { writer.write(&mut entity_mut) };
+
+    #[cfg(test)]
+    if let Some(mut count) = world.get_resource_mut::<PanelSeedInsertCount>() {
+        count.0 += 1;
+    }
+}
+
+fn prepare_cascade_seed<A: CascadeRoot>(
+    world: &World,
+    entity: Entity,
+    authored: Cascade<A>,
+    written: Tick,
+) -> CascadeSeedPlan<A> {
+    let Ok(entity_ref) = world.get_entity(entity) else {
+        return CascadeSeedPlan::Preserve;
+    };
+    if entity_ref.contains::<Cascade<A>>() {
+        return CascadeSeedPlan::Preserve;
+    }
+
+    let resolved_restore = entity_ref.get::<Resolved<A>>().cloned();
+    let resolved = resolve_entity_cascade_with::<A, A::Root>(world, entity, &authored);
+    let resolved = match resolved {
+        Some(value)
+            if resolved_restore
+                .as_ref()
+                .is_none_or(|current| current.0 != value) =>
+        {
+            ResolvedSeedWrite::Insert(Resolved(value))
+        },
+        Some(_) | None => ResolvedSeedWrite::Preserve,
+    };
+    let resolved_written_tick = matches!(resolved, ResolvedSeedWrite::Insert(_)).then_some(written);
+
+    CascadeSeedPlan::Insert(CascadeSeedInsertion {
+        cascade_ownership: PanelCascadeOwnership {
+            owner: entity,
+            resolved_restore,
+            resolved_written_tick,
+        },
+        component_ownership: PanelComponentOwnership::new(entity, written),
+        authored,
+        resolved,
+    })
+}
+
+fn push_cascade_seed<A: CascadeAttribute>(
+    writer: &mut BundleWriter<'_>,
+    components: &mut ComponentsRegistrator<'_>,
+    plan: CascadeSeedPlan<A>,
+) {
+    let CascadeSeedPlan::Insert(seed) = plan else {
+        return;
+    };
+    // SAFETY: every value is registered through the same world's registrar;
+    // `seed_panel_bundle` writes this writer back into that world.
+    unsafe {
+        writer.push_component(components, seed.cascade_ownership);
+        writer.push_component(components, seed.component_ownership);
+        writer.push_component(components, seed.authored);
+        if let ResolvedSeedWrite::Insert(resolved) = seed.resolved {
+            writer.push_component(components, resolved);
+        }
+    }
+}
+
 /// Records each derived cache write while the authored cascade remains owned
 /// by the panel role.
 pub(super) fn record_resolved_ownership<A: CascadeRoot>(
-    trigger: On<Insert, Resolved<A>>,
     mut world: DeferredWorld,
+    context: HookContext,
 ) {
-    let entity = trigger.entity;
+    let entity = context.entity;
     let Some((owner, authored_written)) = world
         .get::<PanelComponentOwnership<Cascade<A>>>(entity)
         .map(|ownership| (ownership.owner, ownership.written_tick))
@@ -565,7 +821,7 @@ pub(super) fn record_resolved_ownership<A: CascadeRoot>(
 /// Restores a preserved application cache after the cascade engine removes
 /// the cache at the authored-component removal boundary.
 pub(super) fn restore_preserved_resolved<A: CascadeAttribute>(
-    trigger: On<Remove, Resolved<A>>,
+    trigger: On<Remove<Resolved<A>>>,
     preserved: Query<&PreservedResolved<A>>,
     mut commands: Commands,
 ) {
@@ -880,6 +1136,7 @@ mod tests {
     use bevy::asset::AssetPlugin;
     use bevy::camera::visibility::RenderLayers;
     use bevy::camera::visibility::VisibilityPlugin;
+    use bevy::ecs::observer::Observer;
     use bevy::ecs::system::RunSystemOnce;
     use bevy::mesh::MeshPlugin;
     use bevy::picking::InteractionPlugin;
@@ -920,6 +1177,7 @@ mod tests {
     use super::PanelComponentOwnership;
     use super::PanelRemoval;
     use super::PanelRenderLayersOwnership;
+    use super::PanelSeedInsertCount;
     use super::PreservedResolved;
     use super::panel_owned_despawn_roots;
     use super::write_owned_cascade;
@@ -929,6 +1187,7 @@ mod tests {
     use crate::DiegeticPanel;
     use crate::DiegeticPanelCommands as _;
     use crate::El;
+    use crate::HeadlessDiegeticUiPlugin;
     use crate::HeadlessLayoutPlugin;
     use crate::LayoutBuilder;
     use crate::LayoutTree;
@@ -1273,6 +1532,22 @@ mod tests {
                 .get::<PanelRenderLayersOwnership>(fixture.application_layer_child)
                 .is_none(),
         );
+    }
+
+    #[test]
+    fn layout_plugin_can_start_after_tracked_resolved_exists() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(DiegeticTextMeasurer::default());
+        let entity = app.world_mut().spawn(Resolved(FontUnit(Unit::Points))).id();
+        let owned = app.world_mut().spawn(PanelOwned::from(entity)).id();
+        app.add_plugins(HeadlessLayoutPlugin);
+        app.world_mut()
+            .entity_mut(entity)
+            .insert(Resolved(FontUnit(Unit::Points)));
+        app.update();
+        assert!(app.world().get::<Resolved<FontUnit>>(entity).is_some());
+        assert!(app.world().get::<PanelOwned>(owned).is_some());
     }
 
     #[test]
@@ -1785,6 +2060,86 @@ mod tests {
         app
     }
 
+    #[test]
+    fn a_panel_spawn_seeds_its_cascades_in_one_insert() {
+        let mut app = picking_teardown_app();
+        let before = app.world().resource::<PanelSeedInsertCount>().0;
+
+        app.world_mut()
+            .spawn(picking_teardown_panel(PanelPicking::INTERACTIVE));
+        app.update();
+
+        assert_eq!(app.world().resource::<PanelSeedInsertCount>().0 - before, 1,);
+    }
+
+    #[test]
+    fn a_panel_spawn_adds_no_observer_entity() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(DiegeticTextMeasurer::default())
+            .add_plugins(HeadlessDiegeticUiPlugin);
+        app.update();
+        let before = app
+            .world()
+            .iter_entities()
+            .filter(bevy::ecs::world::EntityRef::contains::<Observer>)
+            .count();
+
+        app.world_mut()
+            .spawn(picking_teardown_panel(PanelPicking::INTERACTIVE));
+        app.update();
+
+        let after = app
+            .world()
+            .iter_entities()
+            .filter(bevy::ecs::world::EntityRef::contains::<Observer>)
+            .count();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn a_removed_cascade_stays_removed_after_panel_replacement() {
+        let mut app = picking_teardown_app();
+        let panel = app
+            .world_mut()
+            .spawn(picking_teardown_panel(PanelPicking::INTERACTIVE))
+            .id();
+        app.update();
+
+        app.world_mut()
+            .entity_mut(panel)
+            .remove::<Cascade<FontUnit>>();
+        assert!(app.world().get::<Cascade<FontUnit>>(panel).is_none());
+
+        app.world_mut()
+            .entity_mut(panel)
+            .insert(picking_teardown_panel(PanelPicking::PASS_THROUGH));
+        app.update();
+
+        assert!(app.world().get::<Cascade<FontUnit>>(panel).is_none());
+    }
+
+    #[test]
+    fn replacing_a_panel_with_live_picking_queues_no_seed() {
+        let mut app = picking_teardown_app();
+        let panel = app
+            .world_mut()
+            .spawn(picking_teardown_panel(PanelPicking::INTERACTIVE))
+            .id();
+        app.update();
+
+        app.world_mut()
+            .entity_mut(panel)
+            .remove::<Cascade<FontUnit>>();
+        let before = app.world().resource::<PanelSeedInsertCount>().0;
+        app.world_mut()
+            .entity_mut(panel)
+            .insert(picking_teardown_panel(PanelPicking::PASS_THROUGH));
+        app.update();
+
+        assert_eq!(app.world().resource::<PanelSeedInsertCount>().0, before);
+    }
+
     fn picking_teardown_panel(picking: PanelPicking) -> DiegeticPanel {
         DiegeticPanel::world()
             .size(Mm(100.0), Mm(50.0))
@@ -2283,6 +2638,108 @@ mod tests {
                 .get::<ApplicationState>(application_parent)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn bounded_panel_retirement_keeps_attachment_cleanup_and_limits_owned_despawns() {
+        let mut app = widget_anchor_teardown_app();
+        let panel = app
+            .world_mut()
+            .spawn(
+                DiegeticPanel::world()
+                    .size(Mm(100.0), Mm(50.0))
+                    .layout(|_| {})
+                    .build()
+                    .expect("panel"),
+            )
+            .id();
+        app.update();
+        let widget = app
+            .world_mut()
+            .spawn((PanelOwned::from(panel), ChildOf(panel)))
+            .id();
+        let child = app
+            .world_mut()
+            .spawn((PanelOwned::from(panel), ChildOf(widget)))
+            .id();
+        let tooltip = app
+            .world_mut()
+            .spawn((PanelOwned::from(panel), TooltipFor::new(widget)))
+            .id();
+        let other = app.world_mut().spawn(PanelOwned::from(panel)).id();
+        let application_child = app
+            .world_mut()
+            .spawn((ApplicationState, ChildOf(panel)))
+            .id();
+        let dependent = app
+            .world_mut()
+            .spawn((ApplicationState, ScreenWidgetAnchoredTo::new(widget)))
+            .id();
+        app.world_mut()
+            .run_system_once(move |mut commands: Commands| {
+                write_owned_render_layers(
+                    &mut commands,
+                    panel,
+                    application_child,
+                    Some(RenderLayers::layer(3)),
+                );
+            })
+            .expect("owned render layers");
+        let owned = [widget, child, tooltip, other];
+        assert!(DiegeticPanel::retire_next_owned_entity(
+            app.world_mut(),
+            panel
+        ));
+        app.update();
+        assert!(app.world().get::<DiegeticPanel>(panel).is_none());
+        assert!(
+            owned
+                .iter()
+                .all(|entity| app.world().get_entity(*entity).is_ok())
+        );
+        assert!(app.world().get::<RenderLayers>(application_child).is_none());
+        let late = app.world_mut().spawn(PanelOwned::from(panel)).id();
+        app.world_mut().flush();
+        let owned = [widget, child, tooltip, other, late];
+        loop {
+            let before = owned
+                .iter()
+                .filter(|entity| app.world().get_entity(**entity).is_ok())
+                .count();
+            let progressed = DiegeticPanel::retire_next_owned_entity(app.world_mut(), panel);
+            app.update();
+            let after = owned
+                .iter()
+                .filter(|entity| app.world().get_entity(**entity).is_ok())
+                .count();
+            assert!(
+                before.saturating_sub(after) <= 1,
+                "one owned despawn per unit"
+            );
+            if !progressed {
+                break;
+            }
+        }
+        assert!(
+            owned
+                .iter()
+                .all(|entity| app.world().get_entity(*entity).is_err())
+        );
+        assert!(
+            app.world()
+                .get::<ScreenWidgetAnchoredTo>(dependent)
+                .is_none()
+        );
+        assert!(app.world().get_entity(dependent).is_ok());
+        assert!(app.world().get_entity(application_child).is_ok());
+        assert!(
+            app.world()
+                .get::<PanelComponentOwnership<Cascade<FontUnit>>>(panel)
+                .is_none()
+        );
+        app.world_mut().despawn(panel);
+        app.update();
+        assert!(app.world().get_entity(panel).is_err());
     }
 
     #[test]

@@ -2,8 +2,10 @@ use bevy::asset::uuid_handle;
 use bevy::prelude::Handle;
 use bevy::shader::Shader;
 
-pub(super) const ANALYTIC_PATH_SHADER_PATH: &str =
-    "embedded://hana_diegetic/render/analytic_paths/analytic_path.wgsl";
+/// Coverage stage of every analytic-path pipeline. Loaded behind a stable
+/// handle at plugin build, so the first frame's pipelines never wait on it.
+pub(super) const ANALYTIC_PATH_SHADER_HANDLE: Handle<Shader> =
+    uuid_handle!("cac363d0-8d00-4b97-9cab-439e4a383c68");
 
 /// Vertex-pulling stage swapped in by `TextExtension::specialize` for
 /// materials whose `vertex_pull` flag is set. Loaded behind a stable handle so

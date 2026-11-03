@@ -108,7 +108,7 @@ pub(super) fn refresh_context_status_panel(
 }
 
 /// Builds the panel rows from Rubric's published context, binding, and palette observations.
-pub(super) fn context_status_sections(
+fn context_status_sections(
     active_context: &ActiveKeymapContext,
     effective_keymap_status: &EffectiveKeymapStatus,
     keymap_bindings: &KeymapBindings,

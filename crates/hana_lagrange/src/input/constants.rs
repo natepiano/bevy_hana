@@ -26,8 +26,8 @@ pub(crate) const ZOOM_SMOOTH_ACTION_NAME: &str = "OrbitCamZoomSmoothAction";
 pub(crate) const DEFAULT_INPUT_GAIN: f32 = 1.0;
 
 // camera labels
-pub(super) const FREE_CAM_CAMERA_LABEL: &str = "FreeCam";
-pub(super) const ORBIT_CAM_CAMERA_LABEL: &str = "OrbitCam";
+pub(super) const FREE_CAM_CAMERA_LABEL: &str = "Free camera";
+pub(super) const ORBIT_CAM_CAMERA_LABEL: &str = "Orbit camera";
 
 // debounce durations
 pub(super) const DEFAULT_REPORTING_DEBOUNCE: Duration = Duration::from_millis(100);
@@ -37,44 +37,44 @@ pub(super) const INTERACTION_CHANNEL_COUNT: usize = 3;
 
 // mode labels
 pub(super) const INPUT_MODE_LABEL: &str = "Input";
-pub(super) const PRESET_MODE_LABEL: &str = "Preset";
+pub(super) const PRESET_MODE_LABEL: &str = "Controls";
 
 // mode values
-pub(super) const CUSTOM_BINDINGS_MODE_VALUE: &str = "custom bindings";
-pub(super) const MANUAL_MODE_VALUE: &str = "manual input";
+pub(super) const CUSTOM_BINDINGS_MODE_VALUE: &str = "Custom controls";
+pub(super) const MANUAL_MODE_VALUE: &str = "Manual input";
 
 // setting row labels
-pub(super) const INVERT_Y_BINDING_LABEL: &str = "alt-i";
+pub(super) const INVERT_Y_BINDING_LABEL: &str = "Alt I";
 pub(super) const INVERT_Y_STATUS_LABEL: &str = "Invert Y";
 
 // row labels
-pub(super) const APP_AUTHORED_INPUT_ROW_LABEL: &str = "app-authored input";
-pub(super) const CUSTOM_INPUT_ROW_LABEL: &str = "custom input";
-pub(super) const GAMEPAD_BINDINGS_ROW_LABEL: &str = "gamepad bindings";
-pub(super) const ONE_FINGER_TOUCH_ROW_LABEL: &str = "one finger touch";
+pub(super) const APP_AUTHORED_INPUT_ROW_LABEL: &str = "App controls";
+pub(super) const CUSTOM_INPUT_ROW_LABEL: &str = "Custom input";
+pub(super) const GAMEPAD_BINDINGS_ROW_LABEL: &str = "Gamepad controls";
+pub(super) const ONE_FINGER_TOUCH_ROW_LABEL: &str = "One finger touch";
 pub(super) const ROLL_DISABLED_ROW_LABEL: &str = "Roll disabled";
-pub(super) const TWO_FINGER_TOUCH_ROW_LABEL: &str = "two finger touch";
+pub(super) const TWO_FINGER_TOUCH_ROW_LABEL: &str = "Two finger touch";
 
 // source-stem labels
-pub(super) const GAMEPAD_BINDING_SOURCE_LABEL: &str = "gamepad binding";
-pub(super) const INPUT_BINDING_SOURCE_LABEL: &str = "input binding";
-pub(super) const KEYBOARD_BINDING_SOURCE_LABEL: &str = "keyboard binding";
-pub(super) const MANUAL_INPUT_SOURCE_LABEL: &str = "manual input";
-pub(super) const MOUSE_BINDING_SOURCE_LABEL: &str = "mouse binding";
-pub(super) const MOUSE_DESCRIPTOR_LABEL: &str = "mouse";
-pub(super) const PINCH_SOURCE_LABEL: &str = "pinch";
-pub(super) const TOUCH_SOURCE_LABEL: &str = "touch";
-pub(super) const TRACKPAD_SOURCE_LABEL: &str = "smooth-scroll";
-pub(super) const WHEEL_SOURCE_LABEL: &str = "wheel";
+pub(super) const GAMEPAD_BINDING_SOURCE_LABEL: &str = "Gamepad binding";
+pub(super) const INPUT_BINDING_SOURCE_LABEL: &str = "Input binding";
+pub(super) const KEYBOARD_BINDING_SOURCE_LABEL: &str = "Keyboard binding";
+pub(super) const MANUAL_INPUT_SOURCE_LABEL: &str = "Manual input";
+pub(super) const MOUSE_BINDING_SOURCE_LABEL: &str = "Mouse binding";
+pub(super) const MOUSE_DESCRIPTOR_LABEL: &str = "Mouse";
+pub(super) const PINCH_SOURCE_LABEL: &str = "Pinch";
+pub(super) const TOUCH_SOURCE_LABEL: &str = "Touch";
+pub(super) const TRACKPAD_SOURCE_LABEL: &str = "Two-finger drag";
+pub(super) const WHEEL_SOURCE_LABEL: &str = "Wheel";
 
 // split zoom-direction row labels — each bidirectional zoom source shows one
 // row per direction, labeled by the physical gesture that drives it.
-pub(super) const WHEEL_ZOOM_IN_LABEL: &str = "wheel ↑";
-pub(super) const WHEEL_ZOOM_OUT_LABEL: &str = "wheel ↓";
-pub(super) const PINCH_ZOOM_IN_LABEL: &str = "pinch out";
-pub(super) const PINCH_ZOOM_OUT_LABEL: &str = "pinch in";
-pub(super) const SMOOTH_SCROLL_ZOOM_IN_LABEL: &str = "scroll ↑";
-pub(super) const SMOOTH_SCROLL_ZOOM_OUT_LABEL: &str = "scroll ↓";
+pub(super) const WHEEL_ZOOM_IN_LABEL: &str = "Wheel ↑";
+pub(super) const WHEEL_ZOOM_OUT_LABEL: &str = "Wheel ↓";
+pub(super) const PINCH_ZOOM_IN_LABEL: &str = "Pinch out";
+pub(super) const PINCH_ZOOM_OUT_LABEL: &str = "Pinch in";
+pub(super) const SMOOTH_SCROLL_ZOOM_IN_LABEL: &str = "Two-finger drag ↑";
+pub(super) const SMOOTH_SCROLL_ZOOM_OUT_LABEL: &str = "Two-finger drag ↓";
 
 // free-cam gamepad row action labels — right-column overrides for the
 // decomposed gamepad translate rows (stick, boost gate, vertical triggers) and

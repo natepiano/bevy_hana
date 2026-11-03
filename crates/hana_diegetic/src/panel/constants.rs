@@ -18,6 +18,21 @@ pub(super) const MIN_PANEL_WORLD_HEIGHT: f32 = 1.0;
 /// than this.
 pub(super) const PANEL_RESIZE_EPSILON: f32 = 0.001;
 
+// library-driven vertical scrolling
+pub(super) const COAST_DECAY: f32 = 12.0;
+pub(super) const SPRING_STIFFNESS: f32 = 280.0;
+pub(super) const OVERSCROLL_RELEASE_SECONDS: f32 = 0.10;
+pub(super) const SCROLL_REST_DISTANCE: f32 = 0.01;
+pub(super) const SCROLL_REST_SPEED: f32 = 0.5;
+/// Overlay thumb width in layout points.
+pub(super) const INDICATOR_WIDTH: f32 = 3.0;
+/// Inset inside the view's border at the right, top and bottom edges, in points.
+pub(super) const INDICATOR_INSET: f32 = 2.0;
+pub(super) const INDICATOR_MIN_LENGTH: f32 = 18.0;
+pub(super) const INDICATOR_MIN_OVERSCROLL_LENGTH: f32 = 8.0;
+pub(super) const INDICATOR_HOLD_SECONDS: f32 = 0.8;
+pub(super) const INDICATOR_FADE_SECONDS: f32 = 0.25;
+
 // gizmos
 /// Color used for text-bound debug gizmos.
 pub(super) const DEBUG_TEXT_GIZMO_COLOR: Color = Color::srgba(0.9, 0.9, 0.2, 0.2);

@@ -1,6 +1,8 @@
 //! [`DiegeticPanel`] — the main panel component and its computed companion.
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use bevy::camera::visibility::RenderLayers;
 use bevy::prelude::Add;
@@ -8,6 +10,7 @@ use bevy::prelude::AlphaMode;
 use bevy::prelude::Camera;
 use bevy::prelude::Commands;
 use bevy::prelude::Component;
+use bevy::prelude::DetectChanges;
 use bevy::prelude::Entity;
 use bevy::prelude::EntityEvent;
 use bevy::prelude::GlobalTransform;
@@ -18,6 +21,7 @@ use bevy::prelude::Insert;
 use bevy::prelude::On;
 use bevy::prelude::Quat;
 use bevy::prelude::Query;
+use bevy::prelude::Ref;
 use bevy::prelude::Reflect;
 use bevy::prelude::ReflectComponent;
 use bevy::prelude::Res;
@@ -59,6 +63,7 @@ use super::events::LastPanelDimensions;
 use super::field;
 use super::field::PanelFieldRecord;
 use super::lifecycle;
+use super::lifecycle::PanelSeedValues;
 use super::precompose::PanelPrecomposeCache;
 use super::scroll;
 use super::scroll::ComputedScrollRecord;
@@ -66,7 +71,6 @@ use super::scroll::ScrollRecordUnderPoint;
 use super::validate_screen_conversion;
 use super::validate_world_conversion;
 use crate::cascade::Cascade;
-use crate::cascade::CascadeAttribute;
 use crate::cascade::FontUnit;
 use crate::cascade::HdrTextCoverageBias;
 use crate::cascade::PanelDefaults;
@@ -75,6 +79,7 @@ use crate::cascade::SdfMaterial;
 use crate::cascade::ShapeMaterial;
 use crate::cascade::TextAlpha;
 use crate::cascade::TextMaterial;
+use crate::constants::DIAGNOSTIC_LOG_TARGET;
 use crate::layout::Anchor;
 use crate::layout::BoundingBox;
 use crate::layout::Dimension;
@@ -83,15 +88,14 @@ use crate::layout::LayoutResult;
 use crate::layout::LayoutTree;
 use crate::layout::LayoutTreeChange;
 use crate::layout::Lighting;
+use crate::layout::MeasureTextFn;
 use crate::layout::PanelSize;
 use crate::layout::ShadowCasting;
 use crate::layout::Sidedness;
 use crate::layout::Sizing;
 use crate::layout::TextStyle;
 use crate::layout::Unit;
-use crate::render::AntiAlias;
 use crate::render::DrawOrder;
-use crate::render::HairlineFade;
 use crate::widgets;
 use crate::widgets::ComputedTooltipRecord;
 use crate::widgets::ComputedWidgetRecord;
@@ -103,14 +107,26 @@ use crate::widgets::WidgetDisabledAppearance;
 use crate::widgets::WidgetFocusedAppearance;
 use crate::widgets::WidgetHoveredAppearance;
 use crate::widgets::WidgetInteractivity;
+use crate::widgets::WidgetKind;
 use crate::widgets::WidgetOf;
 use crate::widgets::WidgetPressedAppearance;
 
 /// Source tree plus the revision token used by derived tree caches.
-#[derive(Clone, Default)]
 pub(super) struct PanelTree {
     tree:     LayoutTree,
     revision: TreeRevision,
+}
+
+impl Clone for PanelTree {
+    fn clone(&self) -> Self {
+        Self {
+            tree:     self.tree.clone(),
+            revision: TreeRevision {
+                tree_id:    TreeRevision::new_tree_id(),
+                generation: self.revision.generation,
+            },
+        }
+    }
 }
 
 impl PanelTree {
@@ -118,7 +134,7 @@ impl PanelTree {
 
     pub(super) const fn revision(&self) -> TreeRevision { self.revision }
 
-    pub(super) const fn next_revision(&self) -> TreeRevision { self.revision.next() }
+    pub(super) fn next_revision(&self) -> TreeRevision { self.revision.next() }
 
     fn replace(&mut self, tree: LayoutTree) {
         self.tree = tree;
@@ -159,31 +175,63 @@ impl PanelTree {
         }
     }
 
-    const fn use_next_revision_after_replacement(&mut self, previous: &Self) {
-        self.revision = previous.next_revision();
+    fn use_next_revision_after_replacement(&mut self, previous: &Self) {
+        self.revision.generation = previous.next_revision().generation;
     }
+}
+
+impl Default for PanelTree {
+    fn default() -> Self { Self::from(LayoutTree::default()) }
 }
 
 impl From<LayoutTree> for PanelTree {
     fn from(tree: LayoutTree) -> Self {
         Self {
             tree,
-            revision: TreeRevision::default(),
+            revision: TreeRevision::for_new_tree(),
         }
     }
 }
 
+static NEXT_TREE_ID: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct TreeRevision(u64);
+pub(crate) struct TreeRevision {
+    tree_id:    u64,
+    generation: u64,
+}
 
 impl TreeRevision {
-    const fn next(self) -> Self { Self(self.0.wrapping_add(1)) }
+    fn new_tree_id() -> u64 {
+        NEXT_TREE_ID
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .unwrap_or_else(|_| std::process::abort())
+    }
 
-    const fn bump(&mut self) { *self = self.next(); }
+    fn for_new_tree() -> Self {
+        Self {
+            tree_id:    Self::new_tree_id(),
+            generation: 0,
+        }
+    }
+
+    fn next(self) -> Self {
+        Self {
+            tree_id:    self.tree_id,
+            generation: self
+                .generation
+                .checked_add(1)
+                .unwrap_or_else(|| std::process::abort()),
+        }
+    }
+
+    fn bump(&mut self) { *self = self.next(); }
+
+    const fn generation(self) -> u64 { self.generation }
 }
 
 impl From<TreeRevision> for u64 {
-    fn from(value: TreeRevision) -> Self { value.0 }
+    fn from(value: TreeRevision) -> Self { value.generation() }
 }
 
 /// A diegetic UI panel attached to a 3D entity.
@@ -230,67 +278,71 @@ impl From<TreeRevision> for u64 {
 pub struct DiegeticPanel {
     /// The layout tree defining this panel's UI structure.
     #[reflect(ignore)]
-    tree:                                  PanelTree,
+    tree:                                     PanelTree,
     /// Panel width in layout `Unit`s. Prefer [`set_size`](Self::set_size) for
     /// mutation to keep dimensions and unit in sync.
-    pub(super) width:                      f32,
+    pub(super) width:                         f32,
     /// Panel height in layout `Unit`s. Prefer [`set_size`](Self::set_size) for
     /// mutation to keep dimensions and unit in sync.
-    pub(super) height:                     f32,
+    pub(super) height:                        f32,
     /// Unit for `width`/`height`. Set automatically by
     /// [`DiegeticPanelBuilder::size`] or [`set_size`](Self::set_size).
-    pub(super) layout_unit:                Unit,
+    pub(super) layout_unit:                   Unit,
     /// Construction seed for the panel's font-unit cascade.
     #[reflect(ignore)]
-    pub(super) font_unit:                  Cascade<Unit>,
+    pub(super) font_unit:                     Cascade<Unit>,
     /// Which point on the panel sits at the entity's [`Transform`] position.
     /// Defaults to [`Anchor::TopLeft`].
-    pub(super) anchor:                     Anchor,
+    pub(super) anchor:                        Anchor,
     /// Target world width in meters. When set, the panel is uniformly scaled
     /// so its width matches this value (height follows aspect ratio).
     /// If both `world_width` and `world_height` are set, non-uniform scaling
     /// is applied.
-    pub(super) world_width:                Option<f32>,
+    pub(super) world_width:                   Option<f32>,
     /// Target world height in meters. When set, the panel is uniformly scaled
     /// so its height matches this value (width follows aspect ratio).
-    pub(super) world_height:               Option<f32>,
+    pub(super) world_height:                  Option<f32>,
+    /// Panel-local Z offset applied only to rendered SDF fill and border surfaces.
+    pub(super) sdf_surface_depth_offset:      f32,
+    /// Whether SDF surfaces keep their exterior AA fringe inside the layout bounds.
+    pub(super) contain_sdf_surface:           bool,
     /// Construction seed for the panel's shadow-casting cascade.
     #[reflect(ignore)]
-    pub(super) shadow_casting:             Cascade<ShadowCasting>,
+    pub(super) shadow_casting:                Cascade<ShadowCasting>,
     /// Construction seed for the panel's hovered widget-appearance cascade.
     #[reflect(ignore)]
-    pub(super) widget_hovered_appearance:  Cascade<WidgetHoveredAppearance>,
+    pub(super) widget_hovered_appearance:     Cascade<WidgetHoveredAppearance>,
     /// Construction seed for the panel's pressed widget-appearance cascade.
     #[reflect(ignore)]
-    pub(super) widget_pressed_appearance:  Cascade<WidgetPressedAppearance>,
+    pub(super) widget_pressed_appearance:     Cascade<WidgetPressedAppearance>,
     /// Construction seed for the panel's focused widget-appearance cascade.
     #[reflect(ignore)]
-    pub(super) widget_focused_appearance:  Cascade<WidgetFocusedAppearance>,
+    pub(super) widget_focused_appearance:     Cascade<WidgetFocusedAppearance>,
     /// Construction seed for the panel's disabled widget-appearance cascade.
     #[reflect(ignore)]
-    pub(super) widget_disabled_appearance: Cascade<WidgetDisabledAppearance>,
+    pub(super) widget_disabled_appearance:    Cascade<WidgetDisabledAppearance>,
     /// Construction seed for the panel's SDF source-material cascade.
     ///
     /// Individual elements can override via `El::material`; `base_color` is
     /// overridden by the layout color when both are set.
     #[reflect(ignore)]
-    pub(super) material:                   Cascade<Handle<StandardMaterial>>,
+    pub(super) material:                      Cascade<Handle<StandardMaterial>>,
     /// Construction seed for the panel's text source-material cascade.
     ///
     /// `base_color` is overridden by `TextStyle::color` when set.
     #[reflect(ignore)]
-    pub(super) text_material:              Cascade<Handle<StandardMaterial>>,
+    pub(super) text_material:                 Cascade<Handle<StandardMaterial>>,
     /// Construction seed for the panel primitive source-material cascade.
     ///
     /// Shape-local colors override `base_color` before projection.
     #[reflect(ignore)]
-    pub(super) shape_material:             Cascade<Handle<StandardMaterial>>,
+    pub(super) shape_material:                Cascade<Handle<StandardMaterial>>,
     /// Construction seed for the panel's text [`AlphaMode`] cascade.
     #[reflect(ignore)]
-    pub(super) text_alpha_mode:            Cascade<AlphaMode>,
+    pub(super) text_alpha_mode:               Cascade<AlphaMode>,
     /// Construction seed for the panel's HDR text coverage-bias cascade.
     #[reflect(ignore)]
-    pub(super) hdr_text_coverage_bias:     Cascade<f32>,
+    pub(super) hdr_text_coverage_bias:        Cascade<f32>,
     /// Builder-provided initial value for the sibling [`PanelPicking`]
     /// component. Applied by
     /// [`sync_panel_picking_on_insert`] only when the entity has no live
@@ -300,9 +352,11 @@ pub struct DiegeticPanel {
     /// and is removed with the panel role unless application code has
     /// replaced or mutated it.
     #[reflect(ignore)]
-    pub(super) picking:                    PanelPicking,
+    pub(super) picking:                       PanelPicking,
+    /// Whether one primary click opens an editable world-panel field.
+    pub(super) single_click_field_activation: bool,
     /// Whether the panel is world-space or screen-space.
-    pub(super) coordinate_space:           CoordinateSpace,
+    pub(super) coordinate_space:              CoordinateSpace,
     /// Maps each text run's [`PanelElementId`](crate::PanelElementId) to the entity
     /// reification created for it, so
     /// [`text_child`](Self::text_child) resolves a named run in O(1).
@@ -312,33 +366,36 @@ pub struct DiegeticPanel {
     /// non-identical [`set_tree`](DiegeticPanelCommands::set_tree) replacement
     /// clears it so a stale id stops resolving when the replacement applies.
     #[reflect(ignore)]
-    pub(crate) text_index:                 HashMap<crate::PanelElementId, Entity>,
+    pub(crate) text_index:                    HashMap<crate::PanelElementId, Entity>,
 }
 
 impl Default for DiegeticPanel {
     fn default() -> Self {
         Self {
-            tree:                       PanelTree::default(),
-            width:                      0.0,
-            height:                     0.0,
-            layout_unit:                Unit::Meters,
-            font_unit:                  Cascade::Inherit,
-            anchor:                     Anchor::TopLeft,
-            world_width:                None,
-            world_height:               None,
-            shadow_casting:             Cascade::Inherit,
-            widget_hovered_appearance:  Cascade::Inherit,
-            widget_pressed_appearance:  Cascade::Inherit,
-            widget_focused_appearance:  Cascade::Inherit,
-            widget_disabled_appearance: Cascade::Inherit,
-            material:                   Cascade::Inherit,
-            text_material:              Cascade::Inherit,
-            shape_material:             Cascade::Inherit,
-            text_alpha_mode:            Cascade::Inherit,
-            hdr_text_coverage_bias:     Cascade::Inherit,
-            picking:                    PanelPicking::default(),
-            coordinate_space:           CoordinateSpace::default(),
-            text_index:                 HashMap::new(),
+            tree:                          PanelTree::default(),
+            width:                         0.0,
+            height:                        0.0,
+            layout_unit:                   Unit::Meters,
+            font_unit:                     Cascade::Inherit,
+            anchor:                        Anchor::TopLeft,
+            world_width:                   None,
+            world_height:                  None,
+            sdf_surface_depth_offset:      0.0,
+            contain_sdf_surface:           false,
+            shadow_casting:                Cascade::Inherit,
+            widget_hovered_appearance:     Cascade::Inherit,
+            widget_pressed_appearance:     Cascade::Inherit,
+            widget_focused_appearance:     Cascade::Inherit,
+            widget_disabled_appearance:    Cascade::Inherit,
+            material:                      Cascade::Inherit,
+            text_material:                 Cascade::Inherit,
+            shape_material:                Cascade::Inherit,
+            text_alpha_mode:               Cascade::Inherit,
+            hdr_text_coverage_bias:        Cascade::Inherit,
+            picking:                       PanelPicking::default(),
+            single_click_field_activation: false,
+            coordinate_space:              CoordinateSpace::default(),
+            text_index:                    HashMap::new(),
         }
     }
 }
@@ -352,35 +409,23 @@ impl DiegeticPanel {
     }
 }
 
-/// Installs the builder's initial [`PanelPicking`] on panel insert or replacement
-/// when the entity has no live `PanelPicking` component. The deferred write
-/// goes through `lifecycle::seed_owned_component`, which records the install
-/// in `PanelComponentOwnership<PanelPicking>` so panel role teardown can tell
-/// the seed apart from application state.
+/// Reinstalls the builder's [`PanelPicking`] when a panel replacement finds no
+/// live picking policy.
 ///
-/// A live `PanelPicking` is authoritative regardless of its value: one supplied
-/// explicitly in the spawn bundle — including [`PanelPicking::INTERACTIVE`],
-/// which equals the default — installed by a screen-overlay opt-out, or written
-/// at runtime is never overwritten, mutated, or recorded as Hana-owned, so
-/// replacing the `DiegeticPanel` preserves the live policy and no equal-value
-/// rewrite bumps the component's change tick. Absence is re-checked when the
-/// deferred insert applies, so any component already installed by then wins.
-///
-/// `teardown_owned_shared_state` removes an unchanged initial value together with its
-/// ownership record when the `DiegeticPanel` role is removed, so a later
-/// re-add installs the new builder value. An application write afterward
-/// moves the component's change tick off the recorded write; teardown then
-/// keeps the component and drops only the stale ownership record.
+/// A newly added panel is handled by [`seed_panel_overrides`], which includes
+/// picking in its single bundle write. Replacements return before queuing when
+/// a live `PanelPicking` is present; absence is checked again by
+/// `seed_owned_component` when the deferred command applies.
 pub(super) fn sync_panel_picking_on_insert(
-    inserted: On<Insert, DiegeticPanel>,
-    panels: Query<(&DiegeticPanel, Has<PanelPicking>)>,
+    inserted: On<Insert<DiegeticPanel>>,
+    panels: Query<(Ref<DiegeticPanel>, Has<PanelPicking>)>,
     mut commands: Commands,
 ) {
-    let entity = inserted.entity;
+    let entity = inserted.event_target();
     let Ok((panel, has_live_picking)) = panels.get(entity) else {
         return;
     };
-    if has_live_picking {
+    if has_live_picking || panel.is_added() {
         return;
     }
     let seed = panel.picking;
@@ -407,7 +452,7 @@ impl DiegeticPanel {
 
     /// Returns the revision a successful tree replacement will produce.
     #[must_use]
-    pub(crate) const fn next_tree_revision(&self) -> TreeRevision { self.tree.next_revision() }
+    pub(crate) fn next_tree_revision(&self) -> TreeRevision { self.tree.next_revision() }
 
     /// Panel width in layout units.
     #[must_use]
@@ -429,9 +474,19 @@ impl DiegeticPanel {
     #[must_use]
     pub const fn coordinate_space(&self) -> &CoordinateSpace { &self.coordinate_space }
 
+    /// Whether one primary click opens an editable field.
+    #[must_use]
+    pub(crate) const fn activates_field_on_single_click(&self) -> bool {
+        self.single_click_field_activation
+    }
+
     pub(super) const fn authored_world_width(&self) -> Option<f32> { self.world_width }
 
     pub(super) const fn authored_world_height(&self) -> Option<f32> { self.world_height }
+
+    pub(crate) const fn sdf_surface_depth_offset(&self) -> f32 { self.sdf_surface_depth_offset }
+
+    pub(crate) const fn contains_sdf_surface(&self) -> bool { self.contain_sdf_surface }
 
     /// Resolves a text run's [`PanelElementId`](crate::PanelElementId) to the entity
     /// reification created for it (its `line_index == 0` child), or `None` if
@@ -1279,12 +1334,12 @@ fn warn_rejected_conversion(operation: &PanelConversionOperation, reason: &str) 
     let panel = operation.panel();
     if let Some(camera) = operation.camera() {
         warn!(
-            "panel operation `{}` rejected for panel {panel:?} and camera {camera:?}: {reason}",
+            target: DIAGNOSTIC_LOG_TARGET, "panel operation `{}` rejected for panel {panel:?} and camera {camera:?}: {reason}",
             operation.name(),
         );
     } else {
         warn!(
-            "panel operation `{}` rejected for panel {panel:?}: {reason}",
+            target: DIAGNOSTIC_LOG_TARGET, "panel operation `{}` rejected for panel {panel:?}: {reason}",
             operation.name(),
         );
     }
@@ -1297,17 +1352,17 @@ fn warn_rejected_conversion_conflict(
     let panel = operation.panel();
     match conflict {
         PanelConversionAttachmentConflict::Outgoing { target } => warn!(
-            "panel operation `{}` rejected for panel {panel:?}: outgoing attachment targets \
+            target: DIAGNOSTIC_LOG_TARGET, "panel operation `{}` rejected for panel {panel:?}: outgoing attachment targets \
              {target:?}",
             operation.name(),
         ),
         PanelConversionAttachmentConflict::IncomingPanel { source } => warn!(
-            "panel operation `{}` rejected for panel {panel:?}: attachment source {source:?} \
+            target: DIAGNOSTIC_LOG_TARGET, "panel operation `{}` rejected for panel {panel:?}: attachment source {source:?} \
              targets the panel",
             operation.name(),
         ),
         PanelConversionAttachmentConflict::IncomingWidget { source, widget } => warn!(
-            "panel operation `{}` rejected for panel {panel:?}: attachment source {source:?} \
+            target: DIAGNOSTIC_LOG_TARGET, "panel operation `{}` rejected for panel {panel:?}: attachment source {source:?} \
              targets owned widget {widget:?}",
             operation.name(),
         ),
@@ -1334,7 +1389,7 @@ fn apply_panel_screen_conversion_now(
     prepared_screen: Option<&PreparedPanelScreenConversion>,
 ) {
     if let Err(error) = validate_screen_conversion(&conversion) {
-        warn!("failed to convert panel {entity:?} to screen space: {error}");
+        warn!(target: DIAGNOSTIC_LOG_TARGET, "failed to convert panel {entity:?} to screen space: {error}");
         return;
     }
     let was_world_panel = !panel.coordinate_space().is_screen();
@@ -1370,7 +1425,7 @@ fn apply_panel_screen_conversion_now(
             screen_handoff(camera, handoff_conversion, camera_transform, transform)
         });
     if let Err(error) = apply_screen_conversion(panel, conversion) {
-        warn!("failed to convert panel {entity:?} to screen space: {error}");
+        warn!(target: DIAGNOSTIC_LOG_TARGET, "failed to convert panel {entity:?} to screen space: {error}");
         return;
     }
     transform.translation.z = 0.0;
@@ -1408,7 +1463,7 @@ fn begin_panel_to_screen_now(
     source: ScreenConversionSource<'_>,
 ) {
     if let Err(error) = validate_screen_conversion(&conversion) {
-        warn!("failed to prepare panel {entity:?} for screen conversion: {error}");
+        warn!(target: DIAGNOSTIC_LOG_TARGET, "failed to prepare panel {entity:?} for screen conversion: {error}");
         return;
     }
     if panel.coordinate_space().is_screen() {
@@ -1448,7 +1503,7 @@ fn prepare_world_panel_for_screen_conversion(
     let old_points_to_world = panel.points_to_world();
     let points_to_pixels = old_points_to_world * (conversion.size.y / old_world_height);
     if !points_to_pixels.is_finite() || points_to_pixels <= 0.0 {
-        warn!("failed to scale panel {entity:?} tree for screen conversion: invalid source scale");
+        warn!(target: DIAGNOSTIC_LOG_TARGET, "failed to scale panel {entity:?} tree for screen conversion: invalid source scale");
         return false;
     }
 
@@ -1546,7 +1601,7 @@ fn apply_panel_world_conversion_now(
     resolved_position: &mut ResolvedScreenPanelPosition,
 ) {
     if let Err(error) = validate_world_conversion(&conversion) {
-        warn!("failed to convert panel {entity:?} to world space: {error}");
+        warn!(target: DIAGNOSTIC_LOG_TARGET, "failed to convert panel {entity:?} to world space: {error}");
         return;
     }
     let saved = if matches!(
@@ -1554,7 +1609,7 @@ fn apply_panel_world_conversion_now(
         conversion::SavedWorldRestoreMode::Restore
     ) {
         let Some(saved) = saved.cloned() else {
-            warn!("failed to convert panel {entity:?} to saved world space: no saved world state");
+            warn!(target: DIAGNOSTIC_LOG_TARGET, "failed to convert panel {entity:?} to saved world space: no saved world state");
             return;
         };
         Some(saved)
@@ -1564,13 +1619,13 @@ fn apply_panel_world_conversion_now(
     let next_transform = conversion.transform;
     if let Some(saved) = saved.as_ref() {
         if let Err(error) = saved.apply_world_conversion(panel, &conversion) {
-            warn!("failed to convert panel {entity:?} to saved world space: {error}");
+            warn!(target: DIAGNOSTIC_LOG_TARGET, "failed to convert panel {entity:?} to saved world space: {error}");
             return;
         }
         widget_index.clear();
         classification.record_tree_change(LayoutTreeChange::LayoutAffecting);
     } else if let Err(error) = apply_world_conversion(panel, conversion) {
-        warn!("failed to convert panel {entity:?} to world space: {error}");
+        warn!(target: DIAGNOSTIC_LOG_TARGET, "failed to convert panel {entity:?} to world space: {error}");
         return;
     }
     *transform = next_transform;
@@ -1606,12 +1661,10 @@ fn apply_panel_world_conversion_now(
 
 /// Spawn-time authoring bridge for panel cascade overrides.
 ///
-/// Reads a newly-added [`DiegeticPanel`]'s construction seeds and queues the
-/// matching `Cascade<A>` components for font unit, materials, text alpha, HDR
-/// coverage bias, shadow casting, anti-aliasing, hairline fade, lighting, and
-/// sidedness. The construction-seed fields are never replayed after spawn.
-/// `resolve_inserted_cascade<A>` in `hana_kana` seeds the panel's
-/// `Resolved<FontUnit>`, which `compute_panel_layouts` reads.
+/// Reads a newly added [`DiegeticPanel`]'s construction seeds and queues one
+/// bundle containing every absent `Cascade<A>`, its resolved value and
+/// ownership records, plus absent panel picking state. Construction seeds are
+/// never replayed when the panel value is replaced.
 ///
 /// At construction, a panel has no cascade ancestor and receives an overriding
 /// `Cascade<FontUnit>` from its builder seed when set, otherwise from
@@ -1626,7 +1679,7 @@ fn apply_panel_world_conversion_now(
 /// `Cascade<TextAlpha>`. This is the panel equivalent of the standalone
 /// `TextStyle` authoring bridge.
 pub(super) fn seed_panel_overrides(
-    trigger: On<Add, DiegeticPanel>,
+    trigger: On<Add<DiegeticPanel>>,
     panels: Query<&DiegeticPanel>,
     defaults: Res<PanelDefaults>,
     mut commands: Commands,
@@ -1646,40 +1699,42 @@ pub(super) fn seed_panel_overrides(
     let widget_pressed_appearance = panel.widget_pressed_appearance.clone();
     let widget_focused_appearance = panel.widget_focused_appearance.clone();
     let widget_disabled_appearance = panel.widget_disabled_appearance.clone();
-    let (lighting, sidedness) = if panel.coordinate_space().is_screen() {
-        (
-            Cascade::Override(Lighting::Unlit),
-            Cascade::Override(Sidedness::FrontOnly),
-        )
+    let lighting = if panel.coordinate_space().is_screen() {
+        Cascade::Override(Lighting::Unlit)
     } else {
-        (Cascade::Inherit, Cascade::Inherit)
+        Cascade::Inherit
     };
+    let sidedness = if panel.coordinate_space().is_screen() {
+        Cascade::Override(Sidedness::FrontOnly)
+    } else {
+        Cascade::Inherit
+    };
+    let picking = panel.picking;
 
     commands.queue(move |world: &mut bevy::ecs::world::World| {
-        seed_panel_value(world, entity, Cascade::Override(FontUnit(font_unit)));
-        seed_panel_value(world, entity, sdf_material);
-        seed_panel_value(world, entity, text_material);
-        seed_panel_value(world, entity, shape_material);
-        seed_panel_value(world, entity, text_alpha);
-        seed_panel_value(world, entity, hdr_text_coverage_bias);
-        seed_panel_value(world, entity, shadow_casting);
-        seed_panel_value(world, entity, widget_hovered_appearance);
-        seed_panel_value(world, entity, widget_pressed_appearance);
-        seed_panel_value(world, entity, widget_focused_appearance);
-        seed_panel_value(world, entity, widget_disabled_appearance);
-        seed_panel_value(world, entity, Cascade::<AntiAlias>::Inherit);
-        seed_panel_value(world, entity, Cascade::<HairlineFade>::Inherit);
-        seed_panel_value(world, entity, lighting);
-        seed_panel_value(world, entity, sidedness);
+        lifecycle::seed_panel_bundle(
+            world,
+            entity,
+            PanelSeedValues {
+                font_unit: Cascade::Override(FontUnit(font_unit)),
+                sdf_material,
+                text_material,
+                shape_material,
+                text_alpha,
+                hdr_text_coverage_bias,
+                shadow_casting,
+                widget_hovered_appearance,
+                widget_pressed_appearance,
+                widget_focused_appearance,
+                widget_disabled_appearance,
+                anti_alias: Cascade::Inherit,
+                hairline_fade: Cascade::Inherit,
+                lighting,
+                sidedness,
+                picking,
+            },
+        );
     });
-}
-
-fn seed_panel_value<A: CascadeAttribute>(
-    world: &mut bevy::ecs::world::World,
-    entity: Entity,
-    authored: Cascade<A>,
-) {
-    lifecycle::seed_owned_cascade(world, entity, entity, authored);
 }
 
 /// Per-frame tree-change classification consumed by the panel layout system.
@@ -1917,14 +1972,17 @@ impl ComputedDiegeticPanel {
     #[must_use]
     pub fn scroll_records(&self) -> &[ComputedScrollRecord] { &self.scroll_records }
 
-    /// Resolves the innermost named scrolling element whose visible region
-    /// holds a panel-local layout point.
+    /// Resolves the innermost named scrolling element with vertical scroll
+    /// range whose visible region holds a panel-local layout point.
+    ///
+    /// An element that scrolls only sideways, such as a single-line field
+    /// while it is edited, leaves the point to its nearest scrolling ancestor.
     #[must_use]
     pub fn scroll_record_at_local_position(&self, panel_local: Vec2) -> ScrollRecordUnderPoint<'_> {
         self.scroll_records
             .iter()
             .rev()
-            .find(|record| record.contains(panel_local))
+            .find(|record| record.extent.max_offset().y > 0.0 && record.contains(panel_local))
             .map_or(
                 ScrollRecordUnderPoint::OutsideScrollingElements,
                 ScrollRecordUnderPoint::Inside,
@@ -1949,6 +2007,30 @@ impl ComputedDiegeticPanel {
 
     pub(crate) fn widget_records(&self) -> &[ComputedWidgetRecord] { &self.widget_records }
 
+    /// Drawn widget-part bounds in layout points, after renderer scissor and
+    /// viewport clipping. A widget may contribute several visible parts.
+    ///
+    /// Includes disabled controls; fully clipped parts contribute nothing.
+    pub fn visible_widget_bounds<'a>(
+        &'a self,
+        panel: &'a DiegeticPanel,
+    ) -> impl Iterator<Item = (&'a crate::PanelElementId, WidgetKind, BoundingBox)> {
+        self.layout
+            .solved()
+            .into_iter()
+            .flat_map(|layout| panel.visible_command_bounds(layout))
+            .filter_map(move |(command, bounds)| {
+                command.kind.draw_sort_tier()?;
+                let record = self.widget_records.iter().find(|record| {
+                    record
+                        .visual_elements()
+                        .binary_search_by_key(&command.element_idx, |(index, _)| *index)
+                        .is_ok()
+                })?;
+                Some((record.id(), record.kind(), bounds))
+            })
+    }
+
     pub(crate) fn tooltip_records(&self) -> &[ComputedTooltipRecord] { &self.tooltip_records }
 
     #[cfg(test)]
@@ -1960,12 +2042,17 @@ impl ComputedDiegeticPanel {
     /// Element-keyed records are rebuilt from the retained solve, since a
     /// visual-only change can rename elements; `layout_to_points` converts the
     /// scroll records back to the panel's layout unit.
-    pub(super) fn regenerate_commands(&mut self, tree: &LayoutTree, layout_to_points: f32) -> bool {
+    pub(super) fn regenerate_commands(
+        &mut self,
+        tree: &LayoutTree,
+        measure_text: &MeasureTextFn,
+        layout_to_points: f32,
+    ) -> bool {
         let PanelLayout::Solved(result) = &mut self.layout else {
             return false;
         };
 
-        result.regenerate_commands(tree);
+        result.regenerate_commands(tree, measure_text);
         self.draw_order = DrawOrder::from_commands(&result.commands);
         let (field_records, field_id_conflicts) = field::collect_panel_field_records(tree, result);
         self.field_records = field_records;
@@ -2140,7 +2227,7 @@ mod tests {
         let mut builder = LayoutBuilder::new(100.0, 50.0);
         builder.with(
             El::new()
-                .editable_field("field", field)
+                .editable_field("field", field, crate::TextStyle::new(10.0))
                 .editor_text(EditorStateColors::new().focused(fill)),
             |builder| {
                 builder.text(("display", TextStyle::new(10.0)));
@@ -2191,6 +2278,122 @@ mod tests {
 
         assert_eq!(cache.hits(), 1);
         assert_eq!(cache.misses(), 1);
+    }
+
+    #[test]
+    fn separately_built_trees_have_distinct_revisions() {
+        let first = PanelTree::from(test_tree("first"));
+        let second = PanelTree::from(test_tree("second"));
+
+        assert_ne!(first.revision(), second.revision());
+    }
+
+    #[test]
+    fn cloned_panel_replacement_rebuilds_scaled_tree() {
+        let original = DiegeticPanel::world()
+            .size(Mm(100.0), Mm(50.0))
+            .with_tree(test_tree("old"))
+            .build()
+            .expect("panel should build");
+        let replacement = original.clone();
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.insert_resource(DiegeticTextMeasurer::default());
+        app.add_plugins(HeadlessLayoutPlugin);
+        let original_entity = app.world_mut().spawn(original).id();
+        let replacement_entity = app.world_mut().spawn(replacement).id();
+        app.update();
+
+        let mut cache = ScaledLayoutTreeCache::default();
+        assert_eq!(
+            cache
+                .get_or_update(
+                    app.world()
+                        .get::<DiegeticPanel>(original_entity)
+                        .expect("original panel should exist")
+                        .tree_source(),
+                    1.0,
+                    1.0,
+                )
+                .element_text(1),
+            Some("old")
+        );
+
+        assert!(
+            app.world_mut()
+                .commands()
+                .set_tree(original_entity, test_tree("original edit"))
+                .is_ok()
+        );
+        assert!(
+            app.world_mut()
+                .commands()
+                .set_tree(replacement_entity, test_tree("replacement edit"))
+                .is_ok()
+        );
+        app.update();
+        let original_revision = app
+            .world()
+            .get::<DiegeticPanel>(original_entity)
+            .map(DiegeticPanel::tree_revision);
+        let replacement_revision = app
+            .world()
+            .get::<DiegeticPanel>(replacement_entity)
+            .map(DiegeticPanel::tree_revision);
+        assert_ne!(original_revision, replacement_revision);
+        let replacement = std::mem::take(
+            &mut *app
+                .world_mut()
+                .get_mut::<DiegeticPanel>(replacement_entity)
+                .expect("replacement should exist"),
+        );
+        *app.world_mut()
+            .get_mut::<DiegeticPanel>(original_entity)
+            .expect("original should exist") = replacement;
+
+        assert_eq!(
+            cache
+                .get_or_update(
+                    app.world()
+                        .get::<DiegeticPanel>(original_entity)
+                        .expect("original should exist")
+                        .tree_source(),
+                    1.0,
+                    1.0,
+                )
+                .element_text(1),
+            Some("replacement edit")
+        );
+        assert_eq!(cache.misses(), 2);
+    }
+
+    #[test]
+    fn replacing_panel_component_rebuilds_its_scaled_tree() {
+        let mut panel = DiegeticPanel::world()
+            .size(Mm(100.0), Mm(50.0))
+            .with_tree(test_tree("old"))
+            .build()
+            .expect("first panel should build");
+        let mut cache = ScaledLayoutTreeCache::default();
+        assert_eq!(
+            cache
+                .get_or_update(panel.tree_source(), 1.0, 1.0)
+                .element_text(1),
+            Some("old")
+        );
+
+        panel = DiegeticPanel::world()
+            .size(Mm(100.0), Mm(50.0))
+            .with_tree(test_tree("new"))
+            .build()
+            .expect("replacement panel should build");
+        assert_eq!(
+            cache
+                .get_or_update(panel.tree_source(), 1.0, 1.0)
+                .element_text(1),
+            Some("new")
+        );
+        assert_eq!(cache.misses(), 2);
     }
 
     #[test]

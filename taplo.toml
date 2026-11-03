@@ -8,7 +8,7 @@ reorder_keys   = true
 
 
 [[rule]]
-include = ["config/agents.toml"]
+include = ["config/agents.toml", "crates/hana/brp_views.toml"]
 
 [rule.formatting]
 reorder_arrays = false

@@ -22,6 +22,6 @@ use crate::orbit_cam::FairyDustOrbitCam;
 
 pub(crate) fn install(app: &mut App) { app.add_observer(insert_smaa); }
 
-fn insert_smaa(trigger: On<Add, FairyDustOrbitCam>, mut commands: Commands) {
+fn insert_smaa(trigger: On<Add<FairyDustOrbitCam>>, mut commands: Commands) {
     commands.entity(trigger.entity).insert(Smaa::default());
 }

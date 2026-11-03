@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `transform_from_orbit` returns the pose an `OrbitCam` writes for a yaw, pitch,
+  radius, focus, projection and `CameraBasis`, so a caller can know where the
+  eye stands before the camera moves there.
+
 ## [0.5.0] - 2026-08-23
 
 ### Added

@@ -22,6 +22,6 @@ pub(crate) fn install(app: &mut App) {
     app.add_observer(insert_stable_transparency);
 }
 
-fn insert_stable_transparency(trigger: On<Add, FairyDustOrbitCam>, mut commands: Commands) {
+fn insert_stable_transparency(trigger: On<Add<FairyDustOrbitCam>>, mut commands: Commands) {
     commands.entity(trigger.entity).insert(StableTransparency);
 }

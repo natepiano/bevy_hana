@@ -7,6 +7,7 @@ use bevy::prelude::Meshable;
 use bevy::prelude::Plane3d;
 use bevy::prelude::Quat;
 use bevy::prelude::Sphere;
+use bevy::prelude::StandardMaterial;
 use bevy::prelude::Torus;
 use bevy::prelude::Transform;
 use bevy::prelude::Vec3;
@@ -33,13 +34,7 @@ pub(crate) fn spawn_scene_objects(
     let ground = commands
         .spawn((
             Mesh3d(meshes.add(Plane3d::default().mesh().size(GROUND_SIZE, GROUND_SIZE))),
-            MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: GROUND_COLOR.with_alpha(GROUND_ALPHA),
-                alpha_mode: AlphaMode::Blend,
-                double_sided: true,
-                cull_mode: None,
-                ..default()
-            })),
+            MeshMaterial3d(materials.add(ground_material())),
         ))
         .observe(pointer::on_ground_clicked)
         .id();
@@ -121,4 +116,16 @@ pub(crate) fn spawn_scene_objects(
         .observe(pointer::on_mesh_unhover);
 
     ground
+}
+
+fn ground_material() -> StandardMaterial {
+    StandardMaterial {
+        base_color: GROUND_COLOR.with_alpha(GROUND_ALPHA),
+        alpha_mode: AlphaMode::Blend,
+        double_sided: true,
+        cull_mode: None,
+        reflectance: 0.0,
+        perceptual_roughness: 1.0,
+        ..default()
+    }
 }

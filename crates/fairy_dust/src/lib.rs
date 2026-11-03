@@ -62,6 +62,7 @@ mod hdr;
 mod keymap;
 mod lighting;
 mod orbit_cam;
+mod panel_insets;
 mod primitive;
 mod release_hold;
 mod restart;
@@ -73,13 +74,18 @@ mod shortcuts;
 mod smaa;
 mod transparency;
 mod unclamp;
+mod widget_drag_claim;
 
+use std::time::Instant;
+
+use bevy::app::PluginGroupBuilder;
 use bevy::asset::AssetPlugin;
 use bevy::log::LogPlugin;
 use bevy::prelude::App;
 use bevy::prelude::DefaultPlugins;
 use bevy::prelude::Plugin;
 use bevy::prelude::PluginGroup;
+use bevy::prelude::Resource;
 #[cfg(test)]
 use bevy::prelude::default;
 #[cfg(test)]
@@ -104,6 +110,9 @@ pub use camera_control_panel::CameraGuidanceAction;
 pub use camera_control_panel::CameraGuidanceRow;
 pub use camera_home::CameraHomeEntity;
 pub use camera_home::CameraHomeTarget;
+pub use camera_home::FrameCameraTarget;
+pub use camera_home::FrameHomeFace;
+pub use camera_home::HomeFace;
 pub use command_palette::PaletteBindingPresentation;
 pub use command_palette::palette_binding_presentation;
 pub use constants::CUBE_FACE_LABEL_SIZE;
@@ -130,7 +139,9 @@ pub use fold_controls::FoldControlDiagnosticReason;
 pub use fold_controls::FoldControlDiagnostics;
 pub use hana_diegetic::Anchor;
 use hana_diegetic::DiegeticUiPlugin;
+use hana_lagrange::CameraInputRoutingConfig;
 use hana_lagrange::LagrangePlugin;
+use hana_lagrange::NoPositionFallback;
 pub use hana_lagrange::OrbitCam;
 pub use keymap::CommandPaletteKeymap;
 pub use keymap::command_palette_recovery_command_id;
@@ -143,6 +154,7 @@ pub use primitive::CubeFaceLabel;
 pub use primitive::CubeFacePanelActivity;
 pub use primitive::CubeFacePanelContent;
 pub use primitive::CubeFacePanelStyle;
+pub use primitive::CubeFaceSpacing;
 pub use primitive::Face;
 pub use primitive::FairyDustCube;
 pub use primitive::cube_face_label;
@@ -159,12 +171,14 @@ pub use restart_camera::RestartCameraRestore;
 pub use restart_camera::RestoreWindowAnimation;
 pub use screen_panels::ControlActivation;
 pub use screen_panels::DescriptionPanel;
+pub use screen_panels::SCREEN_PANEL_GAP;
 pub use screen_panels::StatsPanelRow;
 pub use screen_panels::StatsPanelSection;
 pub use screen_panels::TitleBar;
 pub use screen_panels::TitleBarControl;
 pub use screen_panels::TitleBarOrientation;
 pub use screen_panels::TitleBarSegment;
+pub use screen_panels::TitleBarStateWriters;
 pub use screen_panels::TitleChip;
 pub use screen_panels::TitleChipActivation;
 pub use screen_panels::diegetic_stats_panel;
@@ -180,6 +194,10 @@ pub use screen_panels::gpu_meter_panel;
 pub use screen_panels::screen_panel_frame;
 pub use screen_panels::screen_panel_material;
 pub use screen_panels::screen_panel_material_handle;
+pub use screen_panels::screen_panel_text_edge_trim;
+pub use screen_panels::separation::EdgePanelPlacementState;
+pub use screen_panels::separation::EdgePanelPlacementStatus;
+pub use widget_drag_claim::WidgetDragClaimPlugin;
 
 /// Construct a fresh [`SprinkleBuilder`] whose Fairy Dust baseline is installed
 /// by the first builder operation. Chain capability methods, then call `.run()`.
@@ -206,30 +224,63 @@ fn quiet_log_plugin() -> LogPlugin {
     }
 }
 
+/// Wall-clock endpoints for the expensive baseline plugin builds.
+#[derive(Resource)]
+pub struct BaselineBuildTimings {
+    /// Instant after Bevy's default plugins finish building.
+    pub default_plugins: Instant,
+    /// Instant after the diegetic UI plugin finishes building.
+    pub diegetic_ui:     Instant,
+    /// Instant after the camera input plugin finishes building.
+    pub lagrange:        Instant,
+    /// Instant after all Fairy Dust baseline installers finish.
+    pub complete:        Instant,
+}
+
 /// Install `DefaultPlugins` and the Fairy Dust baseline with `asset_plugin`.
 pub(crate) fn install_baseline(app: &mut App, asset_plugin: AssetPlugin) {
     #[cfg(not(test))]
-    app.add_plugins(DefaultPlugins.set(asset_plugin).set(quiet_log_plugin()));
+    let plugins = DefaultPlugins.build().set(quiet_log_plugin());
     #[cfg(test)]
-    app.add_plugins(
-        DefaultPlugins
-            .build()
-            .set(asset_plugin)
-            .set(RenderPlugin {
-                render_creation: RenderCreation::Automatic(Box::new(WgpuSettings {
-                    backends: None,
-                    ..default()
-                })),
+    let plugins = DefaultPlugins
+        .build()
+        .set(RenderPlugin {
+            render_creation: RenderCreation::Automatic(Box::new(WgpuSettings {
+                backends: None,
                 ..default()
-            })
-            .disable::<LogPlugin>()
-            .disable::<WinitPlugin>(),
-    );
+            })),
+            ..default()
+        })
+        .disable::<LogPlugin>()
+        .disable::<WinitPlugin>();
+    install_baseline_with_plugins(app, asset_plugin, plugins);
+}
+
+pub(crate) fn install_baseline_with_plugins(
+    app: &mut App,
+    asset_plugin: AssetPlugin,
+    plugins: PluginGroupBuilder,
+) {
+    app.add_plugins(plugins.enable::<AssetPlugin>().set(asset_plugin));
+    let default_plugins = Instant::now();
     ensure_plugin(app, DiegeticUiPlugin);
+    let diegetic_ui = Instant::now();
     ensure_plugin(app, LagrangePlugin);
+    let lagrange = Instant::now();
+    ensure_plugin(app, WidgetDragClaimPlugin);
+    app.insert_resource(
+        CameraInputRoutingConfig::cursor_hit_test()
+            .with_no_position_fallback(NoPositionFallback::OnlyEligibleCamera),
+    );
     screen_panels::install_overlay_picking(app);
     restart::install(app);
     screen_space_lights::install(app);
+    app.insert_resource(BaselineBuildTimings {
+        default_plugins,
+        diegetic_ui,
+        lagrange,
+        complete: Instant::now(),
+    });
 }
 
 /// Add `plugin` to `app` if no plugin of the same type is already registered.
@@ -240,5 +291,97 @@ pub(crate) fn install_baseline(app: &mut App, asset_plugin: AssetPlugin) {
 pub(crate) fn ensure_plugin<P: Plugin>(app: &mut App, plugin: P) {
     if !app.is_plugin_added::<P>() {
         app.add_plugins(plugin);
+    }
+}
+
+#[cfg(test)]
+use hana_lagrange::input_test_app as test_app;
+
+#[cfg(test)]
+mod tests {
+    use bevy::image::Image;
+    use bevy::prelude::AssetServer;
+    use bevy::prelude::Assets;
+    use bevy::prelude::Commands;
+    use bevy::prelude::Handle;
+    use bevy::prelude::ResMut;
+    use bevy::prelude::Resource;
+    use bevy::prelude::Startup;
+
+    use super::*;
+
+    #[derive(Resource)]
+    struct SeededImage(Handle<Image>);
+
+    #[derive(Resource)]
+    struct ImageStoreExistedBeforeRender(bool);
+
+    struct SeedImagePlugin;
+
+    impl Plugin for SeedImagePlugin {
+        fn build(&self, app: &mut App) {
+            app.insert_resource(ImageStoreExistedBeforeRender(
+                app.world().contains_resource::<Assets<Image>>(),
+            ));
+            app.add_systems(
+                Startup,
+                |mut commands: Commands, mut images: ResMut<Assets<Image>>| {
+                    commands.insert_resource(SeededImage(images.add(Image::default())));
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn baseline_preserves_image_seeded_by_plugin_before_render() {
+        let mut app = crate::test_app();
+        let plugins = DefaultPlugins
+            .build()
+            .set(RenderPlugin {
+                render_creation: RenderCreation::Automatic(Box::new(WgpuSettings {
+                    backends: None,
+                    ..default()
+                })),
+                ..default()
+            })
+            .disable::<LogPlugin>()
+            .disable::<WinitPlugin>()
+            .add_before::<RenderPlugin>(SeedImagePlugin);
+        install_baseline_with_plugins(&mut app, AssetPlugin::default(), plugins);
+        app.update();
+        assert!(!app.world().resource::<ImageStoreExistedBeforeRender>().0);
+        let handle = &app.world().resource::<SeededImage>().0;
+        assert!(
+            app.world()
+                .resource::<Assets<Image>>()
+                .get(handle)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn baseline_enables_asset_plugin_disabled_by_caller() {
+        let mut app = crate::test_app();
+        let plugins = DefaultPlugins
+            .build()
+            .disable::<AssetPlugin>()
+            .disable::<LogPlugin>()
+            .disable::<WinitPlugin>();
+        install_baseline_with_plugins(&mut app, AssetPlugin::default(), plugins);
+        assert!(app.is_plugin_added::<AssetPlugin>());
+        assert!(app.world().contains_resource::<AssetServer>());
+    }
+
+    #[test]
+    fn baseline_uses_only_eligible_camera_for_no_position_input() {
+        let mut app = crate::test_app();
+        install_baseline(&mut app, AssetPlugin::default());
+
+        assert_eq!(
+            app.world()
+                .resource::<CameraInputRoutingConfig>()
+                .no_position_fallback,
+            NoPositionFallback::OnlyEligibleCamera,
+        );
     }
 }

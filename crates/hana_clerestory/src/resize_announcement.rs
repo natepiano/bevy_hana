@@ -192,7 +192,7 @@ mod tests {
 
         app.update();
 
-        assert!(announcements(&app).is_empty());
+        assert_eq!(announcements(&app), []);
     }
 
     #[test]
@@ -210,7 +210,7 @@ mod tests {
 
         app.update();
 
-        assert!(announcements(&app).is_empty());
+        assert_eq!(announcements(&app), []);
     }
 
     #[test]
@@ -225,6 +225,6 @@ mod tests {
         clear_announcements(&mut app);
         app.update();
 
-        assert!(announcements(&app).is_empty());
+        assert_eq!(announcements(&app), []);
     }
 }

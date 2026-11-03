@@ -24,6 +24,7 @@ use crate::constants::DRM_CLASS_DIRECTORY;
 use crate::constants::DRM_CONNECTOR_EDID_FILE;
 use crate::constants::DRM_CONNECTOR_NAME_SEPARATOR;
 use crate::constants::X11_EDID_PROPERTY_NAME;
+use crate::monitors::DisplayPhysicalSize;
 use crate::monitors::DisplayProductName;
 #[cfg(any(test, feature = "test"))]
 use crate::monitors::identity;
@@ -38,7 +39,7 @@ use crate::monitors::identity::internal_connector::InternalConnector;
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(in crate::monitors) enum QualifiedEvidence {
     InternalConnector(InternalConnector),
-    LinuxEdid(EdidIdentityEvidence),
+    LinuxEdid(EdidIdentityEvidence, DisplayPhysicalSize),
     #[cfg(any(test, feature = "test"))]
     Synthetic(Vec<u8>),
 }
@@ -48,7 +49,7 @@ impl QualifiedEvidence {
     pub(in crate::monitors::identity) fn stable_bytes(&self) -> &[u8] {
         match self {
             Self::InternalConnector(connector) => connector.as_bytes(),
-            Self::LinuxEdid(edid) => edid.stable_bytes(),
+            Self::LinuxEdid(edid, _) => edid.stable_bytes(),
             #[cfg(any(test, feature = "test"))]
             Self::Synthetic(bytes) => bytes,
         }
@@ -64,9 +65,18 @@ impl QualifiedEvidence {
                 display_fingerprint: fingerprint,
                 serial:              ReportedSerial::PlatformCannotReport,
             },
-            Self::LinuxEdid(edid) => edid.identity_evidence(fingerprint),
+            Self::LinuxEdid(edid, _) => edid.identity_evidence(fingerprint),
             #[cfg(any(test, feature = "test"))]
             Self::Synthetic(_) => identity::synthesized_without_serial(fingerprint),
+        }
+    }
+
+    pub(in crate::monitors) const fn physical_size(&self) -> DisplayPhysicalSize {
+        match self {
+            Self::LinuxEdid(_, size) => *size,
+            Self::InternalConnector(_) => DisplayPhysicalSize::NotReported,
+            #[cfg(any(test, feature = "test"))]
+            Self::Synthetic(_) => DisplayPhysicalSize::NotReported,
         }
     }
 }
@@ -179,9 +189,8 @@ fn x11_monitor_evidence(handle: &MonitorHandle) -> MonitorEvidenceObservation {
             };
         },
     };
-    let display_evidence = qualify_edid(x11_output_edid(&connection, output))
-        .map(QualifiedEvidence::LinuxEdid)
-        .or_else(|property_error| {
+    let display_evidence =
+        qualify_edid_with_size(x11_output_edid(&connection, output)).or_else(|property_error| {
             drm_display_evidence(
                 &connector_name,
                 Path::new(DRM_CLASS_DIRECTORY),
@@ -248,7 +257,7 @@ fn drm_display_evidence(
         return Err(unresolved_error);
     };
     if !edid.is_empty() {
-        return EdidEvidence::qualify(edid).map(QualifiedEvidence::LinuxEdid);
+        return qualify_edid_with_size(Ok(edid));
     }
     InternalConnector::identify(connector_name).map_or(Err(unresolved_error), |connector| {
         Ok(QualifiedEvidence::InternalConnector(connector))
@@ -280,10 +289,20 @@ fn drm_connector_directory(connector_name: &str, drm_class_directory: &Path) -> 
     matched_directory
 }
 
+#[cfg(test)]
 fn qualify_edid(
     query: Result<Vec<u8>, MonitorIdentificationError>,
 ) -> Result<EdidIdentityEvidence, MonitorIdentificationError> {
     EdidEvidence::qualify(query?)
+}
+
+fn qualify_edid_with_size(
+    edid: Result<Vec<u8>, MonitorIdentificationError>,
+) -> Result<QualifiedEvidence, MonitorIdentificationError> {
+    let edid = edid?;
+    let physical_size = EdidEvidence::image_size(&edid);
+    EdidEvidence::qualify(edid)
+        .map(|identity| QualifiedEvidence::LinuxEdid(identity, physical_size))
 }
 
 #[cfg(test)]
@@ -317,7 +336,7 @@ mod tests {
     #[test]
     fn qualified_edid_variants_retain_the_extracted_serial_tier() {
         let identity = qualify_edid(Ok(serial_edid())).expect("fixture EDID should qualify");
-        let linux = QualifiedEvidence::LinuxEdid(identity);
+        let linux = QualifiedEvidence::LinuxEdid(identity, DisplayPhysicalSize::NotReported);
 
         assert_eq!(linux.stable_bytes(), b"42");
     }
@@ -332,7 +351,10 @@ mod tests {
 
         assert_eq!(
             wayland_display_evidence(Some("DP-3"), drm_class_directory.path()),
-            Ok(QualifiedEvidence::LinuxEdid(identity))
+            Ok(QualifiedEvidence::LinuxEdid(
+                identity,
+                DisplayPhysicalSize::NotReported
+            ))
         );
     }
 

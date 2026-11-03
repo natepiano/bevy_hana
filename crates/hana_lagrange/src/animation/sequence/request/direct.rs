@@ -243,7 +243,7 @@ fn prepare_direct_camera_playback(
 /// removed. `Discard` runs while the old `CameraSequence` is still queryable,
 /// so cancellation never borrows move identity from the new revision.
 pub(in crate::animation) fn close_discarded_camera_sequence(
-    discarded: On<Discard, CameraSequence>,
+    discarded: On<Discard<CameraSequence>>,
     mut commands: Commands,
     mut retained: Query<(
         &CameraSequence,
@@ -268,7 +268,7 @@ pub(in crate::animation) fn close_discarded_camera_sequence(
 
 /// Removes private retained state when direct authoring is explicitly removed.
 pub(in crate::animation) fn remove_direct_camera_sequence(
-    removed: On<Remove, CameraSequence>,
+    removed: On<Remove<CameraSequence>>,
     mut commands: Commands,
 ) {
     commands.entity(removed.entity).remove::<(
@@ -321,12 +321,7 @@ mod tests {
             app.world().resource::<LifecycleEventOrder>().0,
             Vec::<&str>::new()
         );
-        assert!(
-            app.world()
-                .resource::<CameraBoundaryEventOrder>()
-                .0
-                .is_empty()
-        );
+        assert_eq!(app.world().resource::<CameraBoundaryEventOrder>().0, []);
         let transitions = app.world().resource::<ControllerOverrideTransitionCounts>();
         assert_eq!((transitions.captured, transitions.released), (1, 1));
         assert!(

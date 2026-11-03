@@ -110,6 +110,7 @@ impl FromWorld for JumpFloodPipeline {
                 layout:                           vec![layout.clone()],
                 vertex:                           fullscreen_shader.to_vertex_state(),
                 fragment:                         Some(FragmentState {
+                    constants:   Vec::default(),
                     shader:      FLOOD_SHADER_HANDLE,
                     shader_defs: vec![],
                     entry_point: Some(FRAGMENT_SHADER_ENTRY_POINT.into()),

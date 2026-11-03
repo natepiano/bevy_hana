@@ -62,7 +62,7 @@ pub(super) struct FreeFlightControllerOverrideRestoration {
 /// sequence definition leaves that component in place, so a replacement never
 /// restores damping and immediately recaptures it.
 pub(super) fn restore_retained_camera_state(
-    remove: On<Remove, CameraSequencePlayback>,
+    remove: On<Remove<CameraSequencePlayback>>,
     mut commands: Commands,
     orbit_restorations: Query<&OrbitControllerOverrideRestoration>,
     free_restorations: Query<&FreeFlightControllerOverrideRestoration>,

@@ -1,11 +1,12 @@
-//! On-disk window-state formats and their one-way conversions.
+//! On-disk window-state formats.
 //!
 //! # Versioning strategy
 //!
 //! Every versioned RON file has a `version` envelope. The envelope is parsed before individual
 //! entries so malformed RON and malformed envelopes remain whole-file failures, while a valid
 //! envelope can discard one semantically invalid entry without discarding its valid siblings.
-//! Legacy bare records predate the envelope and retain their original whole-record decoder.
+//! Only the current version and the one before it are read. Any other version, and a file with no
+//! `version` at all, is rejected whole, the same as a file from a future build.
 //!
 //! ## Adding a new version
 //!
@@ -14,17 +15,13 @@
 //! 3. Add a named adjacent conversion from the immediately previous version.
 //! 4. Add the version's decode arm.
 //! 5. Update [`encode`] so normal saves write only the latest format.
-//! 6. Keep every older decoder and add direct tests for the new format and each conversion path.
+//! 6. Remove the decoder for the version two back, so only the new and previous formats load.
+//! 7. Add direct tests for the new format and for the previous version's conversion.
 //!
 //! ## Supported formats
 //!
 //! | Format | Description |
 //! |--------|-------------|
-//! | Legacy single-window | Bare v1-style state before multi-window support |
-//! | v1 | Physical field names and an enumeration index |
-//! | v2 | Logical dimensions and a pre-v3 absolute coordinate |
-//! | v3 | Monitor-relative positions plus the retired enumeration index |
-//! | v4 | Private `monitor_panel` fingerprints without reporter key strength |
 //! | v5 | Reporter-classified display keys or retained v4 evidence awaiting a live match |
 //! | v6 | v5 window state plus the complete per-role binding policy |
 
@@ -34,8 +31,6 @@ use std::fmt::Display;
 use std::fmt::Formatter;
 use std::time::Duration;
 
-use bevy::prelude::IVec2;
-use bevy::prelude::debug;
 use bevy::prelude::warn;
 use hana_rigging::prelude::ApplyDeadline;
 use hana_rigging::prelude::BindingPolicy;
@@ -62,22 +57,12 @@ use serde::Serializer;
 use serde::de::DeserializeOwned;
 use thiserror::Error as ThisError;
 
-use super::constants::PERSISTED_STATE_VERSION_V1;
-use super::constants::PERSISTED_STATE_VERSION_V2;
-use super::constants::PERSISTED_STATE_VERSION_V3;
-use super::constants::PERSISTED_STATE_VERSION_V4;
 use super::constants::PERSISTED_STATE_VERSION_V5;
 use super::window_state::LoadedBindingPolicy;
 use super::window_state::PersistedDisplayIdentityV4;
-use super::window_state::PersistedPosition;
 use super::window_state::PersistedWindowPlacement;
 use super::window_state::PersistedWindowState;
 use super::window_state::PersistedWindowTargetV5;
-use super::window_state::SavedFullscreenVideoMode;
-use super::window_state::SavedVideoMode;
-use super::window_state::SavedWindowMode;
-use super::window_state::UnrebasedDesktopPosition;
-use super::window_state::default_monitor_scale;
 use crate::constants::CURRENT_STATE_VERSION;
 use crate::constants::PRIMARY_WINDOW_KEY;
 use crate::constants::RON_HEADER;
@@ -321,7 +306,7 @@ pub(crate) enum PersistedWindowIdentityMigrationOutcome {
 #[derive(Debug, ThisError)]
 pub(crate) enum PersistedWindowIdentityMigrationFailure {
     /// A reporter association named a non-display device for a persisted window target.
-    #[error("fresh monitor association named non-display device kind {found:?}")]
+    #[error("fresh monitor association named non-monitor device kind {found:?}")]
     NonDisplayKey {
         /// Device kind that cannot anchor a window position.
         found: DeviceKind,
@@ -344,132 +329,7 @@ struct PersistedEntryV5 {
     window_state:   PersistedWindowState,
 }
 
-/// Frozen v4 entry retained only to decode already-written files.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedEntryV4 {
-    #[serde(rename = "key")]
-    persisted_role: PersistedWindowRole,
-    #[serde(rename = "state")]
-    window_state:   PersistedWindowStateV4,
-}
-
-/// Frozen v4 state that never receives new fields or new semantics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedWindowStateV4 {
-    position:          PersistedPosition,
-    logical_width:     u32,
-    logical_height:    u32,
-    #[serde(default, rename = "monitor_panel")]
-    monitor_display:   PersistedDisplayIdentityV4,
-    #[serde(rename = "mode")]
-    saved_window_mode: SavedWindowModeV4,
-    #[serde(default)]
-    app_name:          String,
-}
-
-/// Frozen v4 fullscreen representation whose absent mode meant the current display mode.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum SavedWindowModeV4 {
-    Windowed,
-    BorderlessFullscreen,
-    Fullscreen { video_mode: Option<SavedVideoMode> },
-}
-
-impl From<SavedWindowModeV4> for SavedWindowMode {
-    fn from(window_mode: SavedWindowModeV4) -> Self {
-        match window_mode {
-            SavedWindowModeV4::Windowed => Self::Windowed,
-            SavedWindowModeV4::BorderlessFullscreen => Self::BorderlessFullscreen,
-            SavedWindowModeV4::Fullscreen { video_mode } => Self::Fullscreen {
-                video_mode: video_mode.map_or(
-                    SavedFullscreenVideoMode::Current,
-                    SavedFullscreenVideoMode::Specific,
-                ),
-            },
-        }
-    }
-}
-
-/// v3 state whose enumeration index was deliberately discarded by v3-to-v4 migration.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PersistedWindowStateV3 {
-    position:          PersistedPosition,
-    logical_width:     u32,
-    logical_height:    u32,
-    monitor_index:     usize,
-    #[serde(default, rename = "monitor_panel")]
-    monitor_display:   PersistedDisplayIdentityV4,
-    #[serde(rename = "mode")]
-    saved_window_mode: SavedWindowModeV4,
-    #[serde(default)]
-    app_name:          String,
-}
-
-/// v3 entry retained only to decode files from before index removal.
-#[derive(Debug, Clone, Deserialize)]
-struct PersistedEntryV3 {
-    #[serde(rename = "key")]
-    persisted_role: PersistedWindowRole,
-    #[serde(rename = "state")]
-    window_state:   PersistedWindowStateV3,
-}
-
-/// v2 state with an absolute desktop coordinate and legacy monitor scale.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PersistedWindowStateV2 {
-    logical_position:  Option<(i32, i32)>,
-    logical_width:     u32,
-    logical_height:    u32,
-    #[serde(default = "default_monitor_scale", rename = "monitor_scale")]
-    scale:             f64,
-    #[serde(rename = "monitor_index")]
-    monitor:           usize,
-    #[serde(rename = "mode")]
-    saved_window_mode: SavedWindowModeV4,
-    #[serde(default)]
-    app_name:          String,
-}
-
-/// v2 entry retained only to decode files from before monitor-relative coordinates.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PersistedEntryV2 {
-    #[serde(rename = "key")]
-    persisted_role: PersistedWindowRole,
-    #[serde(rename = "state")]
-    window_state:   PersistedWindowStateV2,
-}
-
-/// v1 state with the historical width and height wire names.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PersistedWindowStateV1 {
-    #[serde(rename = "position")]
-    logical_position:  Option<(i32, i32)>,
-    #[serde(rename = "width")]
-    logical_width:     u32,
-    #[serde(rename = "height")]
-    logical_height:    u32,
-    monitor_index:     usize,
-    #[serde(rename = "mode")]
-    saved_window_mode: SavedWindowModeV4,
-    #[serde(default)]
-    app_name:          String,
-}
-
-/// v1 entry retained only to decode the first multi-window format.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PersistedEntryV1 {
-    #[serde(rename = "key")]
-    persisted_role: PersistedWindowRole,
-    #[serde(rename = "state")]
-    window_state:   PersistedWindowStateV1,
-}
-
-/// Strict structural envelope for the current format and unsupported future formats.
+/// Strict structural envelope shared by every version.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VersionedEnvelope {
@@ -477,14 +337,7 @@ struct VersionedEnvelope {
     entries: Vec<Box<RawValue>>,
 }
 
-/// Frozen structural envelope retaining v1-v4's shipped unknown-field compatibility.
-#[derive(Deserialize)]
-struct FrozenVersionedEnvelope {
-    version: u8,
-    entries: Vec<Box<RawValue>>,
-}
-
-/// Minimal version probe used before selecting the frozen decoder.
+/// Minimal version probe used to name the backup of a file that cannot be read.
 #[derive(Deserialize)]
 struct VersionProbe {
     version: u8,
@@ -504,45 +357,22 @@ enum RejectedEntryRoleEvidence {
     Unavailable,
 }
 
-/// Decode a file into live v5 state without rewriting it.
+/// Decode a v5 or v6 file into live state without rewriting it.
 pub(super) fn decode(
     contents: &str,
     registered_schemes: &RegisteredSchemes,
 ) -> PersistedWindowStateDecodeOutcome {
-    let Ok(version_probe) = from_str::<VersionProbe>(contents) else {
-        return decode_legacy_single_window(contents);
-    };
-
-    let envelope = match version_probe.version {
-        PERSISTED_STATE_VERSION_V1
-        | PERSISTED_STATE_VERSION_V2
-        | PERSISTED_STATE_VERSION_V3
-        | PERSISTED_STATE_VERSION_V4 => {
-            from_str::<FrozenVersionedEnvelope>(contents).map(|frozen_envelope| VersionedEnvelope {
-                version: frozen_envelope.version,
-                entries: frozen_envelope.entries,
-            })
-        },
-        _ => from_str::<VersionedEnvelope>(contents),
-    };
-    let Ok(envelope) = envelope else {
+    let Ok(envelope) = from_str::<VersionedEnvelope>(contents) else {
         return PersistedWindowStateDecodeOutcome::WholeFileRejected;
     };
-    if envelope.version != version_probe.version {
-        return PersistedWindowStateDecodeOutcome::WholeFileRejected;
-    }
 
     match envelope.version {
-        PERSISTED_STATE_VERSION_V1 => decode_v1(envelope.entries),
-        PERSISTED_STATE_VERSION_V2 => decode_v2(envelope.entries),
-        PERSISTED_STATE_VERSION_V3 => decode_v3(envelope.entries),
-        PERSISTED_STATE_VERSION_V4 => decode_v4(envelope.entries),
         PERSISTED_STATE_VERSION_V5 => decode_v5(envelope.entries, registered_schemes),
         CURRENT_STATE_VERSION => decode_v6(envelope.entries, registered_schemes),
         unsupported => {
             warn!(
                 "[decode] Unsupported persisted state version {unsupported} \
-                 (latest supported: {CURRENT_STATE_VERSION})"
+                 (supported: {PERSISTED_STATE_VERSION_V5} and {CURRENT_STATE_VERSION})"
             );
             PersistedWindowStateDecodeOutcome::WholeFileRejected
         },
@@ -554,60 +384,6 @@ pub(super) fn probe_version(contents: &str) -> Option<u8> {
     from_str::<VersionProbe>(contents)
         .ok()
         .map(|probe| probe.version)
-}
-
-fn decode_legacy_single_window(contents: &str) -> PersistedWindowStateDecodeOutcome {
-    let Ok(window_state_v1) = from_str::<PersistedWindowStateV1>(contents) else {
-        return PersistedWindowStateDecodeOutcome::WholeFileRejected;
-    };
-    let window_state = convert_v4_state_to_v5(convert_v1_state_to_v4(
-        window_state_v1,
-        &PersistedWindowRole::Primary,
-    ));
-    PersistedWindowStateDecodeOutcome::Decoded(HashMap::from([(
-        match RoleKey::try_from(PersistedWindowRole::Primary) {
-            Ok(role) => role,
-            Err(error) => {
-                warn!("[decode] legacy primary role is invalid: {error}");
-                return PersistedWindowStateDecodeOutcome::Decoded(HashMap::new());
-            },
-        },
-        window_state.into(),
-    )]))
-}
-
-fn decode_v1(entries: Vec<Box<RawValue>>) -> PersistedWindowStateDecodeOutcome {
-    decode_entries(entries, |entry| {
-        let entry = decode_frozen_entry::<PersistedEntryV1>(entry)?;
-        let state = convert_v1_state_to_v4(entry.window_state, &entry.persisted_role);
-        Ok((entry.persisted_role, convert_v4_state_to_v5(state).into()))
-    })
-}
-
-fn decode_v2(entries: Vec<Box<RawValue>>) -> PersistedWindowStateDecodeOutcome {
-    decode_entries(entries, |entry| {
-        let entry = decode_frozen_entry::<PersistedEntryV2>(entry)?;
-        let state = convert_v2_state_to_v4(entry.window_state, &entry.persisted_role);
-        Ok((entry.persisted_role, convert_v4_state_to_v5(state).into()))
-    })
-}
-
-fn decode_v3(entries: Vec<Box<RawValue>>) -> PersistedWindowStateDecodeOutcome {
-    decode_entries(entries, |entry| {
-        let entry = decode_frozen_entry::<PersistedEntryV3>(entry)?;
-        let state = convert_v3_state_to_v4(entry.window_state);
-        Ok((entry.persisted_role, convert_v4_state_to_v5(state).into()))
-    })
-}
-
-fn decode_v4(entries: Vec<Box<RawValue>>) -> PersistedWindowStateDecodeOutcome {
-    decode_entries(entries, |entry| {
-        let entry = decode_frozen_entry::<PersistedEntryV4>(entry)?;
-        Ok((
-            entry.persisted_role,
-            convert_v4_state_to_v5(entry.window_state).into(),
-        ))
-    })
 }
 
 fn decode_v5(
@@ -635,13 +411,6 @@ fn decode_v6(
             PersistedWindowPlacement::new(entry.window_state, entry.binding_policy.into()),
         ))
     })
-}
-
-fn decode_frozen_entry<T>(entry: &RawValue) -> Result<T, String>
-where
-    T: DeserializeOwned,
-{
-    from_str(entry.get_ron()).map_err(|error| error.to_string())
 }
 
 fn decode_v5_entry<T>(entry: &RawValue) -> Result<T, String>
@@ -705,72 +474,6 @@ fn decode_entries(
     PersistedWindowStateDecodeOutcome::Decoded(states)
 }
 
-fn convert_v1_state_to_v4(
-    state: PersistedWindowStateV1,
-    persisted_role: &PersistedWindowRole,
-) -> PersistedWindowStateV4 {
-    debug!(
-        "[convert_v1_state_to_v4] Ignoring legacy monitor index {} for {persisted_role}",
-        state.monitor_index
-    );
-    PersistedWindowStateV4 {
-        position:          legacy_position(
-            state.logical_position,
-            default_monitor_scale(),
-            persisted_role,
-        ),
-        logical_width:     state.logical_width,
-        logical_height:    state.logical_height,
-        monitor_display:   PersistedDisplayIdentityV4::Anonymous,
-        saved_window_mode: state.saved_window_mode,
-        app_name:          state.app_name,
-    }
-}
-
-fn convert_v2_state_to_v4(
-    state: PersistedWindowStateV2,
-    persisted_role: &PersistedWindowRole,
-) -> PersistedWindowStateV4 {
-    debug!(
-        "[convert_v2_state_to_v4] Ignoring legacy monitor index {} for {persisted_role}",
-        state.monitor
-    );
-    PersistedWindowStateV4 {
-        position:          legacy_position(state.logical_position, state.scale, persisted_role),
-        logical_width:     state.logical_width,
-        logical_height:    state.logical_height,
-        monitor_display:   PersistedDisplayIdentityV4::Anonymous,
-        saved_window_mode: state.saved_window_mode,
-        app_name:          state.app_name,
-    }
-}
-
-fn convert_v3_state_to_v4(state: PersistedWindowStateV3) -> PersistedWindowStateV4 {
-    debug!(
-        "[convert_v3_state_to_v4] Ignoring legacy monitor index {}",
-        state.monitor_index
-    );
-    PersistedWindowStateV4 {
-        position:          state.position,
-        logical_width:     state.logical_width,
-        logical_height:    state.logical_height,
-        monitor_display:   state.monitor_display,
-        saved_window_mode: state.saved_window_mode,
-        app_name:          state.app_name,
-    }
-}
-
-fn convert_v4_state_to_v5(state: PersistedWindowStateV4) -> PersistedWindowState {
-    PersistedWindowState {
-        target:            PersistedWindowTargetV5::AwaitingLegacyEvidence(state.monitor_display),
-        position:          state.position,
-        logical_width:     state.logical_width,
-        logical_height:    state.logical_height,
-        saved_window_mode: state.saved_window_mode.into(),
-        app_name:          state.app_name,
-    }
-}
-
 pub(super) fn resolve_legacy_target(
     legacy_identity: PersistedDisplayIdentityV4,
     live_displays: &LiveDisplayEndpointLookup,
@@ -809,26 +512,6 @@ fn validate_classified_key(
     registered_schemes
         .validate(device_key)
         .map_err(PersistedWindowIdentityMigrationFailure::from)
-}
-
-fn legacy_position(
-    logical_position: Option<(i32, i32)>,
-    captured_scale: f64,
-    persisted_role: &PersistedWindowRole,
-) -> PersistedPosition {
-    let Some((x, y)) = logical_position else {
-        return PersistedPosition::Unpositioned;
-    };
-    UnrebasedDesktopPosition::from_legacy(IVec2::new(x, y), captured_scale).map_or_else(
-        || {
-            warn!(
-                "[legacy_position] [{persisted_role}] Discarding saved position: \
-                 monitor_scale {captured_scale} is not a finite number greater than zero"
-            );
-            PersistedPosition::Unpositioned
-        },
-        PersistedPosition::Unrebased,
-    )
 }
 
 /// Encode live v6 state for a normal save.
@@ -900,7 +583,7 @@ mod tests {
     }
     use std::collections::HashMap;
 
-    use bevy::prelude::UVec2;
+    use bevy::prelude::IVec2;
     use hana_rigging::prelude::DeviceIdSource;
     use hana_rigging::prelude::Digest;
     use hana_rigging::prelude::ReportedId;
@@ -909,6 +592,9 @@ mod tests {
     use ron::ser::to_string_pretty;
 
     use super::*;
+    use crate::persistence::window_state::PersistedDisplayFingerprintV4;
+    use crate::persistence::window_state::PersistedPosition;
+    use crate::persistence::window_state::SavedWindowMode;
 
     fn schemes() -> RegisteredSchemes {
         let mut schemes = RegisteredSchemes::default();
@@ -988,61 +674,6 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_v3_fixture_runs_both_adjacent_conversions() {
-        let contents = include_str!("../../tests/config/ron/windows/v3_anonymous_awaiting.ron");
-        let states = decoded_states(contents);
-        let state = states
-            .get(&primary_role())
-            .unwrap_or_else(|| panic!("v3 fixture did not retain primary state"));
-        assert_eq!(
-            state.target,
-            PersistedWindowTargetV5::AwaitingLegacyEvidence(PersistedDisplayIdentityV4::Anonymous)
-        );
-    }
-
-    #[test]
-    fn frozen_v3_and_v4_keep_their_shipped_unknown_field_compatibility() {
-        let v3 = "(
-            version: 3,
-            future_envelope: \"accepted by the shipped v3 decoder\",
-            entries: [(
-                key: Primary,
-                future_entry: \"accepted by the shipped v3 decoder\",
-                state: (
-                    position: MonitorOffset((10, 20)),
-                    logical_width: 800,
-                    logical_height: 600,
-                    monitor_index: 0,
-                    monitor_panel: Anonymous,
-                    mode: Windowed,
-                ),
-            )],
-        )";
-        let v4 = "(
-            version: 4,
-            future_envelope: \"accepted by the shipped v4 decoder\",
-            entries: [(
-                key: Primary,
-                future_entry: \"accepted by the shipped v4 decoder\",
-                state: (
-                    position: MonitorOffset((10, 20)),
-                    logical_width: 800,
-                    logical_height: 600,
-                    monitor_panel: Anonymous,
-                    mode: Windowed,
-                    future_state: \"accepted by the shipped v4 decoder\",
-                ),
-            )],
-        )";
-
-        for contents in [v3, v4] {
-            let states = decoded_states(contents);
-            assert_eq!(states.len(), 1);
-            assert!(states.contains_key(&primary_role()));
-        }
-    }
-
-    #[test]
     fn v5_envelope_rejects_unknown_top_level_fields() {
         let contents = "(
             version: 5,
@@ -1056,70 +687,39 @@ mod tests {
     }
 
     #[test]
-    fn malformed_v3_and_v4_known_fields_preserve_valid_siblings() {
-        let v3 = "(
-            version: 3,
-            entries: [
-                (
-                    key: Primary,
-                    state: (
-                        position: MonitorOffset((10, 20)),
-                        logical_width: 800,
-                        logical_height: 600,
-                        monitor_index: 0,
-                        monitor_panel: Anonymous,
-                        mode: Windowed,
-                    ),
+    fn v5_fingerprinted_target_without_fresh_evidence_stays_awaiting() {
+        let contents = "(
+            version: 5,
+            entries: [(
+                key: Primary,
+                state: (
+                    target: AwaitingLegacyEvidence(Fingerprinted(9)),
+                    position: MonitorOffset((10, 20)),
+                    logical_width: 800,
+                    logical_height: 600,
+                    mode: Windowed,
                 ),
-                (
-                    key: Managed(\"malformed\"),
-                    state: (
-                        position: MonitorOffset((10, 20)),
-                        logical_width: 800,
-                        logical_height: \"not a number\",
-                        monitor_index: 0,
-                        monitor_panel: Anonymous,
-                        mode: Windowed,
-                    ),
-                ),
-            ],
+            )],
         )";
-        let v4 = "(
-            version: 4,
-            entries: [
-                (
-                    key: Primary,
-                    state: (
-                        position: MonitorOffset((10, 20)),
-                        logical_width: 800,
-                        logical_height: 600,
-                        monitor_panel: Anonymous,
-                        mode: Windowed,
-                    ),
-                ),
-                (
-                    key: Managed(\"malformed\"),
-                    state: (
-                        position: MonitorOffset((10, 20)),
-                        logical_width: 800,
-                        logical_height: \"not a number\",
-                        monitor_panel: Anonymous,
-                        mode: Windowed,
-                    ),
-                ),
-            ],
-        )";
-
-        for contents in [v3, v4] {
-            let states = decoded_states(contents);
-            assert_eq!(states.len(), 1);
-            assert!(states.contains_key(&primary_role()));
-        }
+        let states = decoded_states(contents);
+        assert_eq!(
+            states[&primary_role()].target,
+            PersistedWindowTargetV5::AwaitingLegacyEvidence(
+                PersistedDisplayIdentityV4::Fingerprinted(PersistedDisplayFingerprintV4(9)),
+            )
+        );
     }
 
     #[test]
-    fn v4_fingerprinted_target_without_fresh_evidence_stays_awaiting() {
-        let contents = "(
+    fn files_older_than_v5_are_rejected_whole() {
+        let v1 = "(
+            version: 1,
+            entries: [(
+                key: Primary,
+                state: (position: Some((10, 20)), width: 800, height: 600, monitor_index: 0, mode: Windowed),
+            )],
+        )";
+        let v4 = "(
             version: 4,
             entries: [(
                 key: Primary,
@@ -1132,74 +732,16 @@ mod tests {
                 ),
             )],
         )";
-        let states = decoded_states(contents);
-        assert_eq!(
-            states[&primary_role()].target,
-            PersistedWindowTargetV5::AwaitingLegacyEvidence(
-                PersistedDisplayIdentityV4::Fingerprinted(
-                    super::super::window_state::PersistedDisplayFingerprintV4(9),
+        let unversioned_single_window =
+            "(position: Some((10, 20)), width: 800, height: 600, monitor_index: 0, mode: Windowed)";
+
+        for contents in [v1, v4, unversioned_single_window] {
+            assert!(
+                matches!(
+                    decode(contents),
+                    PersistedWindowStateDecodeOutcome::WholeFileRejected
                 ),
-            )
-        );
-    }
-
-    #[test]
-    fn checked_in_v4_fixtures_retain_evidence_and_self_heal_rejected_siblings() {
-        for contents in [
-            include_str!("../../tests/config/ron/macos/v4_synthesized_awaiting.ron"),
-            include_str!("../../tests/config/ron/windows/v4_reported_live_match.ron"),
-            include_str!("../../tests/config/ron/linux/v4_anonymous_awaiting.ron"),
-        ] {
-            let states = decoded_states(contents);
-            assert_eq!(states.len(), 1);
-            assert!(matches!(
-                states.get(&primary_role()),
-                Some(PersistedWindowState {
-                    target: PersistedWindowTargetV5::AwaitingLegacyEvidence(_),
-                    ..
-                })
-            ));
-        }
-
-        let recovered = decoded_states(include_str!(
-            "../../tests/config/ron/linux/v4_rejected_sibling_self_heal.ron"
-        ));
-        let primary = recovered
-            .get(&primary_role())
-            .cloned()
-            .unwrap_or_else(|| panic!("valid v4 sibling did not survive entry rejection"));
-        assert_eq!(recovered.len(), 1);
-        let self_healed = encode(&HashMap::from([(
-            PersistedWindowRole::Primary,
-            saved_placement(primary),
-        )]))
-        .unwrap_or_else(|error| panic!("recovered v4 entry did not serialize: {error}"));
-        assert!(self_healed.contains("version: 6"));
-        assert_eq!(decoded_states(&self_healed).len(), 1);
-    }
-
-    #[test]
-    fn v1_and_v2_keep_anonymous_targets_without_index_fallback() {
-        let v1 = "(
-            version: 1,
-            entries: [(
-                key: Primary,
-                state: (position: Some((10, 20)), width: 800, height: 600, monitor_index: 7, mode: Windowed),
-            )],
-        )";
-        let v2 = "(
-            version: 2,
-            entries: [(
-                key: Primary,
-                state: (logical_position: Some((10, 20)), logical_width: 800, logical_height: 600, monitor_scale: 2.0, monitor_index: 9, mode: Windowed),
-            )],
-        )";
-        for contents in [v1, v2] {
-            assert_eq!(
-                decoded_states(contents)[&primary_role()].target,
-                PersistedWindowTargetV5::AwaitingLegacyEvidence(
-                    PersistedDisplayIdentityV4::Anonymous,
-                )
+                "expected a whole-file rejection for:\n{contents}"
             );
         }
     }
@@ -1364,210 +906,5 @@ mod tests {
             decode("(version: 5, entries: ["),
             PersistedWindowStateDecodeOutcome::WholeFileRejected
         ));
-    }
-
-    #[test]
-    fn v1_renamed_fields_and_absent_scale_reach_live_state_intact() {
-        let contents = "(
-            version: 1,
-            entries: [(
-                key: Primary,
-                state: (
-                    position: Some((10, 20)),
-                    width: 800,
-                    height: 600,
-                    monitor_index: 7,
-                    mode: Windowed,
-                    app_name: \"v1-app\",
-                ),
-            )],
-        )";
-        let expected_position =
-            UnrebasedDesktopPosition::from_legacy(IVec2::new(10, 20), default_monitor_scale())
-                .unwrap_or_else(|| panic!("test coordinate rejected by the legacy constructor"));
-
-        let state = decoded_states(contents)[&primary_role()].clone();
-
-        assert_eq!(
-            state.position,
-            PersistedPosition::Unrebased(expected_position)
-        );
-        assert_eq!(state.logical_width, 800);
-        assert_eq!(state.logical_height, 600);
-        assert_eq!(state.saved_window_mode, SavedWindowMode::Windowed);
-        assert_eq!(state.app_name, "v1-app");
-    }
-
-    #[test]
-    fn v2_carries_the_scale_that_wrote_its_coordinate() {
-        let with_scale = "(
-            version: 2,
-            entries: [(
-                key: Primary,
-                state: (
-                    logical_position: Some((640, 480)),
-                    logical_width: 1280,
-                    logical_height: 720,
-                    monitor_scale: 2.0,
-                    monitor_index: 1,
-                    mode: Windowed,
-                    app_name: \"v2-app\",
-                ),
-            )],
-        )";
-        let without_scale = "(
-            version: 2,
-            entries: [(
-                key: Primary,
-                state: (
-                    logical_position: Some((640, 480)),
-                    logical_width: 1280,
-                    logical_height: 720,
-                    monitor_index: 1,
-                    mode: Windowed,
-                ),
-            )],
-        )";
-
-        for (contents, scale, app_name) in [
-            (with_scale, 2.0_f64, "v2-app"),
-            (without_scale, default_monitor_scale(), ""),
-        ] {
-            let expected_position =
-                UnrebasedDesktopPosition::from_legacy(IVec2::new(640, 480), scale).unwrap_or_else(
-                    || panic!("test coordinate rejected by the legacy constructor"),
-                );
-
-            let state = decoded_states(contents)[&primary_role()].clone();
-
-            assert_eq!(
-                state.position,
-                PersistedPosition::Unrebased(expected_position)
-            );
-            assert_eq!(state.logical_width, 1280);
-            assert_eq!(state.logical_height, 720);
-            assert_eq!(state.app_name, app_name);
-        }
-    }
-
-    #[test]
-    fn v2_discards_a_coordinate_whose_saved_scale_cannot_be_used() {
-        let contents = "(
-            version: 2,
-            entries: [(
-                key: Primary,
-                state: (
-                    logical_position: Some((640, 480)),
-                    logical_width: 1280,
-                    logical_height: 720,
-                    monitor_scale: 0.0,
-                    monitor_index: 1,
-                    mode: Windowed,
-                ),
-            )],
-        )";
-
-        let state = decoded_states(contents)[&primary_role()].clone();
-
-        assert_eq!(state.position, PersistedPosition::Unpositioned);
-        assert_eq!(state.logical_width, 1280);
-        assert_eq!(state.logical_height, 720);
-    }
-
-    #[test]
-    fn a_v1_or_v2_record_without_a_saved_coordinate_restores_unpositioned() {
-        let v1 = "(
-            version: 1,
-            entries: [(
-                key: Primary,
-                state: (position: None, width: 800, height: 600, monitor_index: 0, mode: Windowed),
-            )],
-        )";
-        let v2 = "(
-            version: 2,
-            entries: [(
-                key: Primary,
-                state: (
-                    logical_position: None,
-                    logical_width: 800,
-                    logical_height: 600,
-                    monitor_index: 0,
-                    mode: Windowed,
-                ),
-            )],
-        )";
-
-        for contents in [v1, v2] {
-            assert_eq!(
-                decoded_states(contents)[&primary_role()].position,
-                PersistedPosition::Unpositioned
-            );
-        }
-    }
-
-    #[test]
-    fn the_checked_in_v3_fixture_keeps_its_placement_size_and_app_name() {
-        let contents = include_str!("../../tests/config/ron/windows/v3_anonymous_awaiting.ron");
-
-        let state = decoded_states(contents)[&primary_role()].clone();
-
-        assert_eq!(
-            state.position,
-            PersistedPosition::MonitorOffset(IVec2::new(24, 16))
-        );
-        assert_eq!(state.logical_width, 800);
-        assert_eq!(state.logical_height, 600);
-        assert_eq!(state.saved_window_mode, SavedWindowMode::Windowed);
-        assert_eq!(state.app_name, "v3-anonymous");
-    }
-
-    #[test]
-    fn a_v4_fullscreen_record_without_a_video_mode_restores_the_displays_current_mode() {
-        let contents = include_str!("../../tests/config/ron/linux/v4_anonymous_awaiting.ron");
-
-        let state = decoded_states(contents)[&primary_role()].clone();
-
-        assert_eq!(
-            state.saved_window_mode,
-            SavedWindowMode::Fullscreen {
-                video_mode: SavedFullscreenVideoMode::Current,
-            }
-        );
-        assert_eq!(state.position, PersistedPosition::Unpositioned);
-        assert_eq!(state.logical_width, 1024);
-        assert_eq!(state.logical_height, 640);
-        assert_eq!(state.app_name, "v4-anonymous");
-    }
-
-    #[test]
-    fn a_v4_fullscreen_record_naming_a_video_mode_restores_that_exact_mode() {
-        let contents = "(
-            version: 4,
-            entries: [(
-                key: Primary,
-                state: (
-                    position: Unpositioned,
-                    logical_width: 1920,
-                    logical_height: 1080,
-                    monitor_panel: Anonymous,
-                    mode: Fullscreen(video_mode: Some((
-                        physical_size: (3840, 2160),
-                        bit_depth: 24,
-                        refresh_rate_millihertz: 59997,
-                    ))),
-                ),
-            )],
-        )";
-
-        assert_eq!(
-            decoded_states(contents)[&primary_role()].saved_window_mode,
-            SavedWindowMode::Fullscreen {
-                video_mode: SavedFullscreenVideoMode::Specific(SavedVideoMode {
-                    physical_size:           UVec2::new(3840, 2160),
-                    bit_depth:               24,
-                    refresh_rate_millihertz: 59_997,
-                }),
-            }
-        );
     }
 }

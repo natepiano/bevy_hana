@@ -182,8 +182,8 @@ pub(super) const fn exact_parts(sequence_time: SequenceTime) -> (u128, u32) {
 mod tests {
     use std::time::Duration;
 
+    use bevy_curve::EaseFunction;
     use bevy_ecs::world::World;
-    use bevy_math::curve::EaseFunction;
 
     use super::*;
 

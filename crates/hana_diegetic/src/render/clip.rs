@@ -11,7 +11,7 @@ use crate::layout::RenderCommandKind;
 use crate::panel::DiegeticPanel;
 
 /// Returns the panel's layout-space viewport.
-pub(super) const fn panel_viewport(panel: &DiegeticPanel) -> BoundingBox {
+pub(crate) const fn panel_viewport(panel: &DiegeticPanel) -> BoundingBox {
     let layout_to_points = panel.layout_unit().to_points();
     BoundingBox {
         x:      0.0,
@@ -25,7 +25,7 @@ pub(super) const fn panel_viewport(panel: &DiegeticPanel) -> BoundingBox {
 /// panel viewport and the active scissor clip.
 ///
 /// Returns `None` when the command is fully outside the effective clip.
-pub(super) fn effective_clip(
+pub(crate) fn effective_clip(
     command_bounds: BoundingBox,
     scissor_clip: Option<BoundingBox>,
     viewport: BoundingBox,
@@ -56,17 +56,16 @@ pub(super) const fn empty_clip() -> BoundingBox {
 ///
 /// Nested clips are intersected — a child clip region is the overlap
 /// of its bounds with the parent's active clip.
-pub(super) fn compute_clip_rects(commands: &[RenderCommand]) -> Vec<Option<BoundingBox>> {
+pub(crate) fn compute_clip_rects(commands: &[RenderCommand]) -> Vec<Option<BoundingBox>> {
     let mut result = Vec::with_capacity(commands.len());
     let mut stack: Vec<BoundingBox> = Vec::new();
 
     for cmd in commands {
         match cmd.kind {
             RenderCommandKind::ScissorStart => {
-                let new_clip = stack
-                    .last()
-                    .and_then(|current| current.intersect(&cmd.bounds))
-                    .unwrap_or(cmd.bounds);
+                let new_clip = stack.last().map_or(cmd.bounds, |parent| {
+                    parent.intersect(&cmd.bounds).unwrap_or_else(empty_clip)
+                });
                 stack.push(new_clip);
             },
             RenderCommandKind::ScissorEnd => {
@@ -137,7 +136,7 @@ mod tests {
     #[test]
     fn empty_commands() {
         let result = compute_clip_rects(&[]);
-        assert!(result.is_empty());
+        assert_eq!(result, []);
     }
 
     #[test]
@@ -187,6 +186,37 @@ mod tests {
         assert!((nested_clip.y - 50.0).abs() < f32::EPSILON);
         assert!((nested_clip.width - 50.0).abs() < f32::EPSILON);
         assert!((nested_clip.height - 50.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn disjoint_nested_clip_stays_empty_until_its_parent_is_restored() {
+        let viewport = bbox(0.0, 0.0, 100.0, 100.0);
+        let hidden_field = bbox(0.0, 120.0, 90.0, 20.0);
+        let field_text = bbox(5.0, 122.0, 70.0, 13.0);
+        let commands = [
+            scissor_start(viewport),
+            scissor_start(hidden_field),
+            rect_cmd(field_text),
+            scissor_start(viewport),
+            rect_cmd(viewport),
+            scissor_end(viewport),
+            scissor_end(hidden_field),
+            rect_cmd(viewport),
+            scissor_end(viewport),
+        ];
+        let clips = compute_clip_rects(&commands);
+
+        for index in 1..6 {
+            assert_eq!(clips[index], Some(empty_clip()));
+            assert_eq!(
+                effective_clip(commands[index].bounds, clips[index], viewport),
+                None
+            );
+        }
+        assert_eq!(clips[6], Some(viewport));
+        assert_eq!(clips[7], Some(viewport));
+        assert_eq!(effective_clip(viewport, clips[7], viewport), Some(viewport));
+        assert_eq!(clips[8], None);
     }
 
     #[test]

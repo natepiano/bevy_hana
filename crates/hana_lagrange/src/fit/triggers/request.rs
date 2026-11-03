@@ -5,10 +5,10 @@ use bevy::prelude::Commands;
 use bevy::prelude::Entity;
 use bevy::prelude::GlobalTransform;
 use bevy::prelude::Mesh;
-use bevy::prelude::Mesh3d;
 use bevy::prelude::Projection;
 use bevy::prelude::Query;
 use bevy::prelude::Vec2;
+use bevy::prelude::Vec3;
 use bevy::prelude::warn;
 
 use crate::animation;
@@ -18,10 +18,13 @@ use crate::animation::AnimationSource;
 use crate::animation::CameraMoveError;
 use crate::animation::CameraRequestPreparationError;
 use crate::animation::PlayAnimation;
+use crate::fit::FitBoundsSource;
 use crate::fit::geometry;
 use crate::fit::geometry::FitAnchor;
 use crate::fit::geometry::FitError;
+use crate::fit::geometry::FitMeshQuery;
 use crate::fit::geometry::FitSolution;
+use crate::fit::geometry::FitViewportInsets;
 
 /// The camera family a facade request prepares through.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,44 +122,60 @@ pub(super) fn finish_higher_camera_request_preparation(
 
 /// Parameters for a fit calculation request.
 pub(super) struct FitRequest<'a> {
-    pub(super) context:    &'a str,
-    pub(super) target:     Entity,
-    pub(super) yaw:        f32,
-    pub(super) pitch:      f32,
-    pub(super) margin:     f32,
-    pub(super) anchor:     FitAnchor,
-    pub(super) offset_px:  Vec2,
-    pub(super) projection: &'a Projection,
-    pub(super) camera:     &'a Camera,
+    pub(super) context:         &'a str,
+    pub(super) bounds:          &'a FitBoundsSource,
+    pub(super) target:          Entity,
+    pub(super) yaw:             f32,
+    pub(super) pitch:           f32,
+    pub(super) margin:          f32,
+    pub(super) anchor:          FitAnchor,
+    pub(super) offset_px:       Vec2,
+    pub(super) viewport_insets: FitViewportInsets,
+    pub(super) projection:      &'a Projection,
+    pub(super) camera:          &'a Camera,
 }
 
 /// Shared fit preparation used by fit-family facade observers.
-/// Extracts target mesh vertices and computes the fit solution for the requested
-/// camera orientation.
+/// Measures the hierarchy or reads request-owned world bounds, then solves for
+/// the requested camera orientation.
 pub(super) fn prepare_fit_for_target(
     request: &FitRequest,
-    mesh_query: &Query<&Mesh3d>,
+    mesh_query: &FitMeshQuery,
     children_query: &Query<&Children>,
     global_transform_query: &Query<&GlobalTransform>,
     meshes: &Assets<Mesh>,
 ) -> Result<FitSolution, CameraRequestPreparationError> {
     let context = request.context;
     let target = request.target;
-    global_transform_query.get(target).map_err(|_| {
-        warn!("{context}: target {target:?} has no GlobalTransform");
-        CameraRequestPreparationError::MissingTargetTransform
-    })?;
-    let (vertices, geometric_center) = geometry::extract_mesh_vertices(
-        target,
-        children_query,
-        mesh_query,
-        global_transform_query,
-        meshes,
-    )
-    .ok_or_else(|| {
-        warn!("{context}: Failed to extract mesh vertices for entity {target:?}");
-        CameraRequestPreparationError::MissingTargetGeometry
-    })?;
+    let (vertices, geometric_center) = match request.bounds {
+        FitBoundsSource::MeasureTarget => {
+            global_transform_query.get(target).map_err(|_| {
+                warn!("{context}: target {target:?} has no GlobalTransform");
+                CameraRequestPreparationError::MissingTargetTransform
+            })?;
+            geometry::extract_mesh_vertices(
+                target,
+                children_query,
+                mesh_query,
+                global_transform_query,
+                meshes,
+            )
+            .ok_or_else(|| {
+                warn!("{context}: Failed to extract mesh vertices for entity {target:?}");
+                CameraRequestPreparationError::MissingTargetGeometry
+            })?
+        },
+        FitBoundsSource::WorldBounds(points) => {
+            if points.is_empty() || points.iter().any(|point| !point.is_finite()) {
+                return Err(CameraRequestPreparationError::MissingTargetGeometry);
+            }
+            let (minimum, maximum) = points.iter().fold(
+                (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)),
+                |(minimum, maximum), point| (minimum.min(*point), maximum.max(*point)),
+            );
+            (points.clone(), minimum * 0.5 + maximum * 0.5)
+        },
+    };
 
     geometry::calculate_fit(
         &vertices,
@@ -166,6 +185,7 @@ pub(super) fn prepare_fit_for_target(
         request.margin,
         request.anchor,
         request.offset_px,
+        request.viewport_insets,
         request.projection,
         request.camera,
     )

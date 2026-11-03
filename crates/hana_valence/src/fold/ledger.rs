@@ -481,8 +481,8 @@ const fn ledger_order(record: &FoldBoundaryRecord) -> LedgerOrder {
 mod tests {
     use std::time::Duration;
 
+    use bevy_curve::EaseFunction;
     use bevy_ecs::world::World;
-    use bevy_math::curve::EaseFunction;
 
     use super::*;
     use crate::FoldGroup;

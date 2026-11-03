@@ -55,7 +55,7 @@ pub struct EstablishedWindowPlacement {
 
 /// A window placement was requested for a device that is not a display.
 #[derive(Debug, thiserror::Error)]
-#[error("window placement requires a display, received {0:?}")]
+#[error("window placement requires a monitor, received {0:?}")]
 pub struct InvalidWindowDisplay(DeviceKind);
 
 /// Placement authored before a window has supplied driver readback.

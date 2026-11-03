@@ -19,7 +19,6 @@ use serde::Deserialize;
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::constants::DEFAULT_SCALE_FACTOR;
 use crate::monitors::CurrentMonitorIndex;
 use crate::monitors::DisplayFingerprint;
 use crate::monitors::DisplayIdentity;
@@ -185,7 +184,6 @@ impl UnrebasedDesktopPosition {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct UnrebasedWire {
     logical:        IVec2,
-    #[serde(default = "default_monitor_scale")]
     captured_scale: f64,
 }
 
@@ -212,11 +210,11 @@ impl From<UnrebasedDesktopPosition> for UnrebasedWire {
     }
 }
 
-/// Frozen v4 display identity retained only for decoding old files and unresolved v5 targets.
+/// Frozen v4 display identity retained only for unresolved targets in v5 and v6 files.
 ///
 /// v4 stored a private fingerprint but could not state whether the evidence was reporter-issued
-/// or synthesized. Keeping that distinction out of this wire adapter prevents an old file from
-/// producing a stronger key than the fresh reporter scan supports.
+/// or synthesized. Keeping that distinction out of this wire adapter prevents a retained v4 target
+/// from producing a stronger key than the fresh reporter scan supports.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum PersistedDisplayIdentityV4 {
     /// A v4 fingerprint that can be compared with fresh reporter evidence.
@@ -246,11 +244,11 @@ pub(crate) struct PersistedDisplayFingerprintV4(pub(crate) u64);
 pub(crate) enum PersistedWindowTargetV5 {
     /// Fresh reporter evidence already classified the physical display as this exact kernel key.
     Classified(DeviceKey),
-    /// A legacy file had no current exact evidence and must wait for a later reporter association.
+    /// v4 display evidence carried in a v5 or v6 record, waiting for a reporter association.
     AwaitingLegacyEvidence(PersistedDisplayIdentityV4),
 }
 
-/// Saved window state persisted by the live v5 format.
+/// Saved window state persisted by the v5 and v6 formats.
 ///
 /// Sizes are in **logical pixels** — the size the window covers on screen as the desktop numbers
 /// it, independent of scale factor. Restore converts them to physical pixels using the target
@@ -277,8 +275,8 @@ pub struct PersistedWindowState {
 pub(crate) enum LoadedBindingPolicy {
     /// The current save format recorded every authored policy field.
     Saved(BindingPolicy),
-    /// A v5 or older entry relies on the window's existing recovery markers and the historical
-    /// defaults for every other policy field.
+    /// A v5 entry, or a v6 entry without a policy, relies on the window's existing recovery
+    /// markers and the historical defaults for every other policy field.
     LegacyWindowMarkers,
 }
 
@@ -331,6 +329,3 @@ impl PersistedWindowPlacementLookup<'_> {
     #[must_use]
     pub(crate) const fn is_not_saved(&self) -> bool { matches!(self, Self::NotSaved) }
 }
-
-/// Default monitor scale for deserialization of legacy files missing the field.
-pub(super) const fn default_monitor_scale() -> f64 { DEFAULT_SCALE_FACTOR }

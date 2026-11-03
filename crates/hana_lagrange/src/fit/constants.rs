@@ -22,6 +22,9 @@ pub(super) const MAX_ITERATIONS: usize = 200;
 pub(super) const MAX_RADIUS_MULTIPLIER: f32 = 100.0;
 /// Minimum allowed margin value.
 pub(super) const MIN_MARGIN: f32 = 0.0;
+/// Smallest share of the viewport width or height that viewport insets may
+/// leave for a fit; tighter insets are ignored.
+pub(super) const MIN_FIT_REGION_FRACTION: f32 = 0.1;
 /// Minimum search radius as a fraction of the object radius (0.1x).
 pub(super) const MIN_RADIUS_MULTIPLIER: f32 = 0.1;
 /// Binary search stops once the remaining radius bracket `max_radius -

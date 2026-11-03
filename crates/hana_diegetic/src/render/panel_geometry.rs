@@ -7,6 +7,9 @@
 //! is picking-only and exempt from the `SdfMaterial` cascade.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::hash::Hash;
+use std::hash::Hasher;
 
 use bevy::asset::load_internal_asset;
 use bevy::camera::NormalizedRenderTarget;
@@ -24,8 +27,10 @@ use bevy::prelude::Color;
 use bevy::prelude::Commands;
 use bevy::prelude::Component;
 use bevy::prelude::Entity;
+use bevy::prelude::FromWorld;
 use bevy::prelude::GlobalTransform;
 use bevy::prelude::Handle;
+use bevy::prelude::Has;
 use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::Mesh;
 use bevy::prelude::Mesh3d;
@@ -41,12 +46,14 @@ use bevy::prelude::ResMut;
 use bevy::prelude::Resource;
 use bevy::prelude::Shader;
 use bevy::prelude::StandardMaterial;
+use bevy::prelude::SystemSet;
 use bevy::prelude::Transform;
 use bevy::prelude::Vec2;
 use bevy::prelude::Vec3;
 use bevy::prelude::Vec4;
 use bevy::prelude::With;
 use bevy::prelude::Without;
+use bevy::prelude::World;
 use bevy::prelude::default;
 
 use super::CommandIndex;
@@ -71,14 +78,23 @@ use crate::panel::DroppedSdfSurfaces;
 use crate::panel::FrameWork;
 use crate::panel::PanelLayout;
 use crate::panel::PanelOwned;
+use crate::widgets::ComputedWidgetRecord;
+use crate::widgets::TOOLTIP_SHADOW_EXTENT;
+use crate::widgets::TooltipPaintInsideBorder;
+use crate::widgets::VisualSlotId;
 
-/// The invisible full-panel interaction quad, one per panel, tagged with its
-/// panel-local size and center so a rebuild can leave it untouched when the
+/// An invisible interaction mesh belonging to a panel or one of its controls.
+///
+/// Tagged with its panel-local size and center so a rebuild can leave it untouched when the
 /// panel has not resized. Its material is a local picking-only invisible asset,
-/// not a source material resolved from `SdfMaterial`. Both pairs are stored as
+/// not a source material resolved from `SdfMaterial`. The mesh and material are
+/// shared; its transform supplies the size. Both pairs are stored as
 /// `f32` bit patterns for exact equality.
+///
+/// The mesh is not `Visibility::Hidden`, since mesh picking skips hidden meshes, so a
+/// client that measures what a panel draws from the meshes under it leaves it out.
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PanelInteractionMesh {
+pub struct PanelInteractionMesh {
     /// Panel-local size (width, height).
     size:   [u32; 2],
     /// Panel-local transform center (x, y).
@@ -86,13 +102,23 @@ pub(crate) struct PanelInteractionMesh {
 }
 
 impl PanelInteractionMesh {
-    pub(crate) const fn new(size: Vec2, center: Vec2) -> Self {
+    /// Marks pick-only geometry with its size and center in the owning panel's frame.
+    #[must_use]
+    pub const fn new(size: Vec2, center: Vec2) -> Self {
         Self {
             size:   vec2_bits(size),
             center: vec2_bits(center),
         }
     }
 }
+
+/// `PostUpdate` phase that resolves each changed panel's SDF surfaces and
+/// rebuilds its interaction mesh, before `TransformSystems::Propagate`.
+///
+/// A system that measures a panel's drawn size from its meshes orders `.after`
+/// this set, so it reads the mesh built this frame rather than the last frame's.
+#[derive(SystemSet, Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PanelGeometryBuild;
 
 /// Plugin that adds panel geometry rendering (backgrounds and borders).
 pub(crate) struct PanelGeometryPlugin;
@@ -102,18 +128,71 @@ impl Plugin for PanelGeometryPlugin {
         load_internal_asset!(
             app,
             SDF_STROKE_SHADER_HANDLE,
-            "sdf_stroke.wgsl",
-            Shader::from_wgsl
+            "sdf_stroke.wesl",
+            |source, _| Shader::from_wesl(source, "embedded://hana_diegetic/sdf_stroke.wesl")
         );
-        app.init_resource::<ResolvedSdfSurfaceRegistry>();
+        app.init_resource::<ResolvedSdfSurfaceRegistry>()
+            .init_resource::<TooltipShadowMaterial>()
+            .init_resource::<InteractionMeshAssets>();
         app.add_systems(
             PostUpdate,
             (
-                build_panel_geometry.before(MaterialTableAppendReady),
+                build_panel_geometry
+                    .in_set(PanelGeometryBuild)
+                    .before(MaterialTableAppendReady),
                 sync_interaction_mesh_render_layers.after(build_panel_geometry),
             )
                 .in_set(PanelChildSystems::Build),
         );
+    }
+}
+
+/// Blended, unlit source material for every tooltip's shadow record.
+///
+/// The tooltip body draws opaque, so its shadow paints from a record of its
+/// own in a blended batch instead of from the body record.
+#[derive(Resource)]
+struct TooltipShadowMaterial(Handle<StandardMaterial>);
+
+impl FromWorld for TooltipShadowMaterial {
+    fn from_world(world: &mut World) -> Self {
+        world.init_resource::<Assets<StandardMaterial>>();
+        let handle = world
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial {
+                alpha_mode: AlphaMode::Blend,
+                unlit: true,
+                ..super::default_panel_material()
+            });
+        Self(handle)
+    }
+}
+
+/// One unit quad and invisible picking material shared by every panel. Resizing
+/// changes the existing entity's transform rather than replacing assets or roles.
+#[derive(Resource)]
+struct InteractionMeshAssets {
+    mesh:     Handle<Mesh>,
+    material: Handle<StandardMaterial>,
+}
+
+impl FromWorld for InteractionMeshAssets {
+    fn from_world(world: &mut World) -> Self {
+        let mesh = world
+            .resource_mut::<Assets<Mesh>>()
+            .add(Rectangle::new(1.0, 1.0));
+        let material = world
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial {
+                base_color: Color::NONE,
+                alpha_mode: AlphaMode::Blend,
+                unlit: true,
+                double_sided: true,
+                cull_mode: None,
+                depth_bias: -constants::LAYER_DEPTH_BIAS,
+                ..default()
+            });
+        Self { mesh, material }
     }
 }
 
@@ -160,13 +239,30 @@ fn sync_panel_interaction_layers(
     }
 }
 
+/// Which part of a layout element owns an SDF surface or retained record.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum SdfSourcePart {
+    /// The element's own fill or border surface.
+    Element,
+    /// The divider between the child at this ordinal and its successor.
+    Divider(usize),
+    /// The library-owned scroll thumb over this element's children.
+    ScrollIndicator,
+}
+
+impl SdfSourcePart {
+    /// Returns whether this source belongs to the element itself.
+    #[must_use]
+    pub(super) const fn is_element(self) -> bool { matches!(self, Self::Element) }
+}
+
 /// Gathered fill + border data for a single element.
 #[derive(Clone, Copy)]
 pub(super) struct ElementSurface {
     /// Layout-tree identity for this surface, or the parent identity for a child divider.
     index:                  ElementIndex,
-    /// Adjacent-child pair ordinal for a child divider; `None` for element surfaces.
-    divider_ordinal:        Option<usize>,
+    /// Element surface or one of its child dividers.
+    source_part:            SdfSourcePart,
     /// Bounding box from the render command.
     bounds:                 BoundingBox,
     /// Fill command state, if the element has an authored fill command.
@@ -232,9 +328,9 @@ impl ElementSurface {
     /// Child dividers retain their parent `ElementIndex` for material-table
     /// identity, but resolve their material and corner radius from the panel.
     const fn visual_source_element(self) -> Option<ElementIndex> {
-        match self.divider_ordinal {
-            Some(_) => None,
-            None => Some(self.index),
+        match self.source_part {
+            SdfSourcePart::Divider(_) | SdfSourcePart::ScrollIndicator => None,
+            SdfSourcePart::Element => Some(self.index),
         }
     }
 
@@ -285,6 +381,7 @@ fn build_panel_geometry(
             Option<&RenderLayers>,
             Option<&Resolved<SdfMaterial>>,
             Option<&Resolved<ShadowCasting>>,
+            Has<TooltipPaintInsideBorder>,
         ),
         Or<(
             Changed<ComputedDiegeticPanel>,
@@ -293,14 +390,21 @@ fn build_panel_geometry(
         )>,
     >,
     old_interaction: Query<(Entity, &PanelOwned, &PanelInteractionMesh)>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut standard_materials: ResMut<Assets<StandardMaterial>>,
+    interaction_assets: Res<InteractionMeshAssets>,
     sdf_material_default: Res<SdfMaterial>,
     mut resolved_surfaces: ResMut<ResolvedSdfSurfaceRegistry>,
+    tooltip_shadow_material: Res<TooltipShadowMaterial>,
     mut commands: Commands,
 ) {
-    for (panel_entity, panel, computed, panel_layers, panel_sdf_material, panel_shadow_casting) in
-        &changed_panels
+    for (
+        panel_entity,
+        panel,
+        computed,
+        panel_layers,
+        panel_sdf_material,
+        panel_shadow_casting,
+        tooltip,
+    ) in &changed_panels
     {
         let PanelLayout::Solved(result) = computed.layout() else {
             resolved_surfaces.remove_panel(panel_entity, SurfaceEvictionCause::LayoutUnsolved);
@@ -316,6 +420,11 @@ fn build_panel_geometry(
             anchor_y,
             shadow_casting: panel_shadow_casting.map_or(ShadowCasting::On, |resolved| resolved.0),
             layer: panel_layers.cloned().unwrap_or(RenderLayers::layer(0)),
+            body_shadow: if tooltip {
+                PanelBodyShadow::Tooltip(&tooltip_shadow_material.0)
+            } else {
+                PanelBodyShadow::None
+            },
             sdf_material: panel_sdf_material.map_or_else(
                 || sdf_material_default.0.clone(),
                 |resolved| resolved.0.0.clone(),
@@ -323,10 +432,25 @@ fn build_panel_geometry(
         };
         let gathered = gather_surfaces(context.panel, &result.commands, computed.draw_order());
         let desired = desired_surfaces(gathered);
+        let clipped_content = clipped_content_owners(&result.commands);
         let mut resolved: Vec<ResolvedSdfSurface<'_>> = Vec::with_capacity(desired.len());
         for surface in &desired {
-            push_resolved_sdf_surfaces(surface, &context, &mut resolved);
+            // The shadow shares its body's depth and command, so the stable
+            // sorts below and in the SDF batches keep it ahead of the body.
+            if let PanelBodyShadow::Tooltip(material) = context.body_shadow
+                && surface.index == ElementIndex::default()
+                && surface.source_part.is_element()
+            {
+                resolved.push(tooltip_shadow_surface(surface, &context, material));
+            }
+            push_resolved_sdf_surfaces(
+                surface,
+                &context,
+                clipped_content.contains(&surface.index),
+                &mut resolved,
+            );
         }
+        stack_switch_knobs(&mut resolved, computed.widget_records());
         resolved.sort_by(|left, right| {
             left.draw_depth
                 .draw_order_index()
@@ -344,10 +468,44 @@ fn build_panel_geometry(
         reconcile_interaction_mesh(
             &context,
             &old_interaction,
-            &mut meshes,
-            &mut standard_materials,
+            &interaction_assets,
             &mut commands,
         );
+    }
+}
+
+/// Keeps the capsule above the track's fill and its separately clipped border.
+/// Borders are emitted on the traversal back up, after the knob's command.
+/// Resolving a border separately must preserve the switch's semantic stacking.
+fn stack_switch_knobs(surfaces: &mut [ResolvedSdfSurface<'_>], widgets: &[ComputedWidgetRecord]) {
+    for widget in widgets {
+        let slots = widget.visual_slots();
+        let Some(track) = slots
+            .iter()
+            .find(|slot| slot.slot == VisualSlotId::SWITCH_ROOT)
+        else {
+            continue;
+        };
+        let Some(knob) = slots
+            .iter()
+            .find(|slot| slot.slot == VisualSlotId::SWITCH_KNOB)
+        else {
+            continue;
+        };
+        let Some(track_depth) = surfaces
+            .iter()
+            .filter(|surface| surface.element_index.get() == track.element_index)
+            .map(|surface| surface.draw_depth)
+            .max_by_key(|depth| depth.draw_order_index())
+        else {
+            continue;
+        };
+        for surface in surfaces
+            .iter_mut()
+            .filter(|surface| surface.element_index.get() == knob.element_index)
+        {
+            surface.draw_depth = surface.draw_depth.in_front_of(track_depth);
+        }
     }
 }
 
@@ -369,51 +527,45 @@ pub(super) struct PanelReconcileContext<'a> {
     layer:           RenderLayers,
     /// Panel's cascade-resolved SDF material handle.
     sdf_material:    Handle<StandardMaterial>,
+    /// Whether the panel's root surface paints a tooltip shadow behind it.
+    body_shadow:     PanelBodyShadow<'a>,
 }
 
-/// Reconciles the invisible full-panel interaction quad: it is respawned only
-/// when the panel-local size or center changed, and left untouched otherwise.
+/// Whether a panel's root surface paints a tooltip shadow behind it.
+#[derive(Clone, Copy)]
+enum PanelBodyShadow<'a> {
+    /// The panel is a tooltip; its root surface gets a shadow record drawn
+    /// from this blended source material.
+    Tooltip(&'a Handle<StandardMaterial>),
+    /// The panel paints no shadow.
+    None,
+}
+
+/// Reconciles the invisible full-panel interaction quad. A resize writes its
+/// dimensions and transform together, preserving the entity and its components.
 fn reconcile_interaction_mesh(
     context: &PanelReconcileContext<'_>,
     old_interaction: &Query<(Entity, &PanelOwned, &PanelInteractionMesh)>,
-    meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
+    assets: &InteractionMeshAssets,
     commands: &mut Commands,
 ) {
-    let panel_size = interaction_mesh_size(context.panel);
+    let size = interaction_mesh_size(context.panel);
     let center = Vec2::new(
-        panel_size.x.mul_add(0.5, -context.anchor_x),
-        panel_size.y.mul_add(-0.5, context.anchor_y),
+        size.x.mul_add(0.5, -context.anchor_x),
+        size.y.mul_add(-0.5, context.anchor_y),
     );
-    let interaction = PanelInteractionMesh::new(panel_size, center);
+    let interaction = PanelInteractionMesh::new(size, center);
+    let transform =
+        Transform::from_xyz(center.x, center.y, 0.0).with_scale(Vec3::new(size.x, size.y, 1.0));
     let existing = old_interaction
         .iter()
         .find(|(_, ownership, _)| ownership.owner() == context.panel_entity);
     match existing {
         Some((_, _, current)) if *current == interaction => {},
         Some((entity, ..)) => {
-            commands.entity(entity).despawn();
-            spawn_interaction_mesh(
-                interaction,
-                panel_size,
-                center,
-                context,
-                meshes,
-                materials,
-                commands,
-            );
+            commands.entity(entity).insert((interaction, transform));
         },
-        None => {
-            spawn_interaction_mesh(
-                interaction,
-                panel_size,
-                center,
-                context,
-                meshes,
-                materials,
-                commands,
-            );
-        },
+        None => spawn_interaction_mesh(interaction, transform, context, assets, commands),
     }
 }
 
@@ -457,29 +609,17 @@ fn gather_surfaces(
                 };
                 let command_index = CommandIndex::from(cmd_index);
                 let element_index = ElementIndex::from(cmd.element_idx);
-                if let RectangleSource::ChildDivider { ordinal } = source {
-                    dividers.push(ElementSurface {
-                        index: element_index,
-                        divider_ordinal: Some(*ordinal),
-                        bounds: cmd.bounds,
-                        fill: Some(ElementFill {
-                            color: *color,
-                            command_index,
-                            draw_depth,
-                            clip_rect: Some(active_clip),
-                        }),
-                        border: None,
-                        command_index,
-                        draw_depth,
-                        clip_rect: Some(active_clip),
-                        fill_material_override: FillMaterialOverride::Included,
-                    });
-                } else {
+                let source_part = match source {
+                    RectangleSource::Background => SdfSourcePart::Element,
+                    RectangleSource::ChildDivider { ordinal } => SdfSourcePart::Divider(*ordinal),
+                    RectangleSource::ScrollIndicator => SdfSourcePart::ScrollIndicator,
+                };
+                if source_part.is_element() {
                     let surface = surfaces
                         .entry(element_index)
                         .or_insert_with(|| ElementSurface {
                             index: element_index,
-                            divider_ordinal: None,
+                            source_part: SdfSourcePart::Element,
                             bounds: cmd.bounds,
                             fill: None,
                             border: None,
@@ -493,6 +633,23 @@ fn gather_surfaces(
                         command_index,
                         draw_depth,
                         clip_rect: Some(active_clip),
+                    });
+                } else {
+                    dividers.push(ElementSurface {
+                        index: element_index,
+                        source_part,
+                        bounds: cmd.bounds,
+                        fill: Some(ElementFill {
+                            color: *color,
+                            command_index,
+                            draw_depth,
+                            clip_rect: Some(active_clip),
+                        }),
+                        border: None,
+                        command_index,
+                        draw_depth,
+                        clip_rect: Some(active_clip),
+                        fill_material_override: FillMaterialOverride::Included,
                     });
                 }
             },
@@ -509,7 +666,7 @@ fn gather_surfaces(
                     .entry(element_index)
                     .or_insert_with(|| ElementSurface {
                         index: element_index,
-                        divider_ordinal: None,
+                        source_part: SdfSourcePart::Element,
                         bounds: cmd.bounds,
                         fill: None,
                         border: None,
@@ -569,8 +726,8 @@ pub(super) struct ResolvedSdfSurface<'a> {
     /// Layout-tree identity used by the material-table source key; child
     /// dividers retain their parent element identity here.
     pub(super) element_index:   ElementIndex,
-    /// Adjacent-child pair ordinal for a child divider; `None` for element surfaces.
-    pub(super) divider_ordinal: Option<usize>,
+    /// Element surface or one of its child dividers.
+    pub(super) source_part:     SdfSourcePart,
     /// Retained-record role when clipping separates the fill and border.
     pub(super) record_role:     SdfRecordRole,
     /// `DrawCommandDepth` for sorted and OIT ordering.
@@ -591,13 +748,41 @@ pub(super) struct ResolvedSdfSurface<'a> {
     pub(super) corner_radii:    [f32; 4],
     /// Panel-local border widths [top, right, bottom, left].
     pub(super) border_widths:   [f32; 4],
-    /// Panel-local clip rect [left, bottom, right, top] after padding
+    /// Shader-local Y-down clip rect [left, top, right, bottom] after padding
     /// expansion.
     pub(super) clip_rect:       Vec4,
     /// Render layers copied to SDF fill batch records.
     pub(super) render_layers:   RenderLayers,
     /// Shadow-casting policy copied to SDF fill batch records.
     pub(super) shadow_casting:  ShadowCasting,
+}
+
+/// The soft shadow a tooltip shadow record paints behind its body.
+///
+/// Equality and hashing compare each distance's bits, so a record key holding
+/// one stays a total identity.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SdfTooltipShadow {
+    /// Panel-local distance from the shadow's edge to where it fades out.
+    pub(super) blur_support:    f32,
+    /// Panel-local distance the shadow sits below the body.
+    pub(super) downward_offset: f32,
+}
+
+impl SdfTooltipShadow {
+    const fn bits(self) -> (u32, u32) {
+        (self.blur_support.to_bits(), self.downward_offset.to_bits())
+    }
+}
+
+impl PartialEq for SdfTooltipShadow {
+    fn eq(&self, other: &Self) -> bool { self.bits() == other.bits() }
+}
+
+impl Eq for SdfTooltipShadow {}
+
+impl Hash for SdfTooltipShadow {
+    fn hash<H: Hasher>(&self, state: &mut H) { self.bits().hash(state); }
 }
 
 /// Retained-record role for one resolved SDF surface.
@@ -609,6 +794,8 @@ pub(super) enum SdfRecordRole {
     Fill,
     /// The clipped surface retains only its border.
     Border,
+    /// The tooltip body's soft shadow, drawn from a record of its own.
+    TooltipShadow(SdfTooltipShadow),
 }
 
 impl ResolvedSdfSurface<'_> {
@@ -616,18 +803,18 @@ impl ResolvedSdfSurface<'_> {
     #[must_use]
     pub(super) fn clip_rect_limits_mesh(&self) -> bool {
         let clip_left = self.clip_rect.x;
-        let clip_bottom = self.clip_rect.y;
+        let clip_top = self.clip_rect.y;
         let clip_right = self.clip_rect.z;
-        let clip_top = self.clip_rect.w;
+        let clip_bottom = self.clip_rect.w;
         let mesh_left = -self.mesh_half_size.x;
-        let mesh_bottom = -self.mesh_half_size.y;
+        let mesh_top = -self.mesh_half_size.y;
         let mesh_right = self.mesh_half_size.x;
-        let mesh_top = self.mesh_half_size.y;
+        let mesh_bottom = self.mesh_half_size.y;
 
         clip_left > mesh_left
-            || clip_bottom > mesh_bottom
+            || clip_top > mesh_top
             || clip_right < mesh_right
-            || clip_top < mesh_top
+            || clip_bottom < mesh_bottom
     }
 }
 
@@ -684,8 +871,8 @@ pub(crate) struct StoredResolvedSdfSurface {
     command_index:   CommandIndex,
     /// Index of the source element in the panel's `LayoutTree`.
     element_index:   ElementIndex,
-    /// Adjacent-child pair ordinal for a child divider; `None` for element surfaces.
-    divider_ordinal: Option<usize>,
+    /// Element surface or one of its child dividers.
+    source_part:     SdfSourcePart,
     /// Retained-record role when clipping separates the fill and border.
     record_role:     SdfRecordRole,
     /// `DrawCommandDepth` for sorted and OIT ordering.
@@ -706,7 +893,8 @@ pub(crate) struct StoredResolvedSdfSurface {
     corner_radii:    [f32; 4],
     /// Panel-local border widths [top, right, bottom, left].
     border_widths:   [f32; 4],
-    /// Panel-local clip rect [left, bottom, right, top].
+    /// Shader-local Y-down clip rect [left, top, right, bottom] after padding
+    /// expansion.
     clip_rect:       Vec4,
 }
 
@@ -716,7 +904,7 @@ impl StoredResolvedSdfSurface {
             panel_entity:    surface.panel_entity,
             command_index:   surface.command_index,
             element_index:   surface.element_index,
-            divider_ordinal: surface.divider_ordinal,
+            source_part:     surface.source_part,
             record_role:     surface.record_role,
             draw_depth:      surface.draw_depth,
             fill_material:   StoredResolvedSdfMaterial::from_resolved(&surface.fill_material),
@@ -740,9 +928,10 @@ impl StoredResolvedSdfSurface {
     /// identity only, so it has no visual-slot source element.
     #[must_use]
     pub(super) const fn visual_source_element(&self) -> Option<ElementIndex> {
-        match self.divider_ordinal {
-            Some(_) => None,
-            None => Some(self.element_index),
+        match (self.source_part, self.record_role) {
+            (SdfSourcePart::Divider(_) | SdfSourcePart::ScrollIndicator, _)
+            | (SdfSourcePart::Element, SdfRecordRole::TooltipShadow(_)) => None,
+            (SdfSourcePart::Element, _) => Some(self.element_index),
         }
     }
 
@@ -756,7 +945,7 @@ impl StoredResolvedSdfSurface {
             panel_entity: self.panel_entity,
             command_index: self.command_index,
             element_index: self.element_index,
-            divider_ordinal: self.divider_ordinal,
+            source_part: self.source_part,
             record_role: self.record_role,
             draw_depth: self.draw_depth,
             fill_material: self.fill_material.as_resolved(),
@@ -800,6 +989,8 @@ pub(crate) enum SurfaceEvictionCause {
 #[derive(Default, Resource)]
 pub(crate) struct ResolvedSdfSurfaceRegistry {
     surfaces_by_panel: HashMap<Entity, Vec<StoredResolvedSdfSurface>>,
+    /// Panels whose retained surfaces were replaced or removed since routing.
+    dirty_panels:      HashSet<Entity>,
     /// Surfaces evicted since [`Self::take_evictions`] last ran.
     ///
     /// Evictions and the routing pass that reports them run in different
@@ -820,6 +1011,7 @@ impl ResolvedSdfSurfaceRegistry {
         panel_entity: Entity,
         surfaces: Vec<StoredResolvedSdfSurface>,
     ) {
+        self.dirty_panels.insert(panel_entity);
         if surfaces.is_empty() {
             self.surfaces_by_panel.remove(&panel_entity);
         } else {
@@ -830,6 +1022,7 @@ impl ResolvedSdfSurfaceRegistry {
     /// Removes retained SDF surfaces for one panel and records how many were
     /// evicted under `cause`.
     pub(crate) fn remove_panel(&mut self, panel_entity: Entity, cause: SurfaceEvictionCause) {
+        self.dirty_panels.insert(panel_entity);
         let Some(evicted) = self.surfaces_by_panel.remove(&panel_entity) else {
             return;
         };
@@ -853,6 +1046,31 @@ impl ResolvedSdfSurfaceRegistry {
     pub(crate) fn surfaces(&self) -> impl Iterator<Item = &StoredResolvedSdfSurface> {
         self.surfaces_by_panel.values().flatten()
     }
+
+    /// Returns whether at least one panel needs its SDF records rerouted.
+    pub(crate) fn has_dirty_panels(&self) -> bool { !self.dirty_panels.is_empty() }
+
+    /// Takes panels whose SDF surface sets changed since the previous route.
+    pub(crate) fn take_dirty_panels(&mut self) -> HashSet<Entity> {
+        core::mem::take(&mut self.dirty_panels)
+    }
+
+    /// Iterates one panel's retained SDF surfaces.
+    pub(crate) fn panel_surfaces(
+        &self,
+        panel: Entity,
+    ) -> impl Iterator<Item = &StoredResolvedSdfSurface> {
+        self.surfaces_by_panel.get(&panel).into_iter().flatten()
+    }
+}
+
+/// Elements whose own content clip ends before their outline paints.
+fn clipped_content_owners(commands: &[RenderCommand]) -> HashSet<ElementIndex> {
+    commands
+        .iter()
+        .filter(|command| matches!(command.kind, RenderCommandKind::ScissorStart))
+        .map(|command| ElementIndex::from(command.element_idx))
+        .collect()
 }
 
 /// Resolves an [`ElementSurface`] into render-neutral SDF data.
@@ -863,17 +1081,21 @@ impl ResolvedSdfSurfaceRegistry {
 fn push_resolved_sdf_surfaces<'a>(
     surface: &ElementSurface,
     context: &'a PanelReconcileContext<'a>,
+    content_is_clipped: bool,
     output: &mut Vec<ResolvedSdfSurface<'a>>,
 ) {
-    let resolved = resolve_sdf_surface(surface, context);
+    let mut resolved = resolve_sdf_surface(surface, context);
     if surface.fill.is_none() || surface.border.is_none() {
+        if surface.border.is_some() && content_is_clipped {
+            resolved.record_role = SdfRecordRole::Border;
+        }
         output.push(resolved);
         return;
     }
 
     let border_surface = surface.border_only();
     let mut border_resolved = resolve_sdf_surface(&border_surface, context);
-    if !should_split_clipped_border(surface, &resolved, &border_resolved) {
+    if !should_split_clipped_border(surface, &resolved, &border_resolved, content_is_clipped) {
         output.push(resolved);
         return;
     }
@@ -889,12 +1111,15 @@ fn should_split_clipped_border(
     surface: &ElementSurface,
     resolved: &ResolvedSdfSurface<'_>,
     border_resolved: &ResolvedSdfSurface<'_>,
+    content_is_clipped: bool,
 ) -> bool {
     surface.fill.is_some()
         && surface.border.is_some()
         && resolved.fill_material.authorship.is_authored()
         && resolved.border_material.authorship.is_authored()
-        && border_resolved.clip_rect_limits_mesh()
+        // Borders escape their own content clip, but still paint after its
+        // images. Keep that ordering separate from the border's ancestor clip.
+        && (content_is_clipped || border_resolved.clip_rect_limits_mesh())
 }
 
 fn resolve_sdf_surface<'a>(
@@ -917,70 +1142,36 @@ fn resolve_sdf_surface<'a>(
 
     let local_width = surface.bounds.width * context.points_to_world;
     let local_height = surface.bounds.height * context.points_to_world;
-    let corner_radii = visual_source_element.map_or([0.0; 4], |element_index| {
-        panel_local_corner_radii(context.panel, element_index, context.points_to_world)
-    });
+    let corner_radii = if surface.source_part == SdfSourcePart::ScrollIndicator {
+        [local_width * 0.5; 4]
+    } else {
+        visual_source_element.map_or([0.0; 4], |element_index| {
+            panel_local_corner_radii(context.panel, element_index, context.points_to_world)
+        })
+    };
     let border_widths = surface
         .border
         .map_or([0.0; 4], |border| border.widths)
         .map(|width| width * context.points_to_world);
 
-    let half_width = local_width * 0.5;
-    let half_height = local_height * 0.5;
-
     // Mesh is slightly larger than the SDF form so the exterior
     // anti-aliasing ramp has fragments to render on.
     let pad = constants::SDF_AA_PADDING;
+    let edge_inset = if context.panel.contains_sdf_surface() {
+        pad
+    } else {
+        0.0
+    };
+    let half_width = local_width.mul_add(0.5, -edge_inset).max(0.0);
+    let half_height = local_height.mul_add(0.5, -edge_inset).max(0.0);
+    let corner_radii = corner_radii.map(|radius| (radius - edge_inset).max(0.0));
     let mesh_half_width = half_width + pad;
     let mesh_half_height = half_height + pad;
 
-    // Convert layout-space clip rect to local quad coords (centered, Y-up).
-    //
-    // ── DO NOT REMOVE THE `± pad` EXPANSION BELOW ─────────────────────────
-    //
-    // Every element's mesh extends `SDF_AA_PADDING` beyond its SDF form so
-    // the shader's `smoothstep` exterior AA ramp has fragments to render on.
-    // The clip rect coming in from `clip::effective_clip` is bound to the
-    // panel viewport (or a tighter scissor), which sits *at* the SDF form
-    // boundary — i.e. exactly where the AA ramp needs to fade. Without the
-    // padding here, the shader's `discard` (in `sdf_panel.wgsl`) throws away
-    // every fragment in the AA region at panel/viewport edges, and the
-    // visible boundary collapses to the underlying polygon edge — a hard
-    // staircase with no MSAA to smooth it.
-    //
-    // Expanding the clip outward by `pad` lets the AA ramp survive while
-    // still clipping anything that's actually past the panel by more than
-    // 1mm of world space (the case the clip was added for: retained
-    // children that overflow after a panel shrink). The two regions don't
-    // conflict — they're separated by exactly `SDF_AA_PADDING`.
-    //
-    // If you find yourself "cleaning this up" because the `- pad` / `+ pad`
-    // look redundant or suspicious: run the `units` example, look at the
-    // ruler ticks, and you'll see the staircase return immediately.
-    // ──────────────────────────────────────────────────────────────────────
-    let clip_rect = surface.clip_rect.map_or_else(
-        || {
-            Vec4::new(
-                -mesh_half_width,
-                -mesh_half_height,
-                mesh_half_width,
-                mesh_half_height,
-            )
-        },
-        |clip_rect| {
-            let (cx, cy) = surface.bounds.center();
-            let left = (clip_rect.x - cx) * context.points_to_world;
-            let right = (clip_rect.x + clip_rect.width - cx) * context.points_to_world;
-            // Layout Y-down → local Y-up.
-            let top = -(clip_rect.y - cy) * context.points_to_world;
-            let bottom = -(clip_rect.y + clip_rect.height - cy) * context.points_to_world;
-            Vec4::new(
-                left - pad,
-                bottom.min(top) - pad,
-                right + pad,
-                bottom.max(top) + pad,
-            )
-        },
+    let clip_rect = sdf_surface_clip_rect(
+        surface,
+        context.points_to_world,
+        Vec2::new(mesh_half_width, mesh_half_height),
     );
 
     let local_center = bounds_to_panel_local_center(
@@ -994,7 +1185,7 @@ fn resolve_sdf_surface<'a>(
         panel_entity: context.panel_entity,
         command_index: surface.command_index,
         element_index: surface.index,
-        divider_ordinal: surface.divider_ordinal,
+        source_part: surface.source_part,
         record_role: SdfRecordRole::Whole,
         draw_depth: surface.draw_depth,
         fill_material: ResolvedSdfMaterial {
@@ -1016,7 +1207,11 @@ fn resolve_sdf_surface<'a>(
             color:         border_color,
         },
         local_center,
-        local_transform: Transform::from_xyz(local_center.x, local_center.y, 0.0),
+        local_transform: Transform::from_xyz(
+            local_center.x,
+            local_center.y,
+            context.panel.sdf_surface_depth_offset(),
+        ),
         sdf_half_size: Vec2::new(half_width, half_height),
         mesh_half_size: Vec2::new(mesh_half_width, mesh_half_height),
         corner_radii,
@@ -1025,6 +1220,116 @@ fn resolve_sdf_surface<'a>(
         render_layers: context.layer.clone(),
         shadow_casting: context.shadow_casting,
     }
+}
+
+/// Soft black behind every tooltip body.
+const TOOLTIP_SHADOW_COLOR: Color = Color::srgba(0.0, 0.0, 0.0, 0.3);
+
+/// Resolves the shadow record behind a tooltip's root surface.
+///
+/// The shadow is the body's rounded rectangle moved down and blurred, painted
+/// from a blended black fill. Its mesh stays centred on the body, so it grows
+/// vertically by the larger reach, below; the clip trims it back to the painted
+/// reach on each side.
+fn tooltip_shadow_surface<'a>(
+    surface: &ElementSurface,
+    context: &'a PanelReconcileContext<'a>,
+    material: &'a Handle<StandardMaterial>,
+) -> ResolvedSdfSurface<'a> {
+    let mut shadow = resolve_sdf_surface(surface, context);
+    let extent = TOOLTIP_SHADOW_EXTENT.panel_local(context.points_to_world);
+    let reach = TOOLTIP_SHADOW_EXTENT.painted_reach(context.points_to_world);
+    let pad = constants::SDF_AA_PADDING;
+    let half = shadow.sdf_half_size;
+    shadow.record_role = SdfRecordRole::TooltipShadow(SdfTooltipShadow {
+        blur_support:    extent.blur_support,
+        downward_offset: extent.downward_offset,
+    });
+    shadow.fill_material = ResolvedSdfMaterial {
+        authorship:    SdfRoleAuthorship::Authored,
+        base_material: Some(material),
+        color:         Some(TOOLTIP_SHADOW_COLOR),
+    };
+    shadow.border_material = ResolvedSdfMaterial {
+        authorship:    SdfRoleAuthorship::Unauthored,
+        base_material: Some(material),
+        color:         None,
+    };
+    shadow.border_widths = [0.0; 4];
+    shadow.shadow_casting = ShadowCasting::Off;
+    shadow.mesh_half_size = half + Vec2::new(reach.sides, reach.above.max(reach.below)) + pad;
+    shadow.clip_rect = Vec4::new(
+        -half.x - reach.sides - pad,
+        -half.y - reach.above - pad,
+        half.x + reach.sides + pad,
+        half.y + reach.below + pad,
+    );
+    shadow
+}
+
+fn sdf_surface_clip_rect(
+    surface: &ElementSurface,
+    points_to_world: f32,
+    mesh_half_size: Vec2,
+) -> Vec4 {
+    let pad = constants::SDF_AA_PADDING;
+    // Convert layout-space clip rect to shader quad coords (centered, Y-down).
+    //
+    // ── DO NOT REMOVE THE `± pad` EXPANSION BELOW ─────────────────────────
+    //
+    // Every element's mesh extends `SDF_AA_PADDING` beyond its SDF form so
+    // the shader's `smoothstep` exterior AA ramp has fragments to render on.
+    // The clip rect coming in from `clip::effective_clip` is bound to the
+    // panel viewport (or a tighter scissor), which sits *at* the SDF form
+    // boundary — i.e. exactly where the AA ramp needs to fade. Without the
+    // padding here, the shader's `discard` (in `sdf_panel.wesl`) throws away
+    // every fragment in the AA region at panel/viewport edges, and the
+    // visible boundary collapses to the underlying polygon edge — a hard
+    // staircase with no MSAA to smooth it.
+    //
+    // Expanding the clip outward by `pad` lets the AA ramp survive while
+    // still clipping anything that's actually past the panel by more than
+    // 1mm of world space (the case the clip was added for: retained
+    // children that overflow after a panel shrink). The two regions don't
+    // conflict — they're separated by exactly `SDF_AA_PADDING`.
+    //
+    // If you find yourself "cleaning this up" because the `- pad` / `+ pad`
+    // look redundant or suspicious: run the `units` example, look at the
+    // ruler ticks, and you'll see the staircase return immediately.
+    // ──────────────────────────────────────────────────────────────────────
+    // The overlay thumb must stop exactly at its view and ancestor scissors.
+    // Retain the ordinary surface AA support and its existing clip expansion.
+    let clip_padding = if surface.source_part == SdfSourcePart::ScrollIndicator {
+        0.0
+    } else {
+        pad
+    };
+    surface.clip_rect.map_or_else(
+        || {
+            Vec4::new(
+                -mesh_half_size.x,
+                -mesh_half_size.y,
+                mesh_half_size.x,
+                mesh_half_size.y,
+            )
+        },
+        |clip_rect| sdf_local_clip_rect(surface.bounds, clip_rect, points_to_world, clip_padding),
+    )
+}
+
+fn sdf_local_clip_rect(
+    bounds: BoundingBox,
+    clip_rect: BoundingBox,
+    points_to_world: f32,
+    pad: f32,
+) -> Vec4 {
+    let (cx, cy) = bounds.center();
+    let left = (clip_rect.x - cx) * points_to_world;
+    let right = (clip_rect.x + clip_rect.width - cx) * points_to_world;
+    // The SDF shader reconstructs UV.y = 0 (the top vertex) as negative Y.
+    let top = (clip_rect.y - cy) * points_to_world;
+    let bottom = (clip_rect.y + clip_rect.height - cy) * points_to_world;
+    Vec4::new(left - pad, top - pad, right + pad, bottom + pad)
 }
 
 /// Resolves the panel or element material that applies to an `ElementSurface`.
@@ -1068,30 +1373,19 @@ fn panel_local_corner_radii(
 /// Spawns the invisible full-panel interaction quad as a child of the panel.
 fn spawn_interaction_mesh(
     interaction: PanelInteractionMesh,
-    size: Vec2,
-    center: Vec2,
+    transform: Transform,
     context: &PanelReconcileContext<'_>,
-    meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
+    assets: &InteractionMeshAssets,
     commands: &mut Commands,
 ) {
-    let material = materials.add(StandardMaterial {
-        base_color: Color::NONE,
-        alpha_mode: AlphaMode::Blend,
-        unlit: true,
-        double_sided: true,
-        cull_mode: None,
-        depth_bias: -constants::LAYER_DEPTH_BIAS,
-        ..default()
-    });
     commands.entity(context.panel_entity).with_child((
         interaction,
         RayCastBackfaces,
         Pickable::IGNORE,
         NotShadowCaster,
-        Mesh3d(meshes.add(Rectangle::new(size.x, size.y))),
-        MeshMaterial3d(material),
-        Transform::from_xyz(center.x, center.y, 0.0),
+        Mesh3d(assets.mesh.clone()),
+        MeshMaterial3d(assets.material.clone()),
+        transform,
         context.layer.clone(),
         PanelOwned::from(context.panel_entity),
     ));
@@ -1272,6 +1566,54 @@ mod tests {
     /// Logical viewport size seeded into every captured test camera.
     const RAY_VIEWPORT_SIZE: Vec2 = Vec2::new(800.0, 600.0);
 
+    #[test]
+    fn panel_layer_sync_leaves_an_unowned_pick_mesh_alone() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_systems(PostUpdate, sync_interaction_mesh_render_layers);
+        let pick_mesh = app
+            .world_mut()
+            .spawn((
+                PanelInteractionMesh::new(Vec2::splat(2.0), Vec2::ZERO),
+                RenderLayers::layer(3),
+            ))
+            .id();
+        app.world_mut().spawn((
+            DiegeticPanel::world()
+                .size(Mm(100.0), Mm(50.0))
+                .layout(|_| {})
+                .build()
+                .expect("panel should build"),
+            RenderLayers::layer(1),
+        ));
+        app.update();
+        assert_eq!(
+            app.world().get::<RenderLayers>(pick_mesh),
+            Some(&RenderLayers::layer(3))
+        );
+    }
+
+    #[test]
+    fn clipped_sdf_fill_keeps_top_edge_in_shader_local_coordinates() {
+        let bounds = BoundingBox {
+            x:      0.0,
+            y:      0.0,
+            width:  10.0,
+            height: 10.0,
+        };
+        let top_clip = BoundingBox {
+            x:      0.0,
+            y:      0.0,
+            width:  10.0,
+            height: 3.0,
+        };
+        let clip = sdf_local_clip_rect(bounds, top_clip, 1.0, 0.001);
+
+        // The shader maps a top vertex's UV.y = 0 to local.y = -half_height.
+        assert!(clip.y <= -5.0 && clip.w > -5.0);
+        assert!(clip.w < 0.0, "a top-only clip must exclude the lower half");
+    }
+
     /// Minimal measurer for geometry tests that include text commands.
     fn zero_measurer() -> DiegeticTextMeasurer {
         DiegeticTextMeasurer {
@@ -1289,12 +1631,73 @@ mod tests {
         app.add_plugins(AssetPlugin::default());
         app.init_asset::<Mesh>();
         render::seed_default_material_cascades(&mut app);
-        app.init_resource::<ResolvedSdfSurfaceRegistry>();
+        app.init_resource::<ResolvedSdfSurfaceRegistry>()
+            .init_resource::<TooltipShadowMaterial>()
+            .init_resource::<InteractionMeshAssets>();
         app.insert_resource(zero_measurer());
         app.add_plugins(HeadlessLayoutPlugin);
         app.add_plugins(cascade::cascade_plugin::<SdfMaterial>());
         app.add_systems(PostUpdate, build_panel_geometry);
         app
+    }
+
+    #[test]
+    fn interaction_quads_share_assets_and_resize_without_respawning() {
+        let mut app = geometry_app();
+        let mut panels = Vec::new();
+        for width in [100.0, 120.0] {
+            panels.push(
+                app.world_mut()
+                    .spawn(
+                        DiegeticPanel::world()
+                            .size(Mm(width), Mm(50.0))
+                            .layout(|_| {})
+                            .build()
+                            .expect("panel builds"),
+                    )
+                    .id(),
+            );
+        }
+        app.update();
+        let mut quads = app.world_mut().query_filtered::<
+            (Entity, &Mesh3d, &MeshMaterial3d<StandardMaterial>), With<PanelInteractionMesh>>();
+        let before: Vec<_> = quads
+            .iter(app.world())
+            .map(|(e, mesh, material)| (e, mesh.0.clone(), material.0.clone()))
+            .collect();
+        assert_eq!(before.len(), 2);
+        assert_eq!(before[0].1, before[1].1, "pick quads share one unit mesh");
+        assert_eq!(
+            before[0].2, before[1].2,
+            "pick quads share one invisible material"
+        );
+        let mesh_count = app.world().resource::<Assets<Mesh>>().len();
+        let material_count = app.world().resource::<Assets<StandardMaterial>>().len();
+        app.world_mut()
+            .get_mut::<DiegeticPanel>(panels[0])
+            .expect("panel exists")
+            .set_size((Mm(140.0), Mm(60.0)))
+            .expect("valid size");
+        app.update();
+        let after: Vec<_> = quads
+            .iter(app.world())
+            .map(|(e, mesh, material)| (e, mesh.0.clone(), material.0.clone()))
+            .collect();
+        assert_eq!(
+            after, before,
+            "resize keeps both entities and asset handles"
+        );
+        assert_eq!(app.world().resource::<Assets<Mesh>>().len(), mesh_count);
+        assert_eq!(
+            app.world().resource::<Assets<StandardMaterial>>().len(),
+            material_count
+        );
+        let transform = app
+            .world()
+            .get::<Transform>(before[0].0)
+            .expect("quad transform");
+        assert!((transform.scale.x - 0.14).abs() < 1e-6);
+        assert!((transform.scale.y - 0.06).abs() < 1e-6);
     }
 
     /// A full-size background with a full-size backed child on top: two
@@ -1363,6 +1766,8 @@ mod tests {
         border_widths:     [f32; 4],
         /// Clip rectangle copied from `ResolvedSdfSurface::clip_rect`.
         clip_rect:         Vec4,
+        /// Panel-local Z translation copied from `ResolvedSdfSurface::local_transform`.
+        local_depth:       f32,
         /// Fill role state copied from `ResolvedSdfMaterial::authorship`.
         fill_authorship:   SdfRoleAuthorship,
         /// Fill color copied from `ResolvedSdfMaterial::color`.
@@ -1392,6 +1797,7 @@ mod tests {
                     corner_radii:      resolved.corner_radii,
                     border_widths:     resolved.border_widths,
                     clip_rect:         resolved.clip_rect,
+                    local_depth:       resolved.local_transform.translation.z,
                     fill_authorship:   resolved.fill_material.authorship,
                     fill_color:        resolved.fill_material.color,
                     fill_material:     resolved.fill_material.base_material.map(Handle::id),
@@ -1469,6 +1875,25 @@ mod tests {
     }
 
     #[test]
+    fn world_panel_sdf_surface_depth_offset_moves_the_resolved_surface() {
+        const DEPTH_OFFSET: f32 = 0.0125;
+
+        let mut app = geometry_app();
+        app.world_mut().spawn(
+            DiegeticPanel::world()
+                .size(Mm(100.0), Mm(50.0))
+                .sdf_surface_depth_offset(DEPTH_OFFSET)
+                .with_tree(rounded_root_tree())
+                .build()
+                .expect("panel should build"),
+        );
+        app.update();
+        app.update();
+
+        assert_eq!(single_surface_snapshot(&app).local_depth, DEPTH_OFFSET);
+    }
+
+    #[test]
     fn text_toggle_keeps_resolved_sdf_oit_depth_positive() {
         let mut app = geometry_app();
         let panel = app
@@ -1486,8 +1911,8 @@ mod tests {
 
         let surface_before = single_surface_snapshot(&app);
         assert_eq!(
-            surface_before.draw_depth.oit_depth_offset().get().to_bits(),
-            constants::OIT_DEPTH_STEP.to_bits(),
+            surface_before.draw_depth.oit_paint_order().get().to_bits(),
+            constants::OIT_PAINT_STEP.to_bits(),
         );
 
         assert!(
@@ -1502,12 +1927,12 @@ mod tests {
         let surface_after = single_surface_snapshot(&app);
         assert_eq!(surface_after.command_index, surface_before.command_index);
         assert_eq!(
-            surface_before.draw_depth.oit_depth_offset().get().to_bits(),
-            surface_after.draw_depth.oit_depth_offset().get().to_bits(),
+            surface_before.draw_depth.oit_paint_order().get().to_bits(),
+            surface_after.draw_depth.oit_paint_order().get().to_bits(),
         );
         assert_eq!(
-            surface_after.draw_depth.oit_depth_offset().get().to_bits(),
-            constants::OIT_DEPTH_STEP.to_bits(),
+            surface_after.draw_depth.oit_paint_order().get().to_bits(),
+            constants::OIT_PAINT_STEP.to_bits(),
         );
     }
 
@@ -1556,15 +1981,15 @@ mod tests {
             below.draw_depth.clip_depth_nudge().get() < above.draw_depth.clip_depth_nudge().get()
         );
         assert!(
-            below.draw_depth.oit_depth_offset().get() < above.draw_depth.oit_depth_offset().get()
+            below.draw_depth.oit_paint_order().get() < above.draw_depth.oit_paint_order().get()
         );
         assert_eq!(
-            below.draw_depth.oit_depth_offset().get().to_bits(),
-            constants::OIT_DEPTH_STEP.to_bits()
+            below.draw_depth.oit_paint_order().get().to_bits(),
+            constants::OIT_PAINT_STEP.to_bits()
         );
         assert_eq!(
-            above.draw_depth.oit_depth_offset().get().to_bits(),
-            (2.0 * constants::OIT_DEPTH_STEP).to_bits()
+            above.draw_depth.oit_paint_order().get().to_bits(),
+            (2.0 * constants::OIT_PAINT_STEP).to_bits()
         );
 
         assert_eq!(below.sdf_half_size, above.sdf_half_size);

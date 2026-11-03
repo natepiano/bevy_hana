@@ -2240,11 +2240,11 @@ mod tests {
 
         publish_pending_attempt_endings(app.world_mut());
 
-        assert!(
+        assert_eq!(
             app.world()
                 .resource::<ObservedEndedRegistrationAttempts>()
-                .0
-                .is_empty()
+                .0,
+            []
         );
         assert!(app.world().resource::<Bindings>().binding(&role).is_ok());
 

@@ -45,6 +45,7 @@ use bevy::prelude::Transform;
 use bevy::prelude::Vec2;
 use bevy::prelude::error;
 
+use crate::constants::DIAGNOSTIC_LOG_TARGET;
 use crate::layout::Anchor;
 use crate::layout::Dimension;
 use crate::layout::El;
@@ -57,7 +58,6 @@ use crate::layout::LayoutBuilder;
 use crate::layout::LayoutTree;
 use crate::layout::Lighting;
 use crate::layout::Px;
-use crate::layout::Sidedness;
 use crate::layout::Sizing;
 use crate::layout::Text;
 use crate::layout::TextAlign;
@@ -102,6 +102,14 @@ impl DiegeticText {
 enum TextSpace {
     World,
     Screen,
+}
+
+/// How a text label chooses its panel anchor in its coordinate space.
+#[derive(Clone, Copy, Debug, Default)]
+enum TextAnchor {
+    #[default]
+    Inherit,
+    Explicit(Anchor),
 }
 
 /// Generates the shared typography setters as inherent methods, so callers reach
@@ -202,14 +210,6 @@ macro_rules! text_style_setters {
                 self
             }
 
-            /// Overrides glyph sidedness for this text (else inherits the
-            /// context default via the `Sidedness` cascade attribute).
-            #[must_use]
-            pub const fn sidedness(mut self, sidedness: Sidedness) -> Self {
-                self.style.set_sidedness(sidedness);
-                self
-            }
-
             /// Overrides glyph lighting for this text (else inherits the context
             /// default via the `Lighting` cascade attribute).
             #[must_use]
@@ -275,7 +275,7 @@ pub struct DiegeticTextBuilder {
     wrap_width:    Option<f32>,
     world_width:   Option<f32>,
     world_height:  Option<f32>,
-    anchor:        Option<Anchor>,
+    anchor:        TextAnchor,
     transform:     Transform,
     position:      Option<Vec2>,
     render_layers: Option<RenderLayers>,
@@ -286,13 +286,6 @@ text_style_setters!(DiegeticTextBuilder);
 
 impl DiegeticTextBuilder {
     fn new(space: TextSpace, text: impl Into<String>) -> Self {
-        // World text sits *at* its point, so it centers on the transform by
-        // default; screen text pins to the window edge via its panel anchor, so
-        // it starts unanchored (the screen builder seeds `TopLeft`).
-        let anchor = match space {
-            TextSpace::World => Some(Anchor::Center),
-            TextSpace::Screen => None,
-        };
         Self {
             space,
             text: text.into(),
@@ -300,7 +293,7 @@ impl DiegeticTextBuilder {
             wrap_width: None,
             world_width: None,
             world_height: None,
-            anchor,
+            anchor: TextAnchor::Inherit,
             transform: Transform::IDENTITY,
             position: None,
             render_layers: None,
@@ -316,7 +309,7 @@ impl DiegeticTextBuilder {
     /// [`Anchor::Center`] centers it on screen.
     #[must_use]
     pub const fn anchor(mut self, anchor: Anchor) -> Self {
-        self.anchor = Some(anchor);
+        self.anchor = TextAnchor::Explicit(anchor);
         self
     }
 
@@ -405,12 +398,13 @@ impl DiegeticTextBuilder {
             Some(meters) => scaled_width.world_height(meters),
             None => scaled_width,
         };
-        let anchored = match self.anchor {
-            Some(anchor) => scaled.anchor(anchor),
-            None => scaled,
+        let anchor = match self.anchor {
+            TextAnchor::Inherit => self.style.anchor(),
+            TextAnchor::Explicit(anchor) => anchor,
         };
+        let anchored = scaled.anchor(anchor);
         anchored.with_tree(tree).build().unwrap_or_else(|error| {
-            error!("DiegeticText::world: {error}; falling back to a default panel");
+            error!(target: DIAGNOSTIC_LOG_TARGET, "DiegeticText::world: {error}; falling back to a default panel");
             DiegeticPanel::default()
         })
     }
@@ -421,8 +415,8 @@ impl DiegeticTextBuilder {
             None => DiegeticPanel::screen().size(Fit, Fit),
         };
         let anchored = match self.anchor {
-            Some(anchor) => sized.anchor(anchor),
-            None => sized,
+            TextAnchor::Explicit(anchor) => sized.anchor(anchor),
+            TextAnchor::Inherit => sized,
         };
         let positioned = match self.position {
             Some(pos) => anchored.screen_position(pos.x, pos.y),
@@ -437,7 +431,7 @@ impl DiegeticTextBuilder {
             None => ordered,
         };
         layered.with_tree(tree).build().unwrap_or_else(|error| {
-            error!("DiegeticText::screen: {error}; falling back to a default panel");
+            error!(target: DIAGNOSTIC_LOG_TARGET, "DiegeticText::screen: {error}; falling back to a default panel");
             DiegeticPanel::default()
         })
     }
@@ -509,6 +503,28 @@ mod tests {
             bounds.width > 0.0,
             "one-element tree width collapsed to {}",
             bounds.width
+        );
+    }
+
+    #[test]
+    fn world_text_uses_style_anchor_by_default() {
+        let builder =
+            DiegeticText::world("Hello").style(TextStyle::new(16.0).with_anchor(Anchor::TopLeft));
+        let tree = build_one_element_tree(&builder.text, &builder.style, None);
+
+        assert_eq!(builder.build_world_panel(tree).anchor(), Anchor::TopLeft);
+    }
+
+    #[test]
+    fn explicit_world_text_anchor_overrides_style_anchor() {
+        let builder = DiegeticText::world("Hello")
+            .style(TextStyle::new(16.0).with_anchor(Anchor::TopLeft))
+            .anchor(Anchor::BottomRight);
+        let tree = build_one_element_tree(&builder.text, &builder.style, None);
+
+        assert_eq!(
+            builder.build_world_panel(tree).anchor(),
+            Anchor::BottomRight
         );
     }
 }

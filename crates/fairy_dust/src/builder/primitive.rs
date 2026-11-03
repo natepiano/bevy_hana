@@ -221,11 +221,9 @@ impl<S> PrimitiveBuilder<S> {
     /// Finalizes the current primitive and mirrors
     /// [`App::add_observer`](bevy::app::App::add_observer).
     #[must_use]
-    pub fn add_observer<E, B, M, I>(self, observer: I) -> SprinkleBuilder<S>
+    pub fn add_observer<M, I>(self, observer: I) -> SprinkleBuilder<S>
     where
-        E: bevy::ecs::event::Event,
-        B: Bundle,
-        I: bevy::ecs::system::IntoObserverSystem<E, B, M>,
+        I: bevy::ecs::observer::IntoObserver<M>,
     {
         self.finish().add_observer(observer)
     }

@@ -19,6 +19,7 @@ use bevy::time::Virtual;
 use hana_rigging::prelude::RiggingSystems;
 pub(crate) use restore_attempt::RestorePreparation;
 pub(crate) use restore_attempt::RestorePreparationSource;
+pub(crate) use restore_attempt::RetainedWindowedPhysicalPosition;
 pub(crate) use restore_attempt::WindowRestoreAttempt;
 pub(crate) use restore_attempt::prepare_driver_restore_targets;
 pub(crate) use restore_attempt::remove_window_restore_work;
@@ -27,6 +28,7 @@ pub(crate) use settle_state::check_restore_settling;
 pub(crate) use target_position::FullscreenRestoreState;
 pub(crate) use target_position::MonitorScaleStrategy;
 pub(crate) use target_position::NativeFullscreenState;
+pub(crate) use target_position::NativeWindowReadbackPosition;
 use target_position::ObservedScaleInputs;
 #[cfg(test)]
 pub(crate) use target_position::TargetPosition;

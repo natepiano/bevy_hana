@@ -18,9 +18,7 @@ use bevy::render::storage::ShaderBuffer;
 use bevy::shader::ShaderRef;
 
 use super::image_batch::ImageBatchKey;
-
-/// Embedded shader path used by all image material passes.
-const IMAGE_PANEL_SHADER_PATH: &str = "embedded://hana_diegetic/shaders/image_panel.wgsl";
+use crate::constants::IMAGE_PANEL_SHADER_HANDLE;
 
 /// Image material extension over `StandardMaterial`.
 ///
@@ -34,24 +32,34 @@ pub(super) struct ImageExtension {
 }
 
 impl MaterialExtension for ImageExtension {
-    fn vertex_shader() -> ShaderRef { IMAGE_PANEL_SHADER_PATH.into() }
+    fn vertex_shader() -> ShaderRef { IMAGE_PANEL_SHADER_HANDLE.into() }
 
-    fn fragment_shader() -> ShaderRef { IMAGE_PANEL_SHADER_PATH.into() }
+    fn fragment_shader() -> ShaderRef { IMAGE_PANEL_SHADER_HANDLE.into() }
 
-    fn prepass_vertex_shader() -> ShaderRef { IMAGE_PANEL_SHADER_PATH.into() }
+    fn prepass_vertex_shader() -> ShaderRef { IMAGE_PANEL_SHADER_HANDLE.into() }
 
-    fn prepass_fragment_shader() -> ShaderRef { IMAGE_PANEL_SHADER_PATH.into() }
+    fn prepass_fragment_shader() -> ShaderRef { IMAGE_PANEL_SHADER_HANDLE.into() }
 
-    fn deferred_vertex_shader() -> ShaderRef { IMAGE_PANEL_SHADER_PATH.into() }
+    fn deferred_vertex_shader() -> ShaderRef { IMAGE_PANEL_SHADER_HANDLE.into() }
 
-    fn deferred_fragment_shader() -> ShaderRef { IMAGE_PANEL_SHADER_PATH.into() }
+    fn deferred_fragment_shader() -> ShaderRef { IMAGE_PANEL_SHADER_HANDLE.into() }
 
     fn specialize(
         _pipeline: &MaterialExtensionPipeline,
-        _descriptor: &mut RenderPipelineDescriptor,
+        descriptor: &mut RenderPipelineDescriptor,
         _layout: &MeshVertexBufferLayoutRef,
         _key: MaterialExtensionKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
+        if descriptor.fragment.as_ref().is_some_and(|fragment| {
+            fragment
+                .shader_defs
+                .contains(&"MATERIAL_OIT_ENABLED".into())
+        }) {
+            descriptor
+                .vertex
+                .shader_defs
+                .push("MATERIAL_OIT_ENABLED".into());
+        }
         Ok(())
     }
 }
@@ -101,12 +109,12 @@ mod tests {
     fn assert_image_shader_ref(shader_ref: ShaderRef) {
         assert!(matches!(
             shader_ref,
-            ShaderRef::Path(path) if path.to_string() == IMAGE_PANEL_SHADER_PATH
+            ShaderRef::Handle(handle) if handle == IMAGE_PANEL_SHADER_HANDLE
         ));
     }
 
     #[test]
-    fn image_extension_uses_embedded_shader_for_all_passes() {
+    fn image_extension_uses_image_panel_shader_for_all_passes() {
         assert_image_shader_ref(ImageExtension::vertex_shader());
         assert_image_shader_ref(ImageExtension::fragment_shader());
         assert_image_shader_ref(ImageExtension::prepass_vertex_shader());
@@ -117,7 +125,7 @@ mod tests {
 
     #[test]
     fn image_shader_reads_record_buffer_and_uses_world_record_transform() {
-        let shader = include_str!("../shaders/image_panel.wgsl");
+        let shader = include_str!("../shaders/image_panel.wesl");
 
         assert!(shader.contains("@binding(107) var<storage, read> image_records"));
         assert!(shader.contains("let local = signs * record.size * 0.5;"));

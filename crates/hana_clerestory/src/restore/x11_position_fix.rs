@@ -8,6 +8,9 @@
 //!
 //! See: <https://github.com/rust-windowing/winit/issues/4445>
 
+#[cfg(test)]
+use std::collections::HashMap;
+
 use bevy::ecs::system::NonSendMarker;
 use bevy::prelude::App;
 use bevy::prelude::ApplyDeferred;
@@ -18,10 +21,13 @@ use bevy::prelude::IVec2;
 use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::Query;
 use bevy::prelude::Res;
+#[cfg(test)]
+use bevy::prelude::Resource;
 use bevy::prelude::Update;
 use bevy::prelude::Window;
 use bevy::prelude::With;
 use bevy::prelude::Without;
+use bevy::prelude::World;
 use bevy::prelude::debug;
 use bevy::prelude::info;
 use bevy::window::WindowPosition;
@@ -40,6 +46,7 @@ use super::WindowRestoreAttempt;
 use super::check_restore_settling;
 use super::place_window_at_saved_geometry;
 use super::prepare_driver_restore_targets;
+use super::target_position::NativeWindowReadbackPosition;
 use super::target_position::TargetPosition;
 use super::target_position::WindowSettleProgress;
 use super::winit_info::X11FrameCompensated;
@@ -50,6 +57,144 @@ use crate::constants::FRAME_EXTENT_PROPERTY_OFFSET;
 use crate::constants::FRAME_EXTENT_TOP_INDEX;
 use crate::constants::FRAME_EXTENTS_ATOM_NAME;
 use crate::events::ExpectedPhysicalPosition;
+use crate::persistence::ReadbackWindowPosition;
+use crate::persistence::WindowPlacementConfiguration;
+
+/// Native readiness for converting an X11 readback coordinate into a frame request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum X11FrameReadback {
+    Available { physical_top: i32 },
+    AwaitingNativeWindow,
+    AwaitingFrameExtents,
+    NativeHandleUnavailable,
+    NotX11,
+    QueryFailed,
+}
+
+/// Why an exact windowed return still needs another native observation.
+pub(crate) enum X11WindowedPositionProgress {
+    Restored,
+    UncompensatedFallback,
+    AwaitingNativeExit,
+    AwaitingFrameReadback,
+    AwaitingPositionReadback,
+}
+
+impl X11WindowedPositionProgress {
+    pub(crate) const fn is_complete(&self) -> bool { matches!(self, Self::Restored) }
+
+    pub(crate) const fn requires_fallback(&self) -> bool {
+        matches!(self, Self::UncompensatedFallback)
+    }
+}
+
+#[cfg(test)]
+#[derive(Resource, Default)]
+struct InjectedX11FrameTops(HashMap<Entity, X11FrameReadback>);
+
+impl WindowPlacementConfiguration {
+    /// Complete only after the window manager reports the retained physical coordinate.
+    pub(crate) fn restore_x11_windowed_position(
+        world: &mut World,
+        entity: Entity,
+        position: NativeWindowReadbackPosition,
+    ) -> X11WindowedPositionProgress {
+        let physical_observed = position.physical_pixels();
+        if WINIT_WINDOWS.with_borrow(|windows| {
+            windows
+                .get_window(entity)
+                .is_some_and(|window| window.fullscreen().is_some())
+        }) {
+            return X11WindowedPositionProgress::AwaitingNativeExit;
+        }
+        let readback = query_frame_top_for_entity(
+            entity,
+            #[cfg(test)]
+            world.get_resource::<InjectedX11FrameTops>(),
+        );
+        let X11FrameReadback::Available { physical_top } = readback else {
+            // There is no native request to compensate before winit creates the window.
+            // Keep the initial geometry in ECS, but wait for native readback before completion.
+            if readback == X11FrameReadback::AwaitingNativeWindow
+                && let Some(mut window) = world.get_mut::<Window>(entity)
+            {
+                window.position = WindowPosition::At(physical_observed);
+            }
+            return match readback {
+                X11FrameReadback::AwaitingNativeWindow | X11FrameReadback::AwaitingFrameExtents => {
+                    X11WindowedPositionProgress::AwaitingFrameReadback
+                },
+                _ => X11WindowedPositionProgress::UncompensatedFallback,
+            };
+        };
+        let observed = WINIT_WINDOWS.with_borrow(|windows| {
+            ReadbackWindowPosition::from(
+                windows
+                    .get_window(entity)
+                    .and_then(|window| window.outer_position().ok())
+                    .map(|position| IVec2::new(position.x, position.y)),
+            )
+        });
+        #[cfg(test)]
+        let observed = if world
+            .get_resource::<InjectedX11FrameTops>()
+            .is_some_and(|injected| injected.0.contains_key(&entity))
+        {
+            match world.get::<Window>(entity).map(|window| window.position) {
+                Some(WindowPosition::At(position)) => ReadbackWindowPosition::Observed(position),
+                _ => ReadbackWindowPosition::Unavailable,
+            }
+        } else {
+            observed
+        };
+        if observed == ReadbackWindowPosition::Observed(physical_observed) {
+            return if world
+                .get::<Window>(entity)
+                .is_some_and(|window| window.position == WindowPosition::At(physical_observed))
+            {
+                X11WindowedPositionProgress::Restored
+            } else {
+                X11WindowedPositionProgress::AwaitingPositionReadback
+            };
+        }
+        if let Some(mut window) = world.get_mut::<Window>(entity) {
+            window.position =
+                WindowPosition::At(position.x11_frame_request(physical_top).physical_pixels());
+        }
+        X11WindowedPositionProgress::AwaitingPositionReadback
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_x11_frame_top_for_test(
+        world: &mut World,
+        entity: Entity,
+        physical_top: i32,
+    ) {
+        world.init_resource::<InjectedX11FrameTops>();
+        world
+            .resource_mut::<InjectedX11FrameTops>()
+            .0
+            .insert(entity, X11FrameReadback::Available { physical_top });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn await_x11_frame_extents_for_test(world: &mut World, entity: Entity) {
+        world.init_resource::<InjectedX11FrameTops>();
+        world
+            .resource_mut::<InjectedX11FrameTops>()
+            .0
+            .insert(entity, X11FrameReadback::AwaitingFrameExtents);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_x11_frame_query_for_test(world: &mut World, entity: Entity) {
+        world.init_resource::<InjectedX11FrameTops>();
+        world
+            .resource_mut::<InjectedX11FrameTops>()
+            .0
+            .insert(entity, X11FrameReadback::QueryFailed);
+    }
+}
 
 /// Compensate each restore target for the X11 frame before placement, then re-apply it once the
 /// window is mapped. Runs only on X11.
@@ -97,6 +242,7 @@ fn compensate_target_position(
         (With<WindowRestoreAttempt>, Without<X11FrameCompensated>),
     >,
     _: NonSendMarker,
+    #[cfg(test)] injected: Option<Res<InjectedX11FrameTops>>,
 ) {
     for (entity, mut target) in &mut windows {
         let ExpectedPhysicalPosition::Specified(physical_position) = target.physical_position()
@@ -105,14 +251,21 @@ fn compensate_target_position(
             continue;
         };
 
-        let Some(physical_frame_top) = query_frame_top_for_entity(entity) else {
+        let X11FrameReadback::Available {
+            physical_top: physical_frame_top,
+        } = query_frame_top_for_entity(
+            entity,
+            #[cfg(test)]
+            injected.as_deref(),
+        )
+        else {
             continue;
         };
 
-        let physical_compensated = IVec2::new(
-            physical_position.x,
-            physical_position.y - physical_frame_top,
-        );
+        let physical_compensated =
+            NativeWindowReadbackPosition::from_physical_pixels(physical_position)
+                .x11_frame_request(physical_frame_top)
+                .physical_pixels();
         info!(
             "[W6] Compensating position: {physical_position:?} -> {physical_compensated:?} (physical_frame_top={physical_frame_top})"
         );
@@ -174,21 +327,42 @@ fn reapply_compensated_position(
     }
 }
 
-fn query_frame_top_for_entity(entity: Entity) -> Option<i32> {
+fn query_frame_top_for_entity(
+    entity: Entity,
+    #[cfg(test)] injected: Option<&InjectedX11FrameTops>,
+) -> X11FrameReadback {
+    #[cfg(test)]
+    if let Some(readback) = injected.and_then(|injected| injected.0.get(&entity)) {
+        return *readback;
+    }
     WINIT_WINDOWS.with(|winit_windows| {
         let winit_windows = winit_windows.borrow();
-        winit_windows.get_window(entity).and_then(|winit_window| {
-            let window_id = get_x11_window_id(&**winit_window)?;
-            query_frame_top(window_id)
-        })
+        let Some(window) = winit_windows.get_window(entity) else {
+            return X11FrameReadback::AwaitingNativeWindow;
+        };
+        match get_x11_window_id(&**window) {
+            Ok(window_id) => query_frame_top(window_id),
+            Err(readback) => readback,
+        }
     })
 }
 
-fn query_frame_top(window_id: u32) -> Option<i32> {
-    let (conn, _) = XCBConnection::connect(None).ok()?;
+fn query_frame_top(window_id: u32) -> X11FrameReadback {
+    match read_frame_top(window_id) {
+        Ok(readback) => readback,
+        Err(X11FrameQueryFailure) => X11FrameReadback::QueryFailed,
+    }
+}
 
-    let atom_cookie = conn.intern_atom(false, FRAME_EXTENTS_ATOM_NAME).ok()?;
-    let atom = atom_cookie.reply().ok()?.atom;
+struct X11FrameQueryFailure;
+
+fn read_frame_top(window_id: u32) -> Result<X11FrameReadback, X11FrameQueryFailure> {
+    let (conn, _) = XCBConnection::connect(None).map_err(|_| X11FrameQueryFailure)?;
+
+    let atom_cookie = conn
+        .intern_atom(false, FRAME_EXTENTS_ATOM_NAME)
+        .map_err(|_| X11FrameQueryFailure)?;
+    let atom = atom_cookie.reply().map_err(|_| X11FrameQueryFailure)?.atom;
 
     let property_cookie = conn
         .get_property(
@@ -199,22 +373,29 @@ fn query_frame_top(window_id: u32) -> Option<i32> {
             FRAME_EXTENT_PROPERTY_OFFSET,
             FRAME_EXTENT_COUNT,
         )
-        .ok()?;
-    let property = property_cookie.reply().ok()?;
+        .map_err(|_| X11FrameQueryFailure)?;
+    let property = property_cookie.reply().map_err(|_| X11FrameQueryFailure)?;
 
-    let values: Vec<u32> = property.value32()?.collect();
+    let Some(values) = property.value32() else {
+        return Ok(X11FrameReadback::AwaitingFrameExtents);
+    };
+    let values: Vec<u32> = values.collect();
     if values.len() >= FRAME_EXTENT_COUNT.to_usize() {
-        Some(values[FRAME_EXTENT_TOP_INDEX].to_i32())
+        Ok(X11FrameReadback::Available {
+            physical_top: values[FRAME_EXTENT_TOP_INDEX].to_i32(),
+        })
     } else {
-        None
+        Ok(X11FrameReadback::AwaitingFrameExtents)
     }
 }
 
-fn get_x11_window_id<W: HasWindowHandle>(window: &W) -> Option<u32> {
-    let handle = window.window_handle().ok()?;
+fn get_x11_window_id<W: HasWindowHandle>(window: &W) -> Result<u32, X11FrameReadback> {
+    let handle = window
+        .window_handle()
+        .map_err(|_| X11FrameReadback::NativeHandleUnavailable)?;
     match handle.as_raw() {
-        RawWindowHandle::Xlib(h) => Some(h.window.to_u32()),
-        RawWindowHandle::Xcb(h) => Some(h.window.get()),
-        _ => None,
+        RawWindowHandle::Xlib(h) => Ok(h.window.to_u32()),
+        RawWindowHandle::Xcb(h) => Ok(h.window.get()),
+        _ => Err(X11FrameReadback::NotX11),
     }
 }

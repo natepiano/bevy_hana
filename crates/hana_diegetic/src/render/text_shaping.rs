@@ -1,11 +1,13 @@
 //! Shared text shaping support used by panel and world text rendering.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 
 use bevy::prelude::Resource;
 use hana_kana::ToU16;
+use parley::FontContext;
 use parley::Layout;
 use parley::LayoutContext;
 use parley::RangedBuilder;
@@ -19,8 +21,11 @@ use parley::style::StyleProperty;
 
 use crate::layout::FontSlant;
 use crate::layout::ResolvedFontFace;
+use crate::layout::RichGlyphCluster;
+use crate::layout::RichShapeCacheLookup;
 use crate::layout::ShapedGlyph;
 use crate::layout::ShapedLineMetrics;
+use crate::layout::ShapedRichParagraph;
 use crate::layout::ShapedTextCache;
 use crate::layout::ShapedTextRun;
 use crate::layout::TextDimensions;
@@ -36,15 +41,19 @@ use crate::text::PositionedGlyph;
 /// shaping call. Wrapped in `Mutex` for `Send + Sync`.
 #[derive(Resource)]
 pub(crate) struct TextShapingContext {
-    layout_cx: Mutex<LayoutContext<()>>,
-    layout:    Mutex<Layout<()>>,
+    layout_cx:      Mutex<LayoutContext<()>>,
+    layout:         Mutex<Layout<()>>,
+    rich_layout_cx: Mutex<LayoutContext<u16>>,
+    rich_layout:    Mutex<Layout<u16>>,
 }
 
 impl Default for TextShapingContext {
     fn default() -> Self {
         Self {
-            layout_cx: Mutex::new(parley::LayoutContext::default()),
-            layout:    Mutex::new(parley::Layout::new()),
+            layout_cx:      Mutex::new(parley::LayoutContext::default()),
+            layout:         Mutex::new(parley::Layout::new()),
+            rich_layout_cx: Mutex::new(LayoutContext::default()),
+            rich_layout:    Mutex::new(Layout::new()),
         }
     }
 }
@@ -114,7 +123,7 @@ pub(super) fn positioned_glyphs<'a>(
 ) -> Vec<PositionedGlyph<'a>> {
     let mut positioned_glyphs = Vec::with_capacity(glyphs.len());
     for glyph in glyphs {
-        let Some((font, collection_index)) = font_registry.font_for_face(glyph.font_face) else {
+        let Ok((font, collection_index)) = font_registry.font_for_face(glyph.font_face) else {
             stats.failed_glyphs += 1;
             continue;
         };
@@ -174,7 +183,11 @@ pub(super) fn shape_text_cached(
     shaped_text_run
 }
 
-fn apply_text_style(builder: &mut RangedBuilder<'_, ()>, config: &TextStyle, family: &str) {
+fn apply_text_style<B: parley::style::Brush>(
+    builder: &mut RangedBuilder<'_, B>,
+    config: &TextStyle,
+    family: &str,
+) {
     builder.push_default(StyleProperty::FontSize(config.size()));
     builder.push_default(StyleProperty::FontFamily(parley::style::FontFamily::named(
         family,
@@ -205,7 +218,10 @@ const fn font_style(slant: FontSlant) -> FontStyle {
     }
 }
 
-fn push_font_features(builder: &mut RangedBuilder<'_, ()>, font_features: crate::FontFeatures) {
+fn push_font_features<B: parley::style::Brush>(
+    builder: &mut RangedBuilder<'_, B>,
+    font_features: crate::FontFeatures,
+) {
     if font_features.is_default() {
         return;
     }
@@ -346,5 +362,182 @@ mod tests {
         };
 
         assert_eq!(GlyphReadiness::from(&stats), GlyphReadiness::Ready);
+    }
+}
+
+/// Shapes one paragraph; colours never enter the geometry cache.
+pub(super) fn shape_rich_paragraph_cached(
+    paragraph: &crate::RichParagraph,
+    scale: f32,
+    registry: &FontRegistry,
+    context: &TextShapingContext,
+    cache: &ShapedTextCache,
+) -> Arc<ShapedRichParagraph> {
+    let family = registry
+        .family_name(FontId(paragraph.base.font_id()))
+        .unwrap_or(DEFAULT_FAMILY);
+    shape_rich_with_fonts(
+        paragraph,
+        scale,
+        &registry.font_context(),
+        family,
+        context,
+        cache,
+    )
+}
+
+pub(crate) fn shape_rich_with_fonts(
+    paragraph: &crate::RichParagraph,
+    scale: f32,
+    font_context: &Mutex<FontContext>,
+    family: &str,
+    context: &TextShapingContext,
+    cache: &ShapedTextCache,
+) -> Arc<ShapedRichParagraph> {
+    if let RichShapeCacheLookup::Cached(shaped) = cache.rich_lookup(paragraph, scale) {
+        return shaped;
+    }
+    let mut fonts = font_context.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut layout_context = context
+        .rich_layout_cx
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let mut layout = context
+        .rich_layout
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let mut builder = layout_context.ranged_builder(&mut fonts, &paragraph.text, 1.0, true);
+    let base = paragraph.base.scaled(scale);
+    apply_text_style(&mut builder, &base, family);
+    builder.push_default(StyleProperty::Brush(0_u16));
+    for (paint_index, run) in paragraph.runs.iter().enumerate() {
+        builder.push(
+            StyleProperty::WordSpacing(run.measure.word_spacing * scale),
+            run.range.clone(),
+        );
+        builder.push(
+            StyleProperty::Brush(paint_index.to_u16()),
+            run.range.clone(),
+        );
+    }
+    builder.build_into(&mut layout, &paragraph.text);
+    layout.break_all_lines(None);
+    drop(fonts);
+    drop(layout_context);
+    let shaped = std::sync::Arc::new(collect_rich_paragraph(&layout, base.font_id(), base.size()));
+    drop(layout);
+    cache.insert_rich(paragraph, scale, std::sync::Arc::clone(&shaped));
+    shaped
+}
+
+fn collect_rich_paragraph(layout: &Layout<u16>, font_id: u16, size: f32) -> ShapedRichParagraph {
+    let mut clusters = Vec::new();
+    let mut line_metrics = Vec::new();
+    let mut line_widths = Vec::new();
+    for (line_index, line) in layout.lines().enumerate() {
+        let m = line.metrics();
+        line_widths.push(m.advance);
+        line_metrics.push(ShapedLineMetrics {
+            ascent:   m.ascent,
+            descent:  m.descent,
+            baseline: m.baseline,
+            top:      m.block_min_coord,
+            bottom:   m.block_max_coord,
+        });
+        // Positioned items split a font run by paint. Iterating their underlying
+        // run would repeat every cluster once per colour; traverse font runs once.
+        let mut run_x = m.inline_min_coord + m.offset;
+        for run in line.runs() {
+            let font = run.font();
+            let face = ResolvedFontFace {
+                requested_font_id: font_id,
+                blob_id:           font.data.id(),
+                collection_index:  font.index,
+            };
+            let mut x = run_x;
+            for cluster in run.visual_clusters() {
+                let mut glyphs = Vec::new();
+                let mut glyph_x = x;
+                for glyph in cluster.glyphs() {
+                    glyphs.push(ShapedGlyph {
+                        font_face: face,
+                        id:        glyph.id.to_u16(),
+                        x:         glyph_x + glyph.x,
+                        y:         glyph.y,
+                        baseline:  m.baseline,
+                        advance:   glyph.advance,
+                    });
+                    glyph_x += glyph.advance;
+                }
+                x += cluster.advance();
+                clusters.push(RichGlyphCluster {
+                    range: cluster.text_range(),
+                    glyphs,
+                    line_index,
+                });
+            }
+            run_x += run.advance();
+        }
+    }
+    ShapedRichParagraph {
+        clusters,
+        dimensions: TextDimensions {
+            width:       layout.full_width(),
+            height:      layout.height(),
+            line_height: layout
+                .lines()
+                .next()
+                .map_or(size, |line| line.metrics().line_height),
+        },
+        line_metrics,
+        line_widths,
+    }
+}
+
+#[cfg(test)]
+mod rich_cluster_tests {
+    use super::*;
+    use crate::RichParagraph;
+    use crate::RichRun;
+    use crate::TextSizing;
+    use crate::TextWrap;
+
+    #[test]
+    fn rich_colours_share_each_font_cluster_once() -> Result<(), String> {
+        let registry = FontRegistry::new().map_err(|error| error.to_string())?;
+        let base = TextStyle::new(16.0);
+        let paragraph = RichParagraph {
+            text: "ABCD".to_owned(),
+            runs: vec![
+                RichRun {
+                    range:   0..2,
+                    measure: base.as_measure(),
+                    color:   bevy::color::Color::WHITE,
+                },
+                RichRun {
+                    range:   2..4,
+                    measure: base.as_measure(),
+                    color:   bevy::color::Color::BLACK,
+                },
+            ],
+            base,
+            sizing: TextSizing::wrap(TextWrap::None),
+        };
+        let shaped = shape_rich_paragraph_cached(
+            &paragraph,
+            1.0,
+            &registry,
+            &TextShapingContext::default(),
+            &ShapedTextCache::default(),
+        );
+        assert_eq!(
+            shaped
+                .clusters
+                .iter()
+                .map(|cluster| cluster.range.clone())
+                .collect::<Vec<_>>(),
+            [0..1, 1..2, 2..3, 3..4]
+        );
+        Ok(())
     }
 }

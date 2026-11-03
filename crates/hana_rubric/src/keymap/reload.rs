@@ -445,15 +445,9 @@ fn retain_recent_diagnostics(diagnostics: &mut Vec<Diagnostic>) {
 }
 
 fn log_diagnostics(diagnostics: &[Diagnostic]) {
+    // Keep source-level detail in tracing; the retained records drive repair UI.
     for diagnostic in diagnostics {
-        match diagnostic.severity {
-            DiagnosticSeverity::Failure => {
-                bevy::log::error!("{}", diagnostic.message);
-            },
-            DiagnosticSeverity::Advisory => {
-                bevy::log::warn!("{}", diagnostic.message);
-            },
-        }
+        crate::log_keymap_diagnostic(diagnostic);
     }
 }
 
@@ -464,6 +458,8 @@ enum CommitOutcome {
 
 #[cfg(test)]
 mod tests {
+    #[path = "log_words.rs"]
+    mod log_words;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;

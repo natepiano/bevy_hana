@@ -35,6 +35,7 @@ use fairy_dust::OrbitCamPose;
 use fairy_dust::TitleBar;
 use fairy_dust::TitleBarControl;
 use fairy_dust::TitleBarSegment;
+use fairy_dust::TitleBarStateWriters;
 use fairy_dust::screen_panel_material;
 use hana_diegetic::PanelSystems;
 use hana_lagrange::OrbitCamPreset;
@@ -190,16 +191,19 @@ fn configure_panel_anchoring_systems(
             (
                 cycle_selected_panel,
                 cycle_anchor_selection.after(cycle_selected_panel),
-                handle_capability_input,
+                handle_capability_input.in_set(TitleBarStateWriters),
                 handle_anchor_count_input,
-                toggle_animation_pause,
-                toggle_show_anchor_markers,
-                toggle_autofit,
-                advance_tile_count_flash,
-                advance_legend_highlight,
+                toggle_animation_pause.in_set(TitleBarStateWriters),
+                toggle_show_anchor_markers.in_set(TitleBarStateWriters),
+                toggle_autofit.in_set(TitleBarStateWriters),
+                advance_tile_count_flash.in_set(TitleBarStateWriters),
+                advance_legend_highlight.in_set(TitleBarStateWriters),
                 // Owns every tile pose while a mode switch eases between layouts.
-                advance_mode_morph.after(handle_capability_input),
+                advance_mode_morph
+                    .in_set(TitleBarStateWriters)
+                    .after(handle_capability_input),
                 advance_animations
+                    .in_set(TitleBarStateWriters)
                     .after(cycle_anchor_selection)
                     .after(handle_capability_input)
                     .after(toggle_animation_pause)

@@ -69,7 +69,7 @@ pub use intent::OrbitDelta;
 pub use intent::PanDelta;
 pub use intent::SmoothZoomDelta;
 pub use intent::ZoomDelta;
-pub(crate) use orbit_transform::transform_from_orbit;
+pub use orbit_transform::transform_from_orbit;
 
 use super::input::IntentChannel;
 use super::input::OrbitCamInputContext;

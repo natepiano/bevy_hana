@@ -51,7 +51,7 @@ impl AssetLoader for FontLoader {
             })
             .unwrap_or(path_str);
 
-        Font::from_bytes(&name, &bytes).ok_or(FontLoaderError::ParseFailed)
+        Font::from_bytes(&name, &bytes).map_err(|_| FontLoaderError::ParseFailed)
     }
 
     fn extensions(&self) -> &[&str] { FONT_FILE_EXTENSIONS }

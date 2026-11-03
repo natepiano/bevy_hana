@@ -98,7 +98,7 @@ mod tests {
         assert_eq!(world.get::<OrbitCamInputMode>(camera), Some(&expected_mode));
 
         let summary = input::describe_orbit_cam_controls(&expected_mode);
-        assert_eq!(summary.mode_label, "Preset");
+        assert_eq!(summary.mode_label, "Controls");
         assert_eq!(summary.mode_value, expected_preset.kind().name());
     }
 }

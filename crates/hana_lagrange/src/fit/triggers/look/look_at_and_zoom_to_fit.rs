@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use bevy::math::curve::easing::EaseFunction;
+use bevy::curve::easing::EaseFunction;
 use bevy::prelude::Assets;
 use bevy::prelude::Camera;
 use bevy::prelude::Children;
@@ -9,7 +9,6 @@ use bevy::prelude::Entity;
 use bevy::prelude::EntityEvent;
 use bevy::prelude::GlobalTransform;
 use bevy::prelude::Mesh;
-use bevy::prelude::Mesh3d;
 use bevy::prelude::On;
 use bevy::prelude::Projection;
 use bevy::prelude::Query;
@@ -19,6 +18,7 @@ use bevy::prelude::ReflectFromReflect;
 use bevy::prelude::Res;
 use bevy::prelude::Transform;
 use bevy::prelude::Vec2;
+use bevy::prelude::Vec3;
 use bevy::prelude::With;
 use bevy::prelude::warn;
 
@@ -32,12 +32,15 @@ use crate::animation::CameraEvaluationError;
 use crate::animation::CameraMove;
 use crate::animation::CameraMoveError;
 use crate::animation::FreeCamRollTarget;
+use crate::fit::FitBoundsSource;
 use crate::fit::camera_pose::FreeCamFitPose;
 use crate::fit::constants::DEFAULT_FIT_MARGIN;
 use crate::fit::constants::LOOK_AT_AND_ZOOM_TO_FIT_CONTEXT;
 use crate::fit::constants::LOOK_AT_AND_ZOOM_TO_FIT_LOOK_FRACTION;
 use crate::fit::geometry::FitAnchor;
+use crate::fit::geometry::FitMeshQuery;
 use crate::fit::geometry::FitSolution;
+use crate::fit::geometry::FitViewportInsets;
 use crate::fit::triggers::request;
 use crate::fit::triggers::request::CameraRequestPart;
 use crate::fit::triggers::request::FitRequest;
@@ -64,6 +67,15 @@ pub struct LookAtAndZoomToFit {
     pub duration: Duration,
     /// Easing curve for the animation.
     pub easing:   EaseFunction,
+    #[reflect(default)]
+    facing:       FitFacing,
+}
+
+#[derive(Clone, Copy, Default, Reflect)]
+enum FitFacing {
+    #[default]
+    FromCamera,
+    Front(Vec3),
 }
 
 impl LookAtAndZoomToFit {
@@ -76,6 +88,7 @@ impl LookAtAndZoomToFit {
             margin: DEFAULT_FIT_MARGIN,
             duration: Duration::ZERO,
             easing: EaseFunction::CubicOut,
+            facing: FitFacing::FromCamera,
         }
     }
 
@@ -97,6 +110,13 @@ impl LookAtAndZoomToFit {
     #[must_use]
     pub const fn easing(mut self, easing: EaseFunction) -> Self {
         self.easing = easing;
+        self
+    }
+
+    /// Fits the target from its front, in the supplied world-space direction.
+    #[must_use]
+    pub const fn facing(mut self, front: Vec3) -> Self {
+        self.facing = FitFacing::Front(front);
         self
     }
 }
@@ -127,6 +147,38 @@ fn look_then_fit_moves(
     Ok([look_move, fit_move])
 }
 
+fn plan_with_requested_facing(
+    plan: LookAtPlan,
+    facing: FitFacing,
+    controller: HigherCameraRequestController,
+    camera: Entity,
+    camera_bases: &Query<&CameraBasis>,
+) -> Result<LookAtPlan, AnimationRejectionReason> {
+    let FitFacing::Front(front) = facing else {
+        return Ok(plan);
+    };
+    let front = front
+        .try_normalize()
+        .ok_or(AnimationRejectionReason::PreparationFailed(
+            CameraEvaluationError::UnrepresentablePose,
+        ))?;
+    let target_position = plan.target_position;
+    let front_position = target_position + front * plan.radius.max(1.0);
+    let mut facing_plan = match controller {
+        HigherCameraRequestController::Orbit => {
+            LookAtPlan::from_world_positions(front_position, target_position)
+        },
+        HigherCameraRequestController::FreeFlight => {
+            let basis = camera_bases
+                .get(camera)
+                .map_err(|_| AnimationRejectionReason::MissingCameraBasis)?;
+            LookAtPlan::from_free_camera(front_position, target_position, *basis)
+        },
+    };
+    facing_plan.camera_position = plan.camera_position;
+    Ok(facing_plan)
+}
+
 /// Prepares one `LookAtAndZoomToFit` through exactly one selected camera controller.
 pub(crate) fn on_look_at_and_zoom_to_fit(
     event: On<LookAtAndZoomToFit>,
@@ -137,7 +189,7 @@ pub(crate) fn on_look_at_and_zoom_to_fit(
     free_cameras: Query<&FreeCam>,
     camera_bases: Query<&CameraBasis>,
     transforms: Query<&Transform>,
-    mesh_query: Query<&Mesh3d>,
+    mesh_query: FitMeshQuery,
     children_query: Query<&Children>,
     global_transforms: Query<&GlobalTransform>,
     meshes: Res<Assets<Mesh>>,
@@ -174,7 +226,7 @@ fn prepare_look_at_and_zoom_to_fit(
     free_cameras: &Query<&FreeCam>,
     camera_bases: &Query<&CameraBasis>,
     transforms: &Query<&Transform>,
-    mesh_query: &Query<&Mesh3d>,
+    mesh_query: &FitMeshQuery,
     children_query: &Query<&Children>,
     global_transforms: &Query<&GlobalTransform>,
     meshes: &Assets<Mesh>,
@@ -233,15 +285,18 @@ fn prepare_look_at_and_zoom_to_fit(
             )
         },
     };
+    let plan = plan_with_requested_facing(plan, event.facing, controller, camera, camera_bases)?;
     let fit = request::prepare_fit_for_target(
         &FitRequest {
             context: LOOK_AT_AND_ZOOM_TO_FIT_CONTEXT,
+            bounds: &FitBoundsSource::MeasureTarget,
             target,
             yaw: plan.yaw,
             pitch: plan.pitch,
             margin,
             anchor: FitAnchor::Center,
             offset_px: Vec2::ZERO,
+            viewport_insets: FitViewportInsets::NONE,
             projection,
             camera: camera_component,
         },
@@ -265,11 +320,14 @@ fn prepare_look_at_and_zoom_to_fit(
 mod tests {
     use bevy::prelude::App;
     use bevy::prelude::Cuboid;
+    use bevy::prelude::Mesh3d;
     use bevy::prelude::PerspectiveProjection;
     use bevy::prelude::ResMut;
     use bevy::prelude::Resource;
     use bevy::prelude::Time;
     use bevy::prelude::Vec3;
+    use bevy::reflect::FromReflect;
+    use bevy::reflect::structs::DynamicStruct;
     use hana_kana::Displacement;
 
     use super::*;
@@ -370,6 +428,22 @@ mod tests {
                 GlobalTransform::from(Transform::from_translation(TEST_CAMERA_POSITION)),
             ))
             .id()
+    }
+
+    #[test]
+    fn look_at_and_zoom_to_fit_reflection_defaults_missing_facing_to_camera() -> TestResult {
+        let mut reflected = DynamicStruct::default();
+        reflected.insert("camera", Entity::PLACEHOLDER);
+        reflected.insert("target", Entity::PLACEHOLDER);
+        reflected.insert("margin", TEST_MARGIN);
+        reflected.insert("duration", TEST_DURATION);
+        reflected.insert("easing", EaseFunction::CubicOut);
+
+        let Some(event) = LookAtAndZoomToFit::from_reflect(&reflected) else {
+            return Err("the original event fields should reconstruct the event");
+        };
+        assert!(matches!(event.facing, FitFacing::FromCamera));
+        Ok(())
     }
 
     #[test]

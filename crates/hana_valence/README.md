@@ -24,12 +24,12 @@ reconfigure.
   travels between and drives `AnchorPose`, so an anchored entity folds around
   one of its authored edges. Arrangement materialization creates every hinge at
   its provider's resting angle; a fold recipe replaces the folded endpoint.
-- **Fold recipes** -- `Accordion`, `Coil`, and `Wrap` are transient authors of
-  fold endpoints. `Commands::apply_fold_recipe` runs one against a selected
-  fold-group alternative and replaces every selected endpoint atomically:
-  nothing is written unless every selected member receives exactly one finite
-  assignment. Downstream crates implement `FoldRecipe` with their own error and
-  their own `ProviderCapability`.
+- **Fold recipes** -- `Accordion`, `Coil`, `Wrap`, and `StripFold` are transient
+  authors of fold endpoints. `Commands::apply_fold_recipe` runs one against a
+  selected fold-group alternative and replaces every selected endpoint
+  atomically: nothing is written unless every selected member receives exactly
+  one finite assignment. Downstream crates implement `FoldRecipe` with their
+  own error and their own `ProviderCapability`.
 - **Arrangements** -- an `Arrangement` is a non-spatial controller. A `Member`
   relationship lives on each member root and points back to that controller;
   Bevy maintains the controller's `Members` reverse collection, whose inherent
@@ -198,6 +198,26 @@ capability at all.
 
 Hex sheets and box nets stay downstream. They are ordinary implementations of
 the same public trait and need no core type.
+
+`CellSheet::try_new(cells, cell_size)` is the sparse counterpart for plain
+`QuadCell` locations. It rejects a non-positive or non-finite pitch and
+duplicate cells, plus row or column indices whose adjacent coordinate would
+overflow. Construction validates exactly one finite strip-fold pivot and one
+representable half-turn endpoint for every hinged cell. A `CellSheet` that
+exists can therefore supply a complete `StripFold`; missing, duplicate,
+foreign, and non-finite pivot assignments have distinct `CellSheetError`
+variants. Cells are canonicalized into row-major order, and one row-running
+strip is authored per edge-connected piece. Every piece has one top-left root;
+its fold-group member order is the depth-first unfold order. The same validated
+pitch feeds `CellSheet::cell_geometry()`, so anchor positions and cell spacing
+cannot diverge.
+
+`StripFold` consumes the sheet's retained `FoldStackPivotClearance` capability.
+It assigns alternating half-turns along each strip, sends sibling branches to
+opposite faces, and uses the provider's per-member pivot displacement to keep
+the carried stack clear. Apply it with
+`CellFoldGroupSelection::Strips`; use `with_custom_fold_sequence` on the same
+selection when playback timing must follow the provider's member order.
 
 ## Provider-authored fold sequences
 

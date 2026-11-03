@@ -118,7 +118,14 @@ pub(super) fn propagate_fit_sizes(
         let content_min = match axis {
             Axis::X => computed[index].min_text_width,
             // Text min height = measured height (matches Clay line 2003).
-            Axis::Y if matches!(element.content, ElementContent::Text { .. }) => current_size,
+            Axis::Y
+                if matches!(
+                    element.content,
+                    ElementContent::Text { .. } | ElementContent::RichText(_)
+                ) =>
+            {
+                current_size
+            },
             Axis::Y => 0.0,
         };
         let leaf_min = content_min.clamp(sizing.min_size(), sizing.max_size());
@@ -241,7 +248,10 @@ pub(super) fn propagate_fit_sizes_xy(
         let min_width = computed[index]
             .min_text_width
             .clamp(width_sizing.min_size(), width_sizing.max_size());
-        let min_height = if matches!(element.content, ElementContent::Text { .. }) {
+        let min_height = if matches!(
+            element.content,
+            ElementContent::Text { .. } | ElementContent::RichText(_)
+        ) {
             current_height.clamp(height_sizing.min_size(), height_sizing.max_size())
         } else {
             0.0_f32.clamp(height_sizing.min_size(), height_sizing.max_size())
@@ -628,6 +638,7 @@ const fn cross_axis_resizable(element: &Element) -> bool {
                 wrap: TextWrap::Words,
             }
         ),
+        ElementContent::RichText(_) => false,
         _ => true,
     }
 }

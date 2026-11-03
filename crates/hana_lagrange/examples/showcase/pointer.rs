@@ -1,10 +1,9 @@
-use bevy::prelude::Click;
-use bevy::prelude::Drag;
 use bevy::prelude::On;
-use bevy::prelude::Out;
-use bevy::prelude::Over;
-use bevy::prelude::Pointer;
 use bevy::prelude::PointerButton;
+use bevy::prelude::PointerClick;
+use bevy::prelude::PointerDrag;
+use bevy::prelude::PointerOut;
+use bevy::prelude::PointerOver;
 use bevy::prelude::Transform;
 
 use super::*;
@@ -14,7 +13,7 @@ use super::*;
 pub(crate) struct HoveredEntity(pub(crate) Option<Entity>);
 
 pub(crate) fn on_mesh_clicked(
-    click: On<Pointer<Click>>,
+    click: On<PointerClick>,
     mut commands: Commands,
     selected: Query<Entity, With<selection_gizmo::Selected>>,
     active_easing: Res<ActiveEasing>,
@@ -44,7 +43,7 @@ pub(crate) fn on_mesh_clicked(
 }
 
 pub(crate) fn on_ground_clicked(
-    click: On<Pointer<Click>>,
+    click: On<PointerClick>,
     mut commands: Commands,
     scene: Res<SceneEntities>,
     selected: Query<Entity, With<selection_gizmo::Selected>>,
@@ -73,7 +72,7 @@ pub(crate) fn on_ground_clicked(
 }
 
 pub(crate) fn on_below_clicked(
-    click: On<Pointer<Click>>,
+    click: On<PointerClick>,
     mut commands: Commands,
     scene: Res<SceneEntities>,
     selected: Query<Entity, With<selection_gizmo::Selected>>,
@@ -104,7 +103,7 @@ pub(crate) fn on_below_clicked(
 }
 
 pub(crate) fn on_mesh_dragged(
-    drag: On<Pointer<Drag>>,
+    drag: On<PointerDrag>,
     mut transforms: Query<&mut Transform>,
     time: Res<Time<Virtual>>,
 ) {
@@ -117,11 +116,11 @@ pub(crate) fn on_mesh_dragged(
     }
 }
 
-pub(crate) fn on_mesh_hover(hover: On<Pointer<Over>>, mut hovered: ResMut<HoveredEntity>) {
+pub(crate) fn on_mesh_hover(hover: On<PointerOver>, mut hovered: ResMut<HoveredEntity>) {
     hovered.0 = Some(hover.entity);
 }
 
-pub(crate) fn on_mesh_unhover(hover: On<Pointer<Out>>, mut hovered: ResMut<HoveredEntity>) {
+pub(crate) fn on_mesh_unhover(hover: On<PointerOut>, mut hovered: ResMut<HoveredEntity>) {
     if hovered.0 == Some(hover.entity) {
         hovered.0 = None;
     }

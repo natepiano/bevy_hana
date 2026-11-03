@@ -153,12 +153,11 @@ class RonWindowValues(TypedDict, total=False):
     pos_x: str
     pos_y: str
     # "offset"  -> pos_x/pos_y are logical pixels from the monitor's own top-left corner (v3).
-    # "desktop" -> pos_x/pos_y are an absolute logical desktop coordinate (v1/v2 templates).
+    # "desktop" -> pos_x/pos_y are an absolute logical desktop coordinate (an `Unrebased` seed).
     pos_units: str
     captured_scale: str
     width: str
     height: str
-    monitor: str
     # v6: RON text inside `target: Classified(..)`, matched against `MONITOR_{i}_DEVICE_KEY`.
     target_device_key: str
     mode: str
@@ -408,13 +407,8 @@ def parse_ron_values(content: str) -> dict[str, RonWindowValues]:
         r"position: Unrebased\(\(logical: \((-?\d+),\s*(-?\d+)\),\s*captured_scale: ([0-9.]+)\)\)"
     )
     re_unpositioned = re.compile(r"position: Unpositioned")
-    # v1/v2: an absolute logical desktop coordinate.
-    re_position = re.compile(r"logical_position: Some\(\((-?\d+),\s*(-?\d+)\)\)")
-    re_position_none = re.compile(r"logical_position: None")
-    re_captured_scale = re.compile(r"monitor_scale: ([0-9.]+)")
     re_width = re.compile(r"logical_width: (\d+)")
     re_height = re.compile(r"logical_height: (\d+)")
-    re_monitor = re.compile(r"monitor_index: (\d+)")
     re_classified = re.compile(r"target: Classified\((.+)\),?\s*$")
     re_mode = re.compile(r"mode: (Windowed|BorderlessFullscreen|Fullscreen)")
 
@@ -457,24 +451,6 @@ def parse_ron_values(content: str) -> dict[str, RonWindowValues]:
             entry["pos_units"] = "offset"
             continue
 
-        m = re_position.search(line)
-        if m:
-            entry["pos_x"] = m.group(1)
-            entry["pos_y"] = m.group(2)
-            entry["pos_units"] = "desktop"
-            continue
-
-        if re_position_none.search(line):
-            entry["pos_x"] = ""
-            entry["pos_y"] = ""
-            entry["pos_units"] = "desktop"
-            continue
-
-        m = re_captured_scale.search(line)
-        if m:
-            entry["captured_scale"] = m.group(1)
-            continue
-
         m = re_width.search(line)
         if m:
             entry["width"] = m.group(1)
@@ -483,11 +459,6 @@ def parse_ron_values(content: str) -> dict[str, RonWindowValues]:
         m = re_height.search(line)
         if m:
             entry["height"] = m.group(1)
-            continue
-
-        m = re_monitor.search(line)
-        if m:
-            entry["monitor"] = m.group(1)
             continue
 
         m = re_classified.search(line)
@@ -751,11 +722,6 @@ def _logical_to_physical_pos(logical: int, scale: float) -> int:
     return _rust_round(float(logical) * scale)
 
 
-def _physical_to_logical_pos(physical: int, scale: float) -> int:
-    """Convert physical position to logical. Matches Rust: (physical / scale).round() as i32."""
-    return _rust_round(float(physical) / scale)
-
-
 def _monitor_origin(entity: JsonDict, env_vars: dict[str, str]) -> tuple[int, int] | None:
     """Physical top-left corner of the monitor the window is currently on.
 
@@ -905,12 +871,12 @@ def _expected_monitor_index(ron_values: RonWindowValues, env_vars: dict[str, str
     """Return the monitor index a saved window is expected on.
 
     A v6 `Classified(..)` target names a display by its kernel device key, so the index is the
-    discovered monitor whose `MONITOR_{i}_DEVICE_KEY` is the same RON text. Older templates carry
-    `monitor_index` directly.
+    discovered monitor whose `MONITOR_{i}_DEVICE_KEY` is the same RON text. A record without a
+    `Classified` target names no display, so no index is expected.
     """
     device_key = ron_values.get("target_device_key", "")
     if not device_key:
-        return ron_values.get("monitor", "")
+        return ""
     i = 0
     while f"MONITOR_{i}_SCALE" in env_vars:
         if _normalize_device_key(env_vars.get(f"MONITOR_{i}_DEVICE_KEY", "")) == device_key:
@@ -930,8 +896,8 @@ def _check_position(
     """Compare the window's live position against the saved one, in the saved value's own units.
 
     A v3 offset is compared as an offset — the live physical position is converted back to a
-    monitor-relative logical offset and matched against the number in the file. A v1/v2 absolute
-    coordinate is compared the legacy way, because that is what those templates still mean.
+    monitor-relative logical offset and matched against the number in the file. An `Unrebased`
+    absolute coordinate is compared the legacy way, because that is what such a seed still means.
     """
     actual_x, actual_y = extract_position_at(entity, COMP_WINDOW)
     saved_x = ron_values.get("pos_x", "")
@@ -957,7 +923,7 @@ def _check_position(
     if ron_values.get("pos_units", "desktop") == "offset":
         expected_offset_x, expected_offset_y = int(saved_x), int(saved_y)
     else:
-        # A v1/v2 seed holds an absolute desktop coordinate. Convert it to an offset the same way
+        # An `Unrebased` seed holds an absolute desktop coordinate. Convert it to an offset the same way
         # the app's migration does — subtract the monitor's logical origin *at the scale that
         # wrote the file*, not at the live scale. Comparing the absolute coordinate directly would
         # reintroduce the very dependence on the desktop layout that v3 removes, and would be off

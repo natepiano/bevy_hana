@@ -5,6 +5,7 @@ use bevy::camera::visibility::RenderLayers;
 use bevy::light::CascadeShadowConfig;
 use bevy::light::CascadeShadowConfigBuilder;
 use bevy::light::DirectionalLightShadowMap;
+use bevy::light::NotShadowCaster;
 use bevy::prelude::App;
 use bevy::prelude::ClearColor;
 use bevy::prelude::Commands;
@@ -24,6 +25,7 @@ use bevy::prelude::Transform;
 use bevy::prelude::Update;
 use bevy::prelude::Vec3;
 use bevy::prelude::With;
+use bevy::prelude::Without;
 use bevy::prelude::default;
 
 use crate::constants::AABB_CORNER_SIGNS;
@@ -129,7 +131,6 @@ fn spawn_studio_lights(mut commands: Commands, config: Res<StudioLightingConfig>
         },
         Transform::from_translation(FILL_LIGHT_POS).looking_at(config.aim_at, Vec3::Y),
     ));
-
     commands.spawn((
         FairyDustStudioLight,
         PointLight {
@@ -148,39 +149,37 @@ fn spawn_studio_lights(mut commands: Commands, config: Res<StudioLightingConfig>
 /// The fit is the larger of two terms:
 ///
 /// - **Geometry** — the bounding-sphere radius of only the meshes the key light actually shadows
-///   (those sharing its [`RenderLayers`], so screen-space UI panels on other layers are excluded)
-///   times [`CASCADE_FIT_RADIUS_MULTIPLE`]. This covers a perspective camera, which frames the
-///   scene proportionally.
-/// - **Camera** — the [`FairyDustOrbitCam`], when orthographic, parks at a fixed `(near + far) / 2`
-///   distance (see `hana_lagrange`'s `update_orbit_transform`) that a small scene's geometry term
-///   can't reach, so the far cascade must extend to it. Perspective projections leave this term at
-///   zero.
+///   (casters sharing its [`RenderLayers`], so the floor and screen-space UI are excluded) times
+///   [`CASCADE_FIT_RADIUS_MULTIPLE`]. This covers a perspective camera, which frames the scene
+///   proportionally.
+/// - **Camera** — the distance from the camera to the casters' center, plus their radius. This
+///   covers both an orthographic camera parked beyond a small scene and a perspective camera zoomed
+///   far away.
 ///
-/// Taking the larger of the two only ever holds or raises the cascade, so a
-/// scene already covered by its geometry term (e.g. a large ground plane) is
-/// left untouched — shadows can never shrink away. Keeping `maximum_distance` to
-/// what is needed packs the shadow map over less area, so shadows stay sharp.
+/// Taking the larger of the two covers both projection types. Keeping
+/// `maximum_distance` to what is needed packs the shadow map over less area,
+/// so shadows stay sharp.
 /// [`Aabb`]s are computed in `PostUpdate`, so this can't run at startup.
 fn fit_cascade_to_scene(
     mut light: Query<(&mut CascadeShadowConfig, Option<&RenderLayers>), With<FairyDustAutoCascade>>,
-    camera: Query<&Projection, With<FairyDustOrbitCam>>,
-    meshes: Query<(&Aabb, &GlobalTransform, Option<&RenderLayers>), With<Mesh3d>>,
+    camera: Query<(&Projection, &GlobalTransform), With<FairyDustOrbitCam>>,
+    meshes: Query<
+        (&Aabb, &GlobalTransform, Option<&RenderLayers>),
+        (With<Mesh3d>, Without<NotShadowCaster>),
+    >,
 ) {
     let Ok((mut cascade, light_layers)) = light.single_mut() else {
         return;
     };
     let light_layers = light_layers.cloned().unwrap_or_default();
-    let Some(radius) = scene_bounding_radius(&meshes, &light_layers) else {
+    let Some((center, radius)) = scene_bounding_sphere(&meshes, &light_layers) else {
         return;
     };
 
     let geometry_distance = radius * CASCADE_FIT_RADIUS_MULTIPLE;
-    let camera_distance = match camera.single() {
-        Ok(Projection::Orthographic(ortho)) => {
-            (f32::midpoint(ortho.near, ortho.far) + radius) * CASCADE_CAMERA_HEADROOM
-        },
-        _ => 0.0,
-    };
+    let camera_distance = camera.single().map_or(0.0, |(_, transform)| {
+        (transform.translation().distance(center) + radius) * CASCADE_CAMERA_HEADROOM
+    });
     let maximum_distance =
         adjusted_cascade_maximum_distance(geometry_distance.max(camera_distance));
 
@@ -220,13 +219,16 @@ const fn first_cascade_far_bound(maximum_distance: f32) -> f32 {
 }
 
 /// World-space bounding-sphere radius of the meshes whose [`RenderLayers`]
-/// intersect `light_layers`, or `None` when none has an [`Aabb`] yet. Each
+/// intersect `light_layers` and cast shadows, or `None` when none has an [`Aabb`] yet. Each
 /// mesh's local [`Aabb`] is walked into world space through its
 /// [`GlobalTransform`]; the radius is the half-diagonal of the union box.
-fn scene_bounding_radius(
-    meshes: &Query<(&Aabb, &GlobalTransform, Option<&RenderLayers>), With<Mesh3d>>,
+fn scene_bounding_sphere(
+    meshes: &Query<
+        (&Aabb, &GlobalTransform, Option<&RenderLayers>),
+        (With<Mesh3d>, Without<NotShadowCaster>),
+    >,
     light_layers: &RenderLayers,
-) -> Option<f32> {
+) -> Option<(Vec3, f32)> {
     let mut min = Vec3::splat(f32::INFINITY);
     let mut max = Vec3::splat(f32::NEG_INFINITY);
     let mut found = false;
@@ -247,12 +249,70 @@ fn scene_bounding_radius(
     if !found {
         return None;
     }
-    Some(((max - min) * 0.5).length())
+    Some(((min + max) * 0.5, ((max - min) * 0.5).length()))
 }
 
 #[cfg(test)]
 mod tests {
+    use bevy::prelude::MinimalPlugins;
+    use bevy::prelude::OrthographicProjection;
+    use bevy::prelude::PerspectiveProjection;
+
     use super::*;
+
+    #[test]
+    fn distant_camera_keeps_casters_inside_last_cascade_in_both_projections()
+    -> Result<(), &'static str> {
+        for projection in [
+            Projection::Perspective(PerspectiveProjection::default()),
+            Projection::Orthographic(OrthographicProjection::default_3d()),
+        ] {
+            let mut app = crate::test_app();
+            app.add_plugins(MinimalPlugins)
+                .add_systems(Update, fit_cascade_to_scene);
+            let light = app
+                .world_mut()
+                .spawn((
+                    FairyDustAutoCascade,
+                    CascadeShadowConfigBuilder {
+                        num_cascades: CASCADE_COUNT,
+                        minimum_distance: CASCADE_MIN_DISTANCE,
+                        maximum_distance: CASCADE_MAX_DISTANCE,
+                        first_cascade_far_bound: CASCADE_FIRST_FAR_BOUND,
+                        ..default()
+                    }
+                    .build(),
+                ))
+                .id();
+            app.world_mut().spawn((
+                FairyDustOrbitCam,
+                projection,
+                GlobalTransform::from(Transform::from_xyz(0.0, 0.0, 20.0)),
+            ));
+            app.world_mut().spawn((
+                Mesh3d::default(),
+                Aabb::from_min_max(Vec3::splat(-0.5), Vec3::splat(0.5)),
+                GlobalTransform::IDENTITY,
+            ));
+            app.world_mut().spawn((
+                Mesh3d::default(),
+                NotShadowCaster,
+                Aabb::from_min_max(Vec3::splat(-50.0), Vec3::splat(50.0)),
+                GlobalTransform::IDENTITY,
+            ));
+
+            app.update();
+
+            let cascade = app
+                .world()
+                .get::<CascadeShadowConfig>(light)
+                .ok_or("key light has no cascade")?;
+            let last_bound = cascade.bounds.last().copied().unwrap_or_default();
+            assert!(last_bound > 20.5);
+            assert!(last_bound < 40.0, "non-casting floor entered cascade fit");
+        }
+        Ok(())
+    }
 
     #[test]
     fn tiny_scene_fit_keeps_first_cascade_bound_above_minimum() {

@@ -245,7 +245,6 @@ mod tests {
 
     use bevy::input::ButtonInput;
     use bevy::input::keyboard::KeyCode;
-    use bevy::prelude::App;
     use bevy::prelude::States;
     use hana_rubric::CommandId;
     use hana_rubric::CommandKeystroke;
@@ -293,7 +292,7 @@ mod tests {
 
     #[test]
     fn an_unconfigured_app_installs_the_shipped_defaults() {
-        let mut app = App::new();
+        let mut app = crate::test_app();
 
         install(&mut app);
 
@@ -311,7 +310,7 @@ mod tests {
 
     #[test]
     fn repeating_the_same_choice_is_accepted() {
-        let mut app = App::new();
+        let mut app = crate::test_app();
 
         configure(&mut app, CommandPaletteKeymap::new(OTHER_KEYMAP));
         configure(&mut app, CommandPaletteKeymap::new(OTHER_KEYMAP));
@@ -327,7 +326,7 @@ mod tests {
         let additional_protected_keystroke = "ctrl-shift-p"
             .parse()
             .map_err(|error| format!("additional protected keystroke parses: {error}"))?;
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.add_plugins(
             KeymapPlugin::new()
                 .with_defaults(FAIRY_DUST_DEFAULT_KEYMAP)
@@ -357,7 +356,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "already installed with different defaults")]
     fn a_state_dimension_plugin_missing_the_reserved_chord_is_refused() {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.add_plugins(
             KeymapPlugin::new()
                 .with_defaults(FAIRY_DUST_DEFAULT_KEYMAP)
@@ -370,7 +369,7 @@ mod tests {
 
     #[test]
     fn a_second_fairy_dust_install_leaves_its_first_plugin_in_place() {
-        let mut app = App::new();
+        let mut app = crate::test_app();
 
         install(&mut app);
         install(&mut app);
@@ -380,7 +379,7 @@ mod tests {
 
     #[test]
     fn every_palette_keymap_rejects_an_authored_recovery_binding() {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         configure(
             &mut app,
             CommandPaletteKeymap::new(
@@ -461,7 +460,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "already installed with different defaults")]
     fn a_preinstalled_mismatched_keymap_plugin_is_rejected_before_runtime() {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.add_plugins(KeymapPlugin::new().with_defaults(FAIRY_DUST_DEFAULT_KEYMAP));
 
         install(&mut app);
@@ -472,7 +471,7 @@ mod tests {
     /// dead hotkey in every example.
     #[test]
     fn the_baseline_install_binds_every_fairy_dust_command() {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         install(&mut app);
         app.finish();
 
@@ -492,7 +491,7 @@ mod tests {
     /// carrying an unauthored title — is one a user cannot find by name.
     #[test]
     fn every_fairy_dust_command_is_listed_with_an_authored_title() {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         install(&mut app);
         app.finish();
 

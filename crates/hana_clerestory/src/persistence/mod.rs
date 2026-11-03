@@ -6,11 +6,15 @@ mod format;
 mod load;
 mod save;
 mod window_state;
+mod windowed_placement;
 
 use std::collections::HashMap;
 use std::collections::HashSet;
 
 use bevy::prelude::App;
+use bevy::prelude::First;
+#[cfg(test)]
+use bevy::prelude::Has;
 use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::Plugin;
 use bevy::prelude::PreStartup;
@@ -20,7 +24,13 @@ use bevy::prelude::Res;
 use bevy::prelude::ResMut;
 use bevy::prelude::Resource;
 use bevy::prelude::Update;
+#[cfg(test)]
+use bevy::prelude::Window;
+#[cfg(test)]
+use bevy::prelude::With;
 use bevy::prelude::warn;
+#[cfg(test)]
+use bevy::window::PrimaryWindow;
 pub use established_window_placement::EstablishedWindowPlacement;
 pub(crate) use established_window_placement::EstablishedWindowPosition;
 pub use established_window_placement::InvalidWindowDisplay;
@@ -56,6 +66,10 @@ pub use window_state::SavedFullscreenVideoMode;
 pub use window_state::SavedVideoMode;
 pub use window_state::SavedWindowMode;
 pub(crate) use window_state::UnrebasedDesktopPosition;
+#[cfg(test)]
+use windowed_placement::WindowedPlacement;
+#[cfg(test)]
+use windowed_placement::WindowedPlacementRestore;
 
 use crate::ClerestoryPreStartupSet;
 use crate::ClerestoryUpdateSet;
@@ -79,8 +93,13 @@ impl Plugin for PersistencePlugin {
                     .in_set(ClerestoryPreStartupSet::PersistenceLoaded),
             )
             .add_systems(
+                First,
+                windowed_placement::advance_windowed_placement_restore,
+            )
+            .add_systems(
                 Update,
                 (
+                    windowed_placement::remember_windowed_placement,
                     resolve_pending_legacy_targets.after(RiggingSystems::Reconcile),
                     save::write_established_window_configurations,
                 )
@@ -284,6 +303,15 @@ pub(crate) fn write_established_window_configurations_for_test(
     bindings: Res<Bindings>,
     inventory: Res<HardwareInventory>,
     role_statuses: Query<(&RoleKey, &RoleStatus)>,
+    primary_windows: Query<(), With<PrimaryWindow>>,
+    windowed_placements: Query<
+        (
+            &Window,
+            Option<&WindowedPlacement>,
+            Has<WindowedPlacementRestore>,
+        ),
+        With<PrimaryWindow>,
+    >,
     managed_windows: Res<ManagedWindowRegistry>,
     retention: Res<crate::ManagedWindowPersistence>,
     persisted: ResMut<PersistedWindowPlacements>,
@@ -293,6 +321,8 @@ pub(crate) fn write_established_window_configurations_for_test(
         bindings,
         inventory,
         role_statuses,
+        primary_windows,
+        windowed_placements,
         managed_windows,
         retention,
         persisted,

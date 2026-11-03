@@ -280,8 +280,8 @@ fn resolve_tracks(segments: Vec<FoldSegment>) -> Vec<FoldMemberTrack> {
 mod tests {
     use std::time::Duration;
 
+    use bevy_curve::EaseFunction;
     use bevy_ecs::world::World;
-    use bevy_math::curve::EaseFunction;
     use hana_kana::SequenceStageId;
 
     use super::*;
@@ -370,8 +370,8 @@ mod tests {
         let sequence = FoldSequenceBuilder::new(timing(SECOND)).build();
         let unauthored = members(1)[0];
 
-        assert!(sequence.stages().is_empty());
-        assert!(sequence.tracks().is_empty());
+        assert_eq!(sequence.stages(), []);
+        assert_eq!(sequence.tracks(), []);
         assert!(sequence.sequence_stages().is_empty());
         assert_eq!(sequence.total(), SequenceTime::ZERO);
         assert_eq!(sequence.ledger().records().len(), 2);

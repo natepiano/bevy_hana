@@ -100,7 +100,10 @@ pub(super) enum ImeEditCommand {
     DeleteBackward(ImeMovementUnit),
     DeleteForward(ImeMovementUnit),
     PlaceCursor(usize),
-    SelectWordAt(usize),
+    SelectRange {
+        anchor: usize,
+        focus:  usize,
+    },
     Move {
         direction: ImeMovementDirection,
         unit:      ImeMovementUnit,
@@ -163,7 +166,18 @@ impl ImeEditBuffer {
             ImeEditCommand::DeleteBackward(unit) => self.delete_backward(unit),
             ImeEditCommand::DeleteForward(unit) => self.delete_forward(unit),
             ImeEditCommand::PlaceCursor(index) => self.place_cursor(index),
-            ImeEditCommand::SelectWordAt(index) => self.select_word_at(index),
+            ImeEditCommand::SelectRange { anchor, focus } => {
+                if !self.text.is_char_boundary(anchor) || !self.text.is_char_boundary(focus) {
+                    return ImeBufferEdit::Unchanged;
+                }
+                let next = ImeSelection { anchor, focus };
+                if self.selection == next {
+                    ImeBufferEdit::Unchanged
+                } else {
+                    self.selection = next;
+                    ImeBufferEdit::Changed
+                }
+            },
             ImeEditCommand::Move {
                 direction,
                 unit,
@@ -266,33 +280,6 @@ impl ImeEditBuffer {
             return ImeBufferEdit::Unchanged;
         }
         let next = ImeSelection::insertion(index);
-        if self.selection == next {
-            ImeBufferEdit::Unchanged
-        } else {
-            self.selection = next;
-            ImeBufferEdit::Changed
-        }
-    }
-
-    fn select_word_at(&mut self, index: usize) -> ImeBufferEdit {
-        if !self.text.is_char_boundary(index) || index == self.text.len() {
-            return self.place_cursor(index);
-        }
-        let end = self.next_boundary(index);
-        let Some(character) = self.char_at(index) else {
-            return self.place_cursor(index);
-        };
-        let next = if is_word_character(character) {
-            ImeSelection {
-                anchor: self.previous_word_boundary(end),
-                focus:  self.next_word_boundary(index),
-            }
-        } else {
-            ImeSelection {
-                anchor: index,
-                focus:  end,
-            }
-        };
         if self.selection == next {
             ImeBufferEdit::Unchanged
         } else {
@@ -470,10 +457,13 @@ mod tests {
     }
 
     #[test]
-    fn pointer_word_selection_uses_the_character_under_the_click() {
+    fn pointer_range_selection_preserves_utf8_boundaries() {
         let mut buffer = ImeEditBuffer::new("alpha béta");
 
-        buffer.apply(ImeEditCommand::SelectWordAt("alpha b".len()));
+        buffer.apply(ImeEditCommand::SelectRange {
+            anchor: "alpha ".len(),
+            focus:  "alpha béta".len(),
+        });
 
         assert_eq!(
             buffer.snapshot(None).cursor,

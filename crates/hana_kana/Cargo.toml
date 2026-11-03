@@ -24,6 +24,7 @@ tween   = ["dep:bevy_tween"]
 bevy              = { workspace = true, features = ["bevy_asset", "bevy_log"] }
 bevy_lookup_curve = { workspace = true }
 bevy_tween        = { workspace = true, optional = true }
+serde             = { workspace = true }
 thiserror         = { workspace = true }
 
 [dev-dependencies]

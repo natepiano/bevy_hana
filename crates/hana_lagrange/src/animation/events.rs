@@ -7,19 +7,24 @@ use std::collections::VecDeque;
 
 use bevy::prelude::Entity;
 use bevy::prelude::EntityEvent;
+use bevy::prelude::Event;
 use bevy::prelude::Reflect;
 use bevy::prelude::ReflectEvent;
 use bevy::prelude::ReflectFromReflect;
+use bevy::reflect::ReflectSerialize;
 use hana_kana::SequenceDirection;
 use hana_kana::SequenceOwner;
 use hana_kana::SequencePosition;
 use hana_kana::SequenceStageId;
 use hana_kana::SequenceTime;
+use serde::Serialize;
+use serde::ser::SerializeStruct;
 
 use super::lifecycle::AnimationConflictPolicy;
 use super::queue::CameraMove;
 use super::queue::CameraMoveError;
 use super::sequence::CameraEvaluationError;
+use crate::fit::FitBoundsSource;
 use crate::fit::ZoomContext;
 
 /// Which request started an animation.
@@ -46,10 +51,22 @@ pub enum AnimationSource {
 /// authored duration. There is no elapsed-time field, because an interior
 /// normalized position does not name one exact authored nanosecond.
 #[derive(Clone, Copy, Debug, PartialEq, Reflect)]
-#[reflect(opaque)]
+#[reflect(opaque, Serialize)]
 pub struct CameraEventTiming {
     position: SequencePosition,
     total:    SequenceTime,
+}
+
+impl Serialize for CameraEventTiming {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut timing = serializer.serialize_struct("CameraEventTiming", 2)?;
+        timing.serialize_field("normalized_position", &self.position.normalized())?;
+        timing.serialize_field("total", &self.total)?;
+        timing.end()
+    }
 }
 
 impl CameraEventTiming {
@@ -128,6 +145,14 @@ impl PlayAnimation {
         self.source = AnimationSource::ZoomToFit;
         self
     }
+}
+
+/// A prepared fit's geometry travels with its animation through private admission.
+/// Public animation and zoom payloads retain their literal-compatible fields.
+#[derive(Event)]
+pub(crate) struct FitAnimationRequest {
+    pub(crate) animation: PlayAnimation,
+    pub(crate) bounds:    FitBoundsSource,
 }
 
 /// Emitted when a retained camera journey becomes effective.

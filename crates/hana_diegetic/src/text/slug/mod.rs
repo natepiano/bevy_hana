@@ -13,6 +13,8 @@ mod support;
 
 use bevy::prelude::App;
 use bevy::prelude::Plugin;
+pub(in crate::text) use glyph::font_glyph_id_has_visible_outline;
+pub(in crate::text) use glyph::load_glyph_by_id_from_face;
 pub(crate) use render::GlyphQuadExtents;
 pub(crate) use render::glyph_quad_extents;
 pub(crate) use runtime::GlyphCache;
@@ -26,8 +28,8 @@ use crate::render::PathExtendedMaterial;
 pub(super) struct SlugPlugin;
 
 #[cfg(test)]
-pub(super) const fn text_material_oit_depth_offset(material: &PathExtendedMaterial) -> f32 {
-    render::text_material_oit_depth_offset(material)
+pub(super) const fn text_material_oit_paint_order(material: &PathExtendedMaterial) -> f32 {
+    render::text_material_oit_paint_order(material)
 }
 
 impl Plugin for SlugPlugin {

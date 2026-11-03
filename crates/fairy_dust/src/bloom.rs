@@ -23,7 +23,7 @@ use crate::orbit_cam::FairyDustOrbitCam;
 
 pub(crate) fn install(app: &mut App) { app.add_observer(insert_bloom); }
 
-fn insert_bloom(trigger: On<Add, FairyDustOrbitCam>, mut commands: Commands) {
+fn insert_bloom(trigger: On<Add<FairyDustOrbitCam>>, mut commands: Commands) {
     commands.entity(trigger.entity).insert(Bloom {
         intensity: BLOOM_INTENSITY,
         prefilter: BloomPrefilter {

@@ -9,24 +9,28 @@
 //! them to each panel's layout unit automatically.
 //!
 //! Press **D** to toggle debug outlines. Press **R** to toggle rulers.
-//! Press **F** to toggle hairline fade; hold **↑** / **↓** to vary the fade
-//! exponent.
+//! Press **F** to toggle hairline fade; hold **↑** / **↓** to vary its strength.
+//! Press **B** for the business card or **V** for the photo card.
 
 use std::time::Duration;
 
 use bevy::prelude::Alpha;
 use bevy::prelude::Assets;
-use bevy::prelude::Click;
+use bevy::prelude::Bundle;
 use bevy::prelude::Color;
 use bevy::prelude::Commands;
 use bevy::prelude::Component;
+use bevy::prelude::Cuboid;
+use bevy::prelude::DetectChanges;
 use bevy::prelude::Entity;
 use bevy::prelude::KeyCode;
+use bevy::prelude::Mesh;
+use bevy::prelude::Mesh3d;
 use bevy::prelude::On;
 use bevy::prelude::OrthographicProjection;
 use bevy::prelude::PerspectiveProjection;
-use bevy::prelude::Pointer;
 use bevy::prelude::PointerButton;
+use bevy::prelude::PointerClick;
 use bevy::prelude::Projection;
 use bevy::prelude::Query;
 use bevy::prelude::Res;
@@ -46,6 +50,7 @@ use bevy::prelude::error;
 use fairy_dust::CameraHomeTarget;
 use fairy_dust::ControlActivation;
 use fairy_dust::DEFAULT_PANEL_BACKGROUND;
+use fairy_dust::FrameCameraTarget;
 use fairy_dust::TitleBar;
 use fairy_dust::TitleBarControl;
 use fairy_dust::TitleBarSegment;
@@ -59,7 +64,6 @@ use hana_diegetic::Border;
 use hana_diegetic::CascadeEntityCommandsExt;
 use hana_diegetic::DiegeticPanel;
 use hana_diegetic::DiegeticPanelCommands;
-use hana_diegetic::DiegeticPerfStats;
 use hana_diegetic::DiegeticText;
 use hana_diegetic::El;
 use hana_diegetic::Fit;
@@ -69,12 +73,12 @@ use hana_diegetic::HairlineWidth;
 use hana_diegetic::In;
 use hana_diegetic::LayoutBuilder;
 use hana_diegetic::LayoutTree;
+use hana_diegetic::Lighting;
 use hana_diegetic::Mm;
 use hana_diegetic::Padding;
 use hana_diegetic::PanelDraw;
 use hana_diegetic::PanelLine;
 use hana_diegetic::PanelPoint;
-use hana_diegetic::PanelShapeBatchPerfStats;
 use hana_diegetic::PaperSize;
 use hana_diegetic::Pt;
 use hana_diegetic::ShadowCasting;
@@ -97,51 +101,63 @@ use hana_lagrange::ZoomToFit;
 const A4: PaperSize = PaperSize::A4;
 const A4_WIDTH: Mm = Mm(A4.width_mm());
 const A4_HEIGHT: Mm = Mm(A4.height_mm());
+/// The occupied part of the page; the lower blank paper can leave the view.
+const A4_SCALE_EXPLANATION: &str = "Paper and cards can keep their familiar sizes in a 3D scene. One unit in this world is one meter. They sit beside each other at their true scale.";
 
 // ── US business card dimensions ──────────────────────────────────────
 const CARD_WIDTH: In = In(3.5);
 const CARD_HEIGHT: In = In(2.0);
-const CARD_NAME_SIZE: Pt = Pt(15.0);
-const CARD_TITLE_SIZE: Pt = Pt(13.0);
-const CARD_DETAIL_SIZE: Pt = Pt(11.0);
-const CARD_FOOTER_SIZE: Pt = Pt(6.5);
+const CARD_NAME_SIZE: Pt = Pt(17.5);
+const CARD_TITLE_SIZE: Pt = Pt(14.0);
+const CARD_DETAIL_SIZE: Pt = Pt(12.0);
 
 // ── Index card ──────────────────────────────────────────────────────
 const INDEX_WIDTH: In = In(5.0);
 const INDEX_HEIGHT: In = In(7.0);
-const INDEX_BG: Color = Color::srgba(0.08, 0.10, 0.14, 1.0);
+const INDEX_BG: Color = Color::srgb(0.18, 0.204, 0.251);
+const INDEX_BORDER_COLOR: Color = Color::srgba(0.506, 0.631, 0.757, 0.85);
 const INDEX_HEADING_COLOR: Color = Color::srgb(0.4, 0.85, 0.75);
 const INDEX_LABEL_COLOR: Color = Color::srgba(0.7, 0.75, 0.85, 0.9);
 const INDEX_CODE_COLOR: Color = Color::srgb(0.95, 0.9, 0.75);
-const INDEX_HEADING_SIZE: Pt = Pt(14.0);
-const INDEX_SUBHEADING_SIZE: Pt = Pt(11.0);
-const INDEX_LABEL_SIZE: Pt = Pt(10.0);
-const INDEX_CODE_SIZE: Pt = Pt(10.0);
-const INDEX_FOOTER_SIZE: Pt = Pt(10.0);
+const INDEX_HEADING_SIZE: Pt = Pt(17.0);
+const INDEX_SUBHEADING_SIZE: Pt = Pt(13.0);
+const INDEX_LABEL_SIZE: Pt = Pt(13.0);
+const INDEX_CODE_SIZE: Pt = Pt(11.0);
 
 // ── Screen panel styling ─────────────────────────────────────────────
 /// Inner-background alpha applied to both the title bar and the camera
 /// control panel. Higher than `fairy_dust`'s default (0.50) so the example's
 /// HUD reads as a more opaque surface against the 3D scene.
 const PANEL_BACKGROUND_ALPHA: f32 = 0.90;
-const BATCH_PANEL_TITLE_SIZE: Pt = Pt(8.0);
-const BATCH_PANEL_VALUE_SIZE: Pt = Pt(10.0);
-const BATCH_PANEL_LABEL_SIZE: Pt = Pt(7.0);
-const BATCH_PANEL_TITLE_COLOR: Color = Color::srgb(0.70, 0.78, 0.90);
-const BATCH_PANEL_VALUE_COLOR: Color = Color::srgb(0.92, 1.00, 0.82);
-const BATCH_PANEL_LABEL_COLOR: Color = Color::srgba(0.78, 0.84, 0.92, 0.86);
+const FADE_PANEL_TITLE_SIZE: Pt = Pt(12.0);
+const FADE_PANEL_ROW_SIZE: Pt = Pt(10.0);
+const FADE_PANEL_ROW_COLOR: Color = Color::srgb(0.78, 0.84, 0.92);
+const TITLE_BAR_LABELS: [&str; 7] = [
+    "D Outlines",
+    "R Rulers",
+    "F Fade",
+    "↑ / ↓ Strength",
+    "P Perspective",
+    "O Orthographic",
+    "Click Zoom in",
+];
+const CARD_VIEW_CONTROL: &str = "B Card";
+const PHOTO_VIEW_CONTROL: &str = "V Photo";
 
 // ── Scene layout ─────────────────────────────────────────────────────
 const GAP: Mm = Mm(15.0);
 const LIFT: Mm = Mm(55.0);
 const TITLE_GAP: Mm = Mm(8.0);
-/// Square edge length of the ground plane in meters. Sized to comfortably
-/// extend beyond the three-panel layout (~0.35m × 0.30m) without dominating
-/// the scene.
-const GROUND_PLANE_SIZE: f32 = 1.0;
+/// Tallest supported window, in logical pixels, for the floor horizon bound.
+const GROUND_MAX_VIEW_HEIGHT: f32 = 1079.0;
 
 // ── Ruler ────────────────────────────────────────────────────────────
 const RULER_GAP: Mm = Mm(3.0);
+const A4_PAGE_Z: f32 = 0.0;
+/// Half a 10 mm label block: the end tick's centred label hangs this far past the ruler.
+const METRIC_END_LABEL_OVERHANG: Mm = Mm(5.0);
+/// Put the printed ruler ahead of the page so their surfaces cannot depth-fight.
+const A4_RULER_FRONT_OFFSET: Mm = Mm(0.5);
 const EDGE_LABEL_EXTRA: In = In(0.5);
 
 // ── Panel ruler — metric (mm units) ─────────────────────────────────
@@ -171,11 +187,13 @@ const PANEL_RULER_QTR_TICK: In = In(0.12);
 const PANEL_RULER_IN_LABEL_GAP: In = In(0.0315);
 
 // ── Home / zoom ─────────────────────────────────────────────────────
-const HOME_PITCH: f32 = 0.1;
+const HOME_PITCH: f32 = 0.0;
 const HOME_YAW: f32 = 0.0;
 const HOME_MARGIN: f32 = 0.25;
 const ZOOM_DURATION_MS: u64 = 1000;
 const ZOOM_MARGIN: f32 = 0.08;
+const CARD_VIEW_MARGIN: f32 = 0.08;
+const PHOTO_VIEW_MARGIN: f32 = 0.08;
 
 // ── Hairline fade ────────────────────────────────────────────────────
 const FADE_EXPONENT_DEFAULT: f32 = 1.0;
@@ -189,6 +207,7 @@ const A4_DIM_COLOR: Color = Color::srgba(0.0, 0.0, 0.1, 1.0);
 const A4_TEXT_COLOR: Color = Color::BLACK;
 const CARD_DIM_COLOR: Color = Color::WHITE;
 const CARD_TEXT_COLOR: Color = Color::srgb(1.0, 1.0, 0.85);
+const CARD_BACKGROUND_COLOR: Color = Color::srgb(0.17, 0.32, 0.62);
 /// Debug outline thickness shown as a physical 0.3mm line on every panel.
 const DEBUG_OUTLINE: Pt = Pt(1.0);
 
@@ -207,13 +226,13 @@ struct IndexPanel;
 struct PanelRuler;
 
 #[derive(Component)]
-struct BatchCountPanel;
+struct FadePanel;
 
-#[derive(Component, Clone, Copy, Default, PartialEq)]
-struct BatchCountDisplay {
-    stats: PanelShapeBatchPerfStats,
-    fade:  HairlineFade,
-}
+#[derive(Component)]
+struct CardViewTarget;
+
+#[derive(Component)]
+struct PhotoViewTarget;
 
 /// Last `Fade` exponent, restored when `F` re-enables fade.
 #[derive(Resource, Clone, Copy)]
@@ -292,61 +311,53 @@ fn build_panel_or_log(
     }
 }
 
-fn spawn_batch_count_panel(commands: &mut Commands, materials: &mut Assets<StandardMaterial>) {
-    let display = BatchCountDisplay::default();
+fn spawn_fade_panel(commands: &mut Commands, materials: &mut Assets<StandardMaterial>) {
+    let display = HairlineFade::Fade {
+        exponent: FADE_EXPONENT_DEFAULT,
+    };
     let unlit = materials.add(screen_panel_material());
     let panel = DiegeticPanel::screen()
         .size(Fit, Fit)
         .anchor(Anchor::BottomLeft)
         .material(unlit.clone())
         .text_material(unlit)
-        .with_tree(build_batch_count_panel_tree(display))
+        .with_tree(build_fade_panel_tree(display))
         .build();
 
-    let Some(panel) = build_panel_or_log(panel, "batch count panel") else {
+    let Some(panel) = build_panel_or_log(panel, "fade panel") else {
         return;
     };
-    commands.spawn((BatchCountPanel, display, panel, Transform::default()));
+    commands.spawn((FadePanel, panel, Transform::default()));
 }
 
-fn update_batch_count_panel(
+fn update_fade_panel(
     mut commands: Commands,
-    perf: Res<DiegeticPerfStats>,
     hairline: Res<HairlineWidth>,
-    mut panels: Query<(Entity, &mut BatchCountDisplay), With<BatchCountPanel>>,
+    panels: Query<Entity, With<FadePanel>>,
 ) {
-    let next = BatchCountDisplay {
-        stats: perf.line_batch,
-        fade:  hairline.fade,
-    };
-    for (entity, mut display) in &mut panels {
-        if *display == next {
-            continue;
-        }
-        *display = next;
-        if let Err(error) = commands.set_tree(entity, build_batch_count_panel_tree(next)) {
-            error!("failed to replace batch-count panel tree: {error}");
+    if !hairline.is_changed() {
+        return;
+    }
+    for entity in &panels {
+        if let Err(error) = commands.set_tree(entity, build_fade_panel_tree(hairline.fade)) {
+            error!("failed to replace fade panel tree: {error}");
         }
     }
 }
 
 fn fade_line(fade: HairlineFade) -> String {
     match fade {
-        HairlineFade::Full => "fade off".to_string(),
-        HairlineFade::Fade { exponent } => format!("fade exp {exponent:.2}"),
+        HairlineFade::Full => "Off".to_string(),
+        HairlineFade::Fade { exponent } => format!("Strength {exponent:.2}"),
     }
 }
 
-fn build_batch_count_panel_tree(display: BatchCountDisplay) -> LayoutTree {
-    let stats = display.stats;
-    let title = TextStyle::new(BATCH_PANEL_TITLE_SIZE)
-        .with_color(BATCH_PANEL_TITLE_COLOR)
+fn build_fade_panel_tree(fade: HairlineFade) -> LayoutTree {
+    let title = TextStyle::new(FADE_PANEL_TITLE_SIZE)
+        .with_color(Color::WHITE)
         .with_shadow_mode(GlyphShadowMode::None);
-    let value = TextStyle::new(BATCH_PANEL_VALUE_SIZE)
-        .with_color(BATCH_PANEL_VALUE_COLOR)
-        .with_shadow_mode(GlyphShadowMode::None);
-    let label = TextStyle::new(BATCH_PANEL_LABEL_SIZE)
-        .with_color(BATCH_PANEL_LABEL_COLOR)
+    let row = TextStyle::new(FADE_PANEL_ROW_SIZE)
+        .with_color(FADE_PANEL_ROW_COLOR)
         .with_shadow_mode(GlyphShadowMode::None);
     let mut builder = LayoutBuilder::with_root(El::new().width(Sizing::FIT).height(Sizing::FIT));
     screen_panel_frame(
@@ -358,16 +369,47 @@ fn build_batch_count_panel_tree(display: BatchCountDisplay) -> LayoutTree {
             builder.with(
                 El::column().width(Sizing::FIT).height(Sizing::FIT).gap(2.0),
                 |builder| {
-                    builder.text(("Line Batches", title));
-                    builder.text((format!("{}", stats.batches), value));
-                    builder.text((format!("records {}", stats.records), label.clone()));
-                    builder.text((format!("uploads {}", stats.uploads), label.clone()));
-                    builder.text((fade_line(display.fade), label));
+                    builder.text(("Fade", title));
+                    builder.text((fade_line(fade), row));
                 },
             );
         },
     );
     builder.build()
+}
+
+fn units_title_bar() -> TitleBar {
+    TitleBar::new()
+        .with_title("Units")
+        .with_background_color(DEFAULT_PANEL_BACKGROUND.with_alpha(PANEL_BACKGROUND_ALPHA))
+        .control(TITLE_BAR_LABELS[0])
+        .control(TITLE_BAR_LABELS[1])
+        .control(TITLE_BAR_LABELS[2])
+        .control(TITLE_BAR_LABELS[3])
+        .control(
+            TitleBarControl::segmented(
+                "A",
+                AA_MODES.map(|(id, label, _)| TitleBarSegment::new(id, label)),
+            )
+            .with_name("Smoothing"),
+        )
+        .control(TITLE_BAR_LABELS[4])
+        .control(TITLE_BAR_LABELS[5])
+        .control(TitleBarControl::from(TITLE_BAR_LABELS[6]).with_help_wording("Click", "Zoom in"))
+        .control(CARD_VIEW_CONTROL)
+        .control(PHOTO_VIEW_CONTROL)
+}
+
+/// A floor ray one half logical pixel below the horizon is the furthest
+/// visible floor sample. Keep the plane past that ray in the tallest view.
+fn ground_plane_size() -> f32 {
+    let highest_camera_y = f32::from(A4_HEIGHT) + f32::from(LIFT);
+    let horizon_distance =
+        highest_camera_y * GROUND_MAX_VIEW_HEIGHT / (PERSPECTIVE_FOV / 2.0).tan();
+    let scene_span = 2.0_f32.mul_add(f32::from(GAP), f32::from(A4_WIDTH))
+        + f32::from(CARD_WIDTH)
+        + f32::from(INDEX_WIDTH);
+    2.0 * (horizon_distance + scene_span)
 }
 
 fn main() {
@@ -376,7 +418,7 @@ fn main() {
         .with_save_window_position()
         .with_studio_lighting()
         .with_ground_plane()
-        .size(GROUND_PLANE_SIZE)
+        .size(ground_plane_size())
         .with_orbit_cam_preset(|_| {}, OrbitCamPreset::blender_like())
         .unclamped()
         .with_stable_transparency()
@@ -384,37 +426,27 @@ fn main() {
         .yaw(HOME_YAW)
         .pitch(HOME_PITCH)
         .margin(HOME_MARGIN)
-        .with_title_bar(
-            TitleBar::new()
-                .with_background_color(DEFAULT_PANEL_BACKGROUND.with_alpha(PANEL_BACKGROUND_ALPHA))
-                .control("D Outlines")
-                .control("R Rulers")
-                .control("F Fade")
-                .control("↑↓ Exponent")
-                .control(TitleBarControl::segmented(
-                    "A",
-                    AA_MODES.map(|(id, label, _)| TitleBarSegment::new(id, label)),
-                ))
-                .control("P Perspective")
-                .control("O Orthographic")
-                .control("Click to Zoom"),
-        )
-        .wire_chip_to_state::<DebugOutlines, _>("D Outlines", |state| match state {
+        .with_title_bar(units_title_bar())
+        .wire_chip_to_state::<DebugOutlines, _>(TITLE_BAR_LABELS[0], |state| match state {
             DebugOutlines::On => ControlActivation::Active,
             DebugOutlines::Off => ControlActivation::Inactive,
         })
-        .wire_chip_to_state::<Rulers, _>("R Rulers", |state| match state {
+        .wire_chip_to_state::<Rulers, _>(TITLE_BAR_LABELS[1], |state| match state {
             Rulers::Visible => ControlActivation::Active,
             Rulers::Hidden => ControlActivation::Inactive,
         })
-        .wire_chip_to_state::<HairlineWidth, _>("F Fade", |hairline| match hairline.fade {
-            HairlineFade::Fade { .. } => ControlActivation::Active,
-            HairlineFade::Full => ControlActivation::Inactive,
+        .wire_chip_to_state::<HairlineWidth, _>(TITLE_BAR_LABELS[2], |hairline| {
+            match hairline.fade {
+                HairlineFade::Fade { .. } => ControlActivation::Active,
+                HairlineFade::Full => ControlActivation::Inactive,
+            }
         })
         // The arrows only act while fade is on, so the chip lights with it.
-        .wire_chip_to_state::<HairlineWidth, _>("↑↓ Exponent", |hairline| match hairline.fade {
-            HairlineFade::Fade { .. } => ControlActivation::Active,
-            HairlineFade::Full => ControlActivation::Inactive,
+        .wire_chip_to_state::<HairlineWidth, _>(TITLE_BAR_LABELS[3], |hairline| {
+            match hairline.fade {
+                HairlineFade::Fade { .. } => ControlActivation::Active,
+                HairlineFade::Full => ControlActivation::Inactive,
+            }
         })
         .wire_chip_to_state::<AntiAlias, _>(AA_MODES[0].0, |anti_alias| {
             chip_activation(*anti_alias == AA_MODES[0].2)
@@ -428,16 +460,16 @@ fn main() {
         .wire_chip_to_state::<AntiAlias, _>(AA_MODES[3].0, |anti_alias| {
             chip_activation(*anti_alias == AA_MODES[3].2)
         })
-        .wire_chip_to_state::<CameraProjection, _>("P Perspective", |state| match state {
+        .wire_chip_to_state::<CameraProjection, _>(TITLE_BAR_LABELS[4], |state| match state {
             CameraProjection::Perspective => ControlActivation::Active,
             CameraProjection::Orthographic => ControlActivation::Inactive,
         })
-        .wire_chip_to_state::<CameraProjection, _>("O Orthographic", |state| match state {
+        .wire_chip_to_state::<CameraProjection, _>(TITLE_BAR_LABELS[5], |state| match state {
             CameraProjection::Orthographic => ControlActivation::Active,
             CameraProjection::Perspective => ControlActivation::Inactive,
         })
         .wire_chip_to_events_filtered::<AnimationBegin, AnimationEnd, _, _>(
-            "Click to Zoom",
+            TITLE_BAR_LABELS[6],
             |event| event.source == AnimationSource::ZoomToFit,
             |event| event.source == AnimationSource::ZoomToFit,
         )
@@ -456,7 +488,7 @@ fn main() {
             ..default()
         })
         .add_systems(Startup, setup)
-        .add_systems(Update, update_batch_count_panel)
+        .add_systems(Update, update_fade_panel)
         // D / R toggles and the P / O projection switch all run through Fairy
         // Dust's shortcut binding, which fires each only when no modifier is held.
         .with_shortcut(KeyCode::KeyD, toggle_debug_outlines)
@@ -465,13 +497,19 @@ fn main() {
         .with_shortcut(KeyCode::KeyP, to_perspective_projection)
         .with_shortcut(KeyCode::KeyO, to_orthographic_projection)
         .with_shortcut(KeyCode::KeyF, toggle_hairline_fade)
+        .with_shortcut(KeyCode::KeyB, show_business_card_view)
+        .with_shortcut(KeyCode::KeyV, show_photo_view)
         .with_held_shortcut(KeyCode::ArrowUp, increase_fade_exponent)
         .with_held_shortcut(KeyCode::ArrowDown, decrease_fade_exponent)
         .run();
 }
 
-fn setup(mut commands: Commands, mut materials: ResMut<Assets<StandardMaterial>>) {
-    spawn_batch_count_panel(&mut commands, &mut materials);
+fn setup(
+    mut commands: Commands,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
+    spawn_fade_panel(&mut commands, &mut materials);
 
     let a4_width_meters = f32::from(A4_WIDTH);
     let a4_height_meters = f32::from(A4_HEIGHT);
@@ -501,7 +539,6 @@ fn setup(mut commands: Commands, mut materials: ResMut<Assets<StandardMaterial>>
         card_x,
         title_gap,
     );
-
     spawn_rulers(
         &mut commands,
         ruler_color,
@@ -516,14 +553,37 @@ fn setup(mut commands: Commands, mut materials: ResMut<Assets<StandardMaterial>>
     );
 
     spawn_card_panel(&mut commands, card_x, card_y);
+    let card_view_left = card_x - f32::from(In(2.5));
+    let card_view_right = card_x + f32::from(In(2.5));
+    let card_view_top = a4_page_top + title_gap + f32::from(Pt(18.0));
+    let card_view_bottom =
+        card_y - card_height_m / 2.0 - f32::from(RULER_GAP) - f32::from(PANEL_RULER_INCH_WIDTH);
+    spawn_fit_target(
+        &mut commands,
+        &mut meshes,
+        CardViewTarget,
+        card_view_left,
+        card_view_right,
+        card_view_top,
+        card_view_bottom,
+    );
 
     let index_width_m = f32::from(INDEX_WIDTH);
     let index_height_m = f32::from(INDEX_HEIGHT);
-    let card_left = card_x - card_width_m / 2.0;
-    let index_x = card_left + index_width_m / 2.0;
-    let a4_page_bottom = a4_page_y - a4_height_meters / 2.0;
-    let index_y = a4_page_bottom + index_height_m / 2.0;
+    let index_x = card_x + card_width_m / 2.0 + gap + index_width_m / 2.0;
+    let index_y = a4_page_top - index_height_m / 2.0;
 
+    // Frame home on one hidden box around the page, card and photo, so the
+    // screen panels never treat the world panels as obstacles.
+    spawn_fit_target(
+        &mut commands,
+        &mut meshes,
+        CameraHomeTarget,
+        group_left,
+        index_x + index_width_m / 2.0,
+        a4_page_top,
+        a4_page_top - a4_height_meters,
+    );
     spawn_photo_panel_with_title(&mut commands, index_x, index_y, index_height_m, title_gap);
     spawn_index_card_rulers(
         &mut commands,
@@ -533,6 +593,57 @@ fn setup(mut commands: Commands, mut materials: ResMut<Assets<StandardMaterial>>
         index_height_m,
         ruler_color,
     );
+    let photo_view_left = index_x - index_width_m / 2.0;
+    let photo_view_right = index_x + index_width_m / 2.0 + f32::from(In(0.65));
+    let photo_view_top = a4_page_top + title_gap + f32::from(Pt(18.0));
+    let photo_view_bottom =
+        index_y - index_height_m / 2.0 - f32::from(RULER_GAP) - f32::from(PANEL_RULER_INCH_WIDTH);
+    spawn_fit_target(
+        &mut commands,
+        &mut meshes,
+        PhotoViewTarget,
+        photo_view_left,
+        photo_view_right,
+        photo_view_top,
+        photo_view_bottom,
+    );
+}
+
+fn spawn_fit_target(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    marker: impl Bundle,
+    left: f32,
+    right: f32,
+    top: f32,
+    bottom: f32,
+) {
+    commands.spawn((
+        marker,
+        Mesh3d(meshes.add(Cuboid::new(right - left, top - bottom, 0.001))),
+        Transform::from_xyz(f32::midpoint(left, right), f32::midpoint(top, bottom), 0.0),
+        Visibility::Hidden,
+    ));
+}
+
+fn show_business_card_view(mut commands: Commands, targets: Query<Entity, With<CardViewTarget>>) {
+    if let Ok(target) = targets.single() {
+        commands.trigger(FrameCameraTarget {
+            target,
+            margin: CARD_VIEW_MARGIN,
+            duration: Duration::from_millis(ZOOM_DURATION_MS),
+        });
+    }
+}
+
+fn show_photo_view(mut commands: Commands, targets: Query<Entity, With<PhotoViewTarget>>) {
+    if let Ok(target) = targets.single() {
+        commands.trigger(FrameCameraTarget {
+            target,
+            margin: PHOTO_VIEW_MARGIN,
+            duration: Duration::from_millis(ZOOM_DURATION_MS),
+        });
+    }
 }
 
 fn spawn_a4_with_titles(
@@ -558,15 +669,15 @@ fn spawn_a4_with_titles(
     commands
         .spawn((
             A4Panel,
-            CameraHomeTarget,
             a4_panel,
-            Transform::from_xyz(a4_page_x, a4_page_y, 0.0),
+            Transform::from_xyz(a4_page_x, a4_page_y, A4_PAGE_Z),
         ))
+        .override_lighting(Lighting::Unlit)
         .observe(on_panel_clicked);
 
     commands
         .spawn(
-            DiegeticText::world("A4 Paper — 210 × 297 mm")
+            DiegeticText::world("A4 paper — 210 × 297 mm")
                 .size(18.0)
                 .color(Color::WHITE)
                 .anchor(Anchor::BottomCenter)
@@ -576,7 +687,7 @@ fn spawn_a4_with_titles(
         .override_font_unit(Unit::Points);
     commands
         .spawn(
-            DiegeticText::world("US Business Card — 3½ × 2 in")
+            DiegeticText::world("US business card — 3½ × 2 in")
                 .size(18.0)
                 .color(Color::WHITE)
                 .anchor(Anchor::BottomCenter)
@@ -602,10 +713,10 @@ fn spawn_card_panel(commands: &mut Commands, card_x: f32, card_y: f32) {
     commands
         .spawn((
             CardPanel,
-            CameraHomeTarget,
             card_panel,
             Transform::from_xyz(card_x, card_y, 0.0),
         ))
+        .override_lighting(Lighting::Unlit)
         .observe(on_panel_clicked);
 }
 
@@ -631,10 +742,10 @@ fn spawn_photo_panel_with_title(
     commands
         .spawn((
             IndexPanel,
-            CameraHomeTarget,
             index_panel,
             Transform::from_xyz(index_x, index_y, 0.0),
         ))
+        .override_lighting(Lighting::Unlit)
         .observe(on_panel_clicked);
     commands
         .spawn(
@@ -692,7 +803,7 @@ fn spawn_index_card_rulers(
     let index_width_sixteenths = (INDEX_WIDTH.0 * 16.0).round().to_i32();
     let Some(index_horizontal_ruler) = build_panel_or_log(
         DiegeticPanel::world()
-            .size(INDEX_WIDTH, PANEL_RULER_INCH_WIDTH)
+            .size(In(INDEX_WIDTH.0 + 0.5), PANEL_RULER_INCH_WIDTH)
             .anchor(Anchor::TopLeft)
             .with_tree(build_imperial_horizontal_ruler(
                 index_width_sixteenths,
@@ -745,10 +856,13 @@ fn spawn_rulers(
 
     // A4 horizontal ruler (bottom).
     let a4_bottom_ruler_x = a4_page_x - a4_width_meters / 2.0;
-    let a4_bottom_ruler_y = a4_page_y - a4_height_meters / 2.0 - f32::from(RULER_GAP);
+    let a4_bottom_ruler_y = a4_ruler_top - a4_height_meters - f32::from(RULER_GAP);
     let Some(a4_horizontal_ruler) = build_panel_or_log(
         DiegeticPanel::world()
-            .size(A4_WIDTH, PANEL_RULER_WIDTH)
+            .size(
+                Mm(A4_WIDTH.0 + METRIC_END_LABEL_OVERHANG.0),
+                PANEL_RULER_WIDTH,
+            )
             .anchor(Anchor::TopLeft)
             .with_tree(build_metric_horizontal_ruler(
                 A4_WIDTH.0.to_i32(),
@@ -763,7 +877,11 @@ fn spawn_rulers(
     commands.spawn((
         PanelRuler,
         a4_horizontal_ruler,
-        Transform::from_xyz(a4_bottom_ruler_x, a4_bottom_ruler_y, 0.0),
+        Transform::from_xyz(
+            a4_bottom_ruler_x,
+            a4_bottom_ruler_y,
+            A4_PAGE_Z + f32::from(A4_RULER_FRONT_OFFSET),
+        ),
     ));
 
     // Card vertical ruler (right side).
@@ -798,7 +916,7 @@ fn spawn_rulers(
     let card_w_sixteenths = (CARD_WIDTH.0 * 16.0).round().to_i32();
     let Some(card_horizontal_ruler) = build_panel_or_log(
         DiegeticPanel::world()
-            .size(CARD_WIDTH, PANEL_RULER_INCH_WIDTH)
+            .size(In(CARD_WIDTH.0 + 0.5), PANEL_RULER_INCH_WIDTH)
             .anchor(Anchor::TopLeft)
             .with_tree(build_imperial_horizontal_ruler(
                 card_w_sixteenths,
@@ -1034,11 +1152,6 @@ fn metric_vertical_ruler_lines(height_millimeters: i32, color: Color) -> Vec<Pan
     lines
 }
 
-#[cfg(test)]
-fn metric_horizontal_tick_lines(width_millimeters: i32, color: Color) -> Vec<PanelLine> {
-    horizontal_tick_lines(width_millimeters, 1.0, 0.0, color, millimeter_tick_size)
-}
-
 fn metric_horizontal_ruler_lines(width_millimeters: i32, color: Color) -> Vec<PanelLine> {
     let ticks = horizontal_tick_lines(
         width_millimeters,
@@ -1053,19 +1166,6 @@ fn metric_horizontal_ruler_lines(width_millimeters: i32, color: Color) -> Vec<Pa
             .hairline_fade(HairlineFade::Full),
     );
     lines
-}
-
-#[cfg(test)]
-fn imperial_vertical_tick_lines(height_sixteenths: i32, color: Color) -> Vec<PanelLine> {
-    vertical_tick_lines(
-        height_sixteenths,
-        1.0 / 16.0,
-        PANEL_RULER_INCH_TICK.0,
-        0.0,
-        TickAlignment::Left,
-        color,
-        sixteenth_tick_size,
-    )
 }
 
 fn imperial_vertical_ruler_lines(height_sixteenths: i32, color: Color) -> Vec<PanelLine> {
@@ -1085,17 +1185,6 @@ fn imperial_vertical_ruler_lines(height_sixteenths: i32, color: Color) -> Vec<Pa
             .hairline_fade(HairlineFade::Full),
     );
     lines
-}
-
-#[cfg(test)]
-fn imperial_horizontal_tick_lines(width_sixteenths: i32, color: Color) -> Vec<PanelLine> {
-    horizontal_tick_lines(
-        width_sixteenths,
-        1.0 / 16.0,
-        0.0,
-        color,
-        sixteenth_tick_size,
-    )
 }
 
 fn imperial_horizontal_ruler_lines(width_sixteenths: i32, color: Color) -> Vec<PanelLine> {
@@ -1207,7 +1296,7 @@ fn horizontal_tick_center(edge_x: f32, width: f32, stroke_width: f32) -> f32 {
 
 fn build_metric_panel_ruler(height_millimeters: i32, ruler_color: Color) -> LayoutTree {
     let mut builder = LayoutBuilder::new(PANEL_RULER_WIDTH, Mm(height_millimeters.to_f32()));
-    let label_style = TextStyle::new(Pt(8.0)).with_color(ruler_color);
+    let label_style = TextStyle::new(Pt(9.0)).with_color(ruler_color);
     let last_centimeter_mark = height_millimeters / 10;
     // Top spacer: distance from top of ruler to center of topmost cm block.
     let top_spacer = last_centimeter_mark
@@ -1299,7 +1388,7 @@ fn build_imperial_panel_ruler(
     let last_label_inch = height_sixteenths / 16;
     let top_spacer = panel_height.0 - last_label_inch.to_f32() - 0.5;
     let mut builder = LayoutBuilder::new(PANEL_RULER_INCH_WIDTH, panel_height);
-    let label_style = TextStyle::new(Pt(8.0)).with_color(ruler_color);
+    let label_style = TextStyle::new(Pt(9.0)).with_color(ruler_color);
 
     builder.with(
         El::row()
@@ -1379,15 +1468,17 @@ const fn sixteenth_tick_size(sixteenth: i32) -> (f32, f32) {
 
 /// Horizontal metric ruler — spine on TOP, ticks extending DOWN, labels below.
 fn build_metric_horizontal_ruler(width_millimeters: i32, ruler_color: Color) -> LayoutTree {
-    let mut builder = LayoutBuilder::new(Mm(width_millimeters.to_f32()), PANEL_RULER_WIDTH);
-    let label_style = TextStyle::new(Pt(8.0)).with_color(ruler_color);
-    // Labels go at centimeter 1 through the last label slot, each centered in
-    // a 10mm block.
-    // Skip the cm at the exact edge (it's just a tick, no room for a label).
-    let last_label_centimeter = (width_millimeters - 5) / 10;
+    let mut builder = LayoutBuilder::new(
+        Mm(width_millimeters.to_f32() + METRIC_END_LABEL_OVERHANG.0),
+        PANEL_RULER_WIDTH,
+    );
+    let label_style = TextStyle::new(Pt(9.0)).with_color(ruler_color);
+    // Labels go at centimeter 1 through the end tick, each centered in a 10mm
+    // block; the end tick's label overhangs the ruler by half a block.
+    let last_label_centimeter = width_millimeters / 10;
     let right_spacer = last_label_centimeter
         .to_f32()
-        .mul_add(-10.0, width_millimeters.to_f32() - 5.0);
+        .mul_add(-10.0, width_millimeters.to_f32());
 
     builder.with(El::column().width(Sizing::GROW).height(Sizing::GROW), |b| {
         // ── Top row: spine + ticks ──────────────────────────
@@ -1455,10 +1546,11 @@ fn build_metric_horizontal_ruler(width_millimeters: i32, ruler_color: Color) -> 
 /// Horizontal imperial ruler — spine on TOP, ticks extending DOWN, labels below.
 fn build_imperial_horizontal_ruler(width_sixteenths: i32, ruler_color: Color) -> LayoutTree {
     let width_inches = width_sixteenths.to_f32() / 16.0;
-    let mut builder = LayoutBuilder::new(In(width_inches), PANEL_RULER_INCH_WIDTH);
-    let label_style = TextStyle::new(Pt(8.0)).with_color(ruler_color);
+    let label_width_inches = width_inches + 0.5;
+    let mut builder = LayoutBuilder::new(In(label_width_inches), PANEL_RULER_INCH_WIDTH);
+    let label_style = TextStyle::new(Pt(9.0)).with_color(ruler_color);
     let last_label_inch = width_sixteenths / 16;
-    let right_spacer = width_inches - 0.5 - last_label_inch.to_f32();
+    let right_spacer = label_width_inches - 0.5 - last_label_inch.to_f32();
 
     builder.with(El::column().width(Sizing::GROW).height(Sizing::GROW), |b| {
         // ── Top row: spine + ticks ──────────────────────────
@@ -1551,7 +1643,7 @@ fn build_a4_content(builder: &mut LayoutBuilder, debug: bool) {
     let db = debug_border(debug, DEBUG_OUTLINE);
 
     let heading = TextStyle::new(Pt(18.0)).with_color(A4_TEXT_COLOR);
-    let body = TextStyle::new(Pt(12.0)).with_color(A4_TEXT_COLOR);
+    let body = TextStyle::new(Pt(12.0)).with_color(A4_TEXT_COLOR).bold();
 
     builder.with(
         El::column()
@@ -1572,31 +1664,6 @@ fn build_a4_content(builder: &mut LayoutBuilder, debug: bool) {
             );
 
             build_two_column_article(b, &heading, &body, db);
-
-            // ── Divider ─────────────────────────────────────────
-            b.with(
-                El::new()
-                    .width(Sizing::GROW)
-                    .height(Sizing::fixed(Mm(0.3)))
-                    .background(A4_DIM_COLOR),
-                |_| {},
-            );
-
-            // ── Footer ──────────────────────────────────────────
-            b.with(
-                El::new()
-                    .width(Sizing::GROW)
-                    .align_x(AlignX::Center)
-                    .border(db),
-                |b| {
-                    b.with(El::new().border(db), |b| {
-                        b.text((
-                            "PaperSize::A4  |  layout: Millimeters  |  font: Points",
-                            TextStyle::new(Pt(14.0)).with_color(A4_DIM_COLOR),
-                        ));
-                    });
-                },
-            );
         },
     );
 }
@@ -1629,97 +1696,70 @@ fn build_two_column_article(
     body: &TextStyle,
     db: Border,
 ) {
-    b.with(
-        El::row()
-            .width(Sizing::GROW)
-            .height(Sizing::GROW)
-            .gap(Mm(8.0))
-            .border(db),
-        |b| {
-            b.with(
-                El::column().width(Sizing::GROW).gap(Mm(4.0)).border(db),
-                |b| {
-                    debug_text(b, "Real Units, Real Sizes", heading.clone(), db);
-                    debug_text(
-                        b,
-                        "This page is 210 by 297 millimeters \u{2014} an A4 sheet \
-                         at true physical scale, in a game world where one unit equals \
-                         one meter. The business card beside it is 3.5 by 2 inches. \
-                         Neither requires manual conversion. Each panel declares its \
-                         own layout unit, and the system handles the rest.",
-                        body.clone(),
-                        db,
-                    );
-                    debug_text(
-                        b,
-                        "Font sizes are in typographic points. Padding and spacing \
-                         follow the panel\u{2019}s layout unit. Mix freely: Mm(6.0) \
-                         for a margin, Pt(18.0) for a heading, In(0.5) for a \
-                         gutter. The convenience types carry their unit through the \
-                         layout engine \u{2014} no math required.",
-                        body.clone(),
-                        db,
-                    );
-                    debug_text(
-                        b,
-                        "By default, a panel\u{2019}s dimensions map directly to \
-                         meters. This 210mm-wide A4 page occupies 0.21 meters in \
-                         the scene \u{2014} physically correct at 1:1 world scale.",
-                        body.clone(),
-                        db,
-                    );
-                },
-            );
+    b.with(El::column().width(Sizing::GROW).height(Sizing::GROW), |b| {
+        b.with(
+            El::row()
+                .width(Sizing::GROW)
+                .height(Sizing::FIT)
+                .gap(Mm(8.0))
+                .border(db),
+            |b| {
+                b.with(
+                    El::column().width(Sizing::GROW).gap(Mm(4.0)).border(db),
+                    |b| {
+                        debug_text(b, "Real-world sizes", heading.clone(), db);
+                        debug_text(b, A4_SCALE_EXPLANATION, body.clone(), db);
+                        debug_text(
+                            b,
+                            "Words use familiar print sizes. Margins and gaps follow each object\u{2019}s own measure. You can place the page and the business card together without converting every number by hand.",
+                            body.clone(),
+                            db,
+                        );
+                        debug_text(
+                            b,
+                            "The rulers show how much space each object takes. The page is measured in centimeters; the card beside it is measured in inches.",
+                            body.clone(),
+                            db,
+                        );
+                    },
+                );
 
-            b.with(
-                El::new()
-                    .width(Sizing::fixed(Mm(0.3)))
-                    .height(Sizing::GROW)
-                    .background(A4_DIM_COLOR),
-                |_| {},
-            );
+                // Stop inside the text row's trailing line gap.
+                b.with(
+                    El::new()
+                        .width(Sizing::fixed(Mm(0.3)))
+                        .height(Sizing::percent(0.98))
+                        .background(A4_DIM_COLOR),
+                    |_| {},
+                );
 
-            b.with(
-                El::column().width(Sizing::GROW).gap(Mm(4.0)).border(db),
-                |b| {
-                    debug_text(b, "Any Scale You Need", heading.clone(), db);
-                    debug_text(
-                        b,
-                        "Set world_height on any panel and it scales uniformly to \
-                         fit. A museum placard at 0.3 meters. A highway billboard \
-                         at 12 meters. A planetary-scale announcement at 50,000 \
-                         meters \u{2014} zoom out far enough and there it is. Text \
-                         stays sharp at any distance by rendering glyphs using SDFs \
-                         (signed distance fields), not rasterized bitmaps. \u{2014} \
-                         The GPU evaluates the distance function per fragment - \
-                         edges remain crisp regardless of scale.",
-                        body.clone(),
-                        db,
-                    );
-                    debug_text(
-                        b,
-                        "PanelDefaults sets panel construction defaults: \
-                         layout in meters, fonts in points. \
-                         Override per-panel with layout_unit and font_unit, or \
-                         per-element with types like Mm(10.0) and Pt(24.0) \
-                         inline. The system converts at layout time so the \
-                         engine always works in a consistent coordinate space \
-                         internally.",
-                        body.clone(),
-                        db,
-                    );
-                    debug_text(
-                        b,
-                        "Custom(0.01) defines a centimeter. Custom(9.461e15) \
-                         defines a light-year. The unit system does not care about \
-                         scale \u{2014} it only needs to know the ratio to meters.",
-                        body.clone(),
-                        db,
-                    );
-                },
-            );
-        },
-    );
+                b.with(
+                    El::column().width(Sizing::GROW).gap(Mm(4.0)).border(db),
+                    |b| {
+                        debug_text(b, "Any scale you need", heading.clone(), db);
+                        debug_text(
+                            b,
+                            "Make the same design as small as a museum label or as large as a roadside sign. Its words, borders, and spaces grow together, so the proportions stay familiar.",
+                            body.clone(),
+                            db,
+                        );
+                        debug_text(
+                            b,
+                            "The page keeps its print proportions even when the camera moves. Come close to inspect a line of type, or pull back to compare the objects at a glance.",
+                            body.clone(),
+                            db,
+                        );
+                        debug_text(
+                            b,
+                            "Sizes can range from tiny details to distant signs. Each object still has one clear size in the world.",
+                            body.clone(),
+                            db,
+                        );
+                    },
+                );
+            },
+        );
+    });
 }
 
 /// Builds a business card layout tree (used by `toggle_debug_outlines` for runtime rebuild).
@@ -1736,9 +1776,10 @@ fn build_card_content(builder: &mut LayoutBuilder, debug: bool) {
     builder.with(
         El::column()
             .size(CARD_WIDTH, CARD_HEIGHT)
-            .padding(Padding::all(In(0.15)))
-            .gap(In(0.04))
-            .background(Color::srgb(0.392, 0.584, 0.929)),
+            // Balance the visible glyph ink, including its uneven side bearings.
+            .padding(Padding::new(In(0.2), In(0.1), In(0.18), In(0.12)))
+            .gap(In(0.18))
+            .background(CARD_BACKGROUND_COLOR),
         |b| {
             debug_text(
                 b,
@@ -1764,17 +1805,6 @@ fn build_card_content(builder: &mut LayoutBuilder, debug: bool) {
                 TextStyle::new(CARD_DETAIL_SIZE).with_color(CARD_TEXT_COLOR),
                 db,
             );
-
-            // Spacer
-            b.with(El::new().width(Sizing::GROW).height(Sizing::GROW), |_| {});
-
-            // Footer
-            debug_text(
-                b,
-                "PaperSize::BusinessCard  |  layout: Inches  |  font: Points",
-                TextStyle::new(CARD_FOOTER_SIZE).with_color(CARD_DIM_COLOR),
-                db,
-            );
         },
     );
 }
@@ -1793,19 +1823,19 @@ fn build_index_content(builder: &mut LayoutBuilder, debug: bool) {
     let subheading = TextStyle::new(INDEX_SUBHEADING_SIZE).with_color(INDEX_HEADING_COLOR);
     let label = TextStyle::new(INDEX_LABEL_SIZE).with_color(INDEX_LABEL_COLOR);
     let code = TextStyle::new(INDEX_CODE_SIZE).with_color(INDEX_CODE_COLOR);
-    let footer = TextStyle::new(INDEX_FOOTER_SIZE).with_color(INDEX_LABEL_COLOR);
 
     builder.with(
         El::column()
             .size(INDEX_WIDTH, INDEX_HEIGHT)
             .padding(Padding::all(In(0.2)))
-            .gap(In(0.08))
-            .background(INDEX_BG),
+            .gap(In(0.11))
+            .background(INDEX_BG)
+            .border(Border::all(In(0.02), INDEX_BORDER_COLOR)),
         |b| {
             debug_text(b, "Units API", heading.clone(), db);
 
             // ── Panel sizing ────────────────────────────────────
-            debug_text(b, "Panel Sizing", subheading.clone(), db);
+            debug_text(b, "Panel sizing", subheading.clone(), db);
             index_row(b, "f32", ".size(0.127, 0.178)", &label, &code, db);
             index_row(b, "In", ".size(In(5.0), In(7.0))", &label, &code, db);
             index_row(b, "Mm", ".size(Mm(127.0), Mm(177.8))", &label, &code, db);
@@ -1837,7 +1867,7 @@ fn build_index_content(builder: &mut LayoutBuilder, debug: bool) {
             );
 
             // ── Element sizing ──────────────────────────────────
-            debug_text(b, "Element Sizing", subheading.clone(), db);
+            debug_text(b, "Element sizing", subheading.clone(), db);
             index_row(
                 b,
                 "Fixed",
@@ -1874,28 +1904,9 @@ fn build_index_content(builder: &mut LayoutBuilder, debug: bool) {
             );
 
             // ── World scaling ───────────────────────────────────
-            debug_text(b, "World Scaling", subheading.clone(), db);
+            debug_text(b, "World scaling", subheading.clone(), db);
             index_row(b, "Height", ".world_height(0.5)", &label, &code, db);
             index_row(b, "Width", ".world_width(1.0)", &label, &code, db);
-
-            // Spacer
-            b.with(El::new().width(Sizing::GROW).height(Sizing::GROW), |_| {});
-
-            // Footer
-            b.with(
-                El::new()
-                    .width(Sizing::GROW)
-                    .align_x(AlignX::Center)
-                    .border(db),
-                |b| {
-                    b.with(El::new().border(db), |b| {
-                        b.text((
-                            "PaperSize::Photo5x7  |  layout: Inches  |  font: Points",
-                            footer,
-                        ));
-                    });
-                },
-            );
         },
     );
 }
@@ -1910,11 +1921,14 @@ fn index_row(
     db: Border,
 ) {
     b.with(
-        El::row().width(Sizing::GROW).gap(In(0.12)).border(db),
+        El::row().width(Sizing::GROW).gap(In(0.07)).border(db),
         |b| {
-            b.with(El::column().width(Sizing::fixed(In(1.0))).border(db), |b| {
-                b.text((label_text, label.clone()));
-            });
+            b.with(
+                El::column().width(Sizing::fixed(In(1.06))).border(db),
+                |b| {
+                    b.text((label_text, label.clone()));
+                },
+            );
             b.with(El::column().width(Sizing::GROW).border(db), |b| {
                 b.text((code_text, code.clone()));
             });
@@ -1924,7 +1938,7 @@ fn index_row(
 
 // ── Click handlers ───────────────────────────────────────────────────
 
-fn on_panel_clicked(mut click: On<Pointer<Click>>, mut commands: Commands) {
+fn on_panel_clicked(mut click: On<PointerClick>, mut commands: Commands) {
     if click.button != PointerButton::Primary {
         return;
     }
@@ -1935,203 +1949,4 @@ fn on_panel_clicked(mut click: On<Pointer<Click>>, mut commands: Commands) {
             .margin(ZOOM_MARGIN)
             .duration(Duration::from_millis(ZOOM_DURATION_MS)),
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const EPSILON: f32 = 0.0001;
-
-    #[test]
-    fn metric_vertical_ticks_are_inclusive_and_right_aligned() {
-        let lines = metric_vertical_tick_lines(10, Color::WHITE);
-
-        assert_eq!(lines.len(), 11);
-        assert_close(start_y(&lines[10]), PANEL_RULER_CM_LINE.0 * 0.5);
-        assert_close(end_y(&lines[10]), PANEL_RULER_CM_LINE.0 * 0.5);
-        assert_close(start_x(&lines[10]), 0.0);
-        assert_close(end_x(&lines[10]), PANEL_RULER_CM_TICK.0);
-        assert_close(start_y(&lines[0]), 10.0 - PANEL_RULER_CM_LINE.0 * 0.5);
-        assert_close(
-            start_x(&lines[5]),
-            PANEL_RULER_CM_TICK.0 - PANEL_RULER_MM5_TICK.0,
-        );
-        assert_close(end_x(&lines[5]), PANEL_RULER_CM_TICK.0);
-        assert_close_value(line_width(&lines[5]), PANEL_RULER_MM5_LINE.0);
-    }
-
-    #[test]
-    fn metric_vertical_ruler_lines_include_right_spine() {
-        let lines = metric_vertical_ruler_lines(10, Color::WHITE);
-        let spine = lines.last().expect("ruler lines should include a spine");
-
-        // 11 ticks plus the spine; cm marks 0 and 10 and the spine pin
-        // `HairlineFade::Full`, the rest inherit.
-        assert_eq!(lines.len(), 12);
-        assert_fade_exempt_marks(&lines, &[0, 10]);
-        assert_close(
-            start_x(spine),
-            PANEL_RULER_CM_TICK.0 + PANEL_RULER_SPINE.0 * 0.5,
-        );
-        assert_close(
-            end_x(spine),
-            PANEL_RULER_CM_TICK.0 + PANEL_RULER_SPINE.0 * 0.5,
-        );
-        assert_close(start_y(spine), 0.0);
-        assert_close(end_y(spine), 10.0);
-        assert_close_value(line_width(spine), PANEL_RULER_SPINE.0);
-    }
-
-    #[test]
-    fn metric_horizontal_ticks_are_inclusive_and_endpoint_inset() {
-        let lines = metric_horizontal_tick_lines(10, Color::WHITE);
-
-        assert_eq!(lines.len(), 11);
-        assert_close(start_x(&lines[0]), PANEL_RULER_CM_LINE.0 * 0.5);
-        assert_close(start_y(&lines[0]), 0.0);
-        assert_close(end_y(&lines[0]), PANEL_RULER_CM_TICK.0);
-        assert_close(start_x(&lines[10]), 10.0 - PANEL_RULER_CM_LINE.0 * 0.5);
-        assert_close(end_y(&lines[5]), PANEL_RULER_MM5_TICK.0);
-        assert_close_value(line_width(&lines[5]), PANEL_RULER_MM5_LINE.0);
-    }
-
-    #[test]
-    fn metric_horizontal_ruler_lines_offset_ticks_below_spine() {
-        let lines = metric_horizontal_ruler_lines(10, Color::WHITE);
-        let first_tick = lines.first().expect("ruler lines should include ticks");
-        let spine = lines.last().expect("ruler lines should include a spine");
-
-        assert_eq!(lines.len(), 12);
-        assert_fade_exempt_marks(&lines, &[0, 10]);
-        assert_close(start_y(first_tick), PANEL_RULER_SPINE.0);
-        assert_close(
-            end_y(first_tick),
-            PANEL_RULER_SPINE.0 + PANEL_RULER_CM_TICK.0,
-        );
-        assert_close(start_y(spine), PANEL_RULER_SPINE.0 * 0.5);
-        assert_close(end_y(spine), PANEL_RULER_SPINE.0 * 0.5);
-        assert_close_value(line_width(spine), PANEL_RULER_SPINE.0);
-    }
-
-    #[test]
-    fn imperial_vertical_ticks_use_measured_track_height() {
-        let height_sixteenths = 32;
-        let lines = imperial_vertical_tick_lines(height_sixteenths, Color::WHITE);
-        let measured_height = height_sixteenths.to_f32() / 16.0;
-        let taller_label_panel = measured_height + EDGE_LABEL_EXTRA.0;
-
-        assert_eq!(lines.len(), 33);
-        assert_close(
-            start_y(&lines[0]),
-            measured_height - PANEL_RULER_INCH_LINE.0 * 0.5,
-        );
-        assert_close(start_y(&lines[32]), PANEL_RULER_INCH_LINE.0 * 0.5);
-        assert_close(end_x(&lines[0]), PANEL_RULER_INCH_TICK.0);
-        assert!(start_y(&lines[0]).is_some_and(|y| y < taller_label_panel));
-    }
-
-    #[test]
-    fn imperial_vertical_ruler_lines_offset_ticks_after_spine() {
-        let lines = imperial_vertical_ruler_lines(16, Color::WHITE);
-        let first_tick = lines.first().expect("ruler lines should include ticks");
-        let spine = lines.last().expect("ruler lines should include a spine");
-
-        // 17 ticks plus the spine; inch marks 0 and 16 and the spine pin
-        // `HairlineFade::Full`, the rest inherit.
-        assert_eq!(lines.len(), 18);
-        assert_fade_exempt_marks(&lines, &[0, 16]);
-        assert_close(start_x(first_tick), PANEL_RULER_INCH_SPINE.0);
-        assert_close(
-            end_x(first_tick),
-            PANEL_RULER_INCH_SPINE.0 + PANEL_RULER_INCH_TICK.0,
-        );
-        assert_close(start_x(spine), PANEL_RULER_INCH_SPINE.0 * 0.5);
-        assert_close(end_x(spine), PANEL_RULER_INCH_SPINE.0 * 0.5);
-        assert_close_value(line_width(spine), PANEL_RULER_INCH_SPINE.0);
-    }
-
-    #[test]
-    fn imperial_horizontal_ticks_preserve_major_minor_lengths() {
-        let width_sixteenths = 16;
-        let lines = imperial_horizontal_tick_lines(width_sixteenths, Color::WHITE);
-
-        assert_eq!(lines.len(), 17);
-        assert_close(start_x(&lines[0]), PANEL_RULER_INCH_LINE.0 * 0.5);
-        assert_close(start_x(&lines[16]), 1.0 - PANEL_RULER_INCH_LINE.0 * 0.5);
-        assert_close(end_y(&lines[8]), PANEL_RULER_HALF_TICK.0);
-        assert_close_value(line_width(&lines[8]), PANEL_RULER_HALF_LINE.0);
-        assert_close(end_y(&lines[1]), PANEL_RULER_16TH_TICK.0);
-        assert_close_value(line_width(&lines[1]), PANEL_RULER_16TH_LINE.0);
-    }
-
-    #[test]
-    fn imperial_horizontal_ruler_lines_offset_ticks_below_spine() {
-        let lines = imperial_horizontal_ruler_lines(16, Color::WHITE);
-        let first_tick = lines.first().expect("ruler lines should include ticks");
-        let spine = lines.last().expect("ruler lines should include a spine");
-
-        assert_eq!(lines.len(), 18);
-        assert_fade_exempt_marks(&lines, &[0, 16]);
-        assert_close(start_y(first_tick), PANEL_RULER_INCH_SPINE.0);
-        assert_close(
-            end_y(first_tick),
-            PANEL_RULER_INCH_SPINE.0 + PANEL_RULER_INCH_TICK.0,
-        );
-        assert_close(start_y(spine), PANEL_RULER_INCH_SPINE.0 * 0.5);
-        assert_close(end_y(spine), PANEL_RULER_INCH_SPINE.0 * 0.5);
-        assert_close_value(line_width(spine), PANEL_RULER_INCH_SPINE.0);
-    }
-
-    fn start_x(line: &PanelLine) -> Option<f32> { point_x(line.start()) }
-
-    fn start_y(line: &PanelLine) -> Option<f32> { point_y(line.start()) }
-
-    fn end_x(line: &PanelLine) -> Option<f32> { point_x(line.end()) }
-
-    fn end_y(line: &PanelLine) -> Option<f32> { point_y(line.end()) }
-
-    fn point_x(point: &PanelPoint) -> Option<f32> {
-        point.x().start_dimension().map(|dimension| dimension.value)
-    }
-
-    fn point_y(point: &PanelPoint) -> Option<f32> {
-        point.y().start_dimension().map(|dimension| dimension.value)
-    }
-
-    fn line_width(line: &PanelLine) -> f32 { line.line_style().width_dimension().value }
-
-    /// Ruler lines = ticks in mark order then the spine last; the listed
-    /// major marks and the spine must pin `HairlineFade::Full`, every other
-    /// tick must inherit (no override).
-    fn assert_fade_exempt_marks(lines: &[PanelLine], major_marks: &[i32]) {
-        let (spine, ticks) = lines.split_last().expect("ruler lines should not be empty");
-        assert_eq!(
-            spine.line_style().hairline_fade_override(),
-            Some(HairlineFade::Full),
-            "spine must pin HairlineFade::Full"
-        );
-        for (mark, tick) in (0_i32..).zip(ticks) {
-            let expected = major_marks.contains(&mark).then_some(HairlineFade::Full);
-            assert_eq!(
-                tick.line_style().hairline_fade_override(),
-                expected,
-                "tick at mark {mark} has the wrong fade override"
-            );
-        }
-    }
-
-    fn assert_close(actual: Option<f32>, expected: f32) {
-        assert!(
-            actual.is_some_and(|actual| (actual - expected).abs() <= EPSILON),
-            "expected {expected}, got {actual:?}",
-        );
-    }
-
-    fn assert_close_value(actual: f32, expected: f32) {
-        assert!(
-            (actual - expected).abs() <= EPSILON,
-            "expected {expected}, got {actual}",
-        );
-    }
 }

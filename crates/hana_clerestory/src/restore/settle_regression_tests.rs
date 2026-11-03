@@ -51,13 +51,12 @@ use crate::tests::ApplyingWindowRole;
 /// one that first observed it, and a small fraction of `SETTLE_TIMEOUT_SECS` so the deadline is
 /// still pending for every frame the budget below allows.
 ///
-/// The restore pipeline reads `Time`, which `Time<Virtual>` feeds by clamping the raw step to its
-/// own maximum and then scaling by its relative speed. `TimeUpdateStrategy::ManualDuration` sets
-/// the raw step to this value and the maximum is set to it as well, so the clamp is a no-op and the
-/// default relative speed of one leaves the frame worth exactly this. Both are set rather than one,
-/// because a raw step alone would still be capped by whatever maximum the clock happened to carry.
-/// The order is the trap: a large relative speed multiplies *after* the clamp, so a maximum of this
-/// size does not bound the virtual frame at all once the speed is raised.
+/// The restore pipeline reads `Time`, which `Time<Virtual>` feeds by scaling the raw step by its
+/// relative speed before clamping it to its own maximum. `TimeUpdateStrategy::ManualDuration`
+/// sets the raw step to this value and the maximum is set to it as well, so the default relative
+/// speed of one leaves the frame worth exactly this. Both are set rather than one, because a raw
+/// step alone would still be capped by whatever maximum the clock happened to carry. The maximum
+/// bounds the virtual frame even if the relative speed is raised.
 const REGRESSION_FRAME: Duration = Duration::from_millis(250);
 
 /// Frames the restore is given to resolve.

@@ -46,6 +46,7 @@ pub use cascade::Resolved;
 pub use cascade::resolve_cascade;
 pub use cascade::resolve_cascade_ref;
 pub use cascade::resolve_entity_cascade;
+pub use cascade::resolve_entity_cascade_with;
 pub use cascade::resolved_cascade;
 pub use easing::Easing;
 pub use easing::EasingCurve;
@@ -81,6 +82,8 @@ pub use math::ToF32;
 pub use math::ToF64;
 #[cfg(feature = "math")]
 pub use math::ToI32;
+#[cfg(feature = "math")]
+pub use math::ToI64;
 #[cfg(feature = "math")]
 pub use math::ToU8;
 #[cfg(feature = "math")]

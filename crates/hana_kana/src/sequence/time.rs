@@ -1,17 +1,27 @@
 use std::time::Duration;
 
 use bevy::reflect::Reflect;
+use bevy::reflect::ReflectSerialize;
 
 /// Exact nonnegative sequence time with nanosecond resolution.
 ///
 /// The private representation remains normalized so `nanoseconds` is always
 /// less than one second. Unlike [`Duration`], the whole-seconds field can hold
 /// the exact sum of every duration in an in-memory sequence.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Reflect)]
-#[reflect(opaque)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Reflect, serde::Serialize)]
+#[reflect(opaque, Serialize)]
 pub struct SequenceTime {
+    #[serde(serialize_with = "serialize_whole_seconds")]
     whole_seconds: u128,
+    #[serde(rename = "subsec_nanoseconds")]
     nanoseconds:   u32,
+}
+
+fn serialize_whole_seconds<S>(whole_seconds: &u128, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&whole_seconds.to_string())
 }
 
 impl SequenceTime {

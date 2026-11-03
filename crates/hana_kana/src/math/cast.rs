@@ -32,6 +32,28 @@ impl ToF32 for i32 {
     fn to_f32(self) -> f32 { self as f32 }
 }
 
+impl ToF32 for i64 {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "intentionally lossy — callers ensure values are in range"
+    )]
+    fn to_f32(self) -> f32 { self as f32 }
+}
+
+/// Saturating conversion of a finite `f32` to `i64`.
+pub trait ToI64 {
+    /// Rounds toward zero, saturating values outside the `i64` range.
+    fn to_i64(self) -> i64;
+}
+
+impl ToI64 for f32 {
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "intentionally lossy — callers ensure values are in range"
+    )]
+    fn to_i64(self) -> i64 { self as i64 }
+}
+
 impl ToF32 for u32 {
     #[allow(
         clippy::cast_precision_loss,
@@ -277,4 +299,40 @@ impl ToF64 for u64 {
 
 impl ToF64 for f32 {
     fn to_f64(self) -> f64 { f64::from(self) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ToF32;
+    use super::ToI64;
+
+    #[test]
+    fn i64_values_convert_to_the_nearest_f32() {
+        let value = ((1_i64 << 24) + 1) * (1_i64 << 32) + (1_i64 << 31);
+        for (integer, expected) in [
+            (0, 0.0_f32),
+            (1, 1.0),
+            (3, 3.0),
+            (-3, -3.0),
+            ((1_i64 << 23) - 1, 8_388_607.0),
+            (1_i64 << 23, 8_388_608.0),
+            ((1_i64 << 24) + 1, 16_777_216.0),
+            (value, f32::from_bits((183_u32 << 23) | 1)),
+            (i64::MIN, -9_223_372_036_854_775_808.0),
+            (i64::MAX, 9_223_372_036_854_775_808.0),
+        ] {
+            assert_eq!(integer.to_f32().to_bits(), expected.to_bits(), "{integer}");
+        }
+    }
+
+    #[test]
+    fn finite_f32_to_i64_reaches_values_above_i32_and_saturates() {
+        assert_eq!(3.75_f32.to_i64(), 3);
+        assert_eq!((-3.75_f32).to_i64(), -3);
+        assert_eq!(4_294_967_296.0_f32.to_i64(), 4_294_967_296);
+        assert_eq!(9_223_372_036_854_775_808.0_f32.to_i64(), i64::MAX);
+        assert_eq!((-9_223_372_036_854_775_808.0_f32).to_i64(), i64::MIN);
+        assert_eq!(f32::INFINITY.to_i64(), i64::MAX);
+        assert_eq!(f32::NEG_INFINITY.to_i64(), i64::MIN);
+    }
 }

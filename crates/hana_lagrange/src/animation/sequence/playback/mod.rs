@@ -266,7 +266,7 @@ impl CameraSequencePlayback {
 mod tests {
     use std::time::Duration;
 
-    use bevy::math::curve::easing::EaseFunction;
+    use bevy::curve::easing::EaseFunction;
     use bevy::prelude::Vec3;
     use hana_kana::Easing;
     use hana_kana::SequenceEasingSampler;

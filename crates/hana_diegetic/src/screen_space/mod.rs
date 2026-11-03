@@ -5,6 +5,8 @@ mod constants;
 
 pub use anchoring::ScreenAnchorTarget;
 pub(crate) use anchoring::ScreenAttachmentResolveDiagnostics;
+#[cfg(test)]
+use anchoring::ScreenAttachmentResolveRuns;
 pub(crate) use anchoring::ScreenPanelRect;
 pub(crate) use anchoring::attachment_is_ready as screen_attachment_is_ready;
 pub(crate) use anchoring::resolve_screen_space_panel_attachments;
@@ -16,8 +18,8 @@ use bevy::camera::ClearColorConfig;
 use bevy::camera::RenderTarget;
 use bevy::camera::ScalingMode;
 use bevy::camera::visibility::RenderLayers;
-use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::ecs::schedule::ApplyDeferred;
+use bevy::ecs::schedule::common_conditions::any_component_removed;
 use bevy::ecs::system::SystemParam;
 use bevy::platform::collections::HashMap;
 use bevy::prelude::Add;
@@ -43,7 +45,6 @@ use bevy::prelude::Ref;
 use bevy::prelude::RelationshipTarget;
 use bevy::prelude::Remove;
 use bevy::prelude::ResMut;
-use bevy::prelude::Resource;
 use bevy::prelude::SystemSet;
 use bevy::prelude::Transform;
 use bevy::prelude::Update;
@@ -54,15 +55,17 @@ use bevy::prelude::With;
 use bevy::prelude::default;
 use bevy::prelude::error;
 use bevy::render::render_resource::TextureUsages;
+use bevy::render::view::DebandDither;
+use bevy::render::view::Tonemapping;
 use bevy::window::PrimaryWindow;
 use bevy::window::WindowRef;
-use constants::FIRST_SCREEN_SPACE_VIEW_RENDER_LAYER;
 use constants::SCREEN_SPACE_CAMERA_FAR;
 use constants::SCREEN_SPACE_CAMERA_Z;
 use constants::SCREEN_SPACE_LIGHT_ILLUMINANCE;
 use constants::SCREEN_SPACE_PANEL_RESIZE_EPSILON;
 use hana_valence::ResolvedAnchorGeometry;
 
+use crate::constants::DIAGNOSTIC_LOG_TARGET;
 use crate::layout::Sizing;
 use crate::panel;
 use crate::panel::ComputedDiegeticPanel;
@@ -74,6 +77,9 @@ use crate::panel::PanelSystems;
 use crate::panel::ResolvedScreenPanelPosition;
 use crate::panel::ScreenPosition;
 use crate::render::PanelChildSystems;
+use crate::render::PrivateViewLayer;
+use crate::render::PrivateViewLayerAllocator;
+use crate::render::PrivateViewLayers;
 use crate::widgets;
 use crate::widgets::PanelWidget;
 use crate::widgets::ScreenWidgetAnchorProxy;
@@ -90,7 +96,7 @@ use crate::widgets::WidgetSystems;
 #[derive(Component)]
 pub struct ScreenSpaceCamera {
     authored_layers: RenderLayers,
-    view_layers:     RenderLayers,
+    view_layer:      PrivateViewLayer,
     order:           isize,
     window:          Entity,
 }
@@ -101,44 +107,12 @@ pub struct ScreenSpaceLight {
     view_layers: RenderLayers,
 }
 
-#[derive(Resource)]
-struct ScreenSpaceViewLayers {
-    next: usize,
-}
-
-impl Default for ScreenSpaceViewLayers {
-    fn default() -> Self {
-        Self {
-            next: FIRST_SCREEN_SPACE_VIEW_RENDER_LAYER,
-        }
-    }
-}
-
-impl ScreenSpaceViewLayers {
-    fn allocate(
-        &mut self,
-        panels: &Query<&DiegeticPanel>,
-        entity_layers: &Query<&RenderLayers>,
-    ) -> Option<RenderLayers> {
-        loop {
-            let candidate = self.next;
-            self.next = self.next.checked_add(1)?;
-            let authored = panels.iter().any(|panel| {
-                matches!(
-                    panel.coordinate_space(),
-                    CoordinateSpace::Screen { render_layers, .. }
-                        if render_layers.iter().any(|layer| layer == candidate)
-                )
-            });
-            let assigned = entity_layers
-                .iter()
-                .any(|layers| layers.iter().any(|layer| layer == candidate));
-            if !authored && !assigned {
-                return Some(RenderLayers::from_layers(&[candidate]));
-            }
-        }
-    }
-}
+/// Requests physical-pixel-aligned outer edges for a screen-space panel.
+///
+/// The panel's fill and border stay inside the snapped outer edge, allowing a
+/// one-physical-pixel border to draw at one consistent weight on every side.
+#[derive(Clone, Component, Copy, Debug, Default)]
+pub struct ScreenPixelEdgeSnap;
 
 #[derive(SystemSet, Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum ScreenSpaceSystems {
@@ -200,11 +174,12 @@ pub(crate) struct ScreenSpacePlugin;
 impl Plugin for ScreenSpacePlugin {
     fn build(&self, app: &mut App) {
         app.add_observer(setup_screen_space_view)
+            .add_observer(release_screen_space_view_layer)
             .add_observer(cleanup_screen_space_on_window_close)
             .add_observer(widgets::on_screen_widget_demand_added)
             .add_observer(widgets::on_screen_widget_demand_removed)
             .init_resource::<ScreenAttachmentResolveDiagnostics>()
-            .init_resource::<ScreenSpaceViewLayers>()
+            .init_resource::<PrivateViewLayers>()
             .configure_sets(
                 Update,
                 (
@@ -238,13 +213,25 @@ impl Plugin for ScreenSpacePlugin {
                         .after(ScreenSpaceSystems::WidgetDemandCommandsApplied)
                         .before(PanelSystems::ResolvePanelAttachments),
                     anchoring::resolve_screen_space_panel_attachments
+                        .run_if(anchoring::screen_attachment_inputs_changed)
                         .in_set(PanelSystems::ResolvePanelAttachments),
                     position_screen_space_panels.in_set(PanelSystems::PositionScreenSpace),
                 ),
             )
             .add_systems(
                 PostUpdate,
-                propagate_screen_space_render_layers.after(PanelChildSystems::Build),
+                (
+                    propagate_screen_space_render_layers.after(PanelChildSystems::Build),
+                    despawn_unused_screen_space_views
+                        .run_if(any_component_removed::<DiegeticPanel>),
+                ),
+            );
+        #[cfg(test)]
+        app.init_resource::<ScreenAttachmentResolveRuns>()
+            .add_systems(
+                Update,
+                anchoring::reset_screen_attachment_resolve_runs
+                    .before(PanelSystems::ResolvePanelAttachments),
             );
     }
 }
@@ -264,7 +251,7 @@ fn resolve_window_ref(
             let resolved = primary.single().ok();
             if resolved.is_none() {
                 bevy::log::warn_once!(
-                    "hana_diegetic: screen panel asked for WindowRef::Primary but no \
+                    target: DIAGNOSTIC_LOG_TARGET, "hana_diegetic: screen panel asked for WindowRef::Primary but no \
                      PrimaryWindow exists; panel will be ignored"
                 );
             }
@@ -479,13 +466,12 @@ pub(crate) fn resolve_screen_axis(
 /// Sharing is detected by querying existing cameras for a matching triple —
 /// no central registry is maintained.
 fn setup_screen_space_view(
-    trigger: On<Add, DiegeticPanel>,
+    trigger: On<Add<DiegeticPanel>>,
     panels: Query<&DiegeticPanel>,
     cameras: Query<&ScreenSpaceCamera>,
     lights: Query<&ScreenSpaceLight>,
-    entity_layers: Query<&RenderLayers>,
     primary: Query<Entity, With<PrimaryWindow>>,
-    mut view_layers: ResMut<ScreenSpaceViewLayers>,
+    mut private_view_layer_allocator: PrivateViewLayerAllocator,
     mut commands: Commands,
 ) {
     let Ok(panel) = panels.get(trigger.entity) else {
@@ -496,22 +482,18 @@ fn setup_screen_space_view(
         panel,
         &cameras,
         &lights,
-        &panels,
-        &entity_layers,
         &primary,
-        &mut view_layers,
+        &mut private_view_layer_allocator,
         &mut commands,
     );
 }
 
 fn setup_changed_screen_space_views(
     panels: Query<(Entity, &DiegeticPanel), Changed<DiegeticPanel>>,
-    all_panels: Query<&DiegeticPanel>,
     cameras: Query<&ScreenSpaceCamera>,
     lights: Query<&ScreenSpaceLight>,
-    entity_layers: Query<&RenderLayers>,
     primary: Query<Entity, With<PrimaryWindow>>,
-    mut view_layers: ResMut<ScreenSpaceViewLayers>,
+    mut private_view_layer_allocator: PrivateViewLayerAllocator,
     mut commands: Commands,
 ) {
     for (entity, panel) in &panels {
@@ -520,10 +502,8 @@ fn setup_changed_screen_space_views(
             panel,
             &cameras,
             &lights,
-            &all_panels,
-            &entity_layers,
             &primary,
-            &mut view_layers,
+            &mut private_view_layer_allocator,
             &mut commands,
         );
     }
@@ -534,10 +514,8 @@ fn setup_screen_space_view_for_panel(
     panel: &DiegeticPanel,
     cameras: &Query<&ScreenSpaceCamera>,
     lights: &Query<&ScreenSpaceLight>,
-    panels: &Query<&DiegeticPanel>,
-    entity_layers: &Query<&RenderLayers>,
     primary: &Query<Entity, With<PrimaryWindow>>,
-    view_layers: &mut ScreenSpaceViewLayers,
+    private_view_layer_allocator: &mut PrivateViewLayerAllocator,
     commands: &mut Commands,
 ) {
     let CoordinateSpace::Screen {
@@ -558,24 +536,25 @@ fn setup_screen_space_view_for_panel(
             && cam.authored_layers == *render_layers
             && cam.window == window_entity
     });
-    let (camera_exists, assigned_layers) = if let Some(camera) = existing_camera {
-        (true, camera.view_layers.clone())
+    let (camera_exists, view_layer) = if let Some(camera) = existing_camera {
+        (true, camera.view_layer)
     } else {
-        let Some(assigned_layers) = view_layers.allocate(panels, entity_layers) else {
-            error!("hana_diegetic: screen-space view render-layer identifiers are exhausted");
+        let Ok(view_layer) = private_view_layer_allocator.allocate() else {
+            error!(target: DIAGNOSTIC_LOG_TARGET, "hana_diegetic: screen-space view render-layer identifiers are exhausted");
             return;
         };
-        (false, assigned_layers)
+        (false, view_layer)
     };
+    let assigned_layers = view_layer.render_layers();
     panel::write_owned_render_layers(commands, entity, entity, Some(assigned_layers.clone()));
 
     if !camera_exists {
         commands.spawn((
             ScreenSpaceCamera {
                 authored_layers: render_layers.clone(),
-                view_layers:     assigned_layers.clone(),
-                order:           camera_order,
-                window:          window_entity,
+                view_layer,
+                order: camera_order,
+                window: window_entity,
             },
             Camera3d {
                 depth_texture_usages: Camera3dDepthTextureUsage(
@@ -588,7 +567,8 @@ fn setup_screen_space_view_for_panel(
                 clear_color: ClearColorConfig::None,
                 ..default()
             },
-            Tonemapping::AcesFitted,
+            Tonemapping::None,
+            DebandDither::Disabled,
             RenderTarget::Window(WindowRef::Entity(window_entity)),
             Projection::Orthographic(OrthographicProjection {
                 scaling_mode: ScalingMode::WindowSize,
@@ -702,66 +682,47 @@ fn propagate_layers_recursive(
     }
 }
 
-/// Despawns the overlay camera and its light when the last panel using that
-/// screen-space view is removed.
+/// Despawns each overlay camera, and the light on its view layer, that no
+/// live panel resolves to.
 ///
-/// Reads the removed panel's `(camera_order, render_layers, window)` while
-/// the component is still live (`On<Remove>` fires before the component is
-/// dropped). A view is keyed by the full triple; its camera and light are
-/// despawned only when no surviving panel matches all three.
+/// A view is keyed by the full `(camera_order, render_layers, window)`
+/// triple; its camera and light stay while any panel matches all three.
+/// Iterating cameras (not windows) also reaps a camera whose
+/// `WindowRef::Primary` panels no longer resolve because the primary window
+/// itself was despawned.
 ///
-/// This observer is the sole owner of camera and light despawn. The
-/// `cleanup_screen_space_on_window_close` observer despawns panels only;
-/// teardown of their cameras/lights cascades through this observer,
-/// keeping single-owner cleanup.
-pub(crate) fn cleanup_screen_space_view(
-    removed_entity: Entity,
-    removed_panel: &DiegeticPanel,
-    panels: &Query<(Entity, &DiegeticPanel)>,
-    cameras: &Query<(Entity, &ScreenSpaceCamera)>,
-    lights: &Query<(Entity, &ScreenSpaceLight)>,
-    primary: &Query<Entity, With<PrimaryWindow>>,
-    commands: &mut Commands,
+/// This system is the sole owner of camera and light despawn. It runs in
+/// `PostUpdate`, only in frames where a `DiegeticPanel` was removed, so every
+/// command queued against a camera during `Update` (such as the
+/// `RenderDebugOverlay` insert from `bevy_dev_tools`) applies before the
+/// despawn. A panel replaced within one command flush finds the view's camera
+/// still live in [`setup_screen_space_view`] and keeps it.
+fn despawn_unused_screen_space_views(
+    panels: Query<&DiegeticPanel>,
+    cameras: Query<(Entity, &ScreenSpaceCamera)>,
+    lights: Query<(Entity, &ScreenSpaceLight)>,
+    primary: Query<Entity, With<PrimaryWindow>>,
+    mut commands: Commands,
 ) {
-    let CoordinateSpace::Screen {
-        camera_order,
-        ref render_layers,
-        ..
-    } = *removed_panel.coordinate_space()
-    else {
-        return;
-    };
-
-    // For each matching camera, check whether any *other* surviving panel
-    // still resolves to that camera's window. If not, the camera is dead.
-    // Iterating cameras (not windows) is what lets us clean up orphans
-    // whose `WindowRef::Primary` panels can no longer be resolved because
-    // the primary window itself was despawned.
-    for (cam_entity, cam) in cameras {
-        if cam.order != camera_order || cam.authored_layers != *render_layers {
-            continue;
-        }
-        let still_used = panels.iter().any(|(entity, panel)| {
-            if entity == removed_entity {
-                return false;
-            }
+    for (cam_entity, cam) in &cameras {
+        let still_used = panels.iter().any(|panel| {
             let CoordinateSpace::Screen {
-                camera_order: other_order,
-                render_layers: other_layers,
-                window: other_window_ref,
+                camera_order,
+                render_layers,
+                window: window_ref,
                 ..
             } = panel.coordinate_space()
             else {
                 return false;
             };
-            *other_order == camera_order
-                && other_layers == render_layers
-                && resolve_window_ref(*other_window_ref, primary) == Some(cam.window)
+            *camera_order == cam.order
+                && *render_layers == cam.authored_layers
+                && resolve_window_ref(*window_ref, &primary) == Some(cam.window)
         });
         if !still_used {
             commands.entity(cam_entity).despawn();
-            for (light_entity, light) in lights {
-                if light.view_layers == cam.view_layers {
+            for (light_entity, light) in &lights {
+                if light.view_layers == cam.view_layer.render_layers() {
                     commands.entity(light_entity).despawn();
                 }
             }
@@ -769,13 +730,23 @@ pub(crate) fn cleanup_screen_space_view(
     }
 }
 
+/// Returns a screen-space camera's private layer when that camera is removed.
+fn release_screen_space_view_layer(
+    trigger: On<Remove<ScreenSpaceCamera>>,
+    cameras: Query<&ScreenSpaceCamera>,
+    mut private_view_layers: ResMut<PrivateViewLayers>,
+) {
+    if let Ok(camera) = cameras.get(trigger.entity) {
+        private_view_layers.release(camera.view_layer);
+    }
+}
+
 /// Despawns screen-space panels whose target window was removed.
 ///
-/// Camera and light teardown cascade through [`cleanup_screen_space_view`]
-/// when those panels are despawned — this observer owns panel teardown
-/// only, preserving single-owner cleanup.
+/// This observer owns panel teardown only; the next `PostUpdate` despawns
+/// their cameras and lights through [`despawn_unused_screen_space_views`].
 fn cleanup_screen_space_on_window_close(
-    trigger: On<Remove, Window>,
+    trigger: On<Remove<Window>>,
     panels: Query<(Entity, &DiegeticPanel)>,
     primary: Query<Entity, With<PrimaryWindow>>,
     mut commands: Commands,
@@ -804,8 +775,10 @@ mod tests {
 
     use bevy::camera::RenderTarget;
     use bevy::camera::visibility::RenderLayers;
+    use bevy::ecs::system::RunSystemOnce;
     use bevy::prelude::App;
     use bevy::prelude::ChildOf;
+    use bevy::prelude::Commands;
     use bevy::prelude::Component;
     use bevy::prelude::DetectChanges;
     use bevy::prelude::Entity;
@@ -1577,5 +1550,131 @@ mod tests {
 
         let mut light_q = app.world_mut().query::<&ScreenSpaceLight>();
         assert_eq!(light_q.iter(app.world()).count(), 0);
+    }
+
+    fn single_window_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(monospace_measurer())
+            .add_plugins(HeadlessLayoutPlugin)
+            .add_plugins(ScreenSpacePlugin);
+        app.world_mut().spawn((
+            Window {
+                resolution: (800_u32, 600_u32).into(),
+                ..Default::default()
+            },
+            PrimaryWindow,
+        ));
+        app
+    }
+
+    fn bottom_center_panel() -> DiegeticPanel {
+        DiegeticPanel::screen()
+            .size(Px(100.0), Px(50.0))
+            .anchor(Anchor::BottomCenter)
+            .layout(|_| {})
+            .build()
+            .expect("screen panel builds")
+    }
+
+    /// Returns the only overlay camera and the only overlay light.
+    fn screen_view(app: &mut App) -> (Entity, Entity) {
+        let mut cameras = app
+            .world_mut()
+            .query_filtered::<Entity, With<ScreenSpaceCamera>>();
+        let camera = cameras
+            .single(app.world())
+            .expect("one overlay camera exists");
+        let mut lights = app
+            .world_mut()
+            .query_filtered::<Entity, With<ScreenSpaceLight>>();
+        let light = lights
+            .single(app.world())
+            .expect("one overlay light exists");
+        (camera, light)
+    }
+
+    /// Replacing a screen panel with another on the same view within one
+    /// command flush keeps that view's camera and light.
+    #[test]
+    fn panel_swap_in_one_flush_keeps_the_view_camera_and_light() {
+        let mut app = single_window_app();
+        let replaced = app.world_mut().spawn(bottom_center_panel()).id();
+        app.update();
+        let view = screen_view(&mut app);
+
+        app.world_mut()
+            .run_system_once(move |mut commands: Commands| {
+                commands.entity(replaced).despawn();
+                commands.spawn(bottom_center_panel());
+            })
+            .expect("panel swap system should run");
+        assert_eq!(screen_view(&mut app), view);
+
+        app.update();
+        assert!(app.world().get_entity(replaced).is_err());
+        assert_eq!(screen_view(&mut app), view);
+    }
+
+    /// Despawning the last panel of a view leaves its camera and light in
+    /// place until `PostUpdate` runs.
+    #[test]
+    fn last_panel_despawn_keeps_the_view_until_post_update() {
+        let mut app = single_window_app();
+        let panel = app.world_mut().spawn(bottom_center_panel()).id();
+        app.update();
+        let (camera, light) = screen_view(&mut app);
+
+        app.world_mut()
+            .run_system_once(move |mut commands: Commands| {
+                commands.entity(panel).despawn();
+            })
+            .expect("panel despawn system should run");
+        assert!(app.world().get_entity(panel).is_err());
+        assert!(app.world().get_entity(camera).is_ok());
+        assert!(app.world().get_entity(light).is_ok());
+
+        app.update();
+        assert!(app.world().get_entity(camera).is_err());
+        assert!(app.world().get_entity(light).is_err());
+    }
+
+    /// A view removed in `PostUpdate` returns its private layer for a new key.
+    #[test]
+    fn a_reaped_screen_space_view_returns_its_layer() {
+        let mut app = single_window_app();
+        let panel = app.world_mut().spawn(bottom_center_panel()).id();
+        app.update();
+        let (camera, _) = screen_view(&mut app);
+        let released_layer = app
+            .world()
+            .get::<ScreenSpaceCamera>(camera)
+            .expect("screen-space camera exists")
+            .view_layer;
+
+        app.world_mut()
+            .run_system_once(move |mut commands: Commands| {
+                commands.entity(panel).despawn();
+            })
+            .expect("panel despawn system should run");
+        app.update();
+        assert!(app.world().get_entity(camera).is_err());
+
+        let next_panel = DiegeticPanel::screen()
+            .size(Px(100.0), Px(50.0))
+            .camera_order(1)
+            .layout(|_| {})
+            .build()
+            .expect("next screen panel builds");
+        app.world_mut().spawn(next_panel);
+        app.update();
+        let (next_camera, _) = screen_view(&mut app);
+        assert_eq!(
+            app.world()
+                .get::<ScreenSpaceCamera>(next_camera)
+                .expect("next screen-space camera exists")
+                .view_layer,
+            released_layer,
+        );
     }
 }

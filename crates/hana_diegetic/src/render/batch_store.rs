@@ -260,6 +260,13 @@ impl<K: Clone + Eq + Hash, B: Batch> BatchStore<K, B> {
         self.batches.get_mut(key)
     }
 
+    /// Batch containing a routed member.
+    #[must_use]
+    pub(super) fn member_batch(&self, member: B::MemberKey) -> Option<&B> {
+        let key = self.member_index.get(&member)?;
+        self.batches.get(key)
+    }
+
     /// One batch by key.
     #[must_use]
     pub(super) fn get(&self, key: &K) -> Option<&B> { self.batches.get(key) }

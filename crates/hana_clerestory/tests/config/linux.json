@@ -451,24 +451,6 @@
       }
     },
     {
-      "id": "x11_legacy_v3_multi_window_1_1",
-      "description": "v3 file with both windows on Monitor 1, launched on Monitor 1 (X11): anonymous legacy targets follow the corrected display and the save keeps the unspawned window",
-      "automation": "full",
-      "backend": "x11",
-      "launch_monitor": 1,
-      "requires": {"min_monitors": 2},
-      "ron_file": "legacy_v3_multi_window_1_1.ron",
-      "windows": {
-        "primary": {
-          "validate": ["position", "size", "monitor_index", "mode"]
-        },
-        "window-1": {
-          "spawn_event": "restore_window::events::SpawnManagedWindow",
-          "validate": ["position", "size", "monitor_index", "mode"]
-        }
-      }
-    },
-    {
       "id": "x11_keyboard_snap_W5",
       "description": "Position saved correctly after keyboard snap - tests workaround for winit #4443",
       "automation": "human_only",

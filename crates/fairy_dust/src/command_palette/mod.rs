@@ -105,7 +105,7 @@ use self::panel::command_row_list;
 use self::panel::failure_action_row_index;
 use self::panel::palette_panel_origin;
 use self::panel::palette_panel_width;
-use self::panel::palette_tree_awaiting_assembly;
+use self::panel::palette_tree_awaiting_registry;
 use self::panel::palette_tree_for_query;
 use crate::ensure_plugin;
 use crate::keymap;
@@ -114,7 +114,7 @@ command! {
     action:      OpenCommandPalette,
     event:       OpenCommandPaletteEvent,
     id:          "palette::open",
-    title:       "Open Command Palette",
+    title:       "Open command palette",
     description: "Search every declared command and run the selected one.",
     capability:  Unremappable,
 }
@@ -270,11 +270,11 @@ struct PaletteCommittedQuery(String);
 /// This is separate from a keymap availability result: once the registry is
 /// assembled, a terminal `KeymapBindings` state is still queried and rendered
 /// through Rubric's typed `PaletteBinding::KeymapUnavailable`.
-enum PaletteRegistryAssembly<'registry> {
+enum PaletteRegistry<'registry> {
     /// Plugin assembly has not yet published command metadata.
-    AwaitingAssembly,
+    Pending,
     /// The registry can produce a borrowed shared palette result.
-    Assembled(&'registry CommandRegistry),
+    Ready(&'registry CommandRegistry),
 }
 
 /// UI data produced by one consumer-owned palette rebuild.
@@ -381,9 +381,9 @@ fn toggle_command_palette(
     let Ok((window_entity, window)) = windows.single() else {
         return;
     };
-    let registry_assembly = palette_registry_assembly(command_registry.as_deref());
+    let registry = palette_registry(command_registry.as_deref());
     let presentation = build_palette_presentation(
-        registry_assembly,
+        registry,
         &keymap_load_failures,
         &keymap_path_availability,
         &keymap_bindings,
@@ -495,7 +495,7 @@ fn update_query(
             PaletteRowCursor::default()
         },
     };
-    let registry_assembly = palette_registry_assembly(command_registry.as_deref());
+    let registry = palette_registry(command_registry.as_deref());
     rebuild_palette(
         &windows,
         panel,
@@ -504,7 +504,7 @@ fn update_query(
         &keymap_bindings,
         &active_context,
         &effective_keymap_status,
-        registry_assembly,
+        registry,
         &changed.snapshot.committed_text,
         row_cursor,
         &mut commands,
@@ -538,8 +538,8 @@ fn step_palette_highlight(
     {
         return;
     }
-    let registry_assembly = palette_registry_assembly(command_registry.as_deref());
-    let PaletteRegistryAssembly::Assembled(assembled_registry) = registry_assembly else {
+    let registry = palette_registry(command_registry.as_deref());
+    let PaletteRegistry::Ready(assembled_registry) = registry else {
         return;
     };
     let query_result = query_command_palette(
@@ -565,7 +565,7 @@ fn step_palette_highlight(
         &keymap_bindings,
         &active_context,
         &effective_keymap_status,
-        registry_assembly,
+        registry,
         &palette_query.0,
         *row_cursor,
         &mut commands,
@@ -600,7 +600,7 @@ fn refresh_open_palette_after_keymap_changes(
         return;
     }
 
-    let registry_assembly = palette_registry_assembly(command_registry.as_deref());
+    let registry = palette_registry(command_registry.as_deref());
     rebuild_palette(
         &windows,
         panel,
@@ -609,7 +609,7 @@ fn refresh_open_palette_after_keymap_changes(
         &keymap_bindings,
         &active_context,
         &effective_keymap_status,
-        registry_assembly,
+        registry,
         &palette_query.0,
         row_cursor.copied().unwrap_or_default(),
         &mut commands,
@@ -643,19 +643,19 @@ fn dispatch_selected_command(
         commands.entity(panel).despawn();
         return;
     }
-    let registry_assembly = palette_registry_assembly(command_registry.as_deref());
-    let query_result = match registry_assembly {
-        PaletteRegistryAssembly::AwaitingAssembly => {
+    let registry = palette_registry(command_registry.as_deref());
+    let query_result = match registry {
+        PaletteRegistry::Pending => {
             commands.trigger(ImeRejectCommit {
                 session_id: commit.session_id,
                 attempt_id: commit.attempt_id,
                 reason:     ImeRejection::AppOwned(String::from(
-                    "the command registry is still assembling",
+                    "the command registry is not ready yet",
                 )),
             });
             return;
         },
-        PaletteRegistryAssembly::Assembled(command_registry) => query_command_palette(
+        PaletteRegistry::Ready(command_registry) => query_command_palette(
             command_registry,
             &active_context,
             &effective_keymap_status,
@@ -812,7 +812,7 @@ fn rebuild_palette(
     keymap_bindings: &KeymapBindings,
     active_context: &ActiveKeymapContext,
     effective_keymap_status: &EffectiveKeymapStatus,
-    registry_assembly: PaletteRegistryAssembly<'_>,
+    registry: PaletteRegistry<'_>,
     palette_query: &str,
     row_cursor: PaletteRowCursor,
     commands: &mut Commands,
@@ -823,7 +823,7 @@ fn rebuild_palette(
     let origin = palette_panel_origin(window);
     let panel_width = palette_panel_width(window);
     let presentation = build_palette_presentation(
-        registry_assembly,
+        registry,
         keymap_load_failures,
         keymap_path_availability,
         keymap_bindings,
@@ -851,19 +851,17 @@ fn rebuild_palette(
 
 /// Converts an optional shared registry into the palette's semantic assembly
 /// state at its consumer boundary.
-const fn palette_registry_assembly(
-    command_registry: Option<&CommandRegistry>,
-) -> PaletteRegistryAssembly<'_> {
+const fn palette_registry(command_registry: Option<&CommandRegistry>) -> PaletteRegistry<'_> {
     match command_registry {
-        Some(command_registry) => PaletteRegistryAssembly::Assembled(command_registry),
-        None => PaletteRegistryAssembly::AwaitingAssembly,
+        Some(command_registry) => PaletteRegistry::Ready(command_registry),
+        None => PaletteRegistry::Pending,
     }
 }
 
 /// Queries Rubric and builds one renderer-owned tree without retaining the
 /// borrowed query result after this rebuild returns.
 fn build_palette_presentation(
-    registry_assembly: PaletteRegistryAssembly<'_>,
+    registry: PaletteRegistry<'_>,
     keymap_load_failures: &KeymapLoadFailures,
     keymap_path_availability: &KeymapPathAvailability,
     keymap_bindings: &KeymapBindings,
@@ -878,11 +876,11 @@ fn build_palette_presentation(
         .iter()
         .map(|keymap_failure| keymap_failure.action.clone())
         .collect();
-    let layout_tree = match registry_assembly {
-        PaletteRegistryAssembly::AwaitingAssembly => {
-            palette_tree_awaiting_assembly(palette_query, &keymap_failures, panel_width)
+    let layout_tree = match registry {
+        PaletteRegistry::Pending => {
+            palette_tree_awaiting_registry(palette_query, &keymap_failures, panel_width)
         },
-        PaletteRegistryAssembly::Assembled(command_registry) => {
+        PaletteRegistry::Ready(command_registry) => {
             let query_result = query_command_palette(
                 command_registry,
                 active_context,
@@ -1055,7 +1053,7 @@ mod test_support {
     /// application name is configured, so no disk worker starts and no
     /// configuration directory is touched.
     pub(super) fn palette_test_app() -> App {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.add_plugins(KeymapPlugin::new().with_defaults(FAIRY_DUST_DEFAULT_KEYMAP));
         app.finish();
         app
@@ -1091,6 +1089,7 @@ mod tests {
     use bevy::prelude::With;
     use bevy::state::app::AppExtStates;
     use bevy::state::app::StatesPlugin;
+    use bevy::time::TimeUpdateStrategy;
     use bevy::window::Ime;
     use bevy::window::PrimaryWindow;
     use bevy::window::WindowFocused;
@@ -1128,17 +1127,73 @@ mod tests {
     use super::*;
 
     const LOADED_COMMAND_KEYSTROKE: &str = "ctrl-shift-r";
-    const LOADED_COMMAND_TITLE: &str = "Restart Example";
+    const LOADED_COMMAND_TITLE: &str = "Restart example";
     const REVEAL_FAILURE_ACTION_LABEL: &str = "Reveal";
     const CANONICAL_CONTEXT_DEFAULTS: &str =
         include_str!("../../examples/keymap_contexts.keymap.jsonc");
     const CANONICAL_PENDING_SEQUENCE_DEFAULTS: &str = r#"{
         "bindings": [{ "bindings": { "g h": "example::show_global_route" } }]
     }"#;
-    const CANONICAL_CONTEXT_APPLICATION_NAME: &str = "fairy_dust_keymap_contexts";
     const CANONICAL_EXTRA_PROTECTED_KEYSTROKES: [&str; 2] = ["ctrl-shift-q", "alt-shift-x"];
     const CANONICAL_SHOW_GLOBAL_ROUTE_TITLE: &str = "example::show_global_route";
     const INVALID_CANONICAL_DEFAULTS: &str = "{ invalid default";
+
+    #[test]
+    fn every_registered_command_title_is_sentence_case() -> Result<(), String> {
+        const CAPITALIZED_NAMES: [&str; 9] = [
+            "FPS",
+            "LFO",
+            "UV",
+            "X",
+            "Y",
+            "Z",
+            "Gaussian",
+            "Perlin",
+            "Laplacian",
+        ];
+
+        let mut app = crate::test_app();
+        app.add_plugins(hana_rubric::KeymapPlugin::new());
+        app.finish();
+        let registry = CommandRegistry::initialize(app.world_mut()).map_err(|diagnostics| {
+            format!("command registry initialization failed: {diagnostics:?}")
+        })?;
+        // The headless palette and canonical-context fixtures are declared in this
+        // test module; their ids are not titles shipped by Fairy Dust.
+        let production_commands = registry
+            .iter()
+            .filter(|command| {
+                !command.id.as_str().starts_with("palette_test::")
+                    && !command.id.as_str().starts_with("example::")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            production_commands.len() >= 7,
+            "the sentence-case check needs every shipped Fairy Dust command"
+        );
+        let offending_titles = production_commands
+            .iter()
+            .filter(|command| {
+                !command.title.chars().next().is_some_and(char::is_uppercase)
+                    || command
+                        .title
+                        .split_whitespace()
+                        .flat_map(|word| word.split(['/', '-']))
+                        .skip(1)
+                        .any(|word| {
+                            word.chars().next().is_some_and(char::is_uppercase)
+                                && !CAPITALIZED_NAMES.contains(&word)
+                        })
+            })
+            .map(|command| format!("{}: {:?}", command.id, command.title))
+            .collect::<Vec<_>>();
+        assert!(
+            offending_titles.is_empty(),
+            "command titles outside sentence case:\n{}",
+            offending_titles.join("\n")
+        );
+        Ok(())
+    }
 
     #[derive(Default, Resource)]
     struct DispatchedCommands(usize);
@@ -1226,7 +1281,7 @@ mod tests {
     struct UnrelatedKeyboardOwner;
 
     fn palette_runtime_app() -> App {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.add_plugins(MinimalPlugins)
             .insert_resource(DiegeticTextMeasurer::default())
             .add_plugins((InputPlugin, HeadlessDiegeticUiPlugin))
@@ -1240,7 +1295,7 @@ mod tests {
     }
 
     fn palette_runtime_app_with_defaults(defaults: &'static str) -> App {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.add_plugins(MinimalPlugins)
             .insert_resource(DiegeticTextMeasurer::default())
             .add_plugins((InputPlugin, HeadlessDiegeticUiPlugin))
@@ -1255,7 +1310,7 @@ mod tests {
     }
 
     fn palette_runtime_app_with_two_state_dimensions() -> App {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.add_plugins(MinimalPlugins)
             .insert_resource(DiegeticTextMeasurer::default())
             .add_plugins((InputPlugin, HeadlessDiegeticUiPlugin, StatesPlugin))
@@ -1288,7 +1343,7 @@ mod tests {
         defaults: &'static str,
         context_dimensions: CanonicalContextDimensions,
     ) -> App {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.add_plugins(MinimalPlugins)
             .insert_resource(DiegeticTextMeasurer::default())
             .add_plugins((InputPlugin, HeadlessDiegeticUiPlugin, StatesPlugin))
@@ -1319,7 +1374,6 @@ mod tests {
         let [first_keystroke, second_keystroke] = canonical_context_protected_keystrokes();
         KeymapPlugin::new()
             .with_defaults(defaults)
-            .with_app_name(CANONICAL_CONTEXT_APPLICATION_NAME)
             .with_protected_command_binding(
                 crate::command_palette_recovery_command_id(),
                 crate::command_palette_recovery_keystroke(),
@@ -1335,7 +1389,6 @@ mod tests {
     ) -> crate::CommandPaletteKeymap {
         let [first_keystroke, second_keystroke] = canonical_context_protected_keystrokes();
         crate::CommandPaletteKeymap::new(defaults)
-            .for_application(CANONICAL_CONTEXT_APPLICATION_NAME)
             .with_protected_keystroke(first_keystroke)
             .with_protected_keystroke(second_keystroke)
     }
@@ -1349,7 +1402,7 @@ mod tests {
     }
 
     fn awaiting_keymap_context() -> ActiveKeymapContext {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.add_plugins(
             KeymapPlugin::new().with_state_dimension::<AwaitingPaletteContext>("palette-refresh"),
         );
@@ -1360,7 +1413,7 @@ mod tests {
     }
 
     fn terminal_palette_runtime_app(keymap_plugin: KeymapPlugin) -> App {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.add_plugins(MinimalPlugins)
             .insert_resource(DiegeticTextMeasurer::default())
             .add_plugins((InputPlugin, HeadlessDiegeticUiPlugin))
@@ -1627,7 +1680,7 @@ mod tests {
     /// plugin add, so the second request has to be a no-op.
     #[test]
     fn asking_for_the_palette_twice_installs_it_once() {
-        let mut app = App::new();
+        let mut app = crate::test_app();
 
         install(&mut app);
         install(&mut app);
@@ -1939,7 +1992,15 @@ mod tests {
         app
     }
 
+    /// Presses and releases a bare Down, after the palette's opening chord is released.
     fn press_arrow_down(app: &mut App) {
+        assert!(
+            !app.world()
+                .resource::<ButtonInput<KeyCode>>()
+                .any_pressed(crate::constants::MODIFIER_KEYS),
+            "release the recovery keystroke before pressing Down; a held Command makes it \
+             Command+Down on macOS, which never steps the palette"
+        );
         press_keys(app, [KeyCode::ArrowDown]);
         app.update();
         release_key(app, KeyCode::ArrowDown);
@@ -1961,6 +2022,24 @@ mod tests {
         let mut app = palette_test_row_app();
 
         press_recovery_keystroke(&mut app);
+        release_recovery_keystroke(&mut app);
+        commit_ime_text(&mut app, "Palette Test");
+        press_arrow_down(&mut app);
+        request_palette_ime_commit(&mut app, ImeCommitCause::Request);
+
+        let runs = app.world().resource::<PaletteTestRowRuns>();
+        assert_eq!((runs.dispatch, runs.recover), (0, 1));
+    }
+
+    #[test]
+    fn down_then_enter_runs_the_second_row_when_every_frame_is_slow() {
+        let mut app = palette_test_row_app();
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(
+            std::time::Duration::from_secs(1),
+        ));
+
+        press_recovery_keystroke(&mut app);
+        release_recovery_keystroke(&mut app);
         commit_ime_text(&mut app, "Palette Test");
         press_arrow_down(&mut app);
         request_palette_ime_commit(&mut app, ImeCommitCause::Request);
@@ -1973,6 +2052,7 @@ mod tests {
     fn down_from_an_empty_query_highlights_the_first_row() {
         let mut app = palette_runtime_app();
         press_recovery_keystroke(&mut app);
+        release_recovery_keystroke(&mut app);
         let panel = palette_panel(&mut app);
         let highlighted_row = |app: &App| {
             let query_result = query_command_palette(

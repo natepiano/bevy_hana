@@ -176,17 +176,40 @@ impl ScreenPanelRect {
         source_anchor: Anchor,
         source_anchor_position: Vec2,
     ) -> Option<PanelScreenBounds> {
+        self.placed_outset_bounds(
+            source_anchor,
+            source_anchor_position,
+            Vec2::ZERO,
+            Vec2::ZERO,
+        )
+    }
+
+    /// Screen bounds of this rect placed by `source_anchor`, grown in its own
+    /// Y-down frame by `top_left_outset` and `bottom_right_outset` before it turns.
+    pub(crate) fn placed_outset_bounds(
+        self,
+        source_anchor: Anchor,
+        source_anchor_position: Vec2,
+        top_left_outset: Vec2,
+        bottom_right_outset: Vec2,
+    ) -> Option<PanelScreenBounds> {
         let bounds = self.bounds?;
         let source_offset = bounds.anchor_offset(source_anchor);
         let mut minimum = Vec2::splat(f32::INFINITY);
         let mut maximum = Vec2::splat(f32::NEG_INFINITY);
-        for anchor in [
-            Anchor::TopLeft,
-            Anchor::TopRight,
-            Anchor::BottomRight,
-            Anchor::BottomLeft,
+        for (anchor, outset) in [
+            (Anchor::TopLeft, top_left_outset),
+            (
+                Anchor::TopRight,
+                Vec2::new(bottom_right_outset.x, top_left_outset.y),
+            ),
+            (Anchor::BottomRight, bottom_right_outset),
+            (
+                Anchor::BottomLeft,
+                Vec2::new(top_left_outset.x, bottom_right_outset.y),
+            ),
         ] {
-            let corner_offset = bounds.anchor_offset(anchor) - source_offset;
+            let corner_offset = bounds.anchor_offset(anchor) - source_offset + outset;
             let point = source_anchor_position
                 + projection::rotate_screen_offset(corner_offset, self.angle);
             minimum = minimum.min(point);

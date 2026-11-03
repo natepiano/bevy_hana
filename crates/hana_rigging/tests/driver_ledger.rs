@@ -2031,7 +2031,7 @@ fn a_failed_attempt_returns_the_role_to_idle() -> Result<(), Box<dyn Error>> {
         fixture.control.session_of(&fixture.role),
         SessionLookupView::NotEstablished
     );
-    assert!(fixture.control.establishments().is_empty());
+    assert_eq!(fixture.control.establishments(), []);
     assert!(!matches!(
         fixture.role_status()?,
         RoleStatusView::Established { .. }
@@ -2062,7 +2062,7 @@ fn an_aborted_attempt_returns_the_role_to_idle() -> Result<(), Box<dyn Error>> {
         fixture.control.attempt_of(&fixture.role),
         AttemptLookupView::Idle
     );
-    assert!(fixture.control.establishments().is_empty());
+    assert_eq!(fixture.control.establishments(), []);
     Ok(())
 }
 

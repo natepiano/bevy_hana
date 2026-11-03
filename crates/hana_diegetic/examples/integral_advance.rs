@@ -14,7 +14,7 @@
 //! fonts or invalid requests.
 //!
 //! The comparison panel stays centered in screen space while the lit ground
-//! plane and rotating cube move with the world camera behind it.
+//! plane frames it and the rotating cube remains visible beside it at home.
 
 use bevy::prelude::Assets;
 use bevy::prelude::Color;
@@ -67,10 +67,15 @@ const REQUESTED_SIZES: [Pt; 10] = [
 ];
 
 const CUBE_CLEARANCE: f32 = 0.1;
-const CAMERA_FOCUS: Vec3 = Vec3::new(0.0, 0.6, 0.0);
+// At both home aspect ratios, the farthest ground ray reaches about 61 m from
+// the origin. A 132 m square keeps every edge beyond the window with margin.
+const GROUND_SIZE: f32 = 132.0;
+const CAMERA_FOCUS: Vec3 = Vec3::new(0.0, 1.8, 0.0);
 const CAMERA_YAW: f32 = 1.222_275_4;
 const CAMERA_PITCH: f32 = 0.541_051_57;
-const CAMERA_RADIUS: f32 = 40.0;
+const CAMERA_RADIUS: f32 = 14.5;
+const CUBE_RIGHT_OF_FOCUS: f32 = 10.0;
+const CUBE_TOWARD_CAMERA: f32 = -5.0;
 
 const LABEL_COLUMN_WIDTH: Px = Px(150.0);
 const SAMPLE_COLUMN_WIDTH: Px = Px(250.0);
@@ -110,12 +115,11 @@ fn main() {
         .with_save_window_position()
         .with_studio_lighting()
         .with_ground_plane()
+        .size(GROUND_SIZE)
         .with_cube()
         .size(fairy_dust::EXAMPLE_CUBE_SIZE)
         .color(fairy_dust::EXAMPLE_CUBE_COLOR)
-        .transform(Transform::from_translation(
-            fairy_dust::example_cube_on_ground(CUBE_CLEARANCE),
-        ))
+        .transform(Transform::from_translation(cube_position()))
         .cube_spin(CubeSpinConfig::new())
         .with_orbit_cam_preset_pose(
             OrbitCamPose {
@@ -138,14 +142,25 @@ fn main() {
         .run();
 }
 
+fn cube_position() -> Vec3 {
+    let right = Vec3::new(CAMERA_YAW.cos(), 0.0, -CAMERA_YAW.sin());
+    let toward_camera = Vec3::new(CAMERA_YAW.sin(), 0.0, CAMERA_YAW.cos());
+    fairy_dust::example_cube_on_ground(CUBE_CLEARANCE)
+        + right * CUBE_RIGHT_OF_FOCUS
+        + toward_camera * CUBE_TOWARD_CAMERA
+}
+
 fn spawn_comparison_panel(
     mut commands: Commands,
     fonts: Res<FontRegistry>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let Some(font) = fonts.font(FontId::MONOSPACE) else {
-        error!("integral_advance: embedded monospace font is unavailable");
-        return;
+    let font = match fonts.font(FontId::MONOSPACE) {
+        Ok(font) => font,
+        Err(error) => {
+            error!("integral_advance: embedded monospace font is unavailable: {error}");
+            return;
+        },
     };
     let tree = match comparison_tree(font) {
         Ok(tree) => tree,

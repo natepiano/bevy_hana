@@ -164,7 +164,7 @@ impl InjectedCurrentMonitorSource {
 }
 
 pub(super) fn clear_monitor_selection_inputs(
-    removed: On<Remove, (Window, PrimaryWindow, ManagedWindow)>,
+    removed: On<Remove<(Window, PrimaryWindow, ManagedWindow)>>,
     mut commands: Commands,
 ) {
     commands
@@ -209,7 +209,7 @@ pub(super) fn record_window_manager_placement(
 
 /// Install the exact monitor observation when Bevy inserts or replaces [`OnMonitor`].
 pub(crate) fn install_current_monitor_from_association(
-    insert: On<Insert, OnMonitor>,
+    insert: On<Insert<OnMonitor>>,
     windows: Query<
         (
             &Window,

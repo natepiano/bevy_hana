@@ -3,9 +3,7 @@
 use std::borrow::Cow;
 
 use bevy::math::Rect;
-use bevy::prelude::Add;
 use bevy::prelude::Camera;
-use bevy::prelude::Click;
 use bevy::prelude::Color;
 use bevy::prelude::Commands;
 use bevy::prelude::Component;
@@ -15,8 +13,8 @@ use bevy::prelude::Event;
 use bevy::prelude::GlobalTransform;
 use bevy::prelude::On;
 use bevy::prelude::ParamSet;
-use bevy::prelude::Pointer;
 use bevy::prelude::PointerButton;
+use bevy::prelude::PointerClick;
 use bevy::prelude::Query;
 use bevy::prelude::Res;
 use bevy::prelude::ResMut;
@@ -37,7 +35,6 @@ use super::ImeCancelCause;
 use super::ImeCanceled;
 use super::ImeCommitCause;
 use super::ImeCursorState;
-use super::ImeInputBlocker;
 use super::ImePreedit;
 use super::ImePreeditBoundary;
 use super::ImeRejection;
@@ -50,12 +47,16 @@ use super::ImeTarget;
 use super::ImeTextChanged;
 use super::ImeValidationRejected;
 use super::buffer::ImeEditCommand;
+use super::field::ImeBlurBehavior;
+use super::field::ImeValidationPlacement;
+use super::value_drag::FieldValueDrag;
 use crate::AlignX;
 use crate::AlignY;
 use crate::Anchor;
 use crate::Border;
 use crate::BoundingBox;
 use crate::ComputedDiegeticPanel;
+use crate::ControlMetrics;
 use crate::CornerRadius;
 use crate::DiegeticPanel;
 use crate::DiegeticPanelCommands;
@@ -73,10 +74,16 @@ use crate::Px;
 use crate::Sizing;
 use crate::Text;
 use crate::TextStyle;
+use crate::Unit;
+use crate::cascade::FontUnit;
+use crate::cascade::PanelDefaults;
+use crate::cascade::Resolved;
+use crate::constants::DIAGNOSTIC_LOG_TARGET;
 use crate::layout::EditorPart;
 use crate::layout::FieldDisplayTextUpdate;
 use crate::panel::PanelFieldPresentation;
-use crate::render;
+use crate::widgets::PanelWidget;
+use crate::widgets::WidgetKind;
 
 const EDITOR_CAMERA_ORDER: isize = 120;
 const DEFAULT_EDITOR_WIDTH: f32 = 180.0;
@@ -88,7 +95,7 @@ const EDITOR_FONT_SIZE: f32 = 16.0;
 const EDITOR_PADDING_X: f32 = 10.0;
 const EDITOR_PADDING_Y: f32 = 0.0;
 const EDITOR_GAP: f32 = 3.0;
-const CARET_WIDTH: f32 = 1.0;
+const CARET_WIDTH_TO_FONT_SIZE: f32 = 1.0 / EDITOR_FONT_SIZE;
 const EDITOR_BORDER_WIDTH: f32 = 1.0;
 const EDITOR_CORNER_RADIUS: f32 = 5.0;
 const SOURCE_RECT_MIN_AXIS: f32 = 1.0;
@@ -104,7 +111,8 @@ const EDITOR_CARET: Color = Color::srgb(0.86, 0.96, 1.0);
 /// Field projection captured from panel picking before the session id exists.
 #[derive(Resource, Clone, Debug, Default)]
 pub(super) struct PendingImePanelAnchor {
-    pending: Option<ImePanelAnchorSource>,
+    pending:      Option<ImePanelAnchorSource>,
+    pointer_edit: Option<(ImeTarget, Entity, ImeEditCommand)>,
 }
 
 impl PendingImePanelAnchor {
@@ -125,6 +133,27 @@ impl PendingImePanelAnchor {
             bounds,
             presentation,
         });
+    }
+
+    pub(super) fn set_pointer_edit(
+        &mut self,
+        target: ImeTarget,
+        window: Entity,
+        command: ImeEditCommand,
+    ) {
+        self.pointer_edit = Some((target, window, command));
+    }
+
+    pub(super) fn take_pointer_edit(
+        &mut self,
+        target: &ImeTarget,
+        window: Entity,
+    ) -> Option<ImeEditCommand> {
+        let (pending_target, pending_window, _) = self.pointer_edit.as_ref()?;
+        if pending_target != target || *pending_window != window {
+            return None;
+        }
+        self.pointer_edit.take().map(|(_, _, command)| command)
     }
 
     fn take_for(&mut self, target: &ImeTarget, window: Entity) -> Option<ImePanelAnchorSource> {
@@ -177,7 +206,7 @@ impl ImeEditorState {
         self.active.as_ref().map(|editor| editor.session_id)
     }
 
-    fn is_overlay_panel(&self, entity: Entity) -> bool {
+    pub(super) fn is_overlay_panel(&self, entity: Entity) -> bool {
         self.active.as_ref().is_some_and(|editor| {
             matches!(editor.surface, ImeEditorSurface::ScreenOverlay { panel } if panel == entity)
         })
@@ -189,9 +218,10 @@ impl ImeEditorState {
                 ImeEditorSurface::Inline {
                     panel,
                     authoritative_tree,
+                    ..
                 } => {
                     if let Err(error) = commands.set_tree(panel, authoritative_tree) {
-                        warn!("failed to restore the IME source panel: {error}");
+                        warn!(target: DIAGNOSTIC_LOG_TARGET, "failed to restore the IME source panel: {error}");
                     }
                 },
                 ImeEditorSurface::ScreenOverlay { panel } => {
@@ -209,6 +239,7 @@ impl ImeEditorState {
             ImeEditorSurface::Inline {
                 panel,
                 mut authoritative_tree,
+                ..
             } => {
                 let ImeAppliedResult::AppOwned { display_text, .. } = result else {
                     return;
@@ -218,7 +249,7 @@ impl ImeEditorState {
                         .set_field_display_text(target_field_id(&editor.target), display_text);
                 }
                 if let Err(error) = commands.set_tree(panel, authoritative_tree) {
-                    warn!("failed to finish the app-owned IME source panel: {error}");
+                    warn!(target: DIAGNOSTIC_LOG_TARGET, "failed to finish the app-owned IME source panel: {error}");
                 }
             },
             ImeEditorSurface::ScreenOverlay { panel } => {
@@ -240,6 +271,7 @@ impl ImeEditorState {
             ImeEditorSurface::Inline {
                 panel: source_panel,
                 authoritative_tree,
+                ..
             } if *source_panel == panel => Some(authoritative_tree),
             ImeEditorSurface::Inline { .. } | ImeEditorSurface::ScreenOverlay { .. } => None,
         }
@@ -301,6 +333,7 @@ enum ImeEditorSurface {
     Inline {
         panel:              Entity,
         authoritative_tree: LayoutTree,
+        panel_font_unit:    Unit,
     },
     /// Standalone fallback for an app-owned target without panel geometry.
     ScreenOverlay { panel: Entity },
@@ -319,11 +352,9 @@ struct ImeEditorAnchor {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct TextHit {
+pub(super) struct TextHit {
     /// Nearest insertion boundary to the pointer.
-    insertion: usize,
-    /// First byte of the character under the pointer, or `text.len()` past it.
-    character: usize,
+    pub(super) insertion: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -376,6 +407,12 @@ struct ImeBlurClassification {
 #[derive(Component, Debug)]
 struct ImeEditorPanel;
 
+/// Validation feedback beside an inline field, owned by that editing session.
+#[derive(Component, Debug)]
+pub(super) struct InlineImeValidationPanel {
+    session_id: ImeSessionId,
+}
+
 /// Hands a rebuilt panel tree to whichever inline IME session is editing a
 /// field inside that panel.
 ///
@@ -410,7 +447,7 @@ pub(super) fn replace_panel_tree(
     });
     if !edits_this_panel {
         if let Err(error) = commands.set_tree(event.panel, event.tree.clone()) {
-            warn!("failed to replace an unedited panel's tree: {error}");
+            warn!(target: DIAGNOSTIC_LOG_TARGET, "failed to replace an unedited panel's tree: {error}");
         }
         return;
     }
@@ -430,22 +467,24 @@ pub(super) fn replace_panel_tree(
     update_editor_tree(editor, &mut commands);
 }
 
-pub(super) fn observe_panel_clicks(trigger: On<Add, DiegeticPanel>, mut commands: Commands) {
-    commands
-        .entity(trigger.event_target())
-        .observe(classify_panel_click);
-}
-
 pub(super) fn update_editor_from_text_changed(
     event: On<ImeTextChanged>,
     active_session: Res<ActiveImeSession>,
+    value_drag: Res<FieldValueDrag>,
+    defaults: Option<Res<PanelDefaults>>,
     mut pending_anchor: ResMut<PendingImePanelAnchor>,
     mut editor_state: ResMut<ImeEditorState>,
     mut blur_intent: ResMut<ImeBlurIntent>,
-    panels: Query<&DiegeticPanel>,
+    mut panel_queries: ParamSet<(
+        Query<(&DiegeticPanel, Option<&Resolved<FontUnit>>)>,
+        Query<(Entity, &InlineImeValidationPanel)>,
+    )>,
     mut commands: Commands,
 ) {
     let event = event.event();
+    if value_drag.suppresses_editor(&event.target) {
+        return;
+    }
     let Some(window) = active_session.active_window() else {
         return;
     };
@@ -457,11 +496,17 @@ pub(super) fn update_editor_from_text_changed(
         .is_none_or(|editor| editor.session_id != event.session_id);
     if needs_spawn {
         editor_state.cancel(&mut commands);
+        let default_font_unit = defaults
+            .as_deref()
+            .copied()
+            .unwrap_or_default()
+            .panel_font_unit;
         let Some(surface) = create_editor_surface(
             &event.target,
             window,
             &event.snapshot,
-            &panels,
+            default_font_unit,
+            &panel_queries.p0(),
             &mut commands,
         ) else {
             return;
@@ -489,6 +534,7 @@ pub(super) fn update_editor_from_text_changed(
         editor.validation = ImeEditorValidation::Accepted;
     }
 
+    clear_inline_validation(event.session_id, &panel_queries.p1(), &mut commands);
     blur_intent.clear_session(event.session_id);
     if let Some(editor) = editor_state.active() {
         update_editor_tree(editor, &mut commands);
@@ -498,6 +544,7 @@ pub(super) fn update_editor_from_text_changed(
 pub(super) fn update_editor_validation(
     event: On<ImeValidationRejected>,
     mut editor_state: ResMut<ImeEditorState>,
+    validation_panels: Query<(Entity, &InlineImeValidationPanel)>,
     mut commands: Commands,
 ) {
     let event = event.event();
@@ -508,6 +555,7 @@ pub(super) fn update_editor_validation(
         return;
     }
 
+    clear_inline_validation(event.session_id, &validation_panels, &mut commands);
     editor.validation = ImeEditorValidation::Rejected(match &event.reason {
         ImeRejection::StaleAttempt => String::from("This edit is no longer current."),
         ImeRejection::InvalidText(message)
@@ -521,9 +569,11 @@ pub(super) fn close_editor_on_cancel(
     event: On<ImeCanceled>,
     mut editor_state: ResMut<ImeEditorState>,
     mut blur_intent: ResMut<ImeBlurIntent>,
+    validation_panels: Query<(Entity, &InlineImeValidationPanel)>,
     mut commands: Commands,
 ) {
     let session_id = event.event().session_id;
+    clear_inline_validation(session_id, &validation_panels, &mut commands);
     if editor_state.session_id() != Some(session_id) {
         return;
     }
@@ -535,10 +585,12 @@ pub(super) fn close_editor_on_apply(
     event: On<ImeApplied>,
     mut editor_state: ResMut<ImeEditorState>,
     mut blur_intent: ResMut<ImeBlurIntent>,
+    validation_panels: Query<(Entity, &InlineImeValidationPanel)>,
     mut commands: Commands,
 ) {
     let event = event.event();
     let session_id = event.session_id;
+    clear_inline_validation(session_id, &validation_panels, &mut commands);
     if editor_state.session_id() != Some(session_id) {
         return;
     }
@@ -556,6 +608,7 @@ pub(super) fn update_editor_anchor(
     )>,
     cameras: Query<(&Camera, &GlobalTransform)>,
     windows: Query<&Window>,
+    validation_panels: Query<(Entity, &InlineImeValidationPanel)>,
     mut commands: Commands,
 ) {
     let Some(editor) = editor_state.active_mut() else {
@@ -602,12 +655,36 @@ pub(super) fn update_editor_anchor(
     };
     let fallback = default_editor_presentation();
     let presentation = editor.presentation.as_ref().unwrap_or(&fallback);
+    let horizontal_scroll = match &editor.target {
+        ImeTarget::WorldPanelField { panel, field_id }
+        | ImeTarget::ScreenPanelField { panel, field_id } => {
+            let panels = panel_queries.p1();
+            panels
+                .get(*panel)
+                .ok()
+                .and_then(|(_, computed, _)| {
+                    let field = field_record(computed, field_id)?;
+                    let solved = computed
+                        .layout()
+                        .solved()?
+                        .scrolls
+                        .iter()
+                        .find(|solved| solved.element_index == field.element_index)?;
+                    (field.bounds.width > 0.0).then_some(
+                        solved.offset_points.x * screen_rect.width() / field.bounds.width,
+                    )
+                })
+                .unwrap_or(0.0)
+        },
+        ImeTarget::AppOwned { .. } => 0.0,
+    };
     let caret_pos = caret_position(
         editor_pos,
         editor_size,
         &editor.snapshot,
         &measurer,
         presentation,
+        horizontal_scroll,
     );
     editor.anchor = Some(ImeEditorAnchor {
         screen_rect,
@@ -615,6 +692,121 @@ pub(super) fn update_editor_anchor(
         editor_size,
         caret_pos,
     });
+    sync_inline_validation(
+        editor,
+        window,
+        &measurer,
+        &validation_panels,
+        &mut panel_queries.p0(),
+        presentation_changed,
+        &mut commands,
+    );
+}
+
+fn clear_inline_validation(
+    session_id: ImeSessionId,
+    panels: &Query<(Entity, &InlineImeValidationPanel)>,
+    commands: &mut Commands,
+) {
+    for (panel, validation) in panels {
+        if validation.session_id == session_id {
+            commands.entity(panel).despawn();
+        }
+    }
+}
+
+fn sync_inline_validation(
+    editor: &ImeEditor,
+    window: &Window,
+    measurer: &DiegeticTextMeasurer,
+    validation_panels: &Query<(Entity, &InlineImeValidationPanel)>,
+    panels: &mut Query<&mut DiegeticPanel>,
+    presentation_changed: bool,
+    commands: &mut Commands,
+) {
+    let ImeEditorValidation::Rejected(message) = &editor.validation else {
+        return;
+    };
+    let ImeEditorSurface::Inline {
+        authoritative_tree, ..
+    } = &editor.surface
+    else {
+        return;
+    };
+    if validation_layout_anchor(authoritative_tree, target_field_id(&editor.target)).is_some()
+        || authoritative_tree.field_can_grow_for_validation(target_field_id(&editor.target))
+    {
+        return;
+    }
+    let Some(anchor) = editor.anchor else {
+        return;
+    };
+    let fallback = default_editor_presentation();
+    let presentation = editor.presentation.as_ref().unwrap_or(&fallback);
+    let mut style = presentation
+        .text_style
+        .clone()
+        .with_color(EDITOR_VALIDATION);
+    style.set_dimension(Px(style.size()));
+    let feedback_dimensions = (measurer.measure_fn)(message, &style.as_measure());
+    let available_width = window.width().clamp(1.0, MAX_EDITOR_WIDTH);
+    let size = Vec2::new(
+        (feedback_dimensions.width + 2.0)
+            .ceil()
+            .clamp(MIN_EDITOR_WIDTH.min(available_width), available_width),
+        (feedback_dimensions.height + 2.0).ceil(),
+    );
+    let below = anchor.screen_rect.max.y + EDITOR_GAP;
+    let y = if below + size.y <= window.height() {
+        below
+    } else {
+        anchor.screen_rect.min.y - EDITOR_GAP - size.y
+    };
+    let position = clamp_editor_position(Vec2::new(anchor.screen_rect.min.x, y), size, window);
+    let mut retained = false;
+    for (panel, validation) in validation_panels {
+        if validation.session_id != editor.session_id {
+            continue;
+        }
+        if presentation_changed {
+            commands.entity(panel).despawn();
+        } else if let Ok(mut panel) = panels.get_mut(panel) {
+            let _ = panel.set_screen_position(position);
+            retained = true;
+        }
+    }
+    if retained {
+        return;
+    }
+    let mut builder = LayoutBuilder::new(size.x, size.y);
+    add_text(
+        &mut builder,
+        message,
+        &style,
+        &presentation.editor_validation,
+    );
+    let panel = DiegeticPanel::screen()
+        .size(Px(size.x), Px(size.y))
+        .font_unit(Unit::Pixels)
+        .anchor(Anchor::TopLeft)
+        .screen_position(position.x, position.y)
+        .camera_order(EDITOR_CAMERA_ORDER)
+        .window(WindowRef::Entity(editor.window))
+        .with_tree(builder.build())
+        .build();
+    match panel {
+        Ok(panel) => {
+            commands.spawn((
+                panel,
+                InlineImeValidationPanel {
+                    session_id: editor.session_id,
+                },
+            ));
+        },
+        Err(error) => {
+            warn!(target: DIAGNOSTIC_LOG_TARGET, "failed to build inline IME validation feedback: {error}");
+        },
+    }
 }
 
 pub(super) fn update_window_ime_position(
@@ -655,58 +847,35 @@ pub(crate) fn handle_blur_intent(
         return;
     }
 
-    commands.trigger(ImeRequestCommit {
-        session_id: intent.session_id,
-        cause:      ImeCommitCause::Blur,
-    });
-}
-
-fn classify_panel_click(
-    mut click: On<Pointer<Click>>,
-    editor_state: Res<ImeEditorState>,
-    mut active_session: ResMut<ActiveImeSession>,
-    input_blocker: Res<ImeInputBlocker>,
-    measurer: Res<DiegeticTextMeasurer>,
-    panels: Query<(&DiegeticPanel, &ComputedDiegeticPanel, &GlobalTransform)>,
-    mut blur_intent: ResMut<ImeBlurIntent>,
-    mut commands: Commands,
-) {
-    if click.button != PointerButton::Primary {
-        return;
+    match active_session.blur_behavior() {
+        ImeBlurBehavior::Cancel => commands.trigger(ImeRequestCancel {
+            session_id: intent.session_id,
+            cause:      ImeCancelCause::Blur,
+        }),
+        ImeBlurBehavior::Commit => commands.trigger(ImeRequestCommit {
+            session_id: intent.session_id,
+            cause:      ImeCommitCause::Blur,
+        }),
+        ImeBlurBehavior::KeepEditing => {},
     }
-    if editor_state.session_id().is_none() {
-        return;
-    }
-    let clicked_panel = click.event_target();
-    if editor_state.is_overlay_panel(clicked_panel) {
-        click.propagate(false);
-        return;
-    }
-    let Some(editor) = editor_state.active() else {
-        return;
-    };
-    if let Some(command) = pointer_edit_command(&click, clicked_panel, editor, &panels, &measurer) {
-        if !active_session.is_composing() {
-            let changed = active_session.apply_edit_command(command, &input_blocker);
-            if let Some(changed) = changed {
-                commands.trigger(changed);
-            }
-        }
-        click.propagate(false);
-        return;
-    }
-    classify_widget_click(clicked_panel, &editor_state, &mut blur_intent);
 }
 
 pub(super) fn classify_non_panel_click(
-    click: On<Pointer<Click>>,
+    click: On<PointerClick>,
     panels: Query<(), With<DiegeticPanel>>,
+    editable_widgets: Query<&WidgetKind, With<PanelWidget>>,
     editor_state: Res<ImeEditorState>,
     mut blur_intent: ResMut<ImeBlurIntent>,
 ) {
     if click.button != PointerButton::Primary
         || panels.contains(click.event_target())
         || editor_state.session_id().is_none()
+    {
+        return;
+    }
+    if editable_widgets
+        .get(click.event_target())
+        .is_ok_and(|kind| *kind == WidgetKind::EditableField)
     {
         return;
     }
@@ -724,42 +893,9 @@ pub(crate) fn classify_widget_click(
     blur_intent.set(session_id, clicked_panel);
 }
 
-fn pointer_edit_command(
-    click: &Pointer<Click>,
-    clicked_panel: Entity,
-    editor: &ImeEditor,
-    panels: &Query<(&DiegeticPanel, &ComputedDiegeticPanel, &GlobalTransform)>,
-    measurer: &DiegeticTextMeasurer,
-) -> Option<ImeEditCommand> {
-    let ImeEditorSurface::Inline { panel, .. } = &editor.surface else {
-        return None;
-    };
-    if clicked_panel != *panel {
-        return None;
-    }
-    let (panel, computed, transform) = panels.get(*panel).ok()?;
-    let panel_local = click
-        .hit
-        .position
-        .and_then(|position| render::project_flat_panel_hit(position, panel, transform))?;
-    let record = field_record(computed, target_field_id(&editor.target))?;
-    if !record.contains(panel_local) {
-        return None;
-    }
-
-    let text_hit = text_hit_at_x(
-        &editor.snapshot.committed_text,
-        panel_local.x,
-        record,
-        measurer,
-    );
-    Some(pointer_command(click.count, text_hit))
-}
-
-const fn pointer_command(click_count: u8, text_hit: TextHit) -> ImeEditCommand {
+pub(super) const fn pointer_command(click_count: u8, text_hit: TextHit) -> ImeEditCommand {
     match click_count {
         1 => ImeEditCommand::PlaceCursor(text_hit.insertion),
-        2 => ImeEditCommand::SelectWordAt(text_hit.character),
         _ => ImeEditCommand::SelectAll,
     }
 }
@@ -768,15 +904,19 @@ fn create_editor_surface(
     target: &ImeTarget,
     window: Entity,
     snapshot: &ImeBufferSnapshot,
-    panels: &Query<&DiegeticPanel>,
+    default_font_unit: Unit,
+    panels: &Query<(&DiegeticPanel, Option<&Resolved<FontUnit>>)>,
     commands: &mut Commands,
 ) -> Option<ImeEditorSurface> {
     match target {
         ImeTarget::WorldPanelField { panel, .. } | ImeTarget::ScreenPanelField { panel, .. } => {
-            let authoritative_tree = panels.get(*panel).ok()?.tree().clone();
+            let (source, font_unit) = panels.get(*panel).ok()?;
+            let authoritative_tree = source.tree().clone();
+            let panel_font_unit = font_unit.map_or(default_font_unit, |resolved| resolved.0.0);
             Some(ImeEditorSurface::Inline {
                 panel: *panel,
                 authoritative_tree,
+                panel_font_unit,
             })
         },
         ImeTarget::AppOwned { .. } => {
@@ -792,21 +932,42 @@ fn update_editor_tree(editor: &ImeEditor, commands: &mut Commands) {
         ImeEditorSurface::Inline {
             panel,
             authoritative_tree,
+            panel_font_unit,
         } => {
-            let presentation = editor
-                .source
-                .as_ref()
-                .map_or_else(default_editor_presentation, |source| {
-                    inline_editor_presentation(&source.presentation)
-                });
+            let Some(authored) =
+                authoritative_tree.editable_field_presentation_for(target_field_id(&editor.target))
+            else {
+                warn!(target: DIAGNOSTIC_LOG_TARGET, "failed to find the IME field's authored presentation");
+                return;
+            };
+            let presentation = inline_editor_presentation(&authored);
+            // A fixed field keeps its frame; validation is drawn beside it.
+            // Flexible fields retain their authored inline validation parts.
+            let validation_anchor =
+                validation_layout_anchor(authoritative_tree, target_field_id(&editor.target));
+            let validation = if validation_anchor.is_none()
+                && authoritative_tree.field_can_grow_for_validation(target_field_id(&editor.target))
+            {
+                &editor.validation
+            } else {
+                &ImeEditorValidation::Accepted
+            };
             let replacement =
-                inline_editor_content_tree(&editor.snapshot, &editor.validation, &presentation);
+                inline_editor_content_tree(&editor.snapshot, validation, &presentation);
             let mut tree = authoritative_tree.clone();
             let update =
                 tree.set_field_editing_content(target_field_id(&editor.target), &replacement);
             if update != FieldDisplayTextUpdate::Updated {
-                warn!("failed to find the IME field while updating inline content: {update:?}");
+                warn!(target: DIAGNOSTIC_LOG_TARGET, "failed to find the IME field while updating inline content: {update:?}");
                 return;
+            }
+            if let (Some(anchor), ImeEditorValidation::Rejected(message)) =
+                (validation_anchor, &editor.validation)
+            {
+                let feedback = inline_validation_tree(message, &presentation, *panel_font_unit);
+                if !tree.wrap_element_with_feedback(anchor, &feedback) {
+                    warn!(target: DIAGNOSTIC_LOG_TARGET, "failed to reserve inline IME validation after {anchor}");
+                }
             }
             (*panel, tree)
         },
@@ -820,8 +981,54 @@ fn update_editor_tree(editor: &ImeEditor, commands: &mut Commands) {
         ),
     };
     if let Err(error) = commands.set_tree(panel, tree) {
-        warn!("failed to update IME editor content: {error}");
+        warn!(target: DIAGNOSTIC_LOG_TARGET, "failed to update IME editor content: {error}");
     }
+}
+
+fn validation_layout_anchor<'tree>(
+    tree: &'tree LayoutTree,
+    field_id: &PanelElementId,
+) -> Option<&'tree PanelElementId> {
+    let ImeValidationPlacement::AfterElement(anchor) =
+        tree.field_spec_for(field_id)?.validation_placement()
+    else {
+        return None;
+    };
+    (0..tree.len())
+        .any(|index| tree.element_id(index) == Some(anchor))
+        .then_some(anchor)
+}
+
+fn inline_validation_tree(
+    message: &str,
+    presentation: &ImeEditorPresentation,
+    panel_font_unit: Unit,
+) -> LayoutTree {
+    let step = ControlMetrics::from_label_size(presentation.text_style.size())
+        .spacing
+        .step();
+    let step = crate::Dimension {
+        value: step,
+        unit:  Some(presentation.text_style.unit().resolve(panel_font_unit)),
+    };
+    let mut builder = LayoutBuilder::with_root(
+        El::column()
+            .width(Sizing::GROW)
+            .height(Sizing::FIT)
+            .gap(step)
+            .padding(Padding::new(0.0, 0.0, 0.0, step)),
+    );
+    let style = presentation
+        .text_style
+        .clone()
+        .with_color(EDITOR_VALIDATION);
+    add_text(
+        &mut builder,
+        message,
+        &style,
+        &presentation.editor_validation,
+    );
+    builder.build()
 }
 
 const fn target_field_id(target: &ImeTarget) -> &PanelElementId {
@@ -850,7 +1057,7 @@ fn spawn_editor_panel(
         Ok(panel) => panel,
         Err(error) => {
             bevy::log::error!(
-                target: "hana_diegetic::ime",
+                target: DIAGNOSTIC_LOG_TARGET,
                 "failed to build IME editor panel: {error:?}"
             );
             return None;
@@ -1038,11 +1245,7 @@ fn projected_editor_presentation(
         Px(authored.corner_radius.bottom_right.value * corner_scale),
         Px(authored.corner_radius.bottom_left.value * corner_scale),
     );
-    let mut text_style = authored
-        .text_style
-        .clone()
-        .unwrap_or_else(editor_text_style)
-        .scaled(corner_scale);
+    let mut text_style = authored.text_style.clone().scaled(corner_scale);
     text_style.set_dimension(Px(text_style.size()));
 
     ImeEditorPresentation {
@@ -1068,10 +1271,7 @@ fn inline_editor_presentation(authored: &PanelFieldPresentation) -> ImeEditorPre
         padding:           authored.padding,
         align_x:           authored.align_x,
         align_y:           authored.align_y,
-        text_style:        authored
-            .text_style
-            .clone()
-            .unwrap_or_else(editor_text_style),
+        text_style:        authored.text_style.clone(),
         editor_text:       EditorPartDeclaration::from_authored(authored.editor_text.clone()),
         editor_selection:  EditorPartDeclaration::from_authored(authored.editor_selection.clone()),
         editor_caret:      EditorPartDeclaration::from_authored(authored.editor_caret.clone()),
@@ -1091,6 +1291,7 @@ fn caret_position(
     snapshot: &ImeBufferSnapshot,
     measurer: &DiegeticTextMeasurer,
     presentation: &ImeEditorPresentation,
+    horizontal_scroll: f32,
 ) -> Vec2 {
     let border = presentation.border.unwrap_or_default();
     let horizontal_chrome = border.left.value
@@ -1098,6 +1299,8 @@ fn caret_position(
         + presentation.padding.left.value
         + presentation.padding.right.value;
     let content_width = (editor_size.x - horizontal_chrome).max(0.0);
+    // Match the drawn caret's envelope, including its paint clearance.
+    let text_width = (content_width - caret_envelope_width(&presentation.text_style)).max(0.0);
     let prefix = caret_prefix_text(snapshot);
     let text = editing_text(snapshot);
     let measure = presentation.text_style.as_measure();
@@ -1105,13 +1308,12 @@ fn caret_position(
     let measured_text = (measurer.measure_fn)(text.as_ref(), &measure).width;
     let aligned_offset = match presentation.align_x {
         AlignX::Left => 0.0,
-        AlignX::Center => (content_width - measured_text).max(0.0) * 0.5,
-        AlignX::Right => (content_width - measured_text).max(0.0),
+        AlignX::Center => (text_width - measured_text).max(0.0) * 0.5,
+        AlignX::Right => (text_width - measured_text).max(0.0),
     };
     let caret_x = border.left.value
         + presentation.padding.left.value
-        + aligned_offset
-        + measured_prefix.clamp(0.0, content_width);
+        + (aligned_offset + measured_prefix - horizontal_scroll).clamp(0.0, text_width);
     let vertical_chrome = border.top.value
         + border.bottom.value
         + presentation.padding.top.value
@@ -1125,14 +1327,17 @@ fn caret_position(
     };
     let caret_y = border.top.value + presentation.padding.top.value + aligned_y;
     Vec2::new(
-        (editor_pos.x + caret_x).round(),
+        (editor_pos.x + caret_x)
+            .round()
+            .min(editor_pos.x + border.left.value + presentation.padding.left.value + text_width),
         (editor_pos.y + caret_y).round(),
     )
 }
 
-fn text_hit_at_x(
+pub(super) fn text_hit_at_x(
     text: &str,
     pointer_x: f32,
+    horizontal_scroll: f32,
     record: &PanelFieldRecord,
     measurer: &DiegeticTextMeasurer,
 ) -> TextHit {
@@ -1142,11 +1347,10 @@ fn text_hit_at_x(
         + border.right.value
         + presentation.padding.left.value
         + presentation.padding.right.value;
-    let content_width = (record.bounds.width - horizontal_chrome).max(0.0);
-    let text_style = presentation
-        .text_style
-        .clone()
-        .unwrap_or_else(editor_text_style);
+    let content_width =
+        (record.bounds.width - horizontal_chrome - caret_envelope_width(&presentation.text_style))
+            .max(0.0);
+    let text_style = presentation.text_style.clone();
     let measure = text_style.as_measure();
     let measured_text = (measurer.measure_fn)(text, &measure).width;
     let aligned_offset = match presentation.align_x {
@@ -1154,16 +1358,13 @@ fn text_hit_at_x(
         AlignX::Center => (content_width - measured_text).max(0.0) * 0.5,
         AlignX::Right => (content_width - measured_text).max(0.0),
     };
-    let text_x = pointer_x
+    let text_x = pointer_x + horizontal_scroll
         - record.bounds.x
         - border.left.value
         - presentation.padding.left.value
         - aligned_offset;
     if text_x <= 0.0 {
-        return TextHit {
-            insertion: 0,
-            character: 0,
-        };
+        return TextHit { insertion: 0 };
     }
 
     let mut previous_width = 0.0;
@@ -1176,16 +1377,12 @@ fn text_hit_at_x(
             } else {
                 end
             };
-            return TextHit {
-                insertion,
-                character: index,
-            };
+            return TextHit { insertion };
         }
         previous_width = width;
     }
     TextHit {
         insertion: text.len(),
-        character: text.len(),
     }
 }
 
@@ -1231,6 +1428,12 @@ fn visible_caret_height(style: &TextStyle) -> f32 {
     }
 }
 
+const fn caret_envelope_width(style: &TextStyle) -> f32 {
+    // SDF antialiasing and the camera's edge filter paint beyond the stroke's
+    // layout bounds. Reserve another stroke width before the field padding.
+    style.size() * CARET_WIDTH_TO_FONT_SIZE * 2.0
+}
+
 fn editor_text_style() -> TextStyle { TextStyle::new(EDITOR_FONT_SIZE) }
 
 fn editor_tree(
@@ -1268,7 +1471,7 @@ fn inline_editor_content_tree(
         El::column()
             .width(Sizing::GROW)
             .height(Sizing::GROW)
-            .gap(EDITOR_GAP)
+            .gap(presentation.text_style.size() * EDITOR_GAP / EDITOR_FONT_SIZE)
             .alignment(presentation.align_x, presentation.align_y),
     );
     append_editor_rows(&mut builder, snapshot, validation, presentation);
@@ -1355,12 +1558,18 @@ fn append_buffer(
                 &presentation.text_style,
                 &presentation.editor_text,
             );
+            if selection.focus.as_usize() == start {
+                add_caret(builder, &presentation.text_style, presentation);
+            }
             add_selected_text(
                 builder,
                 &snapshot.committed_text[start..end],
                 &presentation.text_style,
                 presentation,
             );
+            if selection.focus.as_usize() == end {
+                add_caret(builder, &presentation.text_style, presentation);
+            }
             add_text(
                 builder,
                 &snapshot.committed_text[end..],
@@ -1475,31 +1684,50 @@ fn add_caret(
     presentation: &ImeEditorPresentation,
 ) {
     let caret_height = visible_caret_height(text_style);
+    let caret_width = text_style.size() * CARET_WIDTH_TO_FONT_SIZE;
     builder.with(
         El::column()
+            .caret_marker()
             .width(Sizing::fixed(0.0))
             .height(Sizing::GROW)
             .alignment(AlignX::Left, AlignY::Center),
-        |builder| match &presentation.editor_caret {
-            EditorPartDeclaration::Authored(declaration) => declaration
-                .as_ref()
-                .clone()
-                .with_background_if_unset(EDITOR_CARET)
-                .with_width(Sizing::fixed(CARET_WIDTH))
-                .with_height(Sizing::fixed(caret_height))
-                .with_children(builder, |_| {}),
-            EditorPartDeclaration::Generated => {
-                builder.with(
-                    El::new()
-                        .generated_editor_part()
-                        .width(Sizing::fixed(CARET_WIDTH))
-                        .height(Sizing::fixed(caret_height))
-                        .background(EDITOR_CARET),
-                    |_| {},
-                );
-            },
+        |builder| {
+            builder.with(
+                El::column()
+                    .width(Sizing::fixed(caret_envelope_width(text_style)))
+                    .height(Sizing::fixed(caret_height))
+                    .alignment(AlignX::Left, AlignY::Center),
+                |builder| append_caret_stroke(builder, caret_width, caret_height, presentation),
+            );
         },
     );
+}
+
+fn append_caret_stroke(
+    builder: &mut LayoutBuilder,
+    caret_width: f32,
+    caret_height: f32,
+    presentation: &ImeEditorPresentation,
+) {
+    match &presentation.editor_caret {
+        EditorPartDeclaration::Authored(declaration) => declaration
+            .as_ref()
+            .clone()
+            .with_background_if_unset(EDITOR_CARET)
+            .with_width(Sizing::fixed(caret_width))
+            .with_height(Sizing::fixed(caret_height))
+            .with_children(builder, |_| {}),
+        EditorPartDeclaration::Generated => {
+            builder.with(
+                El::new()
+                    .generated_editor_part()
+                    .width(Sizing::fixed(caret_width))
+                    .height(Sizing::fixed(caret_height))
+                    .background(EDITOR_CARET),
+                |_| {},
+            );
+        },
+    }
 }
 
 #[cfg(test)]
@@ -1518,14 +1746,15 @@ mod tests {
     use bevy::picking::pointer::Location;
     use bevy::picking::pointer::PointerId;
     use bevy::prelude::App;
-    use bevy::prelude::Click;
     use bevy::prelude::Color;
+    use bevy::prelude::Commands;
     use bevy::prelude::Entity;
     use bevy::prelude::GlobalTransform;
     use bevy::prelude::MinimalPlugins;
     use bevy::prelude::On;
     use bevy::prelude::Pointer;
     use bevy::prelude::PointerButton;
+    use bevy::prelude::PointerClick;
     use bevy::prelude::ResMut;
     use bevy::prelude::Resource;
     use bevy::prelude::Window;
@@ -1543,11 +1772,11 @@ mod tests {
     use super::ImeEditorState;
     use super::ImeEditorSurface;
     use super::ImeEditorValidation;
+    use super::PendingImePanelAnchor;
     use super::caret_position;
     use super::caret_prefix_text;
     use super::clamp_editor_position;
     use super::classify_non_panel_click;
-    use super::classify_panel_click;
     use super::classify_widget_click;
     use super::editor_size;
     use super::pointer_command;
@@ -1576,6 +1805,7 @@ mod tests {
     use crate::ImeSelectionSnapshot;
     use crate::ImeSessionId;
     use crate::ImeTarget;
+    use crate::ImeTextChanged;
     use crate::LayoutBuilder;
     use crate::LayoutTree;
     use crate::Mm;
@@ -1586,11 +1816,16 @@ mod tests {
     use crate::Px;
     use crate::RequestWidgetFocus;
     use crate::TextStyle;
+    use crate::Unit;
     use crate::constants::MONOSPACE_WIDTH_RATIO;
     use crate::ime::ActiveImeSession;
     use crate::ime::ImeCommitCause;
     use crate::ime::ImePlugin;
     use crate::ime::buffer::ImeEditCommand;
+    use crate::ime::pointer::FieldSelectionDrag;
+    use crate::ime::pointer::click as classify_panel_click;
+    use crate::ime::value_drag::FieldValueDrag;
+    use crate::layout::LayoutEngine;
     use crate::layout::LayoutTreeChange;
     use crate::layout::RectangleSource;
     use crate::layout::RenderCommandKind;
@@ -1614,7 +1849,7 @@ mod tests {
     const EDITOR_VALIDATION_FOCUSED_COLOR: Color = Color::srgb(0.80, 0.30, 0.80);
 
     fn record_propagated_panel_click(
-        click: On<Pointer<Click>>,
+        click: On<PointerClick>,
         mut clicks: ResMut<PropagatedPanelClicks>,
     ) {
         clicks.0.push(click.get_propagate());
@@ -1639,9 +1874,12 @@ mod tests {
         let field =
             ImeEditableFieldSpec::BuiltIn(ImeBuiltInFieldSpec::new(ImeBuiltInFieldKind::Text));
         let mut builder = LayoutBuilder::new(100.0, 40.0);
-        builder.with(El::new().editable_field("field", field), |builder| {
-            builder.text((text, TextStyle::new(10.0)));
-        });
+        builder.with(
+            El::new().editable_field("field", field, crate::TextStyle::new(10.0)),
+            |builder| {
+                builder.text((text, TextStyle::new(10.0)));
+            },
+        );
         builder.build()
     }
 
@@ -1654,7 +1892,7 @@ mod tests {
         let mut builder = LayoutBuilder::new(100.0, 40.0);
         builder.with(
             El::new()
-                .editable_field("field", field)
+                .editable_field("field", field, crate::TextStyle::new(10.0))
                 .editor_text(EditorStateColors::new().focused(EDITOR_TEXT_FOCUSED_COLOR))
                 .editor_selection(EditorStateColors::new().focused(EDITOR_SELECTION_FOCUSED_FILL))
                 .editor_caret(EditorStateColors::new().focused(EDITOR_CARET_FOCUSED_FILL))
@@ -1677,7 +1915,7 @@ mod tests {
         let mut builder = LayoutBuilder::new(100.0, 40.0);
         builder.with(
             El::new()
-                .editable_field("field", field)
+                .editable_field("field", field, crate::TextStyle::new(10.0))
                 .editor_text(EditorStateColors::new().disabled(EDITOR_TEXT_DISABLED_COLOR))
                 .editor_validation(EditorStateColors::new().disabled(EDITOR_TEXT_DISABLED_COLOR)),
             |builder| {
@@ -1693,7 +1931,7 @@ mod tests {
         let mut builder = LayoutBuilder::new(100.0, 40.0);
         builder.with(
             El::new()
-                .editable_field("field", field)
+                .editable_field("field", field, crate::TextStyle::new(10.0))
                 .editor_selection(EditorStateColors::new().hovered(Color::srgb(0.9, 0.2, 0.1))),
             |builder| {
                 builder.text(("display", TextStyle::new(10.0)));
@@ -1909,11 +2147,7 @@ mod tests {
             .field_records()
             .first()
             .expect("the source panel should have an editable field");
-        let text_style = record
-            .presentation()
-            .text_style
-            .clone()
-            .expect("the editable field should have a text style");
+        let text_style = record.presentation().text_style.clone();
         let measurer = app.world().resource::<DiegeticTextMeasurer>();
         let measure = text_style.as_measure();
         let prefix_width = (measurer.measure_fn)(prefix, &measure).width;
@@ -1948,20 +2182,20 @@ mod tests {
         let window_ref = WindowRef::Entity(window)
             .normalize(None)
             .expect("the entity window reference should normalize");
-        app.world_mut().trigger(Pointer::new(
-            PointerId::Mouse,
-            Location {
-                target:   NormalizedRenderTarget::Window(window_ref),
-                position: Vec2::ZERO,
-            },
-            Click {
-                button: PointerButton::Primary,
-                hit: HitData::new(Entity::PLACEHOLDER, 0.0, Some(position), None),
-                duration: std::time::Duration::ZERO,
-                count,
-            },
-            panel,
-        ));
+        app.world_mut().trigger(PointerClick {
+            entity: panel,
+            pointer: Pointer::new(
+                PointerId::Mouse,
+                Location {
+                    target:   NormalizedRenderTarget::Window(window_ref),
+                    position: Vec2::ZERO,
+                },
+            ),
+            button: PointerButton::Primary,
+            hit: HitData::new(Entity::PLACEHOLDER, 0.0, Some(position), None),
+            duration: std::time::Duration::ZERO,
+            count,
+        });
         app.world_mut().flush();
     }
 
@@ -2009,6 +2243,225 @@ mod tests {
     }
 
     #[test]
+    fn anchored_world_field_draws_typed_text_inline() {
+        let (mut app, window, panel, _) = inline_editor_app("0");
+        let field_id = PanelElementId::named("field");
+        app.world_mut()
+            .resource_mut::<PendingImePanelAnchor>()
+            .store(
+                panel,
+                field_id.clone(),
+                Some(Entity::PLACEHOLDER),
+                window,
+                BoundingBox {
+                    x:      0.0,
+                    y:      0.0,
+                    width:  80.0,
+                    height: 20.0,
+                },
+                PanelFieldPresentation {
+                    text_style: TextStyle::new(10.0),
+                    ..default()
+                },
+            );
+        open_inline_editor(&mut app, window, panel, "0");
+        let session_id = active_session_id(&app);
+        app.world_mut().trigger(ImeTextChanged {
+            session_id,
+            target: ImeTarget::WorldPanelField { panel, field_id },
+            snapshot: insertion_snapshot("1.25", 4),
+        });
+        app.world_mut().flush();
+
+        let editor = app.world().resource::<ImeEditorState>();
+        let editor_panel = editor
+            .active()
+            .and_then(|editor| match editor.surface {
+                ImeEditorSurface::Inline { panel, .. } => Some(panel),
+                ImeEditorSurface::ScreenOverlay { .. } => None,
+            })
+            .expect("a picked world field edits its panel inline");
+        assert_eq!(editor_panel, panel);
+        let surface = app
+            .world()
+            .get::<DiegeticPanel>(editor_panel)
+            .expect("editor surface");
+        assert!(!surface.coordinate_space().is_screen());
+        let measurer = DiegeticTextMeasurer::default();
+        let layout = LayoutEngine::new(measurer.measure_fn).compute(
+            surface.tree(),
+            surface.width(),
+            surface.height(),
+            1.0,
+        );
+        assert!(layout.commands.iter().any(|command| {
+            matches!(&command.kind, RenderCommandKind::Text { text, .. } if text == "1.25")
+                && command.bounds.x >= 0.0
+                && command.bounds.y >= 0.0
+                && command.bounds.x + command.bounds.width <= surface.width()
+                && command.bounds.y + command.bounds.height <= surface.height()
+        }));
+    }
+
+    #[test]
+    fn textless_world_field_edits_at_its_authored_font_size_inside_its_slot() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(DiegeticTextMeasurer::default())
+            .add_plugins((HeadlessLayoutPlugin, ImePlugin));
+        let window = app.world_mut().spawn(Window::default()).id();
+        let field =
+            ImeEditableFieldSpec::BuiltIn(ImeBuiltInFieldSpec::new(ImeBuiltInFieldKind::Text));
+        let mut builder = LayoutBuilder::new(0.1, 0.04);
+        builder.with(
+            El::row()
+                .size(0.1, 0.04)
+                .editable_field("field", field, TextStyle::new(0.008)),
+            |_| {},
+        );
+        let panel = DiegeticPanel::world()
+            .font_unit(Unit::Meters)
+            .size(Mm(100.0), Mm(40.0))
+            .with_tree(builder.build())
+            .build()
+            .expect("world field panel");
+        let panel = app.world_mut().spawn(panel).id();
+        app.update();
+        open_inline_editor(&mut app, window, panel, "value");
+        let panel = app
+            .world()
+            .get::<DiegeticPanel>(panel)
+            .expect("inline panel");
+        let layout = LayoutEngine::new(DiegeticTextMeasurer::default().measure_fn).compute(
+            panel.tree(),
+            panel.width(),
+            panel.height(),
+            1.0,
+        );
+        assert!(layout.commands.iter().any(|command| {
+            matches!(&command.kind, RenderCommandKind::Text { text, config }
+                if text == "value" && (config.size() - 0.008).abs() < f32::EPSILON)
+                && command.bounds.x >= 0.0
+                && command.bounds.y >= 0.0
+                && command.bounds.x + command.bounds.width <= 0.1
+                && command.bounds.y + command.bounds.height <= 0.04
+        }));
+    }
+
+    fn fitted_panel_height_points(app: &App, panel: Entity) -> f32 {
+        app.world()
+            .get::<crate::ComputedDiegeticPanel>(panel)
+            .expect("fitted panel layout")
+            .layout()
+            .solved()
+            .expect("fitted panel solves")
+            .computed
+            .first()
+            .expect("fitted panel root")
+            .bounds
+            .height
+    }
+
+    #[test]
+    fn ime_validation_after_uses_inherited_font_unit() {
+        for (font_unit, label_size) in [(Unit::Pixels, 14.0), (Unit::Meters, 0.004)] {
+            let mut app = App::new();
+            app.add_plugins(MinimalPlugins)
+                .insert_resource(DiegeticTextMeasurer::default())
+                .add_plugins((InputPlugin, crate::HeadlessDiegeticUiPlugin))
+                .add_observer(
+                    |event: On<crate::ImeCommitRequested>, mut commands: Commands| {
+                        commands.trigger(crate::ImeRejectCommit {
+                            session_id: event.session_id,
+                            attempt_id: event.attempt_id,
+                            reason:     crate::ImeRejection::AppOwned("Invalid value.".to_owned()),
+                        });
+                    },
+                );
+            let window = app.world_mut().spawn(Window::default()).id();
+            let field = ImeEditableFieldSpec::AppOwned(
+                crate::ImeAppOwnedFieldSpec::new("field").validation_after("frame"),
+            );
+            let style = TextStyle::new(label_size);
+            assert_eq!(
+                style.unit(),
+                crate::cascade::Cascade::Inherit,
+                "the field must inherit its font unit",
+            );
+            let mut builder = LayoutBuilder::with_root(
+                El::column()
+                    .width(crate::Sizing::GROW)
+                    .height(crate::Sizing::FIT),
+            );
+            builder.with(
+                El::row()
+                    .id("frame")
+                    .width(crate::Sizing::GROW)
+                    .height(crate::Sizing::fixed(crate::Pt(32.0)))
+                    .editable_field("field", field.clone(), style.clone()),
+                |builder| {
+                    builder.text(("value", style));
+                },
+            );
+            let panel = DiegeticPanel::screen()
+                .size(crate::Pt(240.0), crate::Fit)
+                .font_unit(font_unit)
+                .window(WindowRef::Entity(window))
+                .with_tree(builder.build())
+                .build()
+                .expect("validation panel");
+            let panel = app.world_mut().spawn(panel).id();
+            app.update();
+            app.world_mut().trigger(ImeOpenSession {
+                target: ImeTarget::ScreenPanelField {
+                    panel,
+                    field_id: "field".into(),
+                },
+                window,
+                initial_text: "value".to_owned(),
+                field_spec: field,
+                anchor: None,
+            });
+            app.update();
+            let normal_height = fitted_panel_height_points(&app, panel);
+            let session_id = active_session_id(&app);
+            app.world_mut().trigger(ImeRequestCommit {
+                session_id,
+                cause: ImeCommitCause::Enter,
+            });
+            app.update();
+            let rejected = app
+                .world()
+                .get::<crate::ComputedDiegeticPanel>(panel)
+                .expect("rejected panel layout");
+            let message = rejected
+                .layout()
+                .solved()
+                .expect("validation layout solves")
+                .commands
+                .iter()
+                .find(|command| {
+                    matches!(&command.kind, RenderCommandKind::Text { text, .. }
+                        if text == "Invalid value.")
+                })
+                .expect("validation line");
+            let step = crate::ControlMetrics::from_label_size(label_size)
+                .spacing
+                .step()
+                * font_unit.to_points();
+            let growth = fitted_panel_height_points(&app, panel) - normal_height;
+            assert!(
+                (-2.0_f32)
+                    .mul_add(step, growth - message.bounds.height)
+                    .abs()
+                    < 0.0001,
+                "{font_unit:?}: growth {growth} must equal line {} plus two {step} steps",
+                message.bounds.height,
+            );
+        }
+    }
+
+    #[test]
     fn generated_editor_parts_resolve_through_display_editor_display() {
         let (mut app, window, panel) = inline_editor_visual_app(styled_editable_tree());
         let field = resolve_field_widget(&mut app, panel);
@@ -2024,6 +2477,10 @@ mod tests {
                 },
                 VisualSlotOverride {
                     text_color: Some(EDITOR_TEXT_FOCUSED_COLOR),
+                    ..VisualSlotOverride::default()
+                },
+                VisualSlotOverride {
+                    fill_color: Some(EDITOR_CARET_FOCUSED_FILL),
                     ..VisualSlotOverride::default()
                 },
             ],
@@ -2094,7 +2551,7 @@ mod tests {
             .world()
             .get::<WidgetVisualSlots>(field)
             .expect("editable field should retain visual slots after closing the editor");
-        assert!(restored_slots.part_appearances().is_empty());
+        assert_eq!(restored_slots.part_appearances(), []);
         for element_index in selection_indices
             .into_iter()
             .chain(insertion_indices)
@@ -2289,12 +2746,66 @@ mod tests {
             &snapshot,
             &measurer,
             &super::default_editor_presentation(),
+            0.0,
         );
         let expected_x = (super::EDITOR_FONT_SIZE * MONOSPACE_WIDTH_RATIO)
             .mul_add(2.0, super::EDITOR_BORDER_WIDTH + super::EDITOR_PADDING_X);
 
         assert_float_eq(caret.x, expected_x.round());
         assert_float_eq(caret.y, 9.0);
+    }
+
+    #[test]
+    fn caret_position_reserves_its_width_before_the_right_padding() {
+        let measurer = DiegeticTextMeasurer::default();
+        let mut presentation = super::default_editor_presentation();
+        presentation.align_x = AlignX::Right;
+        let border = presentation.border.unwrap_or_default();
+        let caret_width = presentation.text_style.size() * super::CARET_WIDTH_TO_FONT_SIZE;
+        let right_edge = 104.0 - border.right.value - presentation.padding.right.value;
+        for text in ["999", "12345678901234567890"] {
+            let snapshot = insertion_snapshot(text, text.len());
+            let caret = caret_position(
+                Vec2::ZERO,
+                Vec2::new(104.0, 34.0),
+                &snapshot,
+                &measurer,
+                &presentation,
+                0.0,
+            );
+            assert!(
+                caret.x + caret_width <= right_edge,
+                "{text}: caret {caret:?} must end before the padded edge {right_edge}"
+            );
+        }
+    }
+
+    #[test]
+    fn caret_position_subtracts_applied_horizontal_scroll() {
+        let measurer = DiegeticTextMeasurer::default();
+        let snapshot = insertion_snapshot("abcdefghijklmnop", 8);
+        let presentation = super::default_editor_presentation();
+        let unscrolled = caret_position(
+            Vec2::ZERO,
+            Vec2::new(104.0, 34.0),
+            &snapshot,
+            &measurer,
+            &presentation,
+            0.0,
+        );
+        let scrolled = caret_position(
+            Vec2::ZERO,
+            Vec2::new(104.0, 34.0),
+            &snapshot,
+            &measurer,
+            &presentation,
+            25.0,
+        );
+        assert!(
+            scrolled.x < unscrolled.x,
+            "scrolled={scrolled:?}, unscrolled={unscrolled:?}"
+        );
+        assert!(scrolled.x >= super::EDITOR_BORDER_WIDTH + super::EDITOR_PADDING_X);
     }
 
     #[test]
@@ -2354,37 +2865,77 @@ mod tests {
             duplicate_id:  false,
             presentation:  PanelFieldPresentation {
                 align_x: AlignX::Center,
-                text_style: Some(text_style),
+                text_style,
                 ..default()
             },
         };
-        let text_start = (record.bounds.width - text_width).mul_add(0.5, record.bounds.x);
+        let text_start = (record.bounds.width
+            - super::caret_envelope_width(&record.presentation.text_style)
+            - text_width)
+            .mul_add(0.5, record.bounds.x);
 
         let left_half = text_hit_at_x(
             "abcd",
             character_width.mul_add(1.25, text_start),
+            0.0,
             &record,
             &measurer,
         );
         let right_half = text_hit_at_x(
             "abcd",
             character_width.mul_add(1.75, text_start),
+            0.0,
             &record,
             &measurer,
         );
 
-        assert_eq!(left_half.character, 1);
         assert_eq!(left_half.insertion, 1);
-        assert_eq!(right_half.character, 1);
+
         assert_eq!(right_half.insertion, 2);
     }
 
     #[test]
-    fn pointer_click_count_selects_cursor_word_or_all() {
-        let text_hit = super::TextHit {
-            insertion: 4,
-            character: 3,
+    fn click_near_scrolled_field_left_edge_hits_visible_character() {
+        let text_style = TextStyle::new(10.0);
+        let measurer = DiegeticTextMeasurer::default();
+        let character_width = (measurer.measure_fn)("a", &text_style.as_measure()).width;
+        let record = PanelFieldRecord {
+            field_id:      PanelElementId::named("field"),
+            bounds:        BoundingBox {
+                x:      20.0,
+                y:      10.0,
+                width:  72.0,
+                height: 20.0,
+            },
+            field_spec:    ImeEditableFieldSpec::BuiltIn(ImeBuiltInFieldSpec::new(
+                ImeBuiltInFieldKind::Text,
+            )),
+            display_text:  "abcdefghijklmnop".to_owned(),
+            element_index: 0,
+            duplicate_id:  false,
+            presentation:  PanelFieldPresentation {
+                align_x: AlignX::Left,
+                text_style,
+                ..default()
+            },
         };
+        let pointer_x = character_width.mul_add(0.25, record.bounds.x);
+        let hit = text_hit_at_x(
+            &record.display_text,
+            pointer_x,
+            character_width * 8.0,
+            &record,
+            &measurer,
+        );
+        assert!(
+            hit.insertion >= 7,
+            "visible start should be near index 8: {hit:?}"
+        );
+    }
+
+    #[test]
+    fn pointer_click_count_selects_cursor_or_all() {
+        let text_hit = super::TextHit { insertion: 4 };
 
         assert!(matches!(
             pointer_command(1, text_hit),
@@ -2392,7 +2943,7 @@ mod tests {
         ));
         assert!(matches!(
             pointer_command(2, text_hit),
-            ImeEditCommand::SelectWordAt(3)
+            ImeEditCommand::SelectAll
         ));
         assert!(matches!(
             pointer_command(3, text_hit),
@@ -2401,7 +2952,7 @@ mod tests {
     }
 
     #[test]
-    fn panel_pointer_clicks_place_cursor_select_word_and_select_all() {
+    fn panel_pointer_clicks_place_cursor_and_select_all() {
         let text = "alpha beta";
         let (mut app, window, panel) = interactive_inline_editor_app(text);
         let position = field_word_position(&app, panel, "al", "p");
@@ -2429,7 +2980,7 @@ mod tests {
         assert!(matches!(
             snapshot.cursor,
             ImeCursorState::Selection(ImeSelectionSnapshot { anchor, focus })
-                if anchor.as_usize() == 0 && focus.as_usize() == "alpha".len()
+                if anchor.as_usize() == 0 && focus.as_usize() == text.len()
         ));
 
         click_panel_field(&mut app, window, panel, position, 3);
@@ -2469,6 +3020,77 @@ mod tests {
             .tree();
         assert_eq!(committed.field_display_text(1), Some(text));
         assert_eq!(committed.len(), editable_tree(text).len());
+    }
+
+    #[test]
+    fn clicking_outside_a_cancel_on_blur_field_restores_its_old_value() {
+        let text = "0.400";
+        let (mut app, window, panel) = interactive_inline_editor_app(text);
+        let outside_field = panel_local_position(&app, panel, Vec2::new(99.0, 39.0));
+        app.world_mut().trigger(ImeOpenSession {
+            target: ImeTarget::WorldPanelField {
+                panel,
+                field_id: "field".into(),
+            },
+            window,
+            initial_text: text.to_owned(),
+            field_spec: ImeEditableFieldSpec::AppOwned(
+                crate::ImeAppOwnedFieldSpec::new("field").cancel_on_blur(),
+            ),
+            anchor: None,
+        });
+        app.world_mut().flush();
+        click_panel_field(&mut app, window, panel, outside_field, 1);
+        app.world_mut()
+            .run_system_once(super::handle_blur_intent)
+            .expect("blur system should run");
+        app.world_mut().flush();
+
+        assert!(
+            app.world()
+                .resource::<ActiveImeSession>()
+                .active_session_id()
+                .is_none()
+        );
+        let restored = app
+            .world()
+            .get::<DiegeticPanel>(panel)
+            .expect("source panel should remain")
+            .tree();
+        assert_eq!(restored.field_display_text(1), Some(text));
+    }
+
+    #[test]
+    fn a_keep_editing_field_ignores_a_click_outside_it() {
+        let text = "alpha beta";
+        let (mut app, window, panel) = interactive_inline_editor_app(text);
+        let outside = panel_local_position(&app, panel, Vec2::new(99.0, 39.0));
+        app.world_mut().trigger(ImeOpenSession {
+            target: ImeTarget::WorldPanelField {
+                panel,
+                field_id: "field".into(),
+            },
+            window,
+            initial_text: text.to_owned(),
+            field_spec: ImeEditableFieldSpec::AppOwned(
+                crate::ImeAppOwnedFieldSpec::new("field").keep_editing_on_blur(),
+            ),
+            anchor: None,
+        });
+        app.world_mut().flush();
+        let session = app
+            .world()
+            .resource::<ActiveImeSession>()
+            .active_session_id();
+        click_panel_field(&mut app, window, panel, outside, 1);
+        app.world_mut()
+            .run_system_once(super::handle_blur_intent)
+            .expect("blur system runs");
+        app.world_mut().flush();
+        let active = app.world().resource::<ActiveImeSession>();
+        assert_eq!(active.active_session_id(), session);
+        assert!(!active.is_pending_commit());
+        assert!(app.world().resource::<ImeEditorState>().active().is_some());
     }
 
     #[test]
@@ -2512,23 +3134,23 @@ mod tests {
             .add_observer(classify_non_panel_click);
         let clicked_entity = app.world_mut().spawn_empty().id();
 
-        app.world_mut().trigger(Pointer::new(
-            PointerId::Mouse,
-            Location {
-                target:   NormalizedRenderTarget::None {
-                    width:  1,
-                    height: 1,
+        app.world_mut().trigger(PointerClick {
+            entity:   clicked_entity,
+            pointer:  Pointer::new(
+                PointerId::Mouse,
+                Location {
+                    target:   NormalizedRenderTarget::None {
+                        width:  1,
+                        height: 1,
+                    },
+                    position: Vec2::ZERO,
                 },
-                position: Vec2::ZERO,
-            },
-            Click {
-                button:   PointerButton::Primary,
-                hit:      HitData::new(Entity::PLACEHOLDER, 0.0, None, None),
-                duration: std::time::Duration::ZERO,
-                count:    1,
-            },
-            clicked_entity,
-        ));
+            ),
+            button:   PointerButton::Primary,
+            hit:      HitData::new(Entity::PLACEHOLDER, 0.0, None, None),
+            duration: std::time::Duration::ZERO,
+            count:    1,
+        });
 
         assert!(
             app.world()
@@ -2547,7 +3169,10 @@ mod tests {
             .init_resource::<ActiveImeSession>()
             .init_resource::<crate::ImeInputBlocker>()
             .init_resource::<DiegeticTextMeasurer>()
-            .init_resource::<PropagatedPanelClicks>();
+            .init_resource::<PropagatedPanelClicks>()
+            .init_resource::<PendingImePanelAnchor>()
+            .init_resource::<FieldSelectionDrag>()
+            .init_resource::<FieldValueDrag>();
         let panel = app
             .world_mut()
             .spawn_empty()
@@ -2556,23 +3181,23 @@ mod tests {
             .id();
         app.world_mut().flush();
 
-        app.world_mut().trigger(Pointer::new(
-            PointerId::Mouse,
-            Location {
-                target:   NormalizedRenderTarget::None {
-                    width:  1,
-                    height: 1,
+        app.world_mut().trigger(PointerClick {
+            entity:   panel,
+            pointer:  Pointer::new(
+                PointerId::Mouse,
+                Location {
+                    target:   NormalizedRenderTarget::None {
+                        width:  1,
+                        height: 1,
+                    },
+                    position: Vec2::ZERO,
                 },
-                position: Vec2::ZERO,
-            },
-            Click {
-                button:   PointerButton::Primary,
-                hit:      HitData::new(Entity::PLACEHOLDER, 0.0, None, None),
-                duration: std::time::Duration::ZERO,
-                count:    1,
-            },
-            panel,
-        ));
+            ),
+            button:   PointerButton::Primary,
+            hit:      HitData::new(Entity::PLACEHOLDER, 0.0, None, None),
+            duration: std::time::Duration::ZERO,
+            count:    1,
+        });
 
         assert_eq!(app.world().resource::<PropagatedPanelClicks>().0, [true]);
     }

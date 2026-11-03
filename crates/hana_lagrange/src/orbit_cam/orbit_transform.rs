@@ -13,6 +13,7 @@ use hana_kana::Position;
 use super::constants::MIN_ORBIT_RADIUS;
 use super::constants::PERSPECTIVE_NEAR_MIN;
 use super::constants::PERSPECTIVE_NEAR_RADIUS_FACTOR;
+use crate::CameraBasis;
 
 pub(super) fn calculate_from_translation_and_focus(
     translation: impl Into<Position>,
@@ -52,23 +53,29 @@ pub(super) fn update_orbit_transform(
         Projection::Perspective(p) => sync_perspective_near_clip(p, radius),
         Projection::Custom(_) => {},
     }
-    *transform = transform_from_orbit(yaw, pitch, radius, focus, projection, axis);
+    let focus: Position = focus.into();
+    *transform = transform_from_orbit(yaw, pitch, radius, *focus, projection, axis.into());
 }
 
-pub(crate) fn transform_from_orbit(
+/// The camera pose an orbit gives: the eye `radius` from `focus` along yaw and pitch in
+/// `basis`, looking at `focus`. This is the pose an [`OrbitCam`](crate::OrbitCam) writes.
+///
+/// An orthographic camera stands midway between its near and far planes instead, since its
+/// radius is a projection scale.
+#[must_use]
+pub fn transform_from_orbit(
     yaw: f32,
     pitch: f32,
     radius: f32,
-    focus: impl Into<Position>,
+    focus: Vec3,
     projection: &Projection,
-    axis: [Vec3; 3],
+    basis: CameraBasis,
 ) -> Transform {
-    let focus = focus.into();
     let radius = camera_distance_for_orbit(radius, projection);
-    let yaw_rotation = Quat::from_axis_angle(axis[1], yaw);
-    let pitch_rotation = Quat::from_axis_angle(axis[0], -pitch);
+    let yaw_rotation = Quat::from_axis_angle(basis.up, yaw);
+    let pitch_rotation = Quat::from_axis_angle(basis.right, -pitch);
     let rotation = yaw_rotation * pitch_rotation;
-    Transform::from_translation(*focus + rotation * Vec3::new(0.0, 0.0, radius))
+    Transform::from_translation(focus + rotation * Vec3::new(0.0, 0.0, radius))
         .with_rotation(rotation)
 }
 
@@ -255,5 +262,78 @@ mod sync_perspective_near_clip_tests {
         sync_perspective_near_clip(&mut projection, 20.0);
         assert_eq!(projection.near, 0.01);
         assert_eq!(projection.near_clip_plane, Vec4::new(0.0, 0.0, -1.0, -0.01));
+    }
+}
+
+#[cfg(test)]
+mod transform_from_orbit_tests {
+    use bevy::input::mouse::AccumulatedMouseMotion;
+    use bevy::input::mouse::AccumulatedMouseScroll;
+    use bevy::prelude::ButtonInput;
+    use bevy::prelude::KeyCode;
+    use bevy::prelude::MinimalPlugins;
+    use bevy::prelude::MouseButton;
+    use bevy::prelude::OrthographicProjection;
+    use bevy::prelude::PerspectiveProjection;
+    use bevy::prelude::Projection;
+    use bevy::prelude::Transform;
+    use bevy::prelude::Vec3;
+
+    use crate::CameraBasis;
+    use crate::LagrangePlugin;
+    use crate::OrbitCam;
+    use crate::transform_from_orbit;
+
+    const FOCUS: Vec3 = Vec3::new(1.0, 2.0, 3.0);
+    const YAW: f32 = 0.5;
+    const PITCH: f32 = -0.25;
+    const RADIUS: f32 = 6.0;
+    const BASIS: CameraBasis = CameraBasis::Z_UP;
+
+    type TestResult = Result<(), &'static str>;
+
+    /// The `Transform` a live `OrbitCam` writes on its first pass for the test pose.
+    fn orbit_camera_pose(projection: Projection) -> Result<Transform, &'static str> {
+        let mut app = crate::test_app();
+        app.add_plugins((MinimalPlugins, LagrangePlugin))
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<ButtonInput<MouseButton>>()
+            .init_resource::<AccumulatedMouseMotion>()
+            .init_resource::<AccumulatedMouseScroll>();
+        app.finish();
+        let camera = app
+            .world_mut()
+            .spawn((
+                OrbitCam::from_pose(FOCUS, (YAW, PITCH), RADIUS),
+                projection,
+                BASIS,
+            ))
+            .id();
+        app.update();
+        app.world()
+            .get::<Transform>(camera)
+            .copied()
+            .ok_or("camera missing Transform")
+    }
+
+    fn assert_public_pose_matches_orbit_camera(projection: Projection) -> TestResult {
+        let written = orbit_camera_pose(projection.clone())?;
+        let public = transform_from_orbit(YAW, PITCH, RADIUS, FOCUS, &projection, BASIS);
+        assert_eq!(public, written);
+        Ok(())
+    }
+
+    #[test]
+    fn public_orbit_pose_matches_the_perspective_orbit_camera() -> TestResult {
+        assert_public_pose_matches_orbit_camera(Projection::Perspective(
+            PerspectiveProjection::default(),
+        ))
+    }
+
+    #[test]
+    fn public_orbit_pose_matches_the_orthographic_orbit_camera() -> TestResult {
+        assert_public_pose_matches_orbit_camera(Projection::Orthographic(
+            OrthographicProjection::default_3d(),
+        ))
     }
 }

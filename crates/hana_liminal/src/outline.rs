@@ -1,8 +1,11 @@
+use bevy::ecs::lifecycle::HookContext;
+use bevy::ecs::world::DeferredWorld;
 use bevy::prelude::Color;
 use bevy::prelude::Component;
 use bevy::prelude::Entity;
 use bevy::prelude::Reflect;
 use bevy::prelude::ReflectComponent;
+use bevy::prelude::World;
 
 use super::constants::MERGED_OVERLAP_SHADER_FACTOR;
 use super::constants::NON_SCREEN_HULL_SHELL_MODE_SHADER_FACTOR;
@@ -131,6 +134,7 @@ impl OutlineActivity {
 /// ```
 #[derive(Debug, Component, Reflect, Clone)]
 #[reflect(Component)]
+#[component(on_discard = Outline::release_propagation_ownership)]
 pub struct Outline {
     /// Outline width. Pixels for `JumpFlood`/`ScreenHull`, world units for `WorldHull`.
     pub width:               f32,
@@ -151,7 +155,34 @@ pub struct Outline {
     pub(crate) group_source: Option<Entity>,
 }
 
+/// Ownership of a copy inserted by propagation, independent of rendering groups.
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PropagatedOutlineOwnership {
+    InheritedFrom(Entity),
+    Released,
+}
+
 impl Outline {
+    /// Invalidate ownership before lifecycle observers or deferred retirement
+    /// can mistake an authored replacement for the old propagated copy.
+    fn release_propagation_ownership(mut world: DeferredWorld, context: HookContext) {
+        let entity = context.entity;
+        let Some(mut ownership) = world.get_mut::<PropagatedOutlineOwnership>(entity) else {
+            return;
+        };
+        *ownership = PropagatedOutlineOwnership::Released;
+        world.commands().queue(move |world: &mut World| {
+            // A propagated replacement inserts fresh ownership in the same bundle.
+            if world.get::<PropagatedOutlineOwnership>(entity)
+                == Some(&PropagatedOutlineOwnership::Released)
+            {
+                world
+                    .entity_mut(entity)
+                    .remove::<PropagatedOutlineOwnership>();
+            }
+        });
+    }
+
     /// Create a `JumpFlood` outline builder. Width is in pixels.
     #[must_use]
     pub const fn jump_flood(width: f32) -> OutlineBuilder<JumpFloodState> {

@@ -3,7 +3,7 @@
 //! extreme zoom.
 //!
 //! Gated behind the `SprinkleBuilder<WithOrbitCam>` typestate — see
-//! [`crate::SprinkleBuilder::unclamped`]. Runs as an `On<Add, FairyDustOrbitCam>`
+//! [`crate::SprinkleBuilder::unclamped`]. Runs as an `On<Add<FairyDustOrbitCam>>`
 //! observer, so it overrides whatever limits the camera `configure` closure set.
 
 use bevy::prelude::Add;
@@ -19,7 +19,7 @@ use crate::orbit_cam::FairyDustOrbitCam;
 
 pub(crate) fn install(app: &mut App) { app.add_observer(unclamp_limits); }
 
-fn unclamp_limits(trigger: On<Add, FairyDustOrbitCam>, mut cameras: Query<&mut OrbitCam>) {
+fn unclamp_limits(trigger: On<Add<FairyDustOrbitCam>>, mut cameras: Query<&mut OrbitCam>) {
     let Ok(mut camera) = cameras.get_mut(trigger.entity) else {
         return;
     };

@@ -12,7 +12,6 @@ use bevy::picking::mesh_picking::MeshPickingPlugin;
 use bevy::prelude::AlphaMode;
 use bevy::prelude::Assets;
 use bevy::prelude::ButtonInput;
-use bevy::prelude::Click;
 use bevy::prelude::Color;
 use bevy::prelude::Commands;
 use bevy::prelude::Component;
@@ -27,8 +26,8 @@ use bevy::prelude::Name;
 use bevy::prelude::On;
 use bevy::prelude::PerspectiveProjection;
 use bevy::prelude::PointLight;
-use bevy::prelude::Pointer;
 use bevy::prelude::PointerButton;
+use bevy::prelude::PointerClick;
 use bevy::prelude::PostStartup;
 use bevy::prelude::Projection;
 use bevy::prelude::Query;
@@ -390,7 +389,7 @@ fn adjust_illuminance(
     apply_key_illuminance(&mut lights, &mut point_lights, target);
 }
 
-fn on_panel_clicked(mut click: On<Pointer<Click>>, mut commands: Commands) {
+fn on_panel_clicked(mut click: On<PointerClick>, mut commands: Commands) {
     if click.button != PointerButton::Primary {
         return;
     }

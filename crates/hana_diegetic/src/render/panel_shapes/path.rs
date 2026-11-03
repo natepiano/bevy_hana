@@ -11,6 +11,7 @@ use crate::layout::PanelShapePrimitiveKind;
 use crate::layout::ResolvedPanelShapePrimitive;
 use crate::layout::Unit;
 use crate::render::Bounds;
+use crate::render::ContourRole;
 use crate::render::PathContour;
 use crate::render::PathOutline;
 use crate::render::QuadraticSegment;
@@ -28,7 +29,7 @@ const PANEL_LINE_PADDING_DESIGN_UNITS: f32 = 16.0;
 /// tilt (its world width grows ~1/cos(grazing), which a fixed-world pad would
 /// clip into a staircase) is handled separately and camera-correctly by the
 /// vertex stage: it expands each line corner by a fixed device-pixel margin
-/// (see `LINE_AA_MARGIN_PX` in `analytic_path_vertex_pull.wgsl`). That expansion
+/// (see `LINE_AA_MARGIN_PX` in `analytic_path_vertex_pull.wesl`). That expansion
 /// runs only in the main pass, so this floor still covers the prepass/shadow
 /// quad and the design-unit proportional term for thick strokes. It inflates
 /// the transparent quad of every panel line (those fragments cover no stroke and
@@ -257,6 +258,7 @@ fn local_design_outline(contours: Vec<MemberContour>, translation: PathTranslati
                 minimum_feature_size: contour.minimum_feature_size
                     * translation.design_units_per_world,
                 fade_exponent:        contour.fade_exponent,
+                role:                 ContourRole::Ink,
             }
         })
         .collect();

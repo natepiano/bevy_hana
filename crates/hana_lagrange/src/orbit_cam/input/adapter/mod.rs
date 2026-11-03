@@ -174,10 +174,17 @@ impl Plugin for OrbitCamInputAdapterPlugin {
 #[cfg(test)]
 mod tests {
     use core::time::Duration;
+    use std::collections::HashMap;
 
     use bevy::camera::RenderTarget;
+    use bevy::input::ButtonState;
+    use bevy::input::InputSystems;
     use bevy::input::gamepad::Gamepad;
     use bevy::input::gestures::PinchGesture;
+    use bevy::input::keyboard::Key;
+    use bevy::input::keyboard::KeyboardFocusLost;
+    use bevy::input::keyboard::KeyboardInput;
+    use bevy::input::keyboard::keyboard_input_system;
     use bevy::input::mouse::AccumulatedMouseMotion;
     use bevy::input::mouse::AccumulatedMouseScroll;
     use bevy::input::mouse::MouseScrollUnit;
@@ -188,23 +195,31 @@ mod tests {
     use bevy::prelude::Entity;
     use bevy::prelude::GamepadAxis;
     use bevy::prelude::GamepadButton;
+    use bevy::prelude::IntoScheduleConfigs;
     use bevy::prelude::KeyCode;
     use bevy::prelude::MinimalPlugins;
     use bevy::prelude::MouseButton;
     use bevy::prelude::On;
+    use bevy::prelude::PreUpdate;
     use bevy::prelude::ResMut;
     use bevy::prelude::Resource;
     use bevy::prelude::Time;
     use bevy::prelude::Vec2;
     use bevy::prelude::Vec3;
+    use bevy::prelude::Window;
     use bevy::prelude::World;
+    use bevy::window::CursorGrabMode;
+    use bevy::window::CursorMoved;
+    use bevy::window::CursorOptions;
+    use bevy::window::PrimaryWindow;
     use bevy::window::WindowRef;
+    use bevy::window::WindowResolution;
     use bevy_enhanced_input::prelude::ActionMock;
+    use bevy_enhanced_input::prelude::ActionSources;
     use bevy_enhanced_input::prelude::Binding;
     use bevy_enhanced_input::prelude::BindingOf;
     use bevy_enhanced_input::prelude::DeadZone;
     use bevy_enhanced_input::prelude::DeltaScale;
-    use bevy_enhanced_input::prelude::EnhancedInputPlugin;
     use bevy_enhanced_input::prelude::InputContextAppExt;
     use bevy_enhanced_input::prelude::ModKeys;
     use bevy_enhanced_input::prelude::Scale;
@@ -224,18 +239,18 @@ mod tests {
     use crate::input;
     use crate::input::BUTTON_ZOOM_SCALE;
     use crate::input::CameraBindingGateCondition;
+    use crate::input::CameraDragClaim;
     use crate::input::CameraHomed;
     use crate::input::CameraInputDisabled;
     use crate::input::CameraInputModeReplaced;
-    use crate::input::CameraInputModesPlugin;
     use crate::input::CameraInputRoutingConfig;
-    use crate::input::CameraInputRoutingPlugin;
     use crate::input::CameraScrollInputDisabled;
     use crate::input::ControlSpeed;
     use crate::input::DISABLED_INPUT_GAIN;
     use crate::input::HeldBinding;
     use crate::input::INVALID_SOURCE_INPUT_GAIN;
     use crate::input::InputBinding;
+    use crate::input::InputPlugin;
     use crate::input::InteractionSources;
     use crate::input::OneFingerGestures;
     use crate::input::OrbitCamInputContext;
@@ -269,13 +284,11 @@ mod tests {
     use crate::system_sets::LagrangeSystemSetsPlugin;
 
     fn test_app() -> App {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.add_plugins((
             MinimalPlugins,
-            EnhancedInputPlugin,
             LagrangeSystemSetsPlugin,
-            CameraInputModesPlugin,
-            CameraInputRoutingPlugin,
+            InputPlugin,
             OrbitCamInputAdapterPlugin,
         ))
         .add_input_context::<OrbitCamInputContext>();
@@ -284,6 +297,7 @@ mod tests {
             .init_resource::<AccumulatedMouseMotion>()
             .init_resource::<AccumulatedMouseScroll>()
             .init_resource::<TouchTracker>()
+            .add_message::<CursorMoved>()
             .add_message::<PinchGesture>();
         crate::camera_home::add_orbit_cam_home_reset_systems(&mut app);
         app.finish();
@@ -306,7 +320,104 @@ mod tests {
         app.insert_resource(CameraInputRoutingConfig::explicit(camera));
     }
 
+    fn spawn_pointer_window(app: &mut App, scale_factor: f32) -> Entity {
+        let mut resolution = WindowResolution::new(800, 600);
+        resolution.set_scale_factor_override(Some(scale_factor));
+        app.world_mut()
+            .spawn((
+                Window {
+                    resolution,
+                    ..Default::default()
+                },
+                CursorOptions::default(),
+                PrimaryWindow,
+            ))
+            .id()
+    }
+
+    fn move_cursor(app: &mut App, window: Entity, delta: Vec2) {
+        app.world_mut().write_message(CursorMoved {
+            window,
+            position: Vec2::new(400.0, 300.0) + delta,
+            delta: Some(delta),
+        });
+    }
+
+    fn cursor_motion_frame(app: &mut App, window: Entity, delta: Vec2) {
+        move_cursor(app, window, delta);
+        app.update();
+    }
+
     type TestResult = Result<(), &'static str>;
+
+    #[test]
+    fn stuck_overlay_modifiers_release_restores_trackpad_orbit_and_clears_command() -> TestResult {
+        let mut app = test_app();
+        let window = spawn_pointer_window(&mut app, 1.0);
+        app.init_resource::<ButtonInput<Key>>()
+            .add_message::<KeyboardInput>()
+            .add_message::<KeyboardFocusLost>()
+            .add_systems(PreUpdate, keyboard_input_system.in_set(InputSystems));
+        let camera = spawn_camera(
+            app.world_mut(),
+            OrbitCamInputMode::with_preset(OrbitCamPreset::blender_like()),
+        );
+        route_to(&mut app, camera);
+
+        let held_modifiers = HashMap::from([
+            (KeyCode::SuperLeft, Key::Super),
+            (KeyCode::ShiftLeft, Key::Shift),
+        ]);
+        // The screenshot overlay consumes the native Shift and Cmd releases.
+        for (&key_code, logical_key) in &held_modifiers {
+            app.world_mut().write_message(KeyboardInput {
+                key_code,
+                logical_key: logical_key.clone(),
+                state: ButtonState::Pressed,
+                text: None,
+                repeat: false,
+                window,
+            });
+        }
+        app.update();
+        let scroll = Vec2::new(4.0, 6.0);
+        *app.world_mut().resource_mut::<AccumulatedMouseScroll>() = AccumulatedMouseScroll {
+            unit:  MouseScrollUnit::Pixel,
+            delta: scroll,
+        };
+        app.update();
+        let input = camera_input(&app, camera)?;
+        assert!(!input.has_orbit());
+        assert_eq!(input.pan().pixels(), scroll);
+
+        // Send the keyboard releases produced by modifier reconciliation, without
+        // another native Shift key event; otherwise this scroll continues to pan.
+        for (&key_code, logical_key) in &held_modifiers {
+            app.world_mut().write_message(KeyboardInput {
+                key_code,
+                logical_key: logical_key.clone(),
+                state: ButtonState::Released,
+                text: None,
+                repeat: false,
+                window,
+            });
+        }
+        *app.world_mut().resource_mut::<AccumulatedMouseScroll>() = AccumulatedMouseScroll {
+            unit:  MouseScrollUnit::Pixel,
+            delta: scroll,
+        };
+        app.update();
+        let input = camera_input(&app, camera)?;
+        assert_eq!(input.orbit(), OrbitDelta::from(scroll));
+        assert!(!input.has_pan());
+        let physical_keys = app.world().resource::<ButtonInput<KeyCode>>();
+        assert!(!physical_keys.pressed(KeyCode::ShiftLeft));
+        assert!(!physical_keys.pressed(KeyCode::SuperLeft));
+        let logical_keys = app.world().resource::<ButtonInput<Key>>();
+        assert!(!logical_keys.pressed(Key::Shift));
+        assert!(!logical_keys.pressed(Key::Super));
+        Ok(())
+    }
 
     #[derive(Resource, Default)]
     struct ModeReplacementEvents(usize);
@@ -464,7 +575,9 @@ mod tests {
                 })
                 .count();
 
-        assert_eq!(custom_bound_actions.len(), 5);
+        assert_eq!(custom_bound_actions.len(), 7);
+        assert!(custom_bound_actions.contains(&actions.orbit));
+        assert!(custom_bound_actions.contains(&actions.pan));
         assert!(custom_bound_actions.contains(&actions.adapter_orbit));
         assert!(custom_bound_actions.contains(&actions.adapter_pan));
         assert!(custom_bound_actions.contains(&actions.adapter_zoom_coarse));
@@ -581,6 +694,385 @@ mod tests {
         assert_eq!(input.orbit(), OrbitDelta::from(Vec2::new(5.0, -2.0)));
         assert!(input.has_orbit());
         assert!(input.sources().contains(InteractionSources::MOUSE));
+        Ok(())
+    }
+
+    #[test]
+    fn raw_motion_ten_units_deliver_ten_orbit_pixels() -> TestResult {
+        let mut app = test_app();
+        let window = spawn_pointer_window(&mut app, 1.0);
+        let camera = spawn_camera(
+            app.world_mut(),
+            OrbitCamInputMode::with_preset(OrbitCamPreset::simple_mouse()),
+        );
+        route_to(&mut app, camera);
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        app.world_mut()
+            .resource_mut::<AccumulatedMouseMotion>()
+            .delta = Vec2::new(10.0, 0.0);
+        move_cursor(&mut app, window, Vec2::new(10.0, 0.0));
+        app.update();
+
+        assert_eq!(
+            camera_input(&app, camera)?.orbit().pixels(),
+            Vec2::new(10.0, 0.0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scale_two_cursor_drag_matches_ten_raw_units() -> TestResult {
+        let mut app = test_app();
+        let window = spawn_pointer_window(&mut app, 2.0);
+        let camera = spawn_camera(
+            app.world_mut(),
+            OrbitCamInputMode::with_preset(OrbitCamPreset::simple_mouse()),
+        );
+        route_to(&mut app, camera);
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        cursor_motion_frame(&mut app, window, Vec2::new(2.5, 0.0));
+        assert_eq!(camera_input(&app, camera)?.orbit().pixels(), Vec2::ZERO);
+        cursor_motion_frame(&mut app, window, Vec2::new(2.5, 0.0));
+
+        assert_eq!(
+            camera_input(&app, camera)?.orbit().pixels(),
+            Vec2::new(10.0, 0.0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn raw_and_cursor_motion_in_one_frame_are_never_summed() -> TestResult {
+        let mut app = test_app();
+        let window = spawn_pointer_window(&mut app, 1.0);
+        let camera = spawn_camera(
+            app.world_mut(),
+            OrbitCamInputMode::with_preset(OrbitCamPreset::simple_mouse()),
+        );
+        route_to(&mut app, camera);
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        app.world_mut()
+            .resource_mut::<AccumulatedMouseMotion>()
+            .delta = Vec2::new(10.0, 0.0);
+        cursor_motion_frame(&mut app, window, Vec2::new(10.0, 0.0));
+
+        assert_eq!(
+            camera_input(&app, camera)?.orbit().pixels(),
+            Vec2::new(10.0, 0.0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn idle_update_preserves_raw_motion_grace() -> TestResult {
+        let mut app = test_app();
+        let window = spawn_pointer_window(&mut app, 1.0);
+        let camera = spawn_camera(
+            app.world_mut(),
+            OrbitCamInputMode::with_preset(OrbitCamPreset::simple_mouse()),
+        );
+        route_to(&mut app, camera);
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        cursor_motion_frame(&mut app, window, Vec2::new(4.0, 0.0));
+        app.update();
+        app.world_mut()
+            .resource_mut::<AccumulatedMouseMotion>()
+            .delta = Vec2::new(7.0, 0.0);
+        app.update();
+
+        assert_eq!(
+            camera_input(&app, camera)?.orbit().pixels(),
+            Vec2::new(7.0, 0.0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn idle_update_keeps_pending_cursor_delta() -> TestResult {
+        let mut app = test_app();
+        let window = spawn_pointer_window(&mut app, 1.0);
+        let camera = spawn_camera(
+            app.world_mut(),
+            OrbitCamInputMode::with_preset(OrbitCamPreset::simple_mouse()),
+        );
+        route_to(&mut app, camera);
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        cursor_motion_frame(&mut app, window, Vec2::new(4.0, 0.0));
+        app.update();
+        cursor_motion_frame(&mut app, window, Vec2::new(6.0, 0.0));
+
+        assert_eq!(
+            camera_input(&app, camera)?.orbit().pixels(),
+            Vec2::new(10.0, 0.0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn route_gap_keeps_held_cursor_drag_source() -> TestResult {
+        let mut app = test_app();
+        let window = spawn_pointer_window(&mut app, 1.0);
+        let camera = spawn_camera(
+            app.world_mut(),
+            OrbitCamInputMode::with_preset(OrbitCamPreset::simple_mouse()),
+        );
+        route_to(&mut app, camera);
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        cursor_motion_frame(&mut app, window, Vec2::new(4.0, 0.0));
+        cursor_motion_frame(&mut app, window, Vec2::new(6.0, 0.0));
+        assert_eq!(
+            camera_input(&app, camera)?.orbit().pixels(),
+            Vec2::new(10.0, 0.0)
+        );
+
+        app.world_mut()
+            .resource_mut::<CameraInputRoutingConfig>()
+            .explicit_camera = None;
+        app.update();
+        route_to(&mut app, camera);
+        app.world_mut()
+            .resource_mut::<AccumulatedMouseMotion>()
+            .delta = Vec2::new(20.0, 0.0);
+        app.update();
+        assert_eq!(camera_input(&app, camera)?.orbit().pixels(), Vec2::ZERO);
+
+        app.world_mut()
+            .resource_mut::<AccumulatedMouseMotion>()
+            .delta = Vec2::ZERO;
+        cursor_motion_frame(&mut app, window, Vec2::new(5.0, 0.0));
+        assert_eq!(
+            camera_input(&app, camera)?.orbit().pixels(),
+            Vec2::new(5.0, 0.0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_mouse_motion_suppresses_cursor_drag() -> TestResult {
+        let mut app = test_app();
+        let window = spawn_pointer_window(&mut app, 1.0);
+        let camera = spawn_camera(
+            app.world_mut(),
+            OrbitCamInputMode::with_preset(OrbitCamPreset::simple_mouse()),
+        );
+        route_to(&mut app, camera);
+        app.world_mut().resource_mut::<ActionSources>().mouse_motion = false;
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        cursor_motion_frame(&mut app, window, Vec2::new(4.0, 0.0));
+        cursor_motion_frame(&mut app, window, Vec2::new(6.0, 0.0));
+
+        assert_eq!(camera_input(&app, camera)?.orbit().pixels(), Vec2::ZERO);
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_only_right_drag_pans_simple_mouse_camera() -> TestResult {
+        let mut app = test_app();
+        let window = spawn_pointer_window(&mut app, 1.0);
+        let camera = spawn_camera(
+            app.world_mut(),
+            OrbitCamInputMode::with_preset(OrbitCamPreset::simple_mouse()),
+        );
+        route_to(&mut app, camera);
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Right);
+        cursor_motion_frame(&mut app, window, Vec2::new(3.0, -1.5));
+        cursor_motion_frame(&mut app, window, Vec2::new(3.0, -1.5));
+
+        assert_eq!(
+            camera_input(&app, camera)?.pan().pixels(),
+            Vec2::new(6.0, -3.0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_grab_change_mid_drag_keeps_raw_source() -> TestResult {
+        let mut app = test_app();
+        let window = spawn_pointer_window(&mut app, 1.0);
+        let camera = spawn_camera(
+            app.world_mut(),
+            OrbitCamInputMode::with_preset(OrbitCamPreset::simple_mouse()),
+        );
+        route_to(&mut app, camera);
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        app.world_mut()
+            .resource_mut::<AccumulatedMouseMotion>()
+            .delta = Vec2::new(10.0, 0.0);
+        cursor_motion_frame(&mut app, window, Vec2::new(10.0, 0.0));
+        app.world_mut()
+            .get_mut::<CursorOptions>(window)
+            .ok_or("cursor options")?
+            .grab_mode = CursorGrabMode::Locked;
+        app.world_mut()
+            .resource_mut::<AccumulatedMouseMotion>()
+            .delta = Vec2::ZERO;
+        cursor_motion_frame(&mut app, window, Vec2::new(10.0, 0.0));
+        assert_eq!(camera_input(&app, camera)?.orbit().pixels(), Vec2::ZERO);
+        app.world_mut()
+            .resource_mut::<AccumulatedMouseMotion>()
+            .delta = Vec2::new(10.0, 0.0);
+        app.update();
+        assert_eq!(
+            camera_input(&app, camera)?.orbit().pixels(),
+            Vec2::new(10.0, 0.0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_grab_change_mid_drag_keeps_cursor_source() -> TestResult {
+        let mut app = test_app();
+        let window = spawn_pointer_window(&mut app, 1.0);
+        let camera = spawn_camera(
+            app.world_mut(),
+            OrbitCamInputMode::with_preset(OrbitCamPreset::simple_mouse()),
+        );
+        route_to(&mut app, camera);
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        cursor_motion_frame(&mut app, window, Vec2::new(2.5, 0.0));
+        cursor_motion_frame(&mut app, window, Vec2::new(2.5, 0.0));
+        assert_eq!(
+            camera_input(&app, camera)?.orbit().pixels(),
+            Vec2::new(5.0, 0.0)
+        );
+
+        app.world_mut()
+            .get_mut::<CursorOptions>(window)
+            .ok_or("cursor options")?
+            .grab_mode = CursorGrabMode::Locked;
+        app.world_mut()
+            .resource_mut::<AccumulatedMouseMotion>()
+            .delta = Vec2::new(20.0, 0.0);
+        cursor_motion_frame(&mut app, window, Vec2::new(5.0, 0.0));
+        assert_eq!(
+            camera_input(&app, camera)?.orbit().pixels(),
+            Vec2::new(5.0, 0.0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn raw_drag_keeps_orbiting_after_cursor_leaves_window() -> TestResult {
+        let mut app = test_app();
+        let window = spawn_pointer_window(&mut app, 1.0);
+        let camera = spawn_camera(
+            app.world_mut(),
+            OrbitCamInputMode::with_preset(OrbitCamPreset::simple_mouse()),
+        );
+        route_to(&mut app, camera);
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        app.world_mut()
+            .resource_mut::<AccumulatedMouseMotion>()
+            .delta = Vec2::new(10.0, 0.0);
+        cursor_motion_frame(&mut app, window, Vec2::new(10.0, 0.0));
+        app.world_mut()
+            .get_mut::<Window>(window)
+            .ok_or("window")?
+            .set_cursor_position(None);
+        app.world_mut()
+            .resource_mut::<AccumulatedMouseMotion>()
+            .delta = Vec2::new(10.0, 0.0);
+        app.update();
+        assert_eq!(
+            camera_input(&app, camera)?.orbit().pixels(),
+            Vec2::new(10.0, 0.0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_position_only_orbits_simple_mouse_camera() -> TestResult {
+        let mut app = test_app();
+        let window = spawn_pointer_window(&mut app, 1.0);
+        let camera = spawn_camera(
+            app.world_mut(),
+            OrbitCamInputMode::with_preset(OrbitCamPreset::simple_mouse()),
+        );
+        route_to(&mut app, camera);
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        cursor_motion_frame(&mut app, window, Vec2::new(5.0, 0.0));
+        cursor_motion_frame(&mut app, window, Vec2::new(5.0, 0.0));
+
+        assert_eq!(
+            camera_input(&app, camera)?.orbit().pixels(),
+            Vec2::new(10.0, 0.0),
+            "cursor-only drag should orbit by the cursor delta"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_only_button_drag_zoom_uses_selected_motion() -> TestResult {
+        let mut app = test_app();
+        let window = spawn_pointer_window(&mut app, 1.0);
+        let bindings = OrbitCamBindings::builder()
+            .zoom(OrbitCamButtonDragZoom::new(MouseButton::Middle))
+            .build()
+            .map_err(|_| "bindings should validate")?;
+        let camera = spawn_camera(app.world_mut(), OrbitCamInputMode::Bindings(bindings));
+        route_to(&mut app, camera);
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Middle);
+        cursor_motion_frame(&mut app, window, Vec2::new(0.0, -4.0));
+        cursor_motion_frame(&mut app, window, Vec2::new(0.0, -4.0));
+
+        assert_f32_close(
+            camera_input(&app, camera)?.zoom_smooth().amount(),
+            8.0 * BUTTON_ZOOM_SCALE,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn claimed_cursor_drag_stays_silent_while_wheel_zoom_works() -> TestResult {
+        let mut app = test_app();
+        let window = spawn_pointer_window(&mut app, 1.0);
+        let camera = spawn_camera(
+            app.world_mut(),
+            OrbitCamInputMode::with_preset(OrbitCamPreset::simple_mouse()),
+        );
+        route_to(&mut app, camera);
+        *app.world_mut().resource_mut::<CameraDragClaim>() = CameraDragClaim::Claimed;
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        *app.world_mut().resource_mut::<AccumulatedMouseScroll>() = AccumulatedMouseScroll {
+            unit:  MouseScrollUnit::Line,
+            delta: Vec2::new(0.0, WHEEL_SCROLL_DELTA),
+        };
+        cursor_motion_frame(&mut app, window, Vec2::new(10.0, 0.0));
+        app.update();
+
+        let input = camera_input(&app, camera)?;
+        assert_eq!(input.orbit().pixels(), Vec2::ZERO);
+        assert_f32_close(input.zoom_coarse().amount(), WHEEL_SCROLL_DELTA);
+        assert!(input.sources().contains(InteractionSources::WHEEL));
+        assert!(!input.sources().contains(InteractionSources::MOUSE));
         Ok(())
     }
 
@@ -872,6 +1364,34 @@ mod tests {
             .insert(CameraInputDisabled);
         app.update();
         assert_no_camera_input(&app, camera)
+    }
+
+    #[test]
+    fn claimed_simple_mouse_drag_keeps_wheel_zoom() -> TestResult {
+        let mut app = test_app();
+        let camera = spawn_camera(
+            app.world_mut(),
+            OrbitCamInputMode::with_preset(OrbitCamPreset::simple_mouse()),
+        );
+        route_to(&mut app, camera);
+        *app.world_mut().resource_mut::<CameraDragClaim>() = CameraDragClaim::Claimed;
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        app.world_mut()
+            .resource_mut::<AccumulatedMouseMotion>()
+            .delta = Vec2::new(5.0, -2.0);
+        *app.world_mut().resource_mut::<AccumulatedMouseScroll>() = AccumulatedMouseScroll {
+            unit:  MouseScrollUnit::Line,
+            delta: Vec2::new(0.0, WHEEL_SCROLL_DELTA),
+        };
+        app.update();
+        let input = camera_input(&app, camera)?;
+        assert!(!input.has_orbit());
+        assert_f32_close(input.zoom_coarse().amount(), WHEEL_SCROLL_DELTA);
+        assert!(input.sources().contains(InteractionSources::WHEEL));
+        assert!(!input.sources().contains(InteractionSources::MOUSE));
+        Ok(())
     }
 
     #[test]

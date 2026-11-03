@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::hash_map::Entry;
 
 use bevy::asset::Asset;
 use bevy::asset::RenderAssetUsages;
@@ -13,6 +14,8 @@ use bevy::camera::primitives::Aabb;
 use bevy::camera::visibility::NoAutoAabb;
 use bevy::camera::visibility::RenderLayers;
 use bevy::camera::visibility::VisibilitySystems;
+use bevy::ecs::system::SystemParam;
+use bevy::image::Image;
 use bevy::light::NotShadowCaster;
 use bevy::mesh::Indices;
 use bevy::mesh::MeshVertexBufferLayoutRef;
@@ -29,9 +32,11 @@ use bevy::prelude::AlphaMode;
 use bevy::prelude::App;
 use bevy::prelude::AssetServer;
 use bevy::prelude::Assets;
+use bevy::prelude::Changed;
 use bevy::prelude::Color;
 use bevy::prelude::Commands;
 use bevy::prelude::Component;
+use bevy::prelude::DetectChanges;
 use bevy::prelude::Entity;
 use bevy::prelude::GlobalTransform;
 use bevy::prelude::Handle;
@@ -39,6 +44,7 @@ use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::Mat4;
 use bevy::prelude::Mesh;
 use bevy::prelude::Mesh3d;
+use bevy::prelude::Or;
 use bevy::prelude::Plugin;
 use bevy::prelude::PostUpdate;
 use bevy::prelude::Query;
@@ -60,20 +66,23 @@ use bevy::reflect::TypePath;
 use bevy::render::render_resource::AsBindGroup;
 use bevy::render::render_resource::PrimitiveTopology;
 use bevy::render::render_resource::RenderPipelineDescriptor;
-use bevy::render::render_resource::ShaderSize;
 use bevy::render::render_resource::ShaderType;
 use bevy::render::render_resource::SpecializedMeshPipelineError;
 use bevy::render::storage::ShaderBuffer;
 use bevy::shader::ShaderRef;
 use bevy::transform::TransformSystems;
+use bytemuck::Pod;
+use bytemuck::Zeroable;
 use hana_kana::ToU32;
 use hana_kana::ToUsize;
 
+use super::AncestorVisibility;
 use super::BatchAlphaMode;
 use super::BatchRenderLayers;
 use super::CommandIndex;
 use super::Dirty;
 use super::ElementIndex;
+use super::TooltipDepthPriority;
 use super::batch_key;
 use super::batch_key::PipelineCompatibility;
 use super::batch_key::ResourceCompatibility;
@@ -85,12 +94,15 @@ use super::batch_store::BatchStore;
 use super::batch_store::MemberBatch;
 use super::batch_store::MemberFamily;
 use super::batch_store::MemberRecord;
+use super::constants::OIT_PAINT_STEP;
+use super::constants::SDF_AA_PADDING;
 #[cfg(test)]
 use super::draw_order;
 use super::draw_order::DrawCommandDepth;
 use super::draw_order::DrawOrderIndex;
 use super::draw_order::DrawZIndexRank;
 use super::material;
+use super::material::PanelDisplayTarget;
 use super::material_table;
 use super::material_table::BatchAssetWrites;
 use super::material_table::BatchResourcesReady;
@@ -101,37 +113,68 @@ use super::material_table::MaterialSlotCandidate;
 use super::material_table::MaterialSlotId;
 use super::material_table::MaterialSlotInput;
 use super::material_table::MaterialTableAppendReady;
+use super::material_table::MaterialTableBufferPrepared;
 use super::material_table::RetainedBatchBufferUploads;
 #[cfg(test)]
 use super::material_table::SdfDriverRunOrder;
 use super::material_table::SdfPaintMaterial;
+use super::panel_geometry::ResolvedSdfMaterial;
 use super::panel_geometry::ResolvedSdfSurface;
 use super::panel_geometry::ResolvedSdfSurfaceRegistry;
 use super::panel_geometry::SdfRecordRole;
+use super::panel_geometry::SdfSourcePart;
+use super::panel_geometry::StoredResolvedSdfSurface;
 use super::panel_geometry::SurfaceEvictionCause;
 use crate::DrawZIndex;
 use crate::cascade::Resolved;
 use crate::cascade::SdfMaterial;
-use crate::constants::EMBEDDED_SDF_PANEL_BATCH_SHADER_PATH;
+use crate::constants::SDF_PANEL_SHADER_HANDLE;
 use crate::layout::DrawBatchFamily;
 use crate::layout::Lighting;
 use crate::layout::ShadowCasting;
 use crate::layout::Sidedness;
+use crate::panel::ComputedDiegeticPanel;
 use crate::panel::DiegeticPanel;
 use crate::panel::DiegeticPerfStats;
 use crate::panel::DroppedSdfSurfaces;
+use crate::panel::FrameWork;
 use crate::render;
+use crate::screen_space::ScreenPixelEdgeSnap;
+use crate::widgets::SliderDirection;
+use crate::widgets::TooltipFor;
+use crate::widgets::TooltipPaintInsideBorder;
 use crate::widgets::VisualOverrideIndex;
 use crate::widgets::VisualSlotOverride;
+use crate::widgets::WidgetOf;
+use crate::widgets::WidgetSpec;
 
 /// Extra `clip_depth_nudge` layer-units pushing an opaque/alpha-mask SDF fill away
 /// from the camera so coplanar panel text, drawn at its true depth, wins the
 /// depth test instead of z-fighting the fill. Only the depth-buffer regime
 /// (`Opaque`/`Mask`) applies it; transparent and OIT fills order through
-/// `ScreenDepthBias`/`OitDepthOffset` and get zero here. Starts far below one
+/// `ScreenDepthBias`/`OitPaintOrder` and get zero here. Starts far below one
 /// layer-unit; raise by powers of ten until text shows without the fill
 /// visibly floating off the surface.
 const OPAQUE_FILL_DEPTH_PUSH_LAYERS: f32 = 1.0;
+const SDF_TOOLTIP_DEPTH_PRIORITY_FLAG: u32 = 1;
+const SDF_PAINT_INSIDE_BORDER_FLAG: u32 = 1 << 1;
+const SDF_VIEW_ALIGNED_EDGE_SNAP_FLAG: u32 = 1 << 2;
+const SDF_TOOLTIP_KEEP_SNAPPED_EDGES_INSIDE_FLAG: u32 = 1 << 3;
+const SDF_CLIP_DEPTH_NUDGE_PER_LAYER: f32 = 0.000_000_02;
+/// Leave one SDF clip-nudge unit below the OIT opaque-occlusion tolerance.
+const OPAQUE_FILL_MAX_CLIP_NUDGE_LAYERS: f32 =
+    OIT_PAINT_STEP / SDF_CLIP_DEPTH_NUDGE_PER_LAYER - 1.0;
+/// Largest f32 ulp of a reverse-Z depth value, which lies in `[0, 1]`.
+const DEPTH_ULP_BELOW_ONE: f32 = f32::EPSILON / 2.0;
+/// Whole depth ulps a tooltip shadow sits behind its opaque body without OIT,
+/// so the body's depth test hides the overlap on every GPU at every depth.
+/// Each step is `DEPTH_ULP_BELOW_ONE`, never less than one ulp anywhere in the
+/// depth range, and the whole margin stays far inside the tooltip's
+/// `TOOLTIP_NDC_DEPTH_PRIORITY` lift.
+const TOOLTIP_SHADOW_BEHIND_BODY_DEPTH_ULPS: f32 = 16.0;
+/// `TOOLTIP_SHADOW_BEHIND_BODY_DEPTH_ULPS` in SDF clip-nudge layer units.
+const TOOLTIP_SHADOW_BEHIND_BODY_LAYERS: f32 =
+    TOOLTIP_SHADOW_BEHIND_BODY_DEPTH_ULPS * DEPTH_ULP_BELOW_ONE / SDF_CLIP_DEPTH_NUDGE_PER_LAYER;
 
 /// Render material used by batched SDF fill and border records.
 pub(crate) type SdfExtendedMaterial = ExtendedMaterial<StandardMaterial, SdfExtension>;
@@ -194,20 +237,31 @@ pub(super) enum SdfMaterialRole {
     Fill,
     /// Panel or element border ring.
     Border,
+    /// Tooltip body shadow, keyed apart from the body's own fill.
+    TooltipShadow,
+}
+
+impl SdfMaterialRole {
+    /// Returns the source role that keys `surface`'s fill row.
+    const fn fill_of(surface: &ResolvedSdfSurface<'_>) -> Self {
+        match surface.record_role {
+            SdfRecordRole::TooltipShadow(_) => Self::TooltipShadow,
+            SdfRecordRole::Whole | SdfRecordRole::Fill | SdfRecordRole::Border => Self::Fill,
+        }
+    }
 }
 
 /// Material source identity for one SDF fill or border role.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct SdfMaterialSourceKey {
     /// Panel entity that owns this role.
-    pub panel:           Entity,
+    pub panel:       Entity,
     /// Source element in the panel's layout tree.
-    pub element:         ElementIndex,
-    /// Adjacent-child pair ordinal within `element`; `None` means this role belongs to the
-    /// element itself.
-    pub divider_ordinal: Option<usize>,
+    pub element:     ElementIndex,
+    /// Element surface or child divider that owns this material role.
+    pub source_part: SdfSourcePart,
     /// Role within the resolved SDF surface.
-    pub role:            SdfMaterialRole,
+    pub role:        SdfMaterialRole,
 }
 
 /// Append-time source material for one SDF material-table role.
@@ -248,13 +302,13 @@ impl MaterialSlotInput for SdfMaterialSlotInput<'_> {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct SdfRecordKey {
     /// Panel entity that owns this record.
-    pub panel:           Entity,
+    pub panel:       Entity,
     /// Source element in the panel's layout tree.
-    pub element:         ElementIndex,
-    /// Adjacent-child pair ordinal for a child divider; `None` for an element surface.
-    pub divider_ordinal: Option<usize>,
+    pub element:     ElementIndex,
+    /// Element surface or child divider that owns this record.
+    pub source_part: SdfSourcePart,
     /// Role produced when clipping separates a fill from its border.
-    pub role:            SdfRecordRole,
+    pub role:        SdfRecordRole,
 }
 
 /// Panel-local rounded-rectangle SDF half-size in world units.
@@ -271,10 +325,10 @@ pub(super) struct MeshHalfSize {
     pub value: Vec2,
 }
 
-/// Panel-local SDF clip rectangle after AA padding expansion.
+/// Shader-local Y-down SDF clip rectangle after AA padding expansion.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct LocalClipRect {
-    /// `[left, bottom, right, top]` clip rectangle.
+    /// `[left, top, right, bottom]` clip rectangle.
     pub value: Vec4,
 }
 
@@ -292,8 +346,9 @@ pub(super) struct BorderWidths {
     pub value: Vec4,
 }
 
-/// Fill and border role-presence bits read by `sdf_panel.wgsl`.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, ShaderType)]
+/// Fill and border role-presence bits read by `sdf_panel.wesl`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, ShaderType, Pod, Zeroable)]
 pub(super) struct SdfPaintMask {
     /// Bit field written to `SdfRenderRecord::paint_mask`.
     bits: u32,
@@ -330,20 +385,25 @@ impl SdfPaintMask {
     const fn empty() -> Self { Self { bits: 0 } }
 }
 
-/// Per-command monotonic run ordinal used to preserve cross-batch order.
+/// Ordinal of one maximal run of compatible SDF records in its panel's draw
+/// order.
 ///
-/// Example: panel order is `background`, `text`, `border`; `background` and
-/// `border` are both SDF-compatible, but they must not merge into one SDF
-/// batch because that would draw `background`, `border`, `text`.
+/// Example: a panel draws `background`, `badge`, `border`, where `badge` needs
+/// another pipeline. `background` and `border` must not merge into one batch,
+/// which would draw `border` before `badge`; they take runs 0 and 2, and
+/// `SdfBatchKey::sort_depth_bias` sorts each run after the panel's earlier
+/// ones.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub(super) struct ContiguousDrawnRun {
-    /// Frame-local run ordinal.
+    /// Number of the panel's runs drawn before this one.
     pub value: u32,
 }
 
 /// Key for one SDF fill batch and one `SdfBatchResources` entry.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct SdfBatchKey {
+    /// Camera transform the panel reaches after fragment output.
+    pub display_target:         PanelDisplayTarget,
     /// Authored z-index splitter for this batch's SDF records.
     pub z_index:                DrawZIndex,
     /// Dense panel-local rank for `z_index`, used by the batch material
@@ -361,6 +421,125 @@ pub(super) struct SdfBatchKey {
     pub pipeline_compatibility: PipelineCompatibility,
     /// Texture and bind-group facts copied into the SDF render material.
     pub resource_compatibility: ResourceCompatibility,
+    /// Where the batch sorts among non-OIT `Transparent3d` draws.
+    pub transparent_sort:       SdfTransparentSort,
+    /// Which panels' records the batch may hold.
+    pub batch_sharing:          SdfBatchSharing,
+}
+
+impl SdfBatchKey {
+    /// What this batch's fragments paint. Only tooltip shadow records sort
+    /// over a host, so the sort names a shadow batch.
+    const fn fragment_paint(&self) -> SdfFragmentPaint {
+        match self.transparent_sort {
+            SdfTransparentSort::PanelRank => SdfFragmentPaint::Surface,
+            SdfTransparentSort::OverHost(_) => SdfFragmentPaint::TooltipShadow,
+        }
+    }
+
+    /// Lighting path compiled for this batch's homogeneous records.
+    const fn fragment_lighting(&self) -> SdfFragmentLighting {
+        if matches!(self.fragment_paint(), SdfFragmentPaint::TooltipShadow)
+            || self.pipeline_compatibility.unlit
+        {
+            SdfFragmentLighting::UnlitOnly
+        } else {
+            SdfFragmentLighting::Pbr
+        }
+    }
+
+    /// Non-OIT `Transparent3d` sort bias of this batch's material.
+    ///
+    /// Batches of one panel can share a sort base and a centroid depth, so the
+    /// run ordinal lifts each run past the panel's earlier runs; otherwise
+    /// entity order would decide which draws last.
+    fn sort_depth_bias(&self) -> f32 {
+        let base = match self.transparent_sort {
+            SdfTransparentSort::PanelRank => self.z_index_rank.screen_depth_bias(),
+            SdfTransparentSort::OverHost(host_rank) => host_rank.screen_tooltip_shadow_depth_bias(),
+        };
+        base.after_earlier_runs(self.contiguous_drawn_run.value)
+            .get()
+    }
+}
+
+/// Where an SDF batch sorts among a camera's non-OIT `Transparent3d` draws.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum SdfTransparentSort {
+    /// By its z-index rank, among the draws of its own panel.
+    PanelRank,
+    /// Just past the text of the deepest rank its tooltip's host panel draws
+    /// at. A tooltip shadow blends over the host draws under it, so it
+    /// composites after them, and before a surface nearer the camera than that
+    /// band; its depth still sits behind its own opaque body.
+    OverHost(DrawZIndexRank),
+}
+
+/// Which panels an SDF record may share a batch with.
+///
+/// Records inside one blended batch draw in panel-local order, which cannot
+/// place a tooltip over its host, so a tooltip's records draw only with each
+/// other and its own batch sorts after the host's.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum SdfBatchSharing {
+    /// Shares a batch with any panel's records.
+    AnyPanel,
+    /// Draws only with the records of this tooltip panel.
+    TooltipOnly(Entity),
+}
+
+/// Per-panel facts that route one resolved surface into its batch.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SdfRecordRoute {
+    /// Camera transform the panel reaches after fragment output.
+    pub display_target:   PanelDisplayTarget,
+    /// Where the record sorts among non-OIT `Transparent3d` draws.
+    pub transparent_sort: SdfTransparentSort,
+    /// Which panels the record may share a batch with.
+    pub batch_sharing:    SdfBatchSharing,
+}
+
+/// Reads the panel a tooltip describes a widget on, which its shadow falls on.
+#[derive(SystemParam)]
+struct TooltipHosts<'w, 's> {
+    tooltips: Query<'w, 's, &'static TooltipFor>,
+    widgets:  Query<'w, 's, &'static WidgetOf>,
+    panels:   Query<'w, 's, &'static ComputedDiegeticPanel>,
+}
+
+impl TooltipHosts<'_, '_> {
+    /// Where `surface` sorts among non-OIT `Transparent3d` draws.
+    ///
+    /// A tooltip shadow sorts over its host panel's deepest rank; a tooltip
+    /// that describes no panel widget has no host draws, so its shadow sorts
+    /// over the first rank.
+    fn transparent_sort(&self, surface: &ResolvedSdfSurface<'_>) -> SdfTransparentSort {
+        match surface.record_role {
+            SdfRecordRole::TooltipShadow(_) => SdfTransparentSort::OverHost(
+                self.tooltips
+                    .get(surface.panel_entity)
+                    .and_then(|tooltip| self.widgets.get(tooltip.target()))
+                    .and_then(|widget| self.panels.get(widget.panel()))
+                    .map_or_else(
+                        |_| DrawZIndexRank::default(),
+                        |host| host.draw_order().deepest_z_index_rank(),
+                    ),
+            ),
+            SdfRecordRole::Whole | SdfRecordRole::Fill | SdfRecordRole::Border => {
+                SdfTransparentSort::PanelRank
+            },
+        }
+    }
+
+    /// Which panels `surface` may share a batch with: only its own panel when
+    /// that panel is a tooltip, any panel otherwise.
+    fn batch_sharing(&self, surface: &ResolvedSdfSurface<'_>) -> SdfBatchSharing {
+        if self.tooltips.contains(surface.panel_entity) {
+            SdfBatchSharing::TooltipOnly(surface.panel_entity)
+        } else {
+            SdfBatchSharing::AnyPanel
+        }
+    }
 }
 
 /// Material slots and compatibility values appended for one SDF record.
@@ -374,6 +553,29 @@ pub(super) struct SdfRecordMaterialSlots {
     pub pipeline_compatibility: PipelineCompatibility,
     /// Resource compatibility selected for the enclosing SDF batch.
     pub resource_compatibility: ResourceCompatibility,
+}
+
+/// World-space physical plane shared by a panel's coplanar SDF surfaces.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct WorldPanelPlane {
+    pub(super) coefficients: Vec4,
+}
+
+impl WorldPanelPlane {
+    pub(super) fn from_panel(panel: &GlobalTransform, local_depth: f32) -> Self {
+        Self::from_matrix(panel.to_matrix(), local_depth)
+    }
+
+    pub(super) fn from_matrix(transform: Mat4, local_depth: f32) -> Self {
+        let normal = transform
+            .x_axis
+            .truncate()
+            .cross(transform.y_axis.truncate());
+        let origin = transform.transform_point3(Vec3::new(0.0, 0.0, local_depth));
+        Self {
+            coefficients: normal.extend(-normal.dot(origin)),
+        }
+    }
 }
 
 /// CPU-side SDF record retained by `SdfBatchStore`.
@@ -395,6 +597,8 @@ pub(super) struct ResolvedSdfBatchRecord {
     pub local_transform:  Transform,
     /// World transform written after `TransformSystems::Propagate`.
     pub transform:        Mat4,
+    /// Common physical plane, independent of this quad's position and extent.
+    pub panel_plane:      WorldPanelPlane,
     /// Rounded-rectangle SDF half-size.
     pub half_size:        SdfHalfSize,
     /// Mesh half-size including AA padding.
@@ -413,8 +617,8 @@ pub(super) struct ResolvedSdfBatchRecord {
     pub paint_mask:       SdfPaintMask,
     /// Clip-space depth nudge in layer units for non-OIT views.
     pub clip_depth_nudge: f32,
-    /// Per-record OIT position-z offset for coplanar ordering.
-    pub oit_depth_offset: f32,
+    /// Normalized local paint order used only at equal physical OIT depth.
+    pub oit_paint_order:  f32,
     /// Extra shader flags for the SDF fragment path.
     pub flags:            u32,
 }
@@ -426,21 +630,23 @@ impl ResolvedSdfBatchRecord {
         surface: &ResolvedSdfSurface<'_>,
         materials: SdfRecordMaterialSlots,
         contiguous_drawn_run: ContiguousDrawnRun,
+        route: SdfRecordRoute,
     ) -> Self {
         let pipeline_compatibility = sdf_record_pipeline_compatibility(surface, &materials);
         let fill_source = SdfMaterialSourceKey {
-            panel:           surface.panel_entity,
-            element:         surface.element_index,
-            divider_ordinal: surface.divider_ordinal,
-            role:            SdfMaterialRole::Fill,
+            panel:       surface.panel_entity,
+            element:     surface.element_index,
+            source_part: surface.source_part,
+            role:        SdfMaterialRole::fill_of(surface),
         };
         let border_source = SdfMaterialSourceKey {
-            panel:           surface.panel_entity,
-            element:         surface.element_index,
-            divider_ordinal: surface.divider_ordinal,
-            role:            SdfMaterialRole::Border,
+            panel:       surface.panel_entity,
+            element:     surface.element_index,
+            source_part: surface.source_part,
+            role:        SdfMaterialRole::Border,
         };
         let batch_key = SdfBatchKey {
+            display_target: route.display_target,
             z_index: surface.draw_depth.z_index(),
             z_index_rank: surface.draw_depth.z_index_rank(),
             batch_family: DrawBatchFamily::SdfSurface,
@@ -449,14 +655,16 @@ impl ResolvedSdfBatchRecord {
             contiguous_drawn_run,
             pipeline_compatibility,
             resource_compatibility: materials.resource_compatibility.clone(),
+            transparent_sort: route.transparent_sort,
+            batch_sharing: route.batch_sharing,
         };
         let paint_mask = SdfPaintMask::from_materials(materials.fill, materials.border);
         Self {
             record_key: SdfRecordKey {
-                panel:           surface.panel_entity,
-                element:         surface.element_index,
-                divider_ordinal: surface.divider_ordinal,
-                role:            surface.record_role,
+                panel:       surface.panel_entity,
+                element:     surface.element_index,
+                source_part: surface.source_part,
+                role:        surface.record_role,
             },
             draw_order: surface.command_index,
             fill_source,
@@ -465,6 +673,10 @@ impl ResolvedSdfBatchRecord {
             batch_key,
             local_transform: surface.local_transform,
             transform: surface.local_transform.to_matrix(),
+            panel_plane: WorldPanelPlane::from_panel(
+                &GlobalTransform::IDENTITY,
+                surface.local_transform.translation.z,
+            ),
             half_size: SdfHalfSize {
                 value: surface.sdf_half_size,
             },
@@ -488,7 +700,7 @@ impl ResolvedSdfBatchRecord {
                     pipeline_compatibility.alpha,
                     surface.shadow_casting.into(),
                 ),
-            oit_depth_offset: surface.draw_depth.oit_depth_offset().get(),
+            oit_paint_order: surface.draw_depth.oit_paint_order().get(),
             flags: 0,
         }
     }
@@ -496,6 +708,8 @@ impl ResolvedSdfBatchRecord {
     /// Rewrites `SdfRenderRecord::transform` from the panel's propagated transform.
     fn update_world_transform(&mut self, panel_transform: &GlobalTransform) {
         self.transform = panel_transform.to_matrix() * self.local_transform.to_matrix();
+        self.panel_plane =
+            WorldPanelPlane::from_panel(panel_transform, self.local_transform.translation.z);
     }
 
     /// Keeps this record allocated while preventing the SDF shader from drawing it.
@@ -531,14 +745,17 @@ fn clipped_border_uses_transparent_phase(
 ) -> bool {
     matches!(materials.fill, SdfPaintMaterial::NotAuthored)
         && matches!(materials.border, SdfPaintMaterial::Authored(_))
-        && surface.clip_rect_limits_mesh()
+        && (matches!(surface.record_role, SdfRecordRole::Border) || surface.clip_rect_limits_mesh())
 }
 
 /// GPU mirror for one batched SDF fill/border surface.
-#[derive(Clone, Copy, Debug, PartialEq, ShaderType)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, ShaderType, Pod, Zeroable)]
 struct SdfRenderRecord {
     /// World-space transform used by the vertex shader.
     transform:        Mat4,
+    /// Common world plane used to reconstruct coplanar OIT fragment depths.
+    panel_plane:      Vec4,
     /// Rounded-rectangle SDF half-size in local record space.
     half_size:        Vec2,
     /// Quad half-size including AA padding in local record space.
@@ -547,7 +764,7 @@ struct SdfRenderRecord {
     corner_radii:     Vec4,
     /// Per-side widths `[top, right, bottom, left]`.
     border_widths:    Vec4,
-    /// Local clip rectangle `[left, bottom, right, top]`.
+    /// Shader-local Y-down clip rectangle `[left, top, right, bottom]`.
     clip_rect:        Vec4,
     /// Fill material row, or `INVALID_GPU_MATERIAL_SLOT`.
     fill_material:    GpuMaterialSlotId,
@@ -559,8 +776,10 @@ struct SdfRenderRecord {
     flags:            u32,
     /// Clip-space depth nudge in layer units for non-OIT views.
     clip_depth_nudge: f32,
-    /// Per-record OIT position-z offset for coplanar ordering.
-    oit_depth_offset: f32,
+    /// Normalized local paint order used only at equal physical OIT depth.
+    oit_paint_order:  f32,
+    /// Tooltip shadow `(blur support, downward offset)` in local record space.
+    tooltip_shadow:   Vec2,
 }
 
 impl SdfRenderRecord {
@@ -570,20 +789,28 @@ impl SdfRenderRecord {
         record: &ResolvedSdfBatchRecord,
         first_draw_order_index: DrawOrderIndex,
     ) -> Self {
+        let tooltip_shadow = match record.record_key.role {
+            SdfRecordRole::TooltipShadow(shadow) => {
+                Vec2::new(shadow.blur_support, shadow.downward_offset)
+            },
+            SdfRecordRole::Whole | SdfRecordRole::Fill | SdfRecordRole::Border => Vec2::ZERO,
+        };
         Self {
-            transform:        record.transform,
-            half_size:        record.half_size.value,
-            mesh_half_size:   record.mesh_half_size.value,
-            corner_radii:     record.corner_radii.value,
-            border_widths:    record.border_widths.value,
-            clip_rect:        record.clip_rect.value,
-            fill_material:    record.fill_material.to_gpu(),
-            border_material:  record.border_material.to_gpu(),
-            paint_mask:       record.paint_mask,
-            flags:            record.flags,
+            transform: record.transform,
+            panel_plane: record.panel_plane.coefficients,
+            half_size: record.half_size.value,
+            mesh_half_size: record.mesh_half_size.value,
+            corner_radii: record.corner_radii.value,
+            border_widths: record.border_widths.value,
+            clip_rect: record.clip_rect.value,
+            fill_material: record.fill_material.to_gpu(),
+            border_material: record.border_material.to_gpu(),
+            paint_mask: record.paint_mask,
+            flags: record.flags,
             clip_depth_nudge: record.clip_depth_nudge
                 - first_draw_order_index.clip_depth_nudge().get(),
-            oit_depth_offset: record.oit_depth_offset,
+            oit_paint_order: record.oit_paint_order,
+            tooltip_shadow,
         }
     }
 
@@ -592,6 +819,7 @@ impl SdfRenderRecord {
     const fn padded() -> Self {
         Self {
             transform:        Mat4::ZERO,
+            panel_plane:      Vec4::ZERO,
             half_size:        Vec2::ZERO,
             mesh_half_size:   Vec2::ZERO,
             corner_radii:     Vec4::ZERO,
@@ -602,20 +830,19 @@ impl SdfRenderRecord {
             paint_mask:       SdfPaintMask::empty(),
             flags:            0,
             clip_depth_nudge: 0.0,
-            oit_depth_offset: 0.0,
+            oit_paint_order:  0.0,
+            tooltip_shadow:   Vec2::ZERO,
         }
     }
 }
 
 /// Placeholder SDF mesh table row bound at `SDF_MESH_BINDING`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, ShaderType)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, ShaderType, Pod, Zeroable)]
 struct SdfMeshRecord {
     /// Reserved data lane for future mesh-level SDF batch metadata.
     reserved: UVec4,
 }
-
-const _: () = assert!(SdfRenderRecord::SHADER_SIZE.get() == 160);
-const _: () = assert!(SdfMeshRecord::SHADER_SIZE.get() == 16);
 
 /// GPU assets owned by one SDF fill batch.
 #[derive(Debug)]
@@ -634,11 +861,45 @@ pub(super) struct SdfBatchResources {
 
 /// CPU record set and GPU handles for one `SdfBatchKey`.
 #[derive(Debug, Default)]
+enum SdfBatchAllocation {
+    /// No render entity or GPU resources exist yet.
+    #[default]
+    Unallocated,
+    /// The render entity and all GPU resources exist together.
+    Allocated {
+        entity:    Entity,
+        resources: SdfBatchResources,
+    },
+}
+
+impl SdfBatchAllocation {
+    const fn entity(&self) -> Option<Entity> {
+        match self {
+            Self::Unallocated => None,
+            Self::Allocated { entity, .. } => Some(*entity),
+        }
+    }
+
+    const fn resources(&self) -> Option<&SdfBatchResources> {
+        match self {
+            Self::Unallocated => None,
+            Self::Allocated { resources, .. } => Some(resources),
+        }
+    }
+
+    const fn resources_mut(&mut self) -> Option<&mut SdfBatchResources> {
+        match self {
+            Self::Unallocated => None,
+            Self::Allocated { resources, .. } => Some(resources),
+        }
+    }
+}
+
+/// CPU record set and allocation state for one `SdfBatchKey`.
+#[derive(Debug, Default)]
 pub(super) struct SdfBatch {
-    /// Batch render entity; `None` before the first GPU allocation.
-    pub entity:             Option<Entity>,
-    /// GPU handles; `None` before the first GPU allocation.
-    pub gpu:                Option<SdfBatchResources>,
+    /// Render entity and GPU resources, allocated atomically.
+    allocation:             SdfBatchAllocation,
     /// Record-buffer upload state for this batch.
     pub record_upload:      Dirty,
     /// Bounds recomputation state for this batch.
@@ -650,12 +911,15 @@ pub(super) struct SdfBatch {
     /// Lowest `DrawOrderIndex` in this batch.
     ///
     /// `SdfRenderRecord::clip_depth_nudge` is uploaded relative to this value;
-    /// `SdfRenderRecord::oit_depth_offset` stays panel-absolute.
+    /// `SdfRenderRecord::oit_paint_order` stays panel-absolute.
     first_draw_order_index: DrawOrderIndex,
     records:                Vec<ResolvedSdfBatchRecord>,
 }
 
 impl SdfBatch {
+    #[cfg(test)]
+    const fn resources(&self) -> Option<&SdfBatchResources> { self.allocation.resources() }
+
     /// CPU records in upload order.
     #[must_use]
     fn records(&self) -> &[ResolvedSdfBatchRecord] { &self.records }
@@ -723,6 +987,7 @@ impl SdfBatch {
             // the record-buffer re-upload instead of failing the check on the
             // local-vs-world matrix difference.
             record.transform = self.records[position].transform;
+            record.panel_plane = self.records[position].panel_plane;
             if self.records[position] == record {
                 return;
             }
@@ -771,7 +1036,7 @@ impl SdfBatch {
 impl BatchEntry for SdfBatch {
     fn is_empty(&self) -> bool { Self::is_empty(self) }
 
-    fn entity(&self) -> Option<Entity> { self.entity }
+    fn entity(&self) -> Option<Entity> { self.allocation.entity() }
 }
 
 impl Batch for SdfBatch {
@@ -807,32 +1072,58 @@ impl MemberBatch for SdfBatch {
 
 /// Store that maps SDF records to `SdfBatchKey` batches.
 #[derive(Debug, Default, Resource)]
-pub(super) struct SdfBatchStore(BatchStore<SdfBatchKey, SdfBatch>);
+pub(super) struct SdfBatchStore {
+    batches:       BatchStore<SdfBatchKey, SdfBatch>,
+    panel_members: HashMap<Entity, Vec<SdfRecordKey>>,
+}
 
 impl SdfBatchStore {
     /// Inserts or moves one retained SDF record.
     fn upsert_record(&mut self, record: ResolvedSdfBatchRecord) {
         let record_key = record.record_key;
         let batch_key = record.batch_key.clone();
-        self.0.upsert(batch_key, record_key, record);
+        self.batches.upsert(batch_key, record_key, record);
     }
 
-    /// Removes every retained SDF record absent from the current append pass.
-    fn retain_records(&mut self, active: &HashSet<SdfRecordKey>) { self.0.retain(active); }
+    /// Retires only this panel's records that its current route did not publish.
+    fn retain_panel_records(&mut self, panel: Entity, active: &HashSet<SdfRecordKey>) {
+        if self.panel_members.is_empty() {
+            // With no prior panel membership, every routed record belongs to
+            // this first panel, so the store-wide retain is both correct and
+            // avoids constructing a stale-member list.
+            self.batches.retain(active);
+            if !active.is_empty() {
+                self.panel_members
+                    .insert(panel, active.iter().copied().collect());
+            }
+            return;
+        }
+        if let Some(members) = self.panel_members.get(&panel) {
+            for &stale in members.iter().filter(|key| !active.contains(key)) {
+                self.batches.remove(stale);
+            }
+        }
+        if active.is_empty() {
+            self.panel_members.remove(&panel);
+        } else {
+            self.panel_members
+                .insert(panel, active.iter().copied().collect());
+        }
+    }
 
     /// All SDF batches.
-    fn batches(&self) -> impl Iterator<Item = (&SdfBatchKey, &SdfBatch)> { self.0.batches() }
+    fn batches(&self) -> impl Iterator<Item = (&SdfBatchKey, &SdfBatch)> { self.batches.batches() }
 
     /// All SDF batches, mutable.
     fn batches_mut(&mut self) -> impl Iterator<Item = (&SdfBatchKey, &mut SdfBatch)> {
-        self.0.batches_mut()
+        self.batches.batches_mut()
     }
 
     /// One SDF batch by key, mutable.
-    fn get_mut(&mut self, key: &SdfBatchKey) -> Option<&mut SdfBatch> { self.0.get_mut(key) }
+    fn get_mut(&mut self, key: &SdfBatchKey) -> Option<&mut SdfBatch> { self.batches.get_mut(key) }
 
     /// Drops empty batch entries, returning their entities for despawn.
-    fn take_empty_batches(&mut self) -> Vec<Entity> { self.0.take_empty_batches() }
+    fn take_empty_batches(&mut self) -> Vec<Entity> { self.batches.take_empty_batches() }
 }
 
 struct SdfMemberFamily;
@@ -844,7 +1135,7 @@ impl MemberFamily for SdfMemberFamily {
     type Marker = DiegeticSdfFillBatch;
 
     fn store_mut(store: &mut Self::Store) -> &mut BatchStore<Self::Key, Self::Batch> {
-        &mut store.0
+        &mut store.batches
     }
 }
 
@@ -852,7 +1143,7 @@ impl MemberFamily for SdfMemberFamily {
 #[derive(Clone, Copy, Eq, Hash, PartialEq, Debug)]
 enum SdfPipelineMode {
     /// Pulls per-quad geometry from the record storage buffer in the vertex
-    /// stage (`sdf_panel.wgsl`); the only production mode.
+    /// stage (`sdf_panel.wesl`); the only production mode.
     VertexPulled,
     /// Reads geometry from mesh vertex attributes instead of pulling it.
     #[cfg_attr(
@@ -862,50 +1153,93 @@ enum SdfPipelineMode {
     MeshAttributes,
 }
 
+/// What an SDF batch's fragments paint, which picks the one fragment path its
+/// pipeline compiles.
+#[derive(Clone, Copy, Eq, Hash, PartialEq, Debug)]
+enum SdfFragmentPaint {
+    /// Panel and element fills and borders.
+    Surface,
+    /// A tooltip body's blurred drop shadow, behind `SDF_TOOLTIP_SHADOW`.
+    TooltipShadow,
+}
+
+/// Lighting code that an SDF batch's fragment records can execute.
+#[derive(Clone, Copy, Eq, Hash, PartialEq, Debug)]
+enum SdfFragmentLighting {
+    /// Every record uses the shader's unlit color path.
+    UnlitOnly,
+    /// Records use Bevy's PBR lighting path.
+    Pbr,
+}
+
 /// SDF material extension over `StandardMaterial`.
 #[derive(Asset, AsBindGroup, Clone, Debug, TypePath)]
 #[bind_group_data(SdfExtensionKey)]
 pub(crate) struct SdfExtension {
     /// SDF render records read by vertex and fragment stages.
     #[storage(107, read_only, visibility(vertex, fragment))]
-    records:        Handle<ShaderBuffer>,
+    records:                         Handle<ShaderBuffer>,
     /// Shared `MaterialSlotValues` table read by SDF fragments.
     #[storage(106, read_only, visibility(fragment))]
-    material_table: Handle<ShaderBuffer>,
+    material_table:                  Handle<ShaderBuffer>,
     /// Reserved SDF mesh metadata table, present for binding-layout parity.
     #[storage(108, read_only, visibility(vertex))]
-    mesh_records:   Handle<ShaderBuffer>,
-    /// Geometry-sourcing mode for `sdf_panel.wgsl`.
-    pipeline_mode:  SdfPipelineMode,
+    mesh_records:                    Handle<ShaderBuffer>,
+    /// Inverse display transform for unlit fills and borders.
+    #[texture(109, dimension = "3d", visibility(fragment))]
+    #[sampler(110, visibility(fragment))]
+    display_table:                   Handle<Image>,
+    /// Device pixels in one logical pixel, used to floor thin SDF strokes.
+    #[uniform(111)]
+    device_pixels_per_logical_pixel: f32,
+    /// Geometry-sourcing mode for `sdf_panel.wesl`.
+    pipeline_mode:                   SdfPipelineMode,
+    /// Hardware depth-bias integer of the batch's z-index rank. The base
+    /// material's `depth_bias` carries the `Transparent3d` sort bias, which a
+    /// tooltip shadow raises past its host's draws without moving its depth.
+    hardware_depth_bias:             i32,
+    /// Fragment path `sdf_panel.wesl` compiles for this batch.
+    fragment_paint:                  SdfFragmentPaint,
+    /// Lighting path `sdf_panel.wesl` compiles for this batch.
+    fragment_lighting:               SdfFragmentLighting,
 }
 
 /// Pipeline-specialization key for `SdfExtension`.
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub(crate) struct SdfExtensionKey {
     /// Mirror of `SdfExtension::pipeline_mode`.
-    pipeline_mode: SdfPipelineMode,
+    pipeline_mode:       SdfPipelineMode,
+    /// Mirror of `SdfExtension::hardware_depth_bias`.
+    hardware_depth_bias: i32,
+    /// Mirror of `SdfExtension::fragment_paint`.
+    fragment_paint:      SdfFragmentPaint,
+    /// Mirror of `SdfExtension::fragment_lighting`.
+    fragment_lighting:   SdfFragmentLighting,
 }
 
 impl From<&SdfExtension> for SdfExtensionKey {
     fn from(extension: &SdfExtension) -> Self {
         Self {
-            pipeline_mode: extension.pipeline_mode,
+            pipeline_mode:       extension.pipeline_mode,
+            hardware_depth_bias: extension.hardware_depth_bias,
+            fragment_paint:      extension.fragment_paint,
+            fragment_lighting:   extension.fragment_lighting,
         }
     }
 }
 
 impl MaterialExtension for SdfExtension {
-    fn vertex_shader() -> ShaderRef { EMBEDDED_SDF_PANEL_BATCH_SHADER_PATH.into() }
+    fn vertex_shader() -> ShaderRef { SDF_PANEL_SHADER_HANDLE.into() }
 
-    fn fragment_shader() -> ShaderRef { EMBEDDED_SDF_PANEL_BATCH_SHADER_PATH.into() }
+    fn fragment_shader() -> ShaderRef { SDF_PANEL_SHADER_HANDLE.into() }
 
-    fn prepass_vertex_shader() -> ShaderRef { EMBEDDED_SDF_PANEL_BATCH_SHADER_PATH.into() }
+    fn prepass_vertex_shader() -> ShaderRef { SDF_PANEL_SHADER_HANDLE.into() }
 
-    fn prepass_fragment_shader() -> ShaderRef { EMBEDDED_SDF_PANEL_BATCH_SHADER_PATH.into() }
+    fn prepass_fragment_shader() -> ShaderRef { SDF_PANEL_SHADER_HANDLE.into() }
 
-    fn deferred_vertex_shader() -> ShaderRef { EMBEDDED_SDF_PANEL_BATCH_SHADER_PATH.into() }
+    fn deferred_vertex_shader() -> ShaderRef { SDF_PANEL_SHADER_HANDLE.into() }
 
-    fn deferred_fragment_shader() -> ShaderRef { EMBEDDED_SDF_PANEL_BATCH_SHADER_PATH.into() }
+    fn deferred_fragment_shader() -> ShaderRef { SDF_PANEL_SHADER_HANDLE.into() }
 
     fn specialize(
         _pipeline: &MaterialExtensionPipeline,
@@ -913,7 +1247,22 @@ impl MaterialExtension for SdfExtension {
         _layout: &MeshVertexBufferLayoutRef,
         key: MaterialExtensionKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
+        if descriptor.fragment.as_ref().is_some_and(|fragment| {
+            fragment
+                .shader_defs
+                .contains(&"MATERIAL_OIT_ENABLED".into())
+        }) {
+            descriptor
+                .vertex
+                .shader_defs
+                .push("MATERIAL_OIT_ENABLED".into());
+        }
         add_sdf_stripped_material_group_def(descriptor, key.bind_group_data.pipeline_mode);
+        add_sdf_fragment_paint_def(descriptor, key.bind_group_data.fragment_paint);
+        add_sdf_fragment_lighting_def(descriptor, key.bind_group_data.fragment_lighting);
+        if let Some(depth_stencil) = descriptor.depth_stencil.as_mut() {
+            depth_stencil.bias.constant = key.bind_group_data.hardware_depth_bias;
+        }
         Ok(())
     }
 }
@@ -937,6 +1286,31 @@ fn add_sdf_stripped_material_group_def(
     }
 }
 
+/// Compiles the tooltip shadow's fragment path into a shadow batch's pipeline
+/// only, so no surface pipeline carries it.
+fn add_sdf_fragment_paint_def(
+    descriptor: &mut RenderPipelineDescriptor,
+    fragment_paint: SdfFragmentPaint,
+) {
+    if matches!(fragment_paint, SdfFragmentPaint::TooltipShadow)
+        && let Some(fragment) = descriptor.fragment.as_mut()
+    {
+        fragment.shader_defs.push("SDF_TOOLTIP_SHADOW".into());
+    }
+}
+
+/// Compiles Bevy's PBR lighting path only when a batch can execute it.
+fn add_sdf_fragment_lighting_def(
+    descriptor: &mut RenderPipelineDescriptor,
+    fragment_lighting: SdfFragmentLighting,
+) {
+    if matches!(fragment_lighting, SdfFragmentLighting::Pbr)
+        && let Some(fragment) = descriptor.fragment.as_mut()
+    {
+        fragment.shader_defs.push("SDF_PBR_LIGHTING".into());
+    }
+}
+
 fn material_group_is_stripped(descriptor: &RenderPipelineDescriptor) -> bool {
     descriptor
         .layout
@@ -947,11 +1321,12 @@ fn material_group_is_stripped(descriptor: &RenderPipelineDescriptor) -> bool {
 /// Inputs for one `SdfExtendedMaterial` batch asset.
 pub(super) struct SdfBatchMaterialInput {
     /// SDF batch key whose compatibility fields configure the material.
-    pub key:          SdfBatchKey,
+    pub key:           SdfBatchKey,
     /// SDF render-record buffer.
-    pub records:      Handle<ShaderBuffer>,
+    pub records:       Handle<ShaderBuffer>,
     /// Reserved SDF mesh-record buffer.
-    pub mesh_records: Handle<ShaderBuffer>,
+    pub mesh_records:  Handle<ShaderBuffer>,
+    pub display_table: Handle<Image>,
 }
 
 /// Builds the render material for one SDF batch.
@@ -961,6 +1336,7 @@ fn sdf_batch_material(input: SdfBatchMaterialInput) -> SdfExtendedMaterial {
         key,
         records,
         mesh_records,
+        display_table,
     } = input;
     let mut base = batch_key::apply_resource_compatibility_to_standard_material(
         &material::default_panel_material(),
@@ -968,27 +1344,40 @@ fn sdf_batch_material(input: SdfBatchMaterialInput) -> SdfExtendedMaterial {
     );
     base.alpha_mode = sdf_batch_alpha_mode(key.pipeline_compatibility.alpha, key.shadow);
     base.double_sided = key.pipeline_compatibility.double_sided;
-    base.cull_mode = key.pipeline_compatibility.cull_mode;
+    base.cull_mode = key.pipeline_compatibility.cull_mode.into();
     base.unlit = key.pipeline_compatibility.unlit;
     base.fog_enabled = key.pipeline_compatibility.fog_enabled;
     base.opaque_render_method = key.pipeline_compatibility.opaque_render_method.into();
     base.deferred_lighting_pass_id = key.pipeline_compatibility.deferred_lighting_pass_id;
-    base.depth_bias = key.z_index_rank.screen_depth_bias().get();
+    base.depth_bias = key.sort_depth_bias();
     ExtendedMaterial {
         base,
         extension: SdfExtension {
             records,
             material_table: Handle::default(),
             mesh_records,
+            display_table,
+            device_pixels_per_logical_pixel: 1.0,
             pipeline_mode: SdfPipelineMode::VertexPulled,
+            hardware_depth_bias: key.z_index_rank.hardware_depth_bias(),
+            fragment_paint: key.fragment_paint(),
+            fragment_lighting: key.fragment_lighting(),
         },
     }
+}
+
+/// Updates the display scale used to floor thin SDF strokes in logical pixels.
+pub(super) const fn set_sdf_material_logical_pixel_scale(
+    material: &mut SdfExtendedMaterial,
+    device_pixels_per_logical_pixel: f32,
+) {
+    material.extension.device_pixels_per_logical_pixel = device_pixels_per_logical_pixel;
 }
 
 /// SDF batch alpha-mode rule for authored source materials.
 ///
 /// Table-row base-color alpha controls normal transparent composition inside
-/// `sdf_panel.wgsl`. In prepass/shadow pipelines, `fill_alpha >
+/// `sdf_panel.wesl`. In prepass/shadow pipelines, `fill_alpha >
 /// 0.001` is read from the retained material table when a fill role is present;
 /// border-only records skip the fill row and route the transparent interior as
 /// empty. `Opaque`, `Mask`, `Blend`, `Premultiplied`, `Add`, `Multiply`, and
@@ -1011,7 +1400,7 @@ fn sdf_batch_alpha_mode(alpha: BatchAlphaMode, shadow: VisualShadow) -> AlphaMod
 
 /// Extra `clip_depth_nudge` layer-units to push the SDF fill away from the camera,
 /// non-zero only for the depth-buffer regime (`Opaque`/`Mask`). Transparent and
-/// OIT fills order through `ScreenDepthBias`/`OitDepthOffset` instead, so they
+/// OIT fills order through `ScreenDepthBias`/`OitPaintOrder` instead, so they
 /// get zero.
 #[must_use]
 fn opaque_fill_depth_push(alpha: BatchAlphaMode, shadow: VisualShadow) -> f32 {
@@ -1053,7 +1442,7 @@ fn append_sdf_record_materials(
     let fill = append_sdf_role(
         builder,
         surface,
-        SdfMaterialRole::Fill,
+        SdfMaterialRole::fill_of(surface),
         panel_lighting,
         panel_sidedness,
         materials,
@@ -1194,7 +1583,7 @@ fn append_sdf_role(
     default_material: &SdfMaterial,
 ) -> SdfRoleAppend {
     let material = match role {
-        SdfMaterialRole::Fill => &surface.fill_material,
+        SdfMaterialRole::Fill | SdfMaterialRole::TooltipShadow => &surface.fill_material,
         SdfMaterialRole::Border => &surface.border_material,
     };
     if !material.authorship.is_authored() {
@@ -1213,7 +1602,7 @@ fn append_sdf_role(
         key: SdfMaterialSourceKey {
             panel: surface.panel_entity,
             element: surface.element_index,
-            divider_ordinal: surface.divider_ordinal,
+            source_part: surface.source_part,
             role,
         },
         base_material,
@@ -1233,45 +1622,63 @@ fn append_sdf_role(
     }
 }
 
-/// Assigns contiguous run ordinals independently for each `BatchRenderLayers`.
+/// Assigns each record the ordinal of its contiguous run in its own panel's
+/// draw order.
+///
+/// `DrawOrderIndex` orders one panel's commands only, so runs are counted per
+/// panel: another panel's records, such as a shown tooltip's, never split a
+/// panel's run.
 fn assign_contiguous_runs(
-    records: Vec<(SdfRecordMaterialSlots, &ResolvedSdfSurface<'_>)>,
+    mut records: Vec<(
+        SdfRecordMaterialSlots,
+        &ResolvedSdfSurface<'_>,
+        SdfRecordRoute,
+    )>,
 ) -> Vec<ResolvedSdfBatchRecord> {
-    let record_count = records.len();
-    let mut by_layers: HashMap<BatchRenderLayers, Vec<_>> = HashMap::new();
-    for (materials, surface) in records {
-        by_layers
-            .entry(BatchRenderLayers(surface.render_layers.clone()))
-            .or_default()
-            .push((materials, surface));
-    }
+    records.sort_by(|(_, left, _), (_, right, _)| {
+        left.draw_depth
+            .draw_order_index()
+            .cmp(&right.draw_depth.draw_order_index())
+            .then(left.command_index.cmp(&right.command_index))
+    });
 
-    let mut output = Vec::with_capacity(record_count);
-    for (_, mut partition) in by_layers {
-        partition.sort_by(|(_, left), (_, right)| {
-            left.draw_depth
-                .draw_order_index()
-                .cmp(&right.draw_depth.draw_order_index())
-                .then(left.command_index.cmp(&right.command_index))
-        });
+    let mut open_runs = HashMap::<Entity, OpenSdfRun>::new();
+    records
+        .into_iter()
+        .map(|(materials, surface, route)| {
+            let compatibility = SdfRunCompatibility::from_surface(surface, &materials, route);
+            let run = match open_runs.entry(surface.panel_entity) {
+                Entry::Occupied(open) => open.into_mut().extend_or_follow(compatibility),
+                Entry::Vacant(first) => {
+                    first
+                        .insert(OpenSdfRun {
+                            compatibility,
+                            run: ContiguousDrawnRun::default(),
+                        })
+                        .run
+                },
+            };
+            ResolvedSdfBatchRecord::from_resolved(surface, materials, run, route)
+        })
+        .collect()
+}
 
-        let mut previous = None;
-        let mut run = ContiguousDrawnRun::default();
-        for (materials, surface) in partition {
-            let compatibility = SdfRunCompatibility::from_surface(surface, &materials);
-            if previous
-                .as_ref()
-                .is_some_and(|previous| previous != &compatibility)
-            {
-                run.value = run.value.saturating_add(1);
-            }
-            previous = Some(compatibility);
-            output.push(ResolvedSdfBatchRecord::from_resolved(
-                surface, materials, run,
-            ));
+/// The run a panel's latest record joined.
+struct OpenSdfRun {
+    compatibility: SdfRunCompatibility,
+    run:           ContiguousDrawnRun,
+}
+
+impl OpenSdfRun {
+    /// Returns the run of the panel's next record: this run when the record is
+    /// compatible with it, the panel's next run otherwise.
+    fn extend_or_follow(&mut self, compatibility: SdfRunCompatibility) -> ContiguousDrawnRun {
+        if self.compatibility != compatibility {
+            self.compatibility = compatibility;
+            self.run.value = self.run.value.saturating_add(1);
         }
+        self.run
     }
-    output
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1282,10 +1689,15 @@ struct SdfRunCompatibility {
     shadow:                 VisualShadow,
     pipeline_compatibility: PipelineCompatibility,
     resource_compatibility: ResourceCompatibility,
+    transparent_sort:       SdfTransparentSort,
 }
 
 impl SdfRunCompatibility {
-    fn from_surface(surface: &ResolvedSdfSurface<'_>, materials: &SdfRecordMaterialSlots) -> Self {
+    fn from_surface(
+        surface: &ResolvedSdfSurface<'_>,
+        materials: &SdfRecordMaterialSlots,
+        route: SdfRecordRoute,
+    ) -> Self {
         Self {
             z_index:                surface.draw_depth.z_index(),
             z_index_rank:           surface.draw_depth.z_index_rank(),
@@ -1293,8 +1705,65 @@ impl SdfRunCompatibility {
             shadow:                 surface.shadow_casting.into(),
             pipeline_compatibility: sdf_record_pipeline_compatibility(surface, materials),
             resource_compatibility: materials.resource_compatibility.clone(),
+            transparent_sort:       route.transparent_sort,
         }
     }
+}
+
+type ChangedSdfPanelInput = Or<(
+    Changed<DiegeticPanel>,
+    Changed<Transform>,
+    Changed<RenderLayers>,
+    Changed<Resolved<Lighting>>,
+    Changed<Resolved<Sidedness>>,
+    Changed<Resolved<ShadowCasting>>,
+    Changed<TooltipDepthPriority>,
+    Changed<TooltipPaintInsideBorder>,
+)>;
+
+#[cfg(test)]
+#[derive(Debug, Default, Eq, PartialEq, Resource)]
+struct SdfBatchRouteCounts {
+    runs:   usize,
+    visits: usize,
+}
+
+#[cfg(test)]
+fn reset_sdf_batch_route_counts(mut counts: ResMut<SdfBatchRouteCounts>) {
+    *counts = SdfBatchRouteCounts::default();
+}
+
+#[derive(SystemParam)]
+struct SdfBatchRouteWakeInputs<'w, 's> {
+    panels:        Query<'w, 's, Entity, ChangedSdfPanelInput>,
+    tooltip_hosts: Query<'w, 's, (), Or<(Changed<TooltipFor>, Changed<WidgetOf>)>>,
+    visibility:    Query<'w, 's, (), Changed<Visibility>>,
+}
+
+#[derive(SystemParam)]
+struct SdfBatchRouteAssets<'w> {
+    standard_materials: Res<'w, Assets<StandardMaterial>>,
+    asset_server:       Res<'w, AssetServer>,
+    sdf_default:        Res<'w, SdfMaterial>,
+    lighting_default:   Res<'w, Lighting>,
+    sidedness_default:  Res<'w, Sidedness>,
+    visual_overrides:   Res<'w, VisualOverrideIndex>,
+}
+
+fn sdf_batch_route_inputs_changed(
+    surfaces: Res<ResolvedSdfSurfaceRegistry>,
+    wake: SdfBatchRouteWakeInputs,
+    assets: SdfBatchRouteAssets,
+) -> bool {
+    surfaces.has_dirty_panels()
+        || !wake.panels.is_empty()
+        || !wake.tooltip_hosts.is_empty()
+        || !wake.visibility.is_empty()
+        || assets.standard_materials.is_changed()
+        || assets.sdf_default.is_changed()
+        || assets.lighting_default.is_changed()
+        || assets.sidedness_default.is_changed()
+        || assets.visual_overrides.is_changed()
 }
 
 /// Render plugin for the SDF fill batch material type.
@@ -1310,6 +1779,7 @@ impl Plugin for FillBatchPlugin {
             .add_systems(
                 PostUpdate,
                 route_sdf_batch_records
+                    .run_if(sdf_batch_route_inputs_changed)
                     .after(material_table::clear_frame_material_table)
                     .in_set(MaterialTableAppendReady),
             )
@@ -1329,6 +1799,7 @@ impl Plugin for FillBatchPlugin {
                 PostUpdate,
                 material_table::register_sdf_batch_materials::<DiegeticSdfFillBatch>
                     .after(reconcile_sdf_batch_entities)
+                    .before(MaterialTableBufferPrepared)
                     .in_set(BatchResourcesReady),
             )
             .add_systems(
@@ -1346,6 +1817,11 @@ impl Plugin for FillBatchPlugin {
                     .before(update_sdf_batch_bounds)
                     .in_set(BatchResourcesReady),
             );
+        #[cfg(test)]
+        app.init_resource::<SdfBatchRouteCounts>().add_systems(
+            PostUpdate,
+            reset_sdf_batch_route_counts.before(route_sdf_batch_records),
+        );
     }
 }
 
@@ -1353,88 +1829,189 @@ fn route_sdf_batch_records(
     #[cfg(test)] mut run_order: Option<ResMut<SdfDriverRunOrder>>,
     mut build: ResMut<material_table::FrameMaterialTableBuild>,
     mut surfaces: ResMut<ResolvedSdfSurfaceRegistry>,
-    standard_materials: Res<Assets<StandardMaterial>>,
-    asset_server: Res<AssetServer>,
-    sdf_material_default: Res<SdfMaterial>,
-    lighting_default: Res<Lighting>,
-    sidedness_default: Res<Sidedness>,
-    visual_overrides: Res<VisualOverrideIndex>,
+    assets: SdfBatchRouteAssets,
     panels: Query<(
+        Entity,
         &DiegeticPanel,
         Option<&RenderLayers>,
-        Option<&Visibility>,
         Option<&Resolved<Lighting>>,
         Option<&Resolved<Sidedness>>,
         Option<&Resolved<ShadowCasting>>,
     )>,
+    wake: SdfBatchRouteWakeInputs,
+    panel_treatments: SdfPanelTreatmentQueries,
+    tooltip_hosts: TooltipHosts,
+    mut ancestor_visibility: AncestorVisibility,
     mut store: ResMut<SdfBatchStore>,
     mut perf: ResMut<DiegeticPerfStats>,
+    #[cfg(test)] mut counts: Option<ResMut<SdfBatchRouteCounts>>,
 ) {
     #[cfg(test)]
     material_table::record_sdf_driver_run(&mut run_order, material_table::SDF_DRIVER_ROUTE_RESOLVE);
+    #[cfg(test)]
+    if let Some(counts) = counts.as_deref_mut() {
+        counts.runs += 1;
+    }
 
-    let mut resolved_surfaces = Vec::new();
-    let mut active_records = HashSet::new();
+    let full_pass = !wake.tooltip_hosts.is_empty()
+        || !wake.visibility.is_empty()
+        || assets.standard_materials.is_changed()
+        || assets.sdf_default.is_changed()
+        || assets.lighting_default.is_changed()
+        || assets.sidedness_default.is_changed()
+        || assets.visual_overrides.is_changed();
+    let mut dirty_panels = surfaces.take_dirty_panels();
+    dirty_panels.extend(wake.panels.iter());
+    if full_pass {
+        dirty_panels.extend(panels.iter().map(|(entity, ..)| entity));
+    }
     let mut stale_panels = HashSet::new();
     let mut dropped = DroppedSdfSurfaces::default();
-    let mut surface_count = 0_usize;
-    for stored_surface in surfaces.surfaces() {
-        surface_count += 1;
+    let surface_count = surfaces.surfaces().count();
+    for panel_entity in dirty_panels {
+        #[cfg(test)]
+        if let Some(counts) = counts.as_deref_mut() {
+            counts.visits += 1;
+        }
+        build.builder_mut().refresh_sdf_panel(panel_entity);
         let Ok((
-            _panel,
+            _,
+            panel,
             panel_layers,
-            panel_visibility,
             resolved_lighting,
             resolved_sidedness,
             resolved_shadow_casting,
-        )) = panels.get(stored_surface.panel_entity())
+        )) = panels.get(panel_entity)
         else {
             // `panel_missing` is counted by the eviction below, from the length
             // of the bucket `remove_panel` drops. Counting it here as well would
             // report every surface twice.
-            stale_panels.insert(stored_surface.panel_entity());
+            stale_panels.insert(panel_entity);
+            store.retain_panel_records(panel_entity, &HashSet::new());
             continue;
         };
         // Hidden panels keep their frame-table rows and SDF batch records so a
         // `Visibility` change updates the existing GPU buffer allocation.
-        let panel_visibility = panel_visibility.copied().unwrap_or(Visibility::Inherited);
-        let panel_lighting = resolved_lighting.map_or(*lighting_default, |resolved| resolved.0);
-        let panel_sidedness = resolved_sidedness.map_or(*sidedness_default, |resolved| resolved.0);
+        let panel_hidden = ancestor_visibility.is_hidden(panel_entity);
+        let panel_lighting =
+            resolved_lighting.map_or(*assets.lighting_default, |resolved| resolved.0);
+        let panel_sidedness =
+            resolved_sidedness.map_or(*assets.sidedness_default, |resolved| resolved.0);
         let panel_shadow_casting =
             resolved_shadow_casting.map_or(ShadowCasting::On, |resolved| resolved.0);
-        let mut resolved = stored_surface.as_resolved(
-            panel_layers.cloned().unwrap_or(RenderLayers::layer(0)),
-            panel_shadow_casting,
-        );
-        if let Some(slot_override) =
-            stored_surface
-                .visual_source_element()
-                .and_then(|element_index| {
-                    visual_overrides.get(stored_surface.panel_entity(), element_index.get())
-                })
-        {
-            apply_sdf_visual_override(&mut resolved, slot_override);
+        let mut resolved_surfaces = Vec::new();
+        for stored_surface in surfaces.panel_surfaces(panel_entity) {
+            let mut resolved = stored_surface.as_resolved(
+                panel_layers.cloned().unwrap_or(RenderLayers::layer(0)),
+                panel_shadow_casting,
+            );
+            if route_sdf_visual_override(
+                stored_surface,
+                &mut resolved,
+                &assets.visual_overrides,
+                &assets.standard_materials,
+                &assets.asset_server,
+                &assets.sdf_default,
+            ) == SdfVisualRoute::EmptyFill
+            {
+                continue;
+            }
+            resolved_surfaces.push(PanelSdfSurface {
+                surface:        resolved,
+                display_target: super::material::PanelDisplayTarget::from(panel.coordinate_space()),
+                lighting:       panel_lighting,
+                sidedness:      panel_sidedness,
+                hidden:         panel_hidden,
+            });
         }
-        resolved_surfaces.push((resolved, panel_lighting, panel_sidedness, panel_visibility));
+        let routed = append_routed_sdf_records(
+            build.builder_mut(),
+            &resolved_surfaces,
+            &assets.standard_materials,
+            &assets.asset_server,
+            &assets.sdf_default,
+            &tooltip_hosts,
+            &mut dropped,
+        );
+        upsert_sdf_batch_records(
+            panel_entity,
+            routed,
+            &panel_treatments.tooltip_depth_priority,
+            &panel_treatments.tooltip_edge_treatment,
+            &panel_treatments.screen_pixel_edge_snap,
+            &tooltip_hosts.panels,
+            &mut store,
+        );
     }
-    let mut appended = Vec::new();
-    let mut hidden_records = HashSet::new();
-    let builder = build.builder_mut();
-    for (surface, panel_lighting, panel_sidedness, panel_visibility) in &resolved_surfaces {
-        let record_key = SdfRecordKey {
-            panel:           surface.panel_entity,
-            element:         surface.element_index,
-            divider_ordinal: surface.divider_ordinal,
-            role:            surface.record_role,
-        };
+    record_sdf_surface_stats(
+        &mut surfaces,
+        &mut perf,
+        stale_panels,
+        surface_count,
+        dropped,
+    );
+    let _ = surfaces.take_dirty_panels();
+}
+
+/// Panel-level treatments applied uniformly to each routed SDF record.
+#[derive(SystemParam)]
+struct SdfPanelTreatmentQueries<'w, 's> {
+    tooltip_depth_priority: Query<'w, 's, (), With<TooltipDepthPriority>>,
+    tooltip_edge_treatment: Query<'w, 's, &'static TooltipPaintInsideBorder>,
+    screen_pixel_edge_snap: Query<'w, 's, (), With<ScreenPixelEdgeSnap>>,
+}
+
+/// A resolved surface with the panel facts that route it into a batch.
+struct PanelSdfSurface<'a> {
+    surface:        ResolvedSdfSurface<'a>,
+    display_target: PanelDisplayTarget,
+    lighting:       Lighting,
+    sidedness:      Sidedness,
+    /// The panel or an ancestor is hidden; its record keeps its rows and
+    /// buffer slot.
+    hidden:         bool,
+}
+
+/// The surfaces `append_routed_sdf_records` gave material rows this frame.
+struct RoutedSdfRecords<'s> {
+    /// Each routed surface with its material slots and batch route.
+    appended: Vec<(
+        SdfRecordMaterialSlots,
+        &'s ResolvedSdfSurface<'s>,
+        SdfRecordRoute,
+    )>,
+    /// Routed records whose panel is hidden.
+    hidden:   HashSet<SdfRecordKey>,
+    /// Every routed record; the store drops the rest.
+    active:   HashSet<SdfRecordKey>,
+}
+
+/// Appends each surface's fill and border rows to the frame material table,
+/// counting a surface that gets none in `dropped`.
+fn append_routed_sdf_records<'s>(
+    builder: &mut FrameMaterialTableBuilder,
+    resolved_surfaces: &'s [PanelSdfSurface<'s>],
+    standard_materials: &Assets<StandardMaterial>,
+    asset_server: &AssetServer,
+    sdf_material_default: &SdfMaterial,
+    tooltip_hosts: &TooltipHosts<'_, '_>,
+    dropped: &mut DroppedSdfSurfaces<FrameWork>,
+) -> RoutedSdfRecords<'s> {
+    let mut routed = RoutedSdfRecords {
+        appended: Vec::new(),
+        hidden:   HashSet::new(),
+        active:   HashSet::new(),
+    };
+    for panel_surface in resolved_surfaces {
+        let surface = &panel_surface.surface;
         let routing = append_sdf_record_materials(
             builder,
             surface,
-            *panel_lighting,
-            *panel_sidedness,
-            &standard_materials,
-            &asset_server,
-            &sdf_material_default,
+            panel_surface.lighting,
+            panel_surface.sidedness,
+            standard_materials,
+            asset_server,
+            sdf_material_default,
         );
         let materials = match routing {
             SdfRecordRouting::Routed(materials) => materials,
@@ -1451,24 +2028,159 @@ fn route_sdf_batch_records(
                 continue;
             },
         };
-        if *panel_visibility == Visibility::Hidden {
-            hidden_records.insert(record_key);
+        let record_key = sdf_record_key(surface);
+        if panel_surface.hidden {
+            routed.hidden.insert(record_key);
         }
-        active_records.insert(record_key);
-        appended.push((materials, surface));
+        routed.active.insert(record_key);
+        let route = SdfRecordRoute {
+            display_target:   panel_surface.display_target,
+            transparent_sort: tooltip_hosts.transparent_sort(surface),
+            batch_sharing:    tooltip_hosts.batch_sharing(surface),
+        };
+        routed.appended.push((materials, surface, route));
     }
+    routed
+}
 
-    for mut record in assign_contiguous_runs(appended) {
-        if hidden_records.contains(&record.record_key) {
+const fn sdf_record_key(surface: &ResolvedSdfSurface<'_>) -> SdfRecordKey {
+    SdfRecordKey {
+        panel:       surface.panel_entity,
+        element:     surface.element_index,
+        source_part: surface.source_part,
+        role:        surface.record_role,
+    }
+}
+
+fn upsert_sdf_batch_records(
+    panel: Entity,
+    routed: RoutedSdfRecords<'_>,
+    tooltip_panels: &Query<(), With<render::TooltipDepthPriority>>,
+    tooltip_paint_panels: &Query<&TooltipPaintInsideBorder>,
+    edge_snap_panels: &Query<(), With<ScreenPixelEdgeSnap>>,
+    computed_panels: &Query<&ComputedDiegeticPanel>,
+    store: &mut SdfBatchStore,
+) {
+    let mut records = assign_contiguous_runs(routed.appended);
+    let mut frontmost_opaque_by_panel = HashMap::<Entity, f32>::new();
+    for record in &records {
+        if opaque_fill_depth_push(
+            record.batch_key.pipeline_compatibility.alpha,
+            record.batch_key.shadow,
+        ) > 0.0
+        {
+            frontmost_opaque_by_panel
+                .entry(record.record_key.panel)
+                .and_modify(|frontmost| *frontmost = (*frontmost).max(record.clip_depth_nudge))
+                .or_insert(record.clip_depth_nudge);
+        }
+    }
+    for record in &mut records {
+        let tooltip = tooltip_panels.contains(record.record_key.panel);
+        if record.record_key.source_part.is_element()
+            && !matches!(record.record_key.role, SdfRecordRole::TooltipShadow(_))
+            && let Ok(computed) = computed_panels.get(record.record_key.panel)
+            && computed.widget_records().iter().any(|widget| {
+                let paint_inside = match widget.authored() {
+                    WidgetSpec::EditableField(_) => true,
+                    WidgetSpec::Button(button) => button.paints_inside_layout_bounds(),
+                    WidgetSpec::Slider(_) => false,
+                };
+                paint_inside && widget.preorder() == record.record_key.element.get()
+            })
+        {
+            // Keep control paint inside the frame reserved by layout. An exterior
+            // AA halo consumes the clear spacing between neighbouring controls.
+            record.flags |= SDF_PAINT_INSIDE_BORDER_FLAG;
+        }
+        if edge_snap_panels.contains(record.record_key.panel) {
+            record.flags |= SDF_PAINT_INSIDE_BORDER_FLAG | SDF_VIEW_ALIGNED_EDGE_SNAP_FLAG;
+        }
+        if let Ok(edge_treatment) = tooltip_paint_panels.get(record.record_key.panel) {
+            record.flags |= SDF_PAINT_INSIDE_BORDER_FLAG;
+            match edge_treatment {
+                TooltipPaintInsideBorder::ScreenPixelGrid => {
+                    record.flags |= SDF_VIEW_ALIGNED_EDGE_SNAP_FLAG;
+                },
+                TooltipPaintInsideBorder::ViewAlignedWorldPixelGrid => {
+                    record.flags |= SDF_VIEW_ALIGNED_EDGE_SNAP_FLAG
+                        | SDF_TOOLTIP_KEEP_SNAPPED_EDGES_INSIDE_FLAG;
+                },
+                TooltipPaintInsideBorder::AntialiasedWorldPlane => {},
+            }
+        }
+        if let Some(frontmost) = frontmost_opaque_by_panel.get(&record.record_key.panel)
+            && opaque_fill_depth_push(
+                record.batch_key.pipeline_compatibility.alpha,
+                record.batch_key.shadow,
+            ) > 0.0
+        {
+            let shift = if tooltip {
+                *frontmost - OPAQUE_FILL_MAX_CLIP_NUDGE_LAYERS
+            } else {
+                (*frontmost - OPAQUE_FILL_MAX_CLIP_NUDGE_LAYERS).max(0.0)
+            };
+            record.clip_depth_nudge -= shift;
+        }
+        if tooltip {
+            record.flags |= SDF_TOOLTIP_DEPTH_PRIORITY_FLAG;
+            record.clip_depth_nudge +=
+                render::TOOLTIP_NDC_DEPTH_PRIORITY / SDF_CLIP_DEPTH_NUDGE_PER_LAYER;
+            record.oit_paint_order += render::TOOLTIP_NDC_DEPTH_PRIORITY;
+        }
+    }
+    place_tooltip_shadows_behind_bodies(&mut records);
+    for mut record in records {
+        if routed.hidden.contains(&record.record_key) {
             record.mark_hidden();
         }
         store.upsert_record(record);
     }
-    store.retain_records(&active_records);
+    store.retain_panel_records(panel, &routed.active);
     for (_, batch) in store.batches_mut() {
         batch.sort_pending_records();
     }
-    drop(resolved_surfaces);
+}
+
+/// Puts every tooltip shadow behind the body it belongs to.
+///
+/// The shadow paints one antialias width under its body's edge, so the body
+/// must win that overlap. Without OIT the opaque body's depth test hides the
+/// shadow there: the shadow takes the body's clip nudge less
+/// `TOOLTIP_SHADOW_BEHIND_BODY_LAYERS`. Under OIT the resolve pass rejects a
+/// fragment behind opaque depth, so the shadow sits one `OIT_PAINT_STEP`
+/// behind the plane it shares with its body.
+fn place_tooltip_shadows_behind_bodies(records: &mut [ResolvedSdfBatchRecord]) {
+    let mut body_nudges = HashMap::<(Entity, ElementIndex), f32>::new();
+    for record in records.iter().filter(|record| {
+        !matches!(record.record_key.role, SdfRecordRole::TooltipShadow(_))
+            && record.record_key.source_part.is_element()
+    }) {
+        body_nudges
+            .entry((record.record_key.panel, record.record_key.element))
+            .and_modify(|nudge| *nudge = nudge.min(record.clip_depth_nudge))
+            .or_insert(record.clip_depth_nudge);
+    }
+    for shadow in records
+        .iter_mut()
+        .filter(|record| matches!(record.record_key.role, SdfRecordRole::TooltipShadow(_)))
+    {
+        if let Some(body_nudge) =
+            body_nudges.get(&(shadow.record_key.panel, shadow.record_key.element))
+        {
+            shadow.clip_depth_nudge = body_nudge - TOOLTIP_SHADOW_BEHIND_BODY_LAYERS;
+        }
+        shadow.oit_paint_order = -OIT_PAINT_STEP;
+    }
+}
+
+fn record_sdf_surface_stats(
+    surfaces: &mut ResolvedSdfSurfaceRegistry,
+    perf: &mut DiegeticPerfStats,
+    stale_panels: HashSet<Entity>,
+    surface_count: usize,
+    mut dropped: DroppedSdfSurfaces<FrameWork>,
+) {
     for panel_entity in stale_panels {
         surfaces.remove_panel(panel_entity, SurfaceEvictionCause::PanelMissing);
     }
@@ -1480,6 +2192,42 @@ fn route_sdf_batch_records(
     dropped.panel_missing += evictions.panel_missing.get();
     perf.panel_geometry.resolved_surfaces = surface_count.into();
     perf.panel_geometry.dropped_surfaces.accumulate(&dropped);
+}
+
+/// Whether a routed SDF surface has drawable geometry after its widget override.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SdfVisualRoute {
+    Retained,
+    EmptyFill,
+}
+
+fn route_sdf_visual_override<'a>(
+    stored_surface: &StoredResolvedSdfSurface,
+    surface: &mut ResolvedSdfSurface<'a>,
+    visual_overrides: &'a VisualOverrideIndex,
+    materials: &Assets<StandardMaterial>,
+    asset_server: &AssetServer,
+    default_material: &SdfMaterial,
+) -> SdfVisualRoute {
+    let Some(slot_override) = stored_surface
+        .visual_source_element()
+        .and_then(|element_index| {
+            visual_overrides.get(stored_surface.panel_entity(), element_index.get())
+        })
+    else {
+        return SdfVisualRoute::Retained;
+    };
+    if slot_override.fill_extent.is_empty() {
+        return SdfVisualRoute::EmptyFill;
+    }
+    apply_sdf_visual_override(
+        surface,
+        slot_override,
+        materials,
+        asset_server,
+        default_material,
+    );
+    SdfVisualRoute::Retained
 }
 
 /// Applies one widget visual-slot override to a routed SDF surface.
@@ -1497,6 +2245,9 @@ fn route_sdf_batch_records(
 fn apply_sdf_visual_override<'a>(
     surface: &mut ResolvedSdfSurface<'a>,
     slot_override: &'a VisualSlotOverride,
+    materials: &Assets<StandardMaterial>,
+    asset_server: &AssetServer,
+    default_material: &SdfMaterial,
 ) {
     let fill_authored = surface.fill_material.authorship.is_authored();
     let border_authored = surface.border_material.authorship.is_authored();
@@ -1523,9 +2274,89 @@ fn apply_sdf_visual_override<'a>(
             surface.border_material.base_material = Some(material);
         }
     }
+    if fill_authored && slot_override.dim_fill {
+        dim_sdf_material_color(
+            &mut surface.fill_material,
+            materials,
+            asset_server,
+            default_material,
+        );
+    }
+    if border_authored && slot_override.dim_border {
+        dim_sdf_material_color(
+            &mut surface.border_material,
+            materials,
+            asset_server,
+            default_material,
+        );
+    }
+    apply_slider_fill_extent(surface, slot_override);
     if let Some(offset) = slot_override.offset {
         surface.local_transform.translation += offset.extend(0.0);
     }
+}
+
+fn apply_slider_fill_extent(
+    surface: &mut ResolvedSdfSurface<'_>,
+    slot_override: &VisualSlotOverride,
+) {
+    let Ok(interval) = slot_override.fill_interval() else {
+        return;
+    };
+    let start = interval.start_fraction.clamp(0.0, 1.0);
+    let end = interval.end_fraction.clamp(0.0, 1.0);
+    let fraction = (end - start).max(0.0);
+    let authored_half_size = surface.sdf_half_size;
+    let center_fraction = start + end - 1.0;
+    let (new_half_size, shift) = match interval.direction {
+        SliderDirection::LeftToRight => (
+            Vec2::new(authored_half_size.x * fraction, authored_half_size.y),
+            Vec2::new(authored_half_size.x * center_fraction, 0.0),
+        ),
+        SliderDirection::RightToLeft => (
+            Vec2::new(authored_half_size.x * fraction, authored_half_size.y),
+            Vec2::new(-authored_half_size.x * center_fraction, 0.0),
+        ),
+        SliderDirection::BottomToTop => (
+            Vec2::new(authored_half_size.x, authored_half_size.y * fraction),
+            Vec2::new(0.0, authored_half_size.y * center_fraction),
+        ),
+        SliderDirection::TopToBottom => (
+            Vec2::new(authored_half_size.x, authored_half_size.y * fraction),
+            Vec2::new(0.0, -authored_half_size.y * center_fraction),
+        ),
+    };
+    surface.sdf_half_size = new_half_size;
+    surface.mesh_half_size = new_half_size + Vec2::splat(SDF_AA_PADDING);
+    let maximum_radius = new_half_size.x.min(new_half_size.y);
+    surface.corner_radii = surface
+        .corner_radii
+        .map(|radius| radius.min(maximum_radius));
+    surface.local_transform.translation += shift.extend(0.0);
+}
+
+/// Projects an authored role's visible color into the shared disabled gray.
+fn dim_sdf_material_color(
+    role: &mut ResolvedSdfMaterial<'_>,
+    materials: &Assets<StandardMaterial>,
+    asset_server: &AssetServer,
+    default_material: &SdfMaterial,
+) {
+    let color = role.color.or_else(|| {
+        let handle = role.base_material.unwrap_or(&default_material.0);
+        material::material_asset_for_frame(materials, asset_server, handle, &default_material.0)
+            .map(|material| material.base_color)
+    });
+    role.color = color.map(dim_control_color);
+}
+
+fn dim_control_color(color: Color) -> Color {
+    let color = color.to_srgba();
+    let luminance = color
+        .red
+        .mul_add(0.2126, color.green.mul_add(0.7152, color.blue * 0.0722));
+    let gray = (luminance * 0.65).clamp(0.0, 1.0);
+    Color::srgba(gray, gray, gray, color.alpha)
 }
 
 fn update_sdf_batch_world_transforms(
@@ -1548,6 +2379,7 @@ fn reconcile_sdf_batch_entities(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<SdfExtendedMaterial>>,
     mut storage_buffers: ResMut<Assets<ShaderBuffer>>,
+    display_textures: Res<super::display_compensation::DisplayCompensationTextures>,
     mut commands: Commands,
 ) {
     #[cfg(test)]
@@ -1563,7 +2395,7 @@ fn reconcile_sdf_batch_entities(
     let mut to_create = Vec::new();
     let mut to_grow = Vec::new();
     for (key, batch) in store.batches() {
-        match &batch.gpu {
+        match batch.allocation.resources() {
             None => to_create.push(key.clone()),
             Some(gpu) if batch.record_count() > gpu.capacity => to_grow.push(key.clone()),
             Some(_) => {},
@@ -1577,6 +2409,7 @@ fn reconcile_sdf_batch_entities(
         spawn_sdf_batch_entity(
             &key,
             batch,
+            &display_textures,
             &mut commands,
             &mut meshes,
             &mut materials,
@@ -1603,15 +2436,19 @@ fn refresh_sdf_batch_material_depth_biases(
     materials: &mut Assets<SdfExtendedMaterial>,
 ) {
     for (key, batch) in store.batches_mut() {
-        let Some(gpu) = &batch.gpu else {
+        let Some(gpu) = batch.allocation.resources() else {
             continue;
         };
         let Some(mut material) = materials.get_mut(&gpu.material) else {
             continue;
         };
-        let depth_bias = key.z_index_rank.screen_depth_bias().get();
+        let depth_bias = key.sort_depth_bias();
         if material.base.depth_bias.to_bits() != depth_bias.to_bits() {
             material.base.depth_bias = depth_bias;
+        }
+        let hardware_depth_bias = key.z_index_rank.hardware_depth_bias();
+        if material.extension.hardware_depth_bias != hardware_depth_bias {
+            material.extension.hardware_depth_bias = hardware_depth_bias;
         }
     }
 }
@@ -1662,8 +2499,9 @@ fn clipped_local_bounds(
 ) -> Option<(Vec2, Vec2)> {
     let mesh_min = -mesh_half_size.value;
     let mesh_max = mesh_half_size.value;
-    let clip_min = Vec2::new(clip_rect.value.x, clip_rect.value.y);
-    let clip_max = Vec2::new(clip_rect.value.z, clip_rect.value.w);
+    // The shader clip is Y-down; world-space bounds use Y-up mesh corners.
+    let clip_min = Vec2::new(clip_rect.value.x, -clip_rect.value.w);
+    let clip_max = Vec2::new(clip_rect.value.z, -clip_rect.value.y);
     let min = mesh_min.max(clip_min);
     let max = mesh_max.min(clip_max);
     (min.x < max.x && min.y < max.y).then_some((min, max))
@@ -1682,23 +2520,27 @@ const fn clipped_corners(min: Vec2, max: Vec2) -> [Vec2; 4] {
 fn spawn_sdf_batch_entity(
     key: &SdfBatchKey,
     batch: &mut SdfBatch,
+    display_textures: &super::display_compensation::DisplayCompensationTextures,
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<SdfExtendedMaterial>,
     storage_buffers: &mut Assets<ShaderBuffer>,
 ) {
     let capacity = batch.record_count().max(1).next_power_of_two();
-    let records = storage_buffers.add(ShaderBuffer::from(padded_sdf_render_records(
+    let records = ShaderBuffer::from(padded_sdf_render_records(
         batch.records(),
         batch.first_draw_order_index(),
         capacity,
-    )));
-    let mesh_records = storage_buffers.add(ShaderBuffer::from(padded_sdf_mesh_records(capacity)));
+    ));
+    let mesh_records = ShaderBuffer::from(padded_sdf_mesh_records(capacity));
+    let records = storage_buffers.add(records);
+    let mesh_records = storage_buffers.add(mesh_records);
     let mesh = meshes.add(inert_sdf_batch_mesh(capacity));
     let material = materials.add(sdf_batch_material(SdfBatchMaterialInput {
-        key:          key.clone(),
-        records:      records.clone(),
-        mesh_records: mesh_records.clone(),
+        key:           key.clone(),
+        records:       records.clone(),
+        mesh_records:  mesh_records.clone(),
+        display_table: key.display_target.table(display_textures),
     }));
     let mut entity = commands.spawn((
         DiegeticSdfFillBatch,
@@ -1713,14 +2555,16 @@ fn spawn_sdf_batch_entity(
     if key.shadow == VisualShadow::None {
         entity.insert(NotShadowCaster);
     }
-    batch.entity = Some(entity.id());
-    batch.gpu = Some(SdfBatchResources {
-        records,
-        mesh_records,
-        mesh,
-        material,
-        capacity,
-    });
+    batch.allocation = SdfBatchAllocation::Allocated {
+        entity:    entity.id(),
+        resources: SdfBatchResources {
+            records,
+            mesh_records,
+            mesh,
+            material,
+            capacity,
+        },
+    };
     batch.record_upload.clear();
 }
 
@@ -1732,10 +2576,10 @@ fn grow_sdf_batch_assets(
     materials: &mut Assets<SdfExtendedMaterial>,
     storage_buffers: &mut Assets<ShaderBuffer>,
 ) {
-    let Some(entity) = batch.entity else {
+    let Some(entity) = batch.allocation.entity() else {
         return;
     };
-    let Some(current_capacity) = batch.gpu.as_ref().map(|gpu| gpu.capacity) else {
+    let Some(current_capacity) = batch.allocation.resources().map(|gpu| gpu.capacity) else {
         return;
     };
     let required = batch.record_count().max(1);
@@ -1746,15 +2590,17 @@ fn grow_sdf_batch_assets(
     while capacity < required {
         capacity *= 2;
     }
-    let records = storage_buffers.add(ShaderBuffer::from(padded_sdf_render_records(
+    let records = ShaderBuffer::from(padded_sdf_render_records(
         batch.records(),
         batch.first_draw_order_index(),
         capacity,
-    )));
-    let mesh_records = storage_buffers.add(ShaderBuffer::from(padded_sdf_mesh_records(capacity)));
+    ));
+    let mesh_records = ShaderBuffer::from(padded_sdf_mesh_records(capacity));
+    let records = storage_buffers.add(records);
+    let mesh_records = storage_buffers.add(mesh_records);
     let mesh = meshes.add(inert_sdf_batch_mesh(capacity));
     commands.entity(entity).insert(Mesh3d(mesh.clone()));
-    let Some(gpu) = batch.gpu.as_mut() else {
+    let Some(gpu) = batch.allocation.resources_mut() else {
         return;
     };
     if let Some(mut material) = materials.get_mut(&gpu.material) {
@@ -1833,20 +2679,21 @@ fn commit_sdf_batch_buffers(
         if !batch.record_upload.is_set() {
             continue;
         }
-        let Some(gpu) = &batch.gpu else {
+        let Some(gpu) = batch.allocation.resources() else {
             continue;
         };
+        if batch.record_count() > gpu.capacity {
+            continue;
+        }
         let payload = padded_sdf_render_records(
             batch.records(),
             batch.first_draw_order_index(),
             gpu.capacity,
         );
+        let bytes = bytemuck::cast_slice(&payload).to_vec();
+        let handle = gpu.records.clone();
         batch.record_upload.clear();
-        material_table::stage_retained_batch_buffer_upload(
-            &mut staged_uploads,
-            &gpu.records,
-            ShaderBuffer::from(payload),
-        );
+        material_table::stage_retained_batch_buffer_upload(&mut staged_uploads, &handle, bytes);
         uploads += 1;
     }
     perf.panel_geometry.sdf_batches = batches.into();
@@ -1872,6 +2719,8 @@ mod tests {
     use bevy::asset::Asset;
     use bevy::asset::AssetEvent;
     use bevy::asset::AssetPlugin;
+    use bevy::camera::RenderTarget;
+    use bevy::camera::RenderTargetInfo;
     use bevy::camera::visibility::RenderLayers;
     use bevy::ecs::change_detection::Tick;
     use bevy::ecs::message::Messages;
@@ -1880,19 +2729,28 @@ mod tests {
     use bevy::picking::hover::PickingInteraction;
     use bevy::prelude::AlphaMode;
     use bevy::prelude::AssetApp;
+    use bevy::prelude::Camera;
+    use bevy::prelude::ChildOf;
     use bevy::prelude::DetectChanges;
     use bevy::prelude::MinimalPlugins;
+    use bevy::prelude::PerspectiveProjection;
+    use bevy::prelude::Projection;
+    use bevy::prelude::Quat;
     use bevy::prelude::TransformPlugin;
     use bevy::prelude::UVec2;
     use bevy::prelude::Window;
     use bevy::prelude::default;
     use bevy::render::render_resource::Face;
     use bevy::render::render_resource::FragmentState;
+    use bevy::render::render_resource::ShaderSize;
     use bevy::shader::Shader;
     use bevy::shader::ShaderDefVal;
     use bevy::window::PrimaryWindow;
+    use bevy::window::WindowRef;
     use hana_kana::ToF32;
+    use hana_kana::ToI32;
 
+    use super::material::PanelDisplayTarget;
     use super::*;
     use crate::AlignX;
     use crate::AlignY;
@@ -1907,7 +2765,6 @@ mod tests {
     use crate::SliderDirection;
     use crate::SliderState;
     use crate::Tooltip;
-    use crate::TooltipPlacementPolicy;
     use crate::Tooltips;
     use crate::layout::Border;
     use crate::layout::BoundingBox;
@@ -1929,6 +2786,8 @@ mod tests {
     use crate::panel::HeadlessLayoutPlugin;
     use crate::panel::LifetimeTotal;
     use crate::render::PathExtendedMaterial;
+    use crate::render::TooltipDepthPriority;
+    use crate::render::display_compensation::DisplayCompensationPlugin;
     use crate::render::image_batch::ImageBatchPlugin;
     use crate::render::image_batch::ImageBatchStore;
     use crate::render::image_batch::ResolvedImageRecord;
@@ -1949,6 +2808,7 @@ mod tests {
     use crate::screen_space::ScreenSpacePlugin;
     use crate::text::DiegeticTextMeasurer;
     use crate::widgets::ComputedWidgetRecord;
+    use crate::widgets::TooltipPaintInsideBorder;
     use crate::widgets::VisualOverrideIndex;
     use crate::widgets::VisualSlotId;
     use crate::widgets::VisualSlotOverride;
@@ -1956,6 +2816,77 @@ mod tests {
     use crate::widgets::WidgetVisualOverrides;
     use crate::widgets::WidgetVisualSlots;
     use crate::widgets::WidgetsPlugin;
+
+    const _: () = assert!(SdfRenderRecord::SHADER_SIZE.get() == 176);
+
+    #[test]
+    fn sdf_render_record_direct_storage_matches_encase() -> Result<(), String> {
+        let record = SdfRenderRecord {
+            transform:        Mat4::from_scale_rotation_translation(
+                Vec3::new(2.0, 3.0, 4.0),
+                Quat::from_rotation_x(0.4),
+                Vec3::new(5.0, 6.0, 7.0),
+            ),
+            panel_plane:      Vec4::new(0.0, 0.5, 1.0, 2.0),
+            half_size:        Vec2::new(8.0, 9.0),
+            mesh_half_size:   Vec2::new(10.0, 11.0),
+            corner_radii:     Vec4::new(1.0, 2.0, 3.0, 4.0),
+            border_widths:    Vec4::new(0.1, 0.2, 0.3, 0.4),
+            clip_rect:        Vec4::new(-2.0, -3.0, 12.0, 13.0),
+            fill_material:    MaterialSlotId::try_from(7)
+                .map_err(|error| format!("{error:?}"))?
+                .into(),
+            border_material:  MaterialSlotId::try_from(11)
+                .map_err(|error| format!("{error:?}"))?
+                .into(),
+            paint_mask:       SdfPaintMask {
+                bits: SdfPaintMask::FILL | SdfPaintMask::BORDER,
+            },
+            flags:            19,
+            clip_depth_nudge: 0.001,
+            oit_paint_order:  0.75,
+            tooltip_shadow:   Vec2::new(1.5, 2.5),
+        };
+        assert_eq!(size_of::<SdfRenderRecord>(), 176);
+        assert_eq!(
+            bytemuck::bytes_of(&record),
+            crate::render::encase_storage_bytes(&record)?
+        );
+        let records = vec![record, SdfRenderRecord::padded()];
+        assert_eq!(
+            bytemuck::cast_slice::<_, u8>(&records),
+            crate::render::encase_storage_bytes(&records)?
+        );
+        Ok(())
+    }
+
+    const _: () = assert!(SdfMeshRecord::SHADER_SIZE.get() == 16);
+
+    #[test]
+    fn sdf_mesh_record_direct_storage_matches_encase() -> Result<(), String> {
+        let record = SdfMeshRecord {
+            reserved: UVec4::new(3, 5, 7, 11),
+        };
+        assert_eq!(size_of::<SdfMeshRecord>(), 16);
+        assert_eq!(
+            bytemuck::bytes_of(&record),
+            crate::render::encase_storage_bytes(&record)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sdf_paint_mask_direct_storage_matches_encase() -> Result<(), String> {
+        let record = SdfPaintMask {
+            bits: SdfPaintMask::FILL | SdfPaintMask::BORDER,
+        };
+        assert_eq!(
+            bytemuck::bytes_of(&record),
+            crate::render::encase_storage_bytes(&record)?
+        );
+        assert_eq!(size_of::<SdfPaintMask>(), 4);
+        Ok(())
+    }
 
     const ANIMATED_BASE_BLUE_SPEED: f32 = 0.29;
     const ANIMATED_BASE_COLOR_SWING: f32 = 0.05;
@@ -1996,6 +2927,7 @@ mod tests {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
             .add_plugins(AssetPlugin::default())
+            .add_plugins(DisplayCompensationPlugin)
             .add_plugins(TransformPlugin)
             .insert_resource(zero_measurer())
             .add_plugins(HeadlessLayoutPlugin)
@@ -2027,6 +2959,69 @@ mod tests {
         for _ in 0..SDF_SETTLE_FRAMES {
             app.update();
         }
+    }
+
+    #[test]
+    fn sdf_batch_route_sleeps_and_visits_only_one_changed_panel() {
+        let mut app = sdf_pipeline_app();
+        let panels: Vec<_> = (0..30)
+            .map(|_| spawn_sdf_panel(&mut app, one_surface_tree(), StandardMaterial::default()))
+            .collect();
+        settle_sdf_pipeline(&mut app);
+        app.update();
+
+        let routed_panels: HashSet<_> = sdf_records(&app)
+            .iter()
+            .map(|record| record.record_key.panel)
+            .collect();
+        assert_eq!(routed_panels.len(), panels.len());
+
+        assert_eq!(
+            app.world().resource::<SdfBatchRouteCounts>(),
+            &SdfBatchRouteCounts::default()
+        );
+
+        let changed_panel = panels[0];
+        assert!(
+            app.world_mut()
+                .commands()
+                .set_tree(
+                    changed_panel,
+                    single_surface_tree(Color::srgb(0.7, 0.2, 0.1)),
+                )
+                .is_ok(),
+        );
+        app.world_mut().flush();
+        app.update();
+
+        let counts = app.world().resource::<SdfBatchRouteCounts>();
+        assert_eq!(counts.runs, 1);
+        assert_eq!(counts.visits, 1);
+
+        app.update();
+        app.world_mut()
+            .entity_mut(changed_panel)
+            .get_mut::<Transform>()
+            .expect("panel should carry a transform")
+            .translation
+            .x += 1.0;
+        app.update();
+
+        let counts = app.world().resource::<SdfBatchRouteCounts>();
+        assert_eq!(counts.runs, 1, "an authored panel move wakes the route");
+        assert_eq!(counts.visits, 1, "only the moved panel is visited");
+
+        app.update();
+        app.world_mut()
+            .entity_mut(changed_panel)
+            .remove::<DiegeticPanel>();
+        app.update();
+
+        let counts = app.world().resource::<SdfBatchRouteCounts>();
+        assert_eq!(
+            counts.runs, 1,
+            "panel removal wakes retained-row retirement"
+        );
     }
 
     fn spawn_sdf_panel(app: &mut App, tree: LayoutTree, material: StandardMaterial) -> Entity {
@@ -2082,8 +3077,7 @@ mod tests {
                 .background(Color::srgb(0.2, 0.8, 0.4)),
         )
         .show_after(Duration::ZERO)
-        .hide_after(Duration::ZERO)
-        .placement_policy(TooltipPlacementPolicy::Fixed);
+        .hide_after(Duration::ZERO);
         tooltip.text((label, TextStyle::new(4.0)));
         let mut builder = LayoutBuilder::new(Mm(100.0), Mm(50.0));
         builder.with(
@@ -2095,6 +3089,32 @@ mod tests {
             |_| {},
         );
         builder.build()
+    }
+
+    fn add_tooltip_presentation(app: &mut App) -> Entity {
+        let viewport = UVec2::new(800, 600);
+        let window = app
+            .world_mut()
+            .spawn((Window::default(), PrimaryWindow))
+            .id();
+        let mut camera = Camera::default();
+        camera.computed.target_info = Some(RenderTargetInfo {
+            physical_size: viewport,
+            scale_factor:  1.0,
+        });
+        let mut projection = Projection::Perspective(PerspectiveProjection::default());
+        projection.update(800.0, 600.0);
+        camera.computed.clip_from_view = projection.get_clip_from_view();
+        let transform = Transform::from_xyz(0.0, 0.0, 5.0);
+        app.world_mut()
+            .spawn((
+                camera,
+                RenderTarget::Window(WindowRef::Entity(window)),
+                RenderLayers::layer(0),
+                transform,
+                GlobalTransform::from(transform),
+            ))
+            .id()
     }
 
     fn one_surface_tree() -> LayoutTree {
@@ -2197,13 +3217,12 @@ mod tests {
             })
             .expect("panel should belong to an SDF batch");
         let gpu = batch
-            .gpu
-            .as_ref()
+            .resources()
             .expect("the settled SDF batch should own GPU assets");
         SdfBatchGpuIdentity {
             key:          key.clone(),
             entity:       batch
-                .entity
+                .entity()
                 .expect("the settled SDF batch should own an entity"),
             records:      gpu.records.clone(),
             mesh_records: gpu.mesh_records.clone(),
@@ -2215,6 +3234,7 @@ mod tests {
     fn shown_tooltip_fixture() -> ShownTooltipFixture {
         let mut app = sdf_pipeline_app();
         app.add_plugins(WidgetsPlugin);
+        let camera = add_tooltip_presentation(&mut app);
         let panel = spawn_sdf_panel(
             &mut app,
             tooltip_surface_tree("Retained tooltip"),
@@ -2234,9 +3254,10 @@ mod tests {
             .get::<Tooltips>(widget)
             .and_then(|tooltips| tooltips.iter().next())
             .expect("tooltip controller should reify");
-        app.world_mut()
-            .entity_mut(widget)
-            .insert(PickingInteraction::Hovered);
+        app.world_mut().entity_mut(widget).insert((
+            PickingInteraction::Hovered,
+            crate::widgets::TooltipPointerCamera::new(camera),
+        ));
         for _ in 0..TOOLTIP_REVEAL_SETTLE_FRAMES {
             app.update();
         }
@@ -2257,6 +3278,7 @@ mod tests {
     fn first_tooltip_reveal_preserves_peer_rows_and_material_table_allocation() {
         let mut app = sdf_pipeline_app();
         app.add_plugins(WidgetsPlugin);
+        let camera = add_tooltip_presentation(&mut app);
         let panel = spawn_sdf_panel(
             &mut app,
             tooltip_surface_tree("First tooltip"),
@@ -2296,8 +3318,8 @@ mod tests {
 
         let table_buffer = app.world().resource::<MaterialTableBuffer>();
         let table_handle = table_buffer
-            .handle
-            .clone()
+            .handle()
+            .cloned()
             .expect("the settled table should have an allocated buffer");
         let table_capacity = table_buffer.capacity;
         let table_allocations = table_buffer.allocations;
@@ -2310,9 +3332,10 @@ mod tests {
             "tooltip render records should remain deferred until first reveal",
         );
 
-        app.world_mut()
-            .entity_mut(widget)
-            .insert(PickingInteraction::Hovered);
+        app.world_mut().entity_mut(widget).insert((
+            PickingInteraction::Hovered,
+            crate::widgets::TooltipPointerCamera::new(camera),
+        ));
         for _ in 0..TOOLTIP_REVEAL_SETTLE_FRAMES {
             app.update();
             assert_eq!(
@@ -2349,8 +3372,8 @@ mod tests {
         let visible_peer_materials = sdf_material_assignments_except(&app, controller);
         let table_buffer = app.world().resource::<MaterialTableBuffer>();
         let table_handle = table_buffer
-            .handle
-            .clone()
+            .handle()
+            .cloned()
             .expect("the material table should have an allocated buffer");
         let table_capacity = table_buffer.capacity;
         let table_allocations = table_buffer.allocations;
@@ -2554,6 +3577,76 @@ mod tests {
             record.transform,
             global.to_matrix() * record.local_transform.to_matrix(),
             "the retained screen record must contain the final propagated transform",
+        );
+    }
+
+    #[test]
+    fn screen_sdf_batches_bind_identity_and_world_batches_bind_world_table() {
+        let mut app = sdf_pipeline_app();
+        app.add_plugins(ScreenSpacePlugin);
+        let (identity, world) = {
+            let textures = app
+                .world()
+                .resource::<render::display_compensation::DisplayCompensationTextures>();
+            (textures.identity.clone(), textures.world.clone())
+        };
+        for handle in [&identity, &world] {
+            let image = app.world().resource::<Assets<Image>>().get(handle);
+            assert!(image.is_some_and(|image| image.texture_descriptor.dimension
+                == bevy::render::render_resource::TextureDimension::D3));
+        }
+        let window = app
+            .world_mut()
+            .spawn((Window::default(), PrimaryWindow))
+            .id();
+        let world_panel = spawn_sdf_panel(
+            &mut app,
+            single_surface_tree(Color::WHITE),
+            StandardMaterial::default(),
+        );
+        let screen_panel = spawn_sdf_screen_panel(
+            &mut app,
+            single_surface_tree(Color::WHITE),
+            StandardMaterial::default(),
+            window,
+            1,
+            RenderLayers::layer(6),
+        );
+        settle_sdf_pipeline(&mut app);
+
+        let store = app.world().resource::<SdfBatchStore>();
+        let materials = app.world().resource::<Assets<SdfExtendedMaterial>>();
+        for (panel, expected_target, expected_table) in [
+            (world_panel, PanelDisplayTarget::World, world),
+            (screen_panel, PanelDisplayTarget::Screen, identity),
+        ] {
+            let (key, batch) = store
+                .batches()
+                .find(|(_, batch)| {
+                    batch
+                        .records()
+                        .iter()
+                        .any(|record| record.record_key.panel == panel)
+                })
+                .expect("panel should have an SDF batch");
+            assert_eq!(key.display_target, expected_target);
+            let gpu = batch.resources().expect("batch should have a material");
+            let bound = materials
+                .get(&gpu.material)
+                .expect("material should be retained");
+            assert_eq!(bound.extension.display_table, expected_table);
+        }
+    }
+
+    #[test]
+    fn filled_panel_interior_skips_border_display_lookup() {
+        let shader = include_str!("../shaders/sdf_panel.wesl");
+        let coverage = shader.find("var border_alpha = classic_border_alpha;");
+        let guard = shader.find("if has_border && border_alpha > 0.0");
+        let lookup =
+            shader.find("border = vec4<f32>(compensated_unlit_rgb(border.rgb), border.a);");
+        assert!(
+            matches!((coverage, guard, lookup), (Some(coverage), Some(guard), Some(lookup)) if coverage < guard && guard < lookup)
         );
     }
 
@@ -2969,7 +4062,7 @@ mod tests {
         expected_allocations: LifetimeTotal,
     ) {
         let table_buffer = app.world().resource::<MaterialTableBuffer>();
-        assert_eq!(table_buffer.handle.as_ref(), Some(expected_handle));
+        assert_eq!(table_buffer.handle(), Some(expected_handle));
         assert_eq!(table_buffer.capacity, expected_capacity);
         assert_eq!(table_buffer.allocations, expected_allocations);
     }
@@ -3045,9 +4138,9 @@ mod tests {
             .count()
     }
 
-    fn crate_wgsl_files() -> Vec<PathBuf> {
+    fn crate_wesl_files() -> Vec<PathBuf> {
         let mut files = Vec::new();
-        collect_wgsl_files(
+        collect_wesl_files(
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
             &mut files,
         );
@@ -3055,15 +4148,15 @@ mod tests {
         files
     }
 
-    fn collect_wgsl_files(path: &Path, files: &mut Vec<PathBuf>) {
+    fn collect_wesl_files(path: &Path, files: &mut Vec<PathBuf>) {
         for entry in fs::read_dir(path).expect("crate source directory should be readable") {
             let entry = entry.expect("crate source entry should be readable");
             let path = entry.path();
             if path.is_dir() {
-                collect_wgsl_files(&path, files);
+                collect_wesl_files(&path, files);
             } else if path
                 .extension()
-                .is_some_and(|extension| extension == "wgsl")
+                .is_some_and(|extension| extension == "wesl")
             {
                 files.push(path);
             }
@@ -3130,10 +4223,10 @@ mod tests {
     }
 
     fn assert_sdf_shader_ref(shader_ref: ShaderRef) {
-        let ShaderRef::Path(path) = shader_ref else {
-            panic!("SdfExtension shader entry point should use the shared SDF shader path");
+        let ShaderRef::Handle(handle) = shader_ref else {
+            panic!("SdfExtension shader entry point should use the shared SDF shader handle");
         };
-        assert_eq!(path.to_string(), EMBEDDED_SDF_PANEL_BATCH_SHADER_PATH);
+        assert_eq!(handle, SDF_PANEL_SHADER_HANDLE);
     }
 
     fn assert_ordered(source: &str, ordered_needles: &[&str]) {
@@ -3149,10 +4242,10 @@ mod tests {
     fn fill_input(material: &StandardMaterial, color: Option<Color>) -> SdfMaterialSlotInput<'_> {
         SdfMaterialSlotInput {
             key:            SdfMaterialSourceKey {
-                panel:           Entity::from_bits(1),
-                element:         ElementIndex::from(0),
-                divider_ordinal: None,
-                role:            SdfMaterialRole::Fill,
+                panel:       Entity::from_bits(1),
+                element:     ElementIndex::from(0),
+                source_part: SdfSourcePart::Element,
+                role:        SdfMaterialRole::Fill,
             },
             base_material:  material,
             color_override: color,
@@ -3194,10 +4287,10 @@ mod tests {
         render::apply_sidedness(&mut base_material, Sidedness::BackOnly);
         let input = SdfMaterialSlotInput {
             key:            SdfMaterialSourceKey {
-                panel:           Entity::from_bits(1),
-                element:         ElementIndex::from(0),
-                divider_ordinal: None,
-                role:            SdfMaterialRole::Fill,
+                panel:       Entity::from_bits(1),
+                element:     ElementIndex::from(0),
+                source_part: SdfSourcePart::Element,
+                role:        SdfMaterialRole::Fill,
             },
             base_material:  &base_material,
             color_override: None,
@@ -3482,6 +4575,7 @@ mod tests {
                 });
                 pipeline_compatibility.double_sided = cull_mode.is_none();
                 let key = SdfBatchKey {
+                    display_target: PanelDisplayTarget::World,
                     z_index: 0.into(),
                     z_index_rank: DrawZIndexRank::default(),
                     batch_family: DrawBatchFamily::SdfSurface,
@@ -3492,11 +4586,14 @@ mod tests {
                     resource_compatibility: ResourceCompatibility::from(
                         &StandardMaterial::default(),
                     ),
+                    transparent_sort: SdfTransparentSort::PanelRank,
+                    batch_sharing: SdfBatchSharing::AnyPanel,
                 };
                 let material = sdf_batch_material(SdfBatchMaterialInput {
                     key,
                     records: Handle::default(),
                     mesh_records: Handle::default(),
+                    display_table: Handle::default(),
                 });
 
                 let expected_alpha = match shadow {
@@ -3511,6 +4608,26 @@ mod tests {
                 assert_eq!(material.base.deferred_lighting_pass_id, 3);
             }
         }
+    }
+
+    #[test]
+    fn transparent_fill_material_sorts_before_same_z_panel_text() {
+        let mut key = test_batch_key();
+        key.shadow = VisualShadow::None;
+        key.pipeline_compatibility = PipelineCompatibility::from(&StandardMaterial {
+            alpha_mode: AlphaMode::Blend,
+            ..Default::default()
+        });
+        let text_bias = key.z_index_rank.screen_text_depth_bias().get();
+        let material = sdf_batch_material(SdfBatchMaterialInput {
+            key,
+            records: Handle::default(),
+            mesh_records: Handle::default(),
+            display_table: Handle::default(),
+        });
+
+        assert_eq!(material.base.alpha_mode, AlphaMode::Blend);
+        assert!(material.base.depth_bias < text_bias);
     }
 
     #[test]
@@ -3578,10 +4695,26 @@ mod tests {
             SdfRoleAuthorship::Unauthored,
         );
         let records = assign_contiguous_runs(vec![
-            (slots_for_test(0, &material_a), &surface_0),
-            (slots_for_test(1, &material_a), &surface_1),
-            (slots_for_test(2, &material_b), &surface_2),
-            (slots_for_test(3, &material_a), &surface_3),
+            (
+                slots_for_test(0, &material_a),
+                &surface_0,
+                panel_route(material::PanelDisplayTarget::World),
+            ),
+            (
+                slots_for_test(1, &material_a),
+                &surface_1,
+                panel_route(material::PanelDisplayTarget::World),
+            ),
+            (
+                slots_for_test(2, &material_b),
+                &surface_2,
+                panel_route(material::PanelDisplayTarget::World),
+            ),
+            (
+                slots_for_test(3, &material_a),
+                &surface_3,
+                panel_route(material::PanelDisplayTarget::World),
+            ),
         ]);
 
         let runs: Vec<u32> = records
@@ -3593,6 +4726,59 @@ mod tests {
         assert_eq!(records[0].batch_key, records[1].batch_key);
         assert_ne!(records[1].batch_key, records[2].batch_key);
         assert_ne!(records[2].batch_key, records[3].batch_key);
+    }
+
+    #[test]
+    fn tooltip_records_never_share_a_run_with_another_panel() {
+        let material = StandardMaterial {
+            alpha_mode: AlphaMode::Blend,
+            ..Default::default()
+        };
+        let mut materials = Assets::<StandardMaterial>::default();
+        let handle = materials.add(material.clone());
+        let tooltip_panel = Entity::from_raw_u32(7).expect("valid entity index");
+        let host = panel_route(PanelDisplayTarget::World);
+        let tooltip = SdfRecordRoute {
+            batch_sharing: SdfBatchSharing::TooltipOnly(tooltip_panel),
+            ..host
+        };
+        let routes = [host, tooltip, tooltip, host];
+        let surfaces: Vec<_> = routes
+            .iter()
+            .enumerate()
+            .map(|(command_index, route)| {
+                let mut surface = resolved_surface_for_test(
+                    command_index,
+                    &handle,
+                    SdfRoleAuthorship::Authored,
+                    SdfRoleAuthorship::Unauthored,
+                );
+                if let SdfBatchSharing::TooltipOnly(panel) = route.batch_sharing {
+                    surface.panel_entity = panel;
+                }
+                surface
+            })
+            .collect();
+        let records = assign_contiguous_runs(
+            surfaces
+                .iter()
+                .zip(routes)
+                .enumerate()
+                .map(|(index, (surface, route))| (slots_for_test(index, &material), surface, route))
+                .collect(),
+        );
+
+        let runs: Vec<u32> = records
+            .iter()
+            .map(|record| record.batch_key.contiguous_drawn_run.value)
+            .collect();
+        assert_eq!(runs, vec![0, 0, 0, 0], "each panel's records form one run");
+        assert_eq!(
+            records[0].batch_key, records[3].batch_key,
+            "the tooltip's records between them in draw order never split the host's run"
+        );
+        assert_eq!(records[1].batch_key, records[2].batch_key);
+        assert_ne!(records[0].batch_key, records[1].batch_key);
     }
 
     #[test]
@@ -3627,9 +4813,21 @@ mod tests {
         surface_2.render_layers = RenderLayers::layer(0);
 
         let records = assign_contiguous_runs(vec![
-            (slots_for_test(0, &material), &surface_0),
-            (slots_for_test(1, &material), &surface_1),
-            (slots_for_test(2, &material), &surface_2),
+            (
+                slots_for_test(0, &material),
+                &surface_0,
+                panel_route(material::PanelDisplayTarget::World),
+            ),
+            (
+                slots_for_test(1, &material),
+                &surface_1,
+                panel_route(material::PanelDisplayTarget::World),
+            ),
+            (
+                slots_for_test(2, &material),
+                &surface_2,
+                panel_route(material::PanelDisplayTarget::World),
+            ),
         ]);
 
         let layer_zero = BatchRenderLayers(RenderLayers::layer(0));
@@ -3650,6 +4848,84 @@ mod tests {
         assert_eq!(
             layer_zero_records[0].batch_key,
             layer_zero_records[1].batch_key
+        );
+    }
+
+    #[test]
+    fn split_runs_of_one_panel_sort_in_run_order() {
+        let blend = StandardMaterial {
+            alpha_mode: AlphaMode::Blend,
+            ..Default::default()
+        };
+        let add = StandardMaterial {
+            alpha_mode: AlphaMode::Add,
+            ..Default::default()
+        };
+        let mut materials = Assets::<StandardMaterial>::default();
+        let blend_handle = materials.add(blend.clone());
+        let add_handle = materials.add(add.clone());
+        let authored = [
+            (&blend_handle, &blend),
+            (&add_handle, &add),
+            (&blend_handle, &blend),
+            (&add_handle, &add),
+        ];
+        let surfaces: Vec<_> = authored
+            .iter()
+            .enumerate()
+            .map(|(command_index, (handle, _))| {
+                resolved_surface_for_test(
+                    command_index,
+                    handle,
+                    SdfRoleAuthorship::Authored,
+                    SdfRoleAuthorship::Unauthored,
+                )
+            })
+            .collect();
+        let records = assign_contiguous_runs(
+            surfaces
+                .iter()
+                .zip(authored)
+                .enumerate()
+                .map(|(index, (surface, (_, material)))| {
+                    (
+                        slots_for_test(index, material),
+                        surface,
+                        panel_route(PanelDisplayTarget::Screen),
+                    )
+                })
+                .collect(),
+        );
+        let runs: Vec<u32> = records
+            .iter()
+            .map(|record| record.batch_key.contiguous_drawn_run.value)
+            .collect();
+        assert_eq!(runs, vec![0, 1, 2, 3]);
+
+        let rank = DrawZIndexRank::default();
+        let mut keys: Vec<SdfBatchKey> =
+            records.into_iter().map(|record| record.batch_key).collect();
+        let sorts_in_run_order_under = |keys: &[SdfBatchKey], next_tier: f32| {
+            let biases: Vec<f32> = keys.iter().map(SdfBatchKey::sort_depth_bias).collect();
+            biases.windows(2).all(|pair| pair[0] < pair[1])
+                && biases.last().is_some_and(|last| *last < next_tier)
+        };
+        assert_eq!(
+            keys[0].sort_depth_bias().to_bits(),
+            rank.screen_depth_bias().get().to_bits(),
+            "a panel's first run keeps its rank's bias"
+        );
+        assert!(
+            sorts_in_run_order_under(&keys, rank.screen_panel_shape_depth_bias().get()),
+            "each run sorts after the panel's earlier runs and before its panel shapes"
+        );
+
+        for key in &mut keys {
+            key.transparent_sort = SdfTransparentSort::OverHost(rank);
+        }
+        assert!(
+            sorts_in_run_order_under(&keys, DrawZIndexRank::from(1).screen_depth_bias().get()),
+            "tooltip shadow runs sort in run order and before the host's next rank"
         );
     }
 
@@ -3686,28 +4962,32 @@ mod tests {
         let mut batch = SdfBatch::default();
         let record = ResolvedSdfBatchRecord {
             record_key:       SdfRecordKey {
-                panel:           Entity::from_bits(1),
-                element:         ElementIndex::from(0),
-                divider_ordinal: None,
-                role:            SdfRecordRole::Whole,
+                panel:       Entity::from_bits(1),
+                element:     ElementIndex::from(0),
+                source_part: SdfSourcePart::Element,
+                role:        SdfRecordRole::Whole,
             },
             draw_order:       CommandIndex::from(0),
             fill_source:      SdfMaterialSourceKey {
-                panel:           Entity::from_bits(1),
-                element:         ElementIndex::from(0),
-                divider_ordinal: None,
-                role:            SdfMaterialRole::Fill,
+                panel:       Entity::from_bits(1),
+                element:     ElementIndex::from(0),
+                source_part: SdfSourcePart::Element,
+                role:        SdfMaterialRole::Fill,
             },
             border_source:    SdfMaterialSourceKey {
-                panel:           Entity::from_bits(1),
-                element:         ElementIndex::from(0),
-                divider_ordinal: None,
-                role:            SdfMaterialRole::Border,
+                panel:       Entity::from_bits(1),
+                element:     ElementIndex::from(0),
+                source_part: SdfSourcePart::Element,
+                role:        SdfMaterialRole::Border,
             },
             draw_depth:       draw_depth_for_test(0),
             batch_key:        test_batch_key(),
             local_transform:  Transform::IDENTITY,
             transform:        Mat4::from_translation(Vec3::new(2.0, 3.0, 4.0)),
+            panel_plane:      WorldPanelPlane::from_panel(
+                &GlobalTransform::from(Transform::from_xyz(2.0, 3.0, 4.0)),
+                0.0,
+            ),
             half_size:        SdfHalfSize { value: Vec2::ONE },
             mesh_half_size:   MeshHalfSize {
                 value: Vec2::splat(2.0),
@@ -3721,15 +5001,28 @@ mod tests {
             border_material:  SdfPaintMaterial::NotAuthored,
             paint_mask:       SdfPaintMask::empty(),
             clip_depth_nudge: 0.0,
-            oit_depth_offset: 0.0,
+            oit_paint_order:  0.0,
             flags:            0,
         };
         batch.upsert_record(record);
 
         let (min, max) = batch.world_bounds().expect("clipped record has bounds");
 
-        assert_eq!(min, Vec3::new(1.0, 1.0, 4.0));
-        assert_eq!(max, Vec3::new(4.0, 4.0, 4.0));
+        assert_eq!(min, Vec3::new(1.0, 2.0, 4.0));
+        assert_eq!(max, Vec3::new(4.0, 5.0, 4.0));
+    }
+
+    #[test]
+    fn top_only_sdf_clip_keeps_top_world_bounds() {
+        let bounds = clipped_local_bounds(
+            MeshHalfSize {
+                value: Vec2::splat(5.0),
+            },
+            LocalClipRect {
+                value: Vec4::new(-5.0, -5.0, 5.0, -2.0),
+            },
+        );
+        assert_eq!(bounds, Some((Vec2::new(-5.0, 2.0), Vec2::new(5.0, 5.0))));
     }
 
     #[test]
@@ -3880,8 +5173,8 @@ mod tests {
         assert_eq!(entity_before.len(), 1);
         assert_eq!(records_before.len(), 1);
         assert_eq!(
-            records_before[0].oit_depth_offset.to_bits(),
-            crate::render::constants::OIT_DEPTH_STEP.to_bits()
+            records_before[0].oit_paint_order.to_bits(),
+            crate::render::constants::OIT_PAINT_STEP.to_bits()
         );
 
         assert!(
@@ -3897,8 +5190,8 @@ mod tests {
         assert_eq!(entity_after, entity_before);
         assert_eq!(records_after.len(), 1);
         assert_eq!(
-            records_after[0].oit_depth_offset.to_bits(),
-            crate::render::constants::OIT_DEPTH_STEP.to_bits()
+            records_after[0].oit_paint_order.to_bits(),
+            crate::render::constants::OIT_PAINT_STEP.to_bits()
         );
     }
 
@@ -3926,6 +5219,517 @@ mod tests {
         assert_eq!(
             opaque_nudge.to_bits(),
             (blend_nudge - OPAQUE_FILL_DEPTH_PUSH_LAYERS).to_bits()
+        );
+    }
+
+    #[test]
+    fn tooltip_opaque_oit_depth_clears_host_at_grazing_angles() {
+        let shader = include_str!("../shaders/sdf_panel.wesl");
+        assert!(shader.contains("(record.flags & TOOLTIP_DEPTH_PRIORITY_FLAG) != 0u"));
+        assert!(shader.contains("clip.z += TOOLTIP_NDC_DEPTH_PRIORITY * clip.w"));
+        let host_distance = 10.0_f32;
+        let near = 0.1_f32;
+        for angle in [75.0_f32, 85.0] {
+            let clearance_on_ray = 0.005 * angle.to_radians().cos();
+            let tooltip_depth =
+                near / (host_distance - clearance_on_ray) + render::TOOLTIP_NDC_DEPTH_PRIORITY;
+            for (host_part, stack_depth) in
+                [("knob", OIT_PAINT_STEP), ("focus", 2.0 * OIT_PAINT_STEP)]
+            {
+                let host_depth = near / host_distance + stack_depth;
+                assert!(
+                    tooltip_depth > host_depth + OIT_PAINT_STEP,
+                    "tooltip opaque prepass depth must clear the {host_part} at {angle} degrees"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn world_tooltip_surface_clears_host_without_hiding_its_text() {
+        let mut app = sdf_pipeline_app();
+        let host = spawn_sdf_panel(
+            &mut app,
+            stacked_surface_tree(Color::WHITE, Color::BLACK),
+            StandardMaterial {
+                alpha_mode: AlphaMode::Blend,
+                ..default()
+            },
+        );
+        let mut tooltip_tree = LayoutBuilder::with_root(
+            El::new()
+                .width(Sizing::GROW)
+                .height(Sizing::GROW)
+                .background(Color::WHITE),
+        );
+        tooltip_tree.text(("Tooltip", TextStyle::new(12.0)));
+        let tooltip = spawn_sdf_panel(
+            &mut app,
+            tooltip_tree.build(),
+            StandardMaterial {
+                alpha_mode: AlphaMode::Opaque,
+                ..default()
+            },
+        );
+        app.world_mut()
+            .entity_mut(tooltip)
+            .insert(TooltipDepthPriority);
+        settle_sdf_pipeline(&mut app);
+
+        let records = sdf_records(&app);
+        let host_front = records
+            .iter()
+            .filter(|record| record.record_key.panel == host)
+            .map(|record| record.oit_paint_order)
+            .fold(0.0_f32, f32::max);
+        let tooltip_surface = records
+            .iter()
+            .find(|record| record.record_key.panel == tooltip)
+            .expect("tooltip should have a surface record");
+        assert_eq!(
+            tooltip_surface.flags & SDF_TOOLTIP_DEPTH_PRIORITY_FLAG,
+            SDF_TOOLTIP_DEPTH_PRIORITY_FLAG,
+        );
+        let surface_nudge = tooltip_surface.clip_depth_nudge * SDF_CLIP_DEPTH_NUDGE_PER_LAYER;
+        assert_eq!(
+            tooltip_surface.clip_depth_nudge.to_bits(),
+            (OPAQUE_FILL_MAX_CLIP_NUDGE_LAYERS
+                + render::TOOLTIP_NDC_DEPTH_PRIORITY / SDF_CLIP_DEPTH_NUDGE_PER_LAYER)
+                .to_bits(),
+        );
+        assert!(
+            render::TOOLTIP_NDC_DEPTH_PRIORITY > host_front,
+            "tooltip OIT path must clear the host's nearest content layer"
+        );
+        assert!(
+            tooltip_surface.oit_paint_order > host_front,
+            "tooltip's OIT path receives the same front priority"
+        );
+        let computed = app.world().get::<ComputedDiegeticPanel>(tooltip);
+        let text_nudge = computed
+            .and_then(|computed| computed.layout().solved().map(|solved| (computed, solved)))
+            .and_then(|(computed, solved)| {
+                solved
+                    .commands
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, command)| {
+                        matches!(command.kind, RenderCommandKind::Text { .. })
+                            .then(|| computed.draw_order().depth_for(index))
+                            .flatten()
+                    })
+            })
+            .map(|depth| {
+                depth.clip_depth_nudge().get().mul_add(
+                    render::TEXT_CLIP_DEPTH_NUDGE_PER_LAYER,
+                    render::TOOLTIP_NDC_DEPTH_PRIORITY,
+                )
+            });
+        assert!(text_nudge.is_some());
+        if let Some(text_nudge) = text_nudge {
+            assert!(
+                text_nudge > surface_nudge,
+                "tooltip text must clear its opaque surface"
+            );
+        }
+
+        for radius in [0.5_f32, 5.0, 50.0, 500.0] {
+            let near = radius * 0.001;
+            for distance in [radius, radius * 3.0] {
+                for face_cosine in [1.0_f32, 0.5] {
+                    let plane_gap = 0.005 * face_cosine;
+                    let host_depth = near / distance + host_front;
+                    let surface_depth = near / (distance - plane_gap) + surface_nudge;
+                    assert!(
+                        surface_depth > host_depth,
+                        "radius={radius}, distance={distance}, cosine={face_cosine}: surface={surface_depth:e}, host={host_depth:e}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tooltip_shadow_runs_under_its_body_edge_and_draws_behind_it() {
+        let mut app = sdf_pipeline_app();
+        let tree = LayoutBuilder::with_root(
+            El::new()
+                .width(Sizing::GROW)
+                .height(Sizing::GROW)
+                .background(Color::WHITE),
+        )
+        .build();
+        let tooltip = spawn_sdf_panel(
+            &mut app,
+            tree,
+            StandardMaterial {
+                alpha_mode: AlphaMode::Opaque,
+                ..default()
+            },
+        );
+        app.world_mut().entity_mut(tooltip).insert((
+            TooltipPaintInsideBorder::ViewAlignedWorldPixelGrid,
+            TooltipDepthPriority,
+        ));
+        settle_sdf_pipeline(&mut app);
+
+        let surfaces = app.world().resource::<ResolvedSdfSurfaceRegistry>();
+        let roles: Vec<SdfRecordRole> = surfaces
+            .surfaces()
+            .filter(|surface| surface.panel_entity() == tooltip)
+            .map(|surface| surface.as_resolved(RenderLayers::layer(0), ShadowCasting::Off))
+            .filter(|surface| surface.element_index == ElementIndex::default())
+            .map(|surface| surface.record_role)
+            .collect();
+        assert!(
+            matches!(roles.first(), Some(SdfRecordRole::TooltipShadow(_))),
+            "the shadow sorts ahead of its body: {roles:?}"
+        );
+
+        let records = sdf_records(&app);
+        let tooltip_records = || {
+            records
+                .iter()
+                .filter(|record| record.record_key.panel == tooltip)
+        };
+        let shadow = tooltip_records()
+            .find(|record| matches!(record.record_key.role, SdfRecordRole::TooltipShadow(_)))
+            .expect("tooltip shadow record");
+        let body = tooltip_records()
+            .find(|record| !matches!(record.record_key.role, SdfRecordRole::TooltipShadow(_)))
+            .expect("tooltip body record");
+        assert!(
+            shadow.clip_depth_nudge < body.clip_depth_nudge,
+            "without OIT the opaque body hides the shadow under its edge"
+        );
+        assert!(
+            (shadow.clip_depth_nudge + TOOLTIP_SHADOW_BEHIND_BODY_LAYERS)
+                * SDF_CLIP_DEPTH_NUDGE_PER_LAYER
+                >= render::TOOLTIP_NDC_DEPTH_PRIORITY,
+            "the shadow stays within its margin of the tooltip depth band's front"
+        );
+        assert!(
+            shadow.oit_paint_order < 0.0,
+            "under OIT the shadow sits behind its body's plane"
+        );
+
+        let shader = include_str!("../shaders/sdf_panel.wesl");
+        assert!(
+            shader.contains("if body_dist < -aa_width(body_dist) {\n        discard;"),
+            "the shadow paints from one antialias width inside the body's edge"
+        );
+    }
+
+    #[test]
+    fn edge_snap_flags_route_for_tooltips_and_opt_in_screen_panels() {
+        let mut app = sdf_pipeline_app();
+        let window = app
+            .world_mut()
+            .spawn((Window::default(), PrimaryWindow))
+            .id();
+        let tree = LayoutBuilder::with_root(
+            El::new()
+                .width(Sizing::GROW)
+                .height(Sizing::GROW)
+                .background(Color::WHITE)
+                .border(Border::all(Px(1.0), Color::WHITE)),
+        )
+        .build();
+        let world = spawn_sdf_panel(&mut app, tree.clone(), StandardMaterial::default());
+        app.world_mut().entity_mut(world).insert((
+            TooltipPaintInsideBorder::ViewAlignedWorldPixelGrid,
+            TooltipDepthPriority,
+        ));
+        let screen = spawn_sdf_screen_panel(
+            &mut app,
+            tree,
+            StandardMaterial::default(),
+            window,
+            0,
+            RenderLayers::layer(0),
+        );
+        app.world_mut()
+            .entity_mut(screen)
+            .insert(TooltipPaintInsideBorder::ScreenPixelGrid);
+        let marked_screen = spawn_sdf_screen_panel(
+            &mut app,
+            multiple_edge_snap_surface_tree(),
+            StandardMaterial::default(),
+            window,
+            0,
+            RenderLayers::layer(0),
+        );
+        app.world_mut()
+            .entity_mut(marked_screen)
+            .insert(ScreenPixelEdgeSnap);
+        let ordinary_control = spawn_sdf_screen_panel(
+            &mut app,
+            ordinary_edge_snap_control_tree(),
+            StandardMaterial::default(),
+            window,
+            0,
+            RenderLayers::layer(0),
+        );
+        settle_sdf_pipeline(&mut app);
+
+        let records = sdf_records(&app);
+        assert_tooltip_edge_snap_records(&records, world, screen);
+        assert_marked_edge_snap_records(&records, marked_screen);
+        assert_ordinary_edge_snap_records(&records, ordinary_control);
+        assert_edge_snap_shader_contract(include_str!("../shaders/sdf_panel.wesl"));
+    }
+
+    #[test]
+    fn pop_up_button_paints_inside_layout_without_changing_ordinary_coverage() {
+        let mut app = sdf_pipeline_app();
+        let mut builder = LayoutBuilder::new(Px(320.0), Px(180.0));
+        builder.text(crate::Button::new().pop_up(
+            "choice",
+            "Opaque",
+            "Transparent",
+            &crate::ControlMetrics::from_label_size(Px(13.0)),
+        ));
+        let popup = spawn_sdf_panel(&mut app, builder.build(), StandardMaterial::default());
+        let ordinary = spawn_sdf_panel(
+            &mut app,
+            ordinary_edge_snap_control_tree(),
+            StandardMaterial::default(),
+        );
+        settle_sdf_pipeline(&mut app);
+
+        let records = sdf_records(&app);
+        let popup_records: Vec<_> = records
+            .iter()
+            .filter(|record| record.record_key.panel == popup)
+            .collect();
+        assert!(
+            !popup_records.is_empty(),
+            "the pop-up must publish SDF paint"
+        );
+        for record in popup_records {
+            assert_eq!(
+                record.flags
+                    & (SDF_PAINT_INSIDE_BORDER_FLAG
+                        | SDF_VIEW_ALIGNED_EDGE_SNAP_FLAG
+                        | SDF_TOOLTIP_DEPTH_PRIORITY_FLAG
+                        | SDF_TOOLTIP_KEEP_SNAPPED_EDGES_INSIDE_FLAG),
+                SDF_PAINT_INSIDE_BORDER_FLAG,
+                "pop-up paint stays inside its bounds without snapping or tooltip treatment"
+            );
+        }
+        assert_ordinary_edge_snap_records(&records, ordinary);
+    }
+
+    fn multiple_edge_snap_surface_tree() -> LayoutTree {
+        let mut builder = LayoutBuilder::new(Px(320.0), Px(180.0));
+        builder.with(
+            El::column()
+                .width(Sizing::GROW)
+                .height(Sizing::GROW)
+                .background(Color::WHITE)
+                .border(Border::all(Px(1.0), Color::WHITE)),
+            |builder| {
+                builder.with(
+                    El::new()
+                        .width(Sizing::GROW)
+                        .height(Sizing::GROW)
+                        .background(Color::WHITE),
+                    |_| {},
+                );
+            },
+        );
+        builder.build()
+    }
+
+    fn ordinary_edge_snap_control_tree() -> LayoutTree {
+        let mut builder = LayoutBuilder::new(Px(320.0), Px(180.0));
+        builder.with(
+            El::new()
+                .width(Sizing::GROW)
+                .height(Sizing::GROW)
+                .background(Color::WHITE)
+                .border(Border::all(Px(1.0), Color::WHITE))
+                .button("ordinary-control"),
+            |_| {},
+        );
+        builder.build()
+    }
+
+    fn assert_marked_edge_snap_records(records: &[ResolvedSdfBatchRecord], panel: Entity) {
+        let marked_records: Vec<_> = records
+            .iter()
+            .filter(|record| record.record_key.panel == panel)
+            .collect();
+        assert!(
+            marked_records.len() > 1,
+            "the opted-in screen-panel fixture must exercise every record"
+        );
+        for record in marked_records {
+            assert_eq!(
+                record.flags & (SDF_PAINT_INSIDE_BORDER_FLAG | SDF_VIEW_ALIGNED_EDGE_SNAP_FLAG),
+                SDF_PAINT_INSIDE_BORDER_FLAG | SDF_VIEW_ALIGNED_EDGE_SNAP_FLAG,
+                "every opted-in screen-panel record must paint inside its snapped edge"
+            );
+            assert_eq!(
+                record.flags & SDF_TOOLTIP_DEPTH_PRIORITY_FLAG,
+                0,
+                "the public edge-snap marker must not make a screen panel a tooltip"
+            );
+        }
+    }
+
+    fn assert_ordinary_edge_snap_records(records: &[ResolvedSdfBatchRecord], panel: Entity) {
+        let ordinary_control_records: Vec<_> = records
+            .iter()
+            .filter(|record| record.record_key.panel == panel)
+            .collect();
+        assert!(
+            !ordinary_control_records.is_empty(),
+            "the ordinary-control fixture must publish an SDF record"
+        );
+        for record in ordinary_control_records {
+            assert_eq!(
+                record.flags & (SDF_PAINT_INSIDE_BORDER_FLAG | SDF_VIEW_ALIGNED_EDGE_SNAP_FLAG),
+                0,
+                "an ordinary control must keep the unflagged coverage path"
+            );
+        }
+    }
+
+    fn assert_tooltip_edge_snap_records(
+        records: &[ResolvedSdfBatchRecord],
+        world: Entity,
+        screen: Entity,
+    ) {
+        for panel in [world, screen] {
+            let record = records
+                .iter()
+                .find(|record| {
+                    record.record_key.panel == panel
+                        && !matches!(record.record_key.role, SdfRecordRole::TooltipShadow(_))
+                })
+                .expect("tooltip SDF record");
+            assert_eq!(
+                record.flags & SDF_PAINT_INSIDE_BORDER_FLAG,
+                SDF_PAINT_INSIDE_BORDER_FLAG,
+                "tooltip paint flag must reach the {panel:?} SDF record",
+            );
+            assert!(
+                record.flags & SDF_VIEW_ALIGNED_EDGE_SNAP_FLAG != 0,
+                "both view-aligned tooltips must snap their outer edges",
+            );
+            assert_eq!(
+                record.flags & SDF_TOOLTIP_KEEP_SNAPPED_EDGES_INSIDE_FLAG != 0,
+                panel == world,
+                "only the world tooltip must keep snapped edges inside",
+            );
+            assert!(
+                record.mesh_half_size.value.x > record.half_size.value.x,
+                "SDF mesh must include horizontal antialias room"
+            );
+            assert!(
+                record.mesh_half_size.value.y > record.half_size.value.y,
+                "SDF mesh must include vertical antialias room"
+            );
+            assert!(
+                record.border_widths.value.x > 0.0,
+                "SDF record must carry the border width"
+            );
+        }
+        let screen_record = records
+            .iter()
+            .find(|record| {
+                record.record_key.panel == screen
+                    && !matches!(record.record_key.role, SdfRecordRole::TooltipShadow(_))
+            })
+            .expect("screen tooltip SDF record");
+        assert_eq!(
+            screen_record.flags & SDF_TOOLTIP_DEPTH_PRIORITY_FLAG,
+            0,
+            "screen tooltip must not receive world depth priority"
+        );
+    }
+
+    fn assert_edge_snap_shader_contract(shader: &str) {
+        assert!(shader.contains("const SDF_PAINT_INSIDE_BORDER_FLAG: u32 = 2u;"));
+        assert!(shader.contains("const SDF_VIEW_ALIGNED_EDGE_SNAP_FLAG: u32 = 4u;"));
+        assert!(shader.contains("const TOOLTIP_KEEP_SNAPPED_EDGES_INSIDE_FLAG: u32 = 8u;"));
+        assert!(shader.contains(
+            "@if(SDF_TOOLTIP_SHADOW) {\n    var pbr_input = tooltip_shadow_pbr_input(in, is_front, record, local);\n}\n@if(!SDF_TOOLTIP_SHADOW) {\n    let view_aligned_edge_snap = (record.flags & SDF_VIEW_ALIGNED_EDGE_SNAP_FLAG) != 0u;"
+        ));
+        assert!(
+            shader.contains("if paint_inside_border && outer_dist >= 0.0 {\n        discard;"),
+            "shader must discard flagged pixels beyond the border outer edge"
+        );
+        assert!(
+            shader
+                .contains("select(aa_width(dist), 0.5 * distance_field_band(dist), paint_inside)"),
+            "shader must centre a one-pixel antialias ramp on each edge of flagged tooltips"
+        );
+        assert!(
+            shader.contains("vec4<f32>(pixel_size.y, pixel_size.x, pixel_size.y, pixel_size.x)"),
+            "tooltip frame widths must follow the physical pixel derivatives"
+        );
+        assert!(
+            shader.contains("let edge_snap_border_clip = view_aligned_edge_snap")
+                && shader.contains(
+                    "vec4<f32>(\n            -record.border_widths.w,\n            -record.border_widths.z,\n            record.border_widths.y,\n            record.border_widths.x,"
+                ),
+            "only view-aligned edge-snap records may restore clipped authored border coverage"
+        );
+        assert!(
+            shader.contains("let near_grid = select(round(near_screen), inward_near_grid,")
+                && shader.contains("let far_grid = select(round(far_screen), inward_far_grid,"),
+            "world edges must snap inward while screen edges snap to the nearest pixel"
+        );
+    }
+
+    #[test]
+    fn tooltip_edge_snap_keeps_ordinary_panel_derivatives_in_uniform_control_flow() {
+        let shader = include_str!("../shaders/sdf_panel.wesl");
+        assert!(
+            !shader.contains("if view_aligned_edge_snap"),
+            "record-specific snapping must not branch before the shared edge derivatives"
+        );
+        assert!(
+            shader.contains("let edge_local = select(")
+                && shader.contains("let effective_half_size = select("),
+            "snapped and ordinary geometry must be selected without control-flow divergence"
+        );
+    }
+
+    #[test]
+    fn opaque_sdf_fill_after_draw_position_six_stays_under_text_occlusion_slack() {
+        let mut builder = LayoutBuilder::new(Mm(100.0), Mm(50.0));
+        builder.with(El::overlay().size(100.0, 50.0), |builder| {
+            for _ in 0..8 {
+                builder.with(El::new().size(100.0, 50.0).background(Color::WHITE), |_| {});
+            }
+        });
+        let mut app = sdf_pipeline_app();
+        spawn_sdf_panel(
+            &mut app,
+            builder.build(),
+            StandardMaterial {
+                alpha_mode: AlphaMode::Opaque,
+                ..default()
+            },
+        );
+        settle_sdf_pipeline(&mut app);
+        let records = sdf_records(&app);
+        assert_eq!(records.len(), 8);
+        let frontmost = records
+            .iter()
+            .map(|record| record.clip_depth_nudge)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            frontmost * SDF_CLIP_DEPTH_NUDGE_PER_LAYER < crate::render::constants::OIT_PAINT_STEP,
+            "late opaque fills must not hide text resting on them"
+        );
+        assert_eq!(
+            (records[7].clip_depth_nudge - records[0].clip_depth_nudge).to_bits(),
+            7.0_f32.to_bits(),
+            "the common depth shift preserves order among opaque fills"
         );
     }
 
@@ -4043,7 +5847,7 @@ mod tests {
             border_record.draw_depth.clip_depth_nudge().get().to_bits()
         );
         assert!(image_record.draw_depth.clip_depth_nudge().get() < border_record.clip_depth_nudge);
-        assert!(image_record.draw_depth.oit_depth_offset().get() < border_record.oit_depth_offset);
+        assert!(image_record.draw_depth.oit_paint_order().get() < border_record.oit_paint_order);
         assert_eq!(
             image_record
                 .draw_depth
@@ -4117,7 +5921,7 @@ mod tests {
             (fill_record.draw_depth.clip_depth_nudge().get() - OPAQUE_FILL_DEPTH_PUSH_LAYERS)
                 .to_bits()
         );
-        assert!(fill_record.oit_depth_offset <= image_record.draw_depth.oit_depth_offset().get());
+        assert!(fill_record.oit_paint_order <= image_record.draw_depth.oit_paint_order().get());
 
         assert_eq!(
             border_record.batch_key.pipeline_compatibility.alpha,
@@ -4127,7 +5931,7 @@ mod tests {
             border_record.clip_depth_nudge.to_bits(),
             border_record.draw_depth.clip_depth_nudge().get().to_bits()
         );
-        assert!(image_record.draw_depth.oit_depth_offset().get() < border_record.oit_depth_offset);
+        assert!(image_record.draw_depth.oit_paint_order().get() < border_record.oit_paint_order);
         assert_eq!(
             image_record
                 .draw_depth
@@ -4205,7 +6009,7 @@ mod tests {
             (fill_record.draw_depth.clip_depth_nudge().get() - OPAQUE_FILL_DEPTH_PUSH_LAYERS)
                 .to_bits()
         );
-        assert!(fill_record.oit_depth_offset <= image_record.draw_depth.oit_depth_offset().get());
+        assert!(fill_record.oit_paint_order <= image_record.draw_depth.oit_paint_order().get());
 
         assert_eq!(
             border_record.batch_key.pipeline_compatibility.alpha,
@@ -4215,7 +6019,7 @@ mod tests {
             border_record.clip_depth_nudge.to_bits(),
             border_record.draw_depth.clip_depth_nudge().get().to_bits()
         );
-        assert!(image_record.draw_depth.oit_depth_offset().get() < border_record.oit_depth_offset);
+        assert!(image_record.draw_depth.oit_paint_order().get() < border_record.oit_paint_order);
         assert_eq!(
             image_record
                 .draw_depth
@@ -4524,7 +6328,7 @@ mod tests {
         let _ = app.world_mut().despawn(panel);
         settle_sdf_pipeline(&mut app);
 
-        assert!(sdf_records(&app).is_empty());
+        assert_eq!(sdf_records(&app), []);
         assert_eq!(frame_material_row_count(&app), 0);
 
         spawn_sdf_panel(
@@ -4589,6 +6393,40 @@ mod tests {
     }
 
     #[test]
+    fn a_hidden_ancestor_masks_sdf_records_the_frame_it_hides() {
+        let mut app = sdf_pipeline_app();
+        let panel = spawn_sdf_panel(
+            &mut app,
+            single_surface_tree(Color::WHITE),
+            StandardMaterial::default(),
+        );
+        let tool = app
+            .world_mut()
+            .spawn((Transform::default(), Visibility::Inherited))
+            .id();
+        app.world_mut().entity_mut(panel).insert(ChildOf(tool));
+        settle_sdf_pipeline(&mut app);
+        let shown_mask = sdf_records(&app)[0].paint_mask.bits();
+        assert_ne!(shown_mask, 0);
+
+        app.world_mut().entity_mut(tool).insert(Visibility::Hidden);
+        app.update();
+        let hidden_records = sdf_records(&app);
+        assert_eq!(hidden_records.len(), 1);
+        assert_eq!(
+            hidden_records[0].paint_mask.bits(),
+            0,
+            "hiding the panel's parent masks its fill in the same frame"
+        );
+
+        app.world_mut()
+            .entity_mut(tool)
+            .insert(Visibility::Inherited);
+        app.update();
+        assert_eq!(sdf_records(&app)[0].paint_mask.bits(), shown_mask);
+    }
+
+    #[test]
     fn topology_churn_reuses_command_rows_without_stale_material_slots() {
         let survivor = Color::srgb(0.2, 0.7, 0.3);
         let added = Color::srgb(0.9, 0.2, 0.1);
@@ -4646,7 +6484,182 @@ mod tests {
         assert!(
             records[0].draw_depth.draw_order_index() <= records[1].draw_depth.draw_order_index()
         );
-        assert!(records[0].oit_depth_offset < records[1].oit_depth_offset);
+        assert!(records[0].oit_paint_order < records[1].oit_paint_order);
+    }
+
+    #[test]
+    fn switch_knob_and_slider_thumb_resolve_in_front_of_their_tracks() {
+        const MINIMUM_QUANTA_MARGIN: u32 = 2;
+        let track = Color::srgb(0.28, 0.73, 0.43);
+        let knob = Color::srgb(0.95, 0.95, 0.96);
+        let mut builder = LayoutBuilder::new(Mm(100.0), Mm(50.0));
+        builder.with(El::column(), |builder| {
+            builder.with(
+                El::overlay()
+                    .size(Mm(65.0), Mm(28.0))
+                    .background(track)
+                    .switch("switch"),
+                |builder| {
+                    builder.with(
+                        El::new()
+                            .size(Mm(23.0), Mm(23.0))
+                            .background(knob)
+                            .switch_knob(),
+                        |_| {},
+                    );
+                },
+            );
+            builder.with(
+                El::overlay()
+                    .size(Mm(100.0), Mm(10.0))
+                    .background(track)
+                    .slider("slider", 0.0..=1.0),
+                |builder| {
+                    builder.with(
+                        El::new()
+                            .size(Mm(4.0), Mm(10.0))
+                            .background(knob)
+                            .slider_thumb(),
+                        |_| {},
+                    );
+                    builder.with(
+                        El::new()
+                            .size(Mm(2.0), Mm(10.0))
+                            .background(knob)
+                            .slider_marker(),
+                        |_| {},
+                    );
+                },
+            );
+        });
+        let mut app = sdf_pipeline_app();
+        spawn_sdf_panel(
+            &mut app,
+            builder.build(),
+            StandardMaterial {
+                alpha_mode: AlphaMode::Blend,
+                ..Default::default()
+            },
+        );
+        settle_sdf_pipeline(&mut app);
+
+        let records = sdf_records(&app);
+        assert_eq!(records.len(), 5);
+        let (switch_track, switch_knob) = (&records[0], &records[1]);
+        let (slider_track, slider_thumb, slider_marker) = (&records[2], &records[3], &records[4]);
+        // The near plane tracks zoom, so the focus distance is zoom itself.
+        let near = 7.754_f32 * 0.001;
+        let depth = near / 7.754;
+        for (under, over, pair) in [
+            (switch_track, switch_knob, "switch knob over its track"),
+            (slider_track, slider_thumb, "slider thumb over its track"),
+            (slider_thumb, slider_marker, "slider marker over its thumb"),
+        ] {
+            let physical = depth.to_bits();
+            let under_packed = (under.oit_paint_order
+                * crate::render::constants::OIT_PACKED_PAINT_RANGE)
+                .round()
+                .to_u32();
+            let over_packed = (over.oit_paint_order
+                * crate::render::constants::OIT_PACKED_PAINT_RANGE)
+                .round()
+                .to_u32();
+            assert!((physical, over_packed) > (physical, under_packed));
+            let margin = over_packed - under_packed;
+            assert!(
+                margin >= MINIMUM_QUANTA_MARGIN,
+                "{pair}: {margin} OIT paint quanta",
+            );
+        }
+        let shader = include_str!("../shaders/sdf_panel.wesl");
+        assert!(shader.contains("oit_draw_layer(oit_pos, out.color, record.oit_paint_order)"));
+    }
+
+    #[test]
+    fn switch_oit_records_share_the_panel_plane_after_the_knob_moves() {
+        let metrics = crate::ControlMetrics::from_label_size(13.0);
+        let switch = metrics.switch;
+        let mut builder = LayoutBuilder::new(100.0, 100.0);
+        builder.with(
+            El::overlay()
+                .size(switch.track_width, switch.track_height)
+                .padding(Padding::all(switch.track_padding))
+                .alignment(AlignX::Left, AlignY::Center)
+                .background(Color::BLACK)
+                .border(Border::all(switch.border_width, Color::BLACK))
+                .corner_radius(switch.track_radius())
+                .switch("power"),
+            |builder| {
+                builder.with(
+                    El::new()
+                        .size(switch.thumb.width, switch.thumb.height)
+                        .background(Color::WHITE)
+                        .corner_radius(switch.thumb.corner_radius())
+                        .switch_knob(),
+                    |_| {},
+                );
+            },
+        );
+        let mut app = sdf_pipeline_app();
+        spawn_sdf_panel(
+            &mut app,
+            builder.build(),
+            StandardMaterial {
+                alpha_mode: AlphaMode::Blend,
+                ..default()
+            },
+        );
+        settle_sdf_pipeline(&mut app);
+        let mut records = sdf_records(&app);
+        assert_eq!(records.len(), 2);
+        let panel_pose = GlobalTransform::from(Transform {
+            translation: Vec3::new(17.23, -2.51, 8.0),
+            rotation:    Quat::from_rotation_y(0.41),
+            scale:       Vec3::new(1.7, 0.9, 1.1),
+        });
+        records[0].update_world_transform(&panel_pose);
+        records[1].local_transform.translation.x += 0.003;
+        records[1].update_world_transform(&panel_pose);
+        let (track, knob) = (&records[0], &records[1]);
+        assert_eq!(
+            track.panel_plane.coefficients.to_array().map(f32::to_bits),
+            knob.panel_plane.coefficients.to_array().map(f32::to_bits),
+        );
+        assert_ne!(track.transform, knob.transform);
+        // The shader reconstructs the same base depth from this common plane.
+        // Only the existing stack-layer offset differs at an overlapping pixel.
+        for depth in [0.001_f32, 0.25, 0.5, 0.999_9] {
+            let packed = |offset: f32| {
+                (offset * crate::render::constants::OIT_PACKED_PAINT_RANGE)
+                    .round()
+                    .to_u32()
+            };
+            let under = packed(track.oit_paint_order);
+            let over = packed(knob.oit_paint_order);
+            assert!(over >= under + 2, "switch OIT layer ties at {depth}");
+            assert!((depth.to_bits(), over) > (depth.to_bits(), under));
+        }
+        assert_switch_plane_survives_an_unchanged_upsert(track.clone());
+    }
+
+    fn assert_switch_plane_survives_an_unchanged_upsert(record: ResolvedSdfBatchRecord) {
+        let expected = record.panel_plane.coefficients.to_array().map(f32::to_bits);
+        let mut batch = SdfBatch::default();
+        batch.upsert_record(record.clone());
+        batch.record_upload.clear();
+        let mut rebuilt = record;
+        rebuilt.transform = rebuilt.local_transform.to_matrix();
+        rebuilt.panel_plane = WorldPanelPlane::from_panel(&GlobalTransform::IDENTITY, 0.0);
+        batch.upsert_record(rebuilt);
+        assert_eq!(
+            batch.records()[0]
+                .panel_plane
+                .coefficients
+                .to_array()
+                .map(f32::to_bits),
+            expected,
+        );
+        assert!(!batch.record_upload.is_set());
     }
 
     #[test]
@@ -4732,7 +6745,7 @@ mod tests {
         let helper_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
             .join("shaders")
-            .join("sdf_material_table.wgsl");
+            .join("sdf_material_table.wesl");
         let helper = fs::read_to_string(&helper_path).expect("SDF material helper should load");
         let body_range = function_body_range(&helper, "fn pbr_input_from_material_table");
         let body = &helper[body_range.clone()];
@@ -4742,11 +6755,11 @@ mod tests {
 
         assert!(helper.contains("fn pbr_input_from_material_table"));
         assert_eq!(outside.matches("material_table[").count(), 0);
-        // Two mutually exclusive in-helper reads: the depth/shadow prepass reads
-        // base_color only, the main pass reads the full row.
+        // Two mutually exclusive in-helper reads: the depth/shadow prepass uses
+        // opacity and UVs, while the main pass applies the full material row.
         assert_eq!(body.matches("material_table[").count(), 2);
-        for path in crate_wgsl_files() {
-            let source = fs::read_to_string(&path).expect("crate WGSL file should load");
+        for path in crate_wesl_files() {
+            let source = fs::read_to_string(&path).expect("crate WESL file should load");
             if path == helper_path {
                 continue;
             }
@@ -4770,7 +6783,7 @@ mod tests {
 
     #[test]
     fn material_table_uv_transform_is_composed_before_texture_sampling() {
-        let helper = include_str!("../shaders/sdf_material_table.wgsl");
+        let helper = include_str!("../shaders/sdf_material_table.wesl");
         let body_range = function_body_range(helper, "fn pbr_input_from_material_table");
         let body = &helper[body_range];
 
@@ -4787,7 +6800,7 @@ mod tests {
 
     #[test]
     fn border_dominant_pixels_use_border_pbr_lighting_fields() {
-        let shader = include_str!("../shaders/sdf_panel.wgsl");
+        let shader = include_str!("../shaders/sdf_panel.wesl");
 
         assert_ordered(
             shader,
@@ -4806,9 +6819,9 @@ mod tests {
     #[test]
     fn sdf_bindings_match_material_table_constants() {
         let rust_source = include_str!("fill_batch.rs");
-        let helper = include_str!("../shaders/sdf_material_table.wgsl");
-        let shader = include_str!("../shaders/sdf_panel.wgsl");
-        let constants = include_str!("material_table.wgsl");
+        let helper = include_str!("../shaders/sdf_material_table.wesl");
+        let shader = include_str!("../shaders/sdf_panel.wesl");
+        let constants = include_str!("material_table.wesl");
 
         assert_eq!(
             storage_binding_for_field(rust_source, "material_table"),
@@ -4841,7 +6854,7 @@ mod tests {
         assert_sdf_shader_ref(SdfExtension::deferred_fragment_shader());
         assert!(
             shader.contains(
-                "#import hana_diegetic::sdf_material_table::pbr_input_from_material_table"
+                "import hana_diegetic::sdf_material_table::pbr_input_from_material_table;"
             )
         );
         assert_ordered(
@@ -4849,14 +6862,14 @@ mod tests {
             &[
                 "fn fill_alpha_for_prepass",
                 "pbr_input_from_material_table(",
-                "#ifdef PREPASS_PIPELINE",
+                "@if(PREPASS_PIPELINE)",
                 "@fragment",
             ],
         );
         assert_ordered(
             shader,
             &[
-                "#else\n@fragment",
+                "@if(!PREPASS_PIPELINE) {\n@fragment",
                 "let fill_pbr = pbr_input_from_material_table(",
                 "let border_pbr = pbr_input_from_material_table(",
             ],
@@ -4867,22 +6880,22 @@ mod tests {
 
     #[test]
     fn stripped_material_group_fallback_is_present_for_prepass_review() {
-        let shader = include_str!("../shaders/sdf_panel.wgsl");
-        let helper = include_str!("../shaders/sdf_material_table.wgsl");
+        let shader = include_str!("../shaders/sdf_panel.wesl");
+        let helper = include_str!("../shaders/sdf_material_table.wesl");
         let mut descriptor = RenderPipelineDescriptor {
             fragment: Some(FragmentState::default()),
             ..Default::default()
         };
 
         add_sdf_stripped_material_group_def(&mut descriptor, SdfPipelineMode::MeshAttributes);
-        assert!(descriptor.vertex.shader_defs.is_empty());
-        assert!(
+        assert_eq!(descriptor.vertex.shader_defs, []);
+        assert_eq!(
             descriptor
                 .fragment
                 .as_ref()
                 .expect("fragment state should exist")
-                .shader_defs
-                .is_empty()
+                .shader_defs,
+            []
         );
 
         add_sdf_stripped_material_group_def(&mut descriptor, SdfPipelineMode::VertexPulled);
@@ -4897,9 +6910,9 @@ mod tests {
                 .shader_defs
                 .contains(&stripped)
         );
-        assert!(shader.contains("#ifdef SDF_STRIPPED_MATERIAL_GROUP"));
-        assert!(shader.contains("#ifdef PREPASS_PIPELINE"));
-        assert!(helper.contains("#ifdef SDF_STRIPPED_MATERIAL_GROUP"));
+        assert!(shader.contains("@if(SDF_STRIPPED_MATERIAL_GROUP)"));
+        assert!(shader.contains("@if(PREPASS_PIPELINE)"));
+        assert!(helper.contains("@if(SDF_STRIPPED_MATERIAL_GROUP)"));
         assert!(helper.contains("pbr_types::pbr_input_new()"));
         assert!(
             !helper[function_body_range(helper, "fn stripped_material_group_pbr_input")]
@@ -4911,8 +6924,102 @@ mod tests {
         );
     }
 
+    #[test]
+    fn only_a_tooltip_shadow_batch_compiles_the_shadow_fragment_path() {
+        let shader = include_str!("../shaders/sdf_panel.wesl");
+        let shadow_def = ShaderDefVal::from("SDF_TOOLTIP_SHADOW");
+        let fragment_defs = |key: SdfBatchKey| {
+            let material = sdf_batch_material(SdfBatchMaterialInput {
+                key,
+                records: Handle::default(),
+                mesh_records: Handle::default(),
+                display_table: Handle::default(),
+            });
+            let extension_key = SdfExtensionKey::from(&material.extension);
+            let mut descriptor = RenderPipelineDescriptor {
+                fragment: Some(FragmentState::default()),
+                ..Default::default()
+            };
+            add_sdf_fragment_paint_def(&mut descriptor, extension_key.fragment_paint);
+            assert_eq!(descriptor.vertex.shader_defs, []);
+            descriptor
+                .fragment
+                .expect("fragment state should exist")
+                .shader_defs
+        };
+
+        let surface = fragment_defs(test_batch_key());
+        let shadow = fragment_defs(SdfBatchKey {
+            transparent_sort: SdfTransparentSort::OverHost(DrawZIndexRank::default()),
+            ..test_batch_key()
+        });
+
+        assert!(
+            !surface.contains(&shadow_def),
+            "surface fragment defs {surface:?} compile the shadow path"
+        );
+        assert!(
+            shadow.contains(&shadow_def),
+            "shadow fragment defs {shadow:?} lack the shadow path"
+        );
+        assert!(shader.contains("@if(SDF_TOOLTIP_SHADOW)"));
+        // The driver inlines lighting once per call site, so a second call
+        // doubles every SDF pipeline's cold compile.
+        assert_eq!(shader.matches("apply_pbr_lighting(").count(), 1);
+    }
+
+    #[test]
+    fn only_an_sdf_batch_with_lit_records_compiles_pbr_lighting() {
+        let shader = include_str!("../shaders/sdf_panel.wesl");
+        let lighting_def = ShaderDefVal::from("SDF_PBR_LIGHTING");
+        let fragment_defs = |material: &StandardMaterial| {
+            let material = sdf_batch_material(SdfBatchMaterialInput {
+                key:           sdf_batch_key_for_material(material, VisualShadow::None),
+                records:       Handle::default(),
+                mesh_records:  Handle::default(),
+                display_table: Handle::default(),
+            });
+            let extension_key = SdfExtensionKey::from(&material.extension);
+            let mut descriptor = RenderPipelineDescriptor {
+                fragment: Some(FragmentState::default()),
+                ..Default::default()
+            };
+            add_sdf_fragment_lighting_def(&mut descriptor, extension_key.fragment_lighting);
+            descriptor
+                .fragment
+                .expect("fragment state should exist")
+                .shader_defs
+        };
+
+        let unlit = fragment_defs(&StandardMaterial {
+            unlit: true,
+            ..Default::default()
+        });
+        let lit = fragment_defs(&StandardMaterial::default());
+
+        assert!(
+            !unlit.contains(&lighting_def),
+            "unlit-only fragment defs {unlit:?} compile PBR lighting"
+        );
+        assert!(
+            lit.contains(&lighting_def),
+            "lit fragment defs {lit:?} lack PBR lighting"
+        );
+        assert!(shader.contains("@if(!PREPASS_PIPELINE && SDF_PBR_LIGHTING)"));
+        assert!(shader.contains("import bevy_pbr::render::pbr_functions::apply_pbr_lighting;"));
+    }
+
+    const fn panel_route(display_target: PanelDisplayTarget) -> SdfRecordRoute {
+        SdfRecordRoute {
+            display_target,
+            transparent_sort: SdfTransparentSort::PanelRank,
+            batch_sharing: SdfBatchSharing::AnyPanel,
+        }
+    }
+
     fn test_batch_key() -> SdfBatchKey {
         SdfBatchKey {
+            display_target:         PanelDisplayTarget::World,
             z_index:                0.into(),
             z_index_rank:           DrawZIndexRank::default(),
             batch_family:           DrawBatchFamily::SdfSurface,
@@ -4921,6 +7028,8 @@ mod tests {
             contiguous_drawn_run:   ContiguousDrawnRun::default(),
             pipeline_compatibility: PipelineCompatibility::from(&StandardMaterial::default()),
             resource_compatibility: ResourceCompatibility::from(&StandardMaterial::default()),
+            transparent_sort:       SdfTransparentSort::PanelRank,
+            batch_sharing:          SdfBatchSharing::AnyPanel,
         }
     }
 
@@ -4934,7 +7043,7 @@ mod tests {
             panel_entity:    Entity::from_bits(1),
             command_index:   CommandIndex::from(command_index),
             element_index:   draw_order::ElementIndex::from(command_index),
-            divider_ordinal: None,
+            source_part:     SdfSourcePart::Element,
             record_role:     SdfRecordRole::Whole,
             draw_depth:      draw_depth_for_test(command_index),
             fill_material:   ResolvedSdfMaterial {
@@ -5308,7 +7417,7 @@ mod tests {
                     .map(|record| {
                         (
                             batch_key.clone(),
-                            batch.entity.expect("widget part batch should be spawned"),
+                            batch.entity().expect("widget part batch should be spawned"),
                             record.clone(),
                         )
                     })
@@ -5517,6 +7626,41 @@ mod tests {
     }
 
     #[test]
+    fn disabled_surface_fallback_dims_authored_fill_and_restores_it() {
+        let mut app = widget_sdf_pipeline_app();
+        spawn_sdf_panel(
+            &mut app,
+            slotted_widget_fill_tree(0),
+            StandardMaterial::default(),
+        );
+        settle_sdf_pipeline(&mut app);
+        let widget = styled_widget(&mut app);
+        let records = sdf_records(&app);
+        assert_fill_row_colors(&app, &records, &[WIDGET_FILL_COLOR, PEER_FILL_COLOR]);
+
+        set_slot_override(
+            &mut app,
+            widget,
+            VisualSlotOverride {
+                dim_fill: true,
+                ..VisualSlotOverride::default()
+            },
+        );
+        app.update();
+        let records = sdf_records(&app);
+        assert_fill_row_colors(
+            &app,
+            &records,
+            &[super::dim_control_color(WIDGET_FILL_COLOR), PEER_FILL_COLOR],
+        );
+
+        clear_slot_override(&mut app, widget);
+        app.update();
+        let records = sdf_records(&app);
+        assert_fill_row_colors(&app, &records, &[WIDGET_FILL_COLOR, PEER_FILL_COLOR]);
+    }
+
+    #[test]
     fn focused_border_authoring_preserves_sibling_material_source_key() {
         let mut app = widget_sdf_pipeline_app();
         let panel = spawn_sdf_panel(
@@ -5529,13 +7673,13 @@ mod tests {
         let expected = SdfMaterialSourceKey {
             panel,
             element: ElementIndex::from(3),
-            divider_ordinal: None,
+            source_part: SdfSourcePart::Element,
             role: SdfMaterialRole::Fill,
         };
         let expected_record_key = SdfRecordKey {
             panel,
             element: ElementIndex::from(3),
-            divider_ordinal: None,
+            source_part: SdfSourcePart::Element,
             role: SdfRecordRole::Whole,
         };
         let records = sdf_records(&app);
@@ -5632,13 +7776,13 @@ mod tests {
         let expected = SdfMaterialSourceKey {
             panel,
             element: ElementIndex::from(3),
-            divider_ordinal: None,
+            source_part: SdfSourcePart::Element,
             role: SdfMaterialRole::Fill,
         };
         let expected_record_key = SdfRecordKey {
             panel,
             element: ElementIndex::from(3),
-            divider_ordinal: None,
+            source_part: SdfSourcePart::Element,
             role: SdfRecordRole::Whole,
         };
         let records = sdf_records(&app);
@@ -5732,20 +7876,20 @@ mod tests {
         let parent_fill = SdfMaterialSourceKey {
             panel,
             element: ElementIndex::from(1),
-            divider_ordinal: None,
+            source_part: SdfSourcePart::Element,
             role: SdfMaterialRole::Fill,
         };
         let expected = HashSet::from([
             SdfMaterialSourceKey {
                 panel,
                 element: ElementIndex::from(1),
-                divider_ordinal: Some(0),
+                source_part: SdfSourcePart::Divider(0),
                 role: SdfMaterialRole::Fill,
             },
             SdfMaterialSourceKey {
                 panel,
                 element: ElementIndex::from(1),
-                divider_ordinal: Some(1),
+                source_part: SdfSourcePart::Divider(1),
                 role: SdfMaterialRole::Fill,
             },
         ]);
@@ -5753,11 +7897,11 @@ mod tests {
         let divider_keys: HashSet<_> = records
             .iter()
             .map(|record| record.fill_source)
-            .filter(|source| source.divider_ordinal.is_some())
+            .filter(|source| !source.source_part.is_element())
             .collect();
         let divider_slots: HashSet<_> = records
             .iter()
-            .filter(|record| record.fill_source.divider_ordinal.is_some())
+            .filter(|record| !record.fill_source.source_part.is_element())
             .filter_map(|record| match record.fill_material {
                 SdfPaintMaterial::Authored(slot) => Some(slot),
                 SdfPaintMaterial::NotAuthored => None,
@@ -5772,7 +7916,7 @@ mod tests {
         let initial_divider_command_indices: HashMap<_, _> = records
             .iter()
             .map(|record| (record.fill_source, record.draw_order))
-            .filter(|(source, _)| source.divider_ordinal.is_some())
+            .filter(|(source, _)| !source.source_part.is_element())
             .collect();
         assert_eq!(divider_keys, expected);
         assert!(parent_fill_slot.is_some());
@@ -5793,13 +7937,13 @@ mod tests {
         let divider_keys: HashSet<_> = sdf_records(&app)
             .iter()
             .map(|record| record.fill_source)
-            .filter(|source| source.divider_ordinal.is_some())
+            .filter(|source| !source.source_part.is_element())
             .collect();
         assert_eq!(divider_keys, expected);
         let updated_divider_command_indices: HashMap<_, _> = sdf_records(&app)
             .iter()
             .map(|record| (record.fill_source, record.draw_order))
-            .filter(|(source, _)| source.divider_ordinal.is_some())
+            .filter(|(source, _)| !source.source_part.is_element())
             .collect();
         assert!(
             expected.iter().all(|key| {
@@ -5845,14 +7989,14 @@ mod tests {
 
         let records = sdf_records(&app);
         let Some(parent_fill) = records.iter().find(|record| {
-            record.fill_source.divider_ordinal.is_none()
+            record.fill_source.source_part.is_element()
                 && fill_row_color(&app, record) == linear_color(SLOT_OVERRIDE_COLOR)
         }) else {
             panic!();
         };
         let dividers: Vec<_> = records
             .iter()
-            .filter(|record| record.fill_source.divider_ordinal.is_some())
+            .filter(|record| !record.fill_source.source_part.is_element())
             .collect();
 
         assert_eq!(dividers.len(), 2);
@@ -6303,13 +8447,13 @@ mod tests {
             let origin = store
                 .batches()
                 .find(|(key, _)| key.z_index == 0.into())
-                .and_then(|(_, batch)| batch.entity)
+                .and_then(|(_, batch)| batch.entity())
                 .expect("the widget fill batch should be spawned");
             let (_, peer_batch) = store
                 .batches()
                 .find(|(key, _)| key.z_index == 1.into())
                 .expect("the peer fill batch should exist");
-            let peer = peer_batch.entity.expect("peer batch should be spawned");
+            let peer = peer_batch.entity().expect("peer batch should be spawned");
             (origin, peer, peer_batch.records().to_vec())
         };
 
@@ -6326,7 +8470,7 @@ mod tests {
         let blend_entity = store
             .batches()
             .find(|(key, _)| key.pipeline_compatibility.alpha == BatchAlphaMode::Blend)
-            .and_then(|(_, batch)| batch.entity)
+            .and_then(|(_, batch)| batch.entity())
             .expect("the re-keyed record should live in a spawned Blend batch");
         let blend_records: Vec<ResolvedSdfBatchRecord> = app
             .world()
@@ -6347,7 +8491,7 @@ mod tests {
             .resource::<SdfBatchStore>()
             .batches()
             .find(|(key, _)| key.z_index == 1.into())
-            .map(|(_, batch)| (batch.entity, batch.records().to_vec()))
+            .map(|(_, batch)| (batch.entity(), batch.records().to_vec()))
             .expect("the peer batch should survive the re-key");
         assert_eq!(peer_after, (Some(peer_entity), peer_records));
 
@@ -6421,6 +8565,120 @@ mod tests {
             |_| {},
         );
         builder.build()
+    }
+
+    fn slider_with_fill_tree(direction: SliderDirection) -> LayoutTree {
+        let (width, height, fill_width, fill_height) = match direction {
+            SliderDirection::LeftToRight | SliderDirection::RightToLeft => (40.0, 16.0, 40.0, 4.0),
+            SliderDirection::BottomToTop | SliderDirection::TopToBottom => (16.0, 40.0, 4.0, 40.0),
+        };
+        let mut builder = LayoutBuilder::new(100.0, 50.0);
+        builder.with(
+            El::overlay()
+                .size(width, height)
+                .alignment(AlignX::Center, AlignY::Center)
+                .widget(
+                    "level",
+                    Slider::new(0.0..=1.0).value(0.0).direction(direction),
+                ),
+            |builder| {
+                builder.with(
+                    El::new()
+                        .size(fill_width, fill_height)
+                        .background(SLOT_OVERRIDE_COLOR)
+                        .slider_fill(),
+                    |_| {},
+                );
+                builder.with(
+                    El::new()
+                        .size(8.0, 8.0)
+                        .background(PEER_FILL_COLOR)
+                        .slider_thumb(),
+                    |_| {},
+                );
+            },
+        );
+        builder.build()
+    }
+
+    #[test]
+    fn slider_fill_keeps_its_leading_edge_and_meets_the_thumb_at_each_value() {
+        for direction in [SliderDirection::LeftToRight, SliderDirection::BottomToTop] {
+            let mut app = widget_sdf_pipeline_app();
+            spawn_sdf_panel(
+                &mut app,
+                slider_with_fill_tree(direction),
+                StandardMaterial::default(),
+            );
+            settle_sdf_pipeline(&mut app);
+            let widget = styled_widget(&mut app);
+            let slots = app
+                .world()
+                .get::<WidgetVisualSlots>(widget)
+                .expect("slider visual slots");
+            let fill_index = slots
+                .element_index(VisualSlotId::SLIDER_FILL)
+                .expect("fill slot");
+            let thumb_index = slots
+                .element_index(VisualSlotId::SLIDER_THUMB)
+                .expect("thumb slot");
+            let mut authored_leading_edge: Option<f32> = None;
+            for value in [0.0, 0.5, 1.0] {
+                if value > 0.0 {
+                    let mut state = app
+                        .world_mut()
+                        .get_mut::<SliderState>(widget)
+                        .expect("slider state");
+                    assert!(state.set_value(value).expect("value applies"));
+                    app.update();
+                }
+                let records = sdf_records(&app);
+                let fill = records
+                    .iter()
+                    .find(|record| record.record_key.element.get() == fill_index)
+                    .expect("fill record");
+                let thumb = records
+                    .iter()
+                    .find(|record| record.record_key.element.get() == thumb_index)
+                    .expect("thumb record");
+                let (leading_edge, trailing_edge, thumb_center) = match direction {
+                    SliderDirection::LeftToRight | SliderDirection::RightToLeft => (
+                        fill.local_transform.translation.x - fill.half_size.value.x,
+                        fill.local_transform.translation.x + fill.half_size.value.x,
+                        thumb.local_transform.translation.x,
+                    ),
+                    SliderDirection::BottomToTop | SliderDirection::TopToBottom => (
+                        fill.local_transform.translation.y - fill.half_size.value.y,
+                        fill.local_transform.translation.y + fill.half_size.value.y,
+                        thumb.local_transform.translation.y,
+                    ),
+                };
+                if let Some(authored) = authored_leading_edge {
+                    assert!((leading_edge - authored).abs() < 1e-6);
+                } else {
+                    authored_leading_edge = Some(leading_edge);
+                }
+                assert!(
+                    (trailing_edge - thumb_center).abs() < 1e-6,
+                    "{direction:?} at {value}: fill must meet the thumb center"
+                );
+            }
+            set_slot_overrides(
+                &mut app,
+                widget,
+                [(
+                    VisualSlotId::SLIDER_FILL,
+                    VisualSlotOverride::slider_fill(direction, 0.0),
+                )],
+            );
+            app.update();
+            assert!(
+                sdf_records(&app)
+                    .iter()
+                    .all(|record| record.record_key.element.get() != fill_index),
+                "zero fill extent must emit no SDF record"
+            );
+        }
     }
 
     #[test]
@@ -6595,7 +8853,7 @@ mod tests {
             .world()
             .resource::<ImageBatchStore>()
             .batches()
-            .filter_map(|(_, batch)| batch.gpu.as_ref().map(|gpu| gpu.records.clone()))
+            .filter_map(|(_, batch)| batch.resources().map(|gpu| gpu.records.clone()))
             .collect();
         assert_eq!(buffers.len(), 1, "expected exactly one image record buffer");
         buffers[0].clone()
@@ -6670,7 +8928,7 @@ mod tests {
             .resource::<ImageBatchStore>()
             .batches()
             .next()
-            .and_then(|(_, batch)| batch.entity)
+            .and_then(|(_, batch)| batch.entity())
             .expect("settled image batch should be spawned");
 
         // A texture override changes the `ImageBatchKey` and moves the record.
@@ -6688,7 +8946,7 @@ mod tests {
         let destination_entity = store
             .batches()
             .find(|(key, _)| key.texture == image_b)
-            .and_then(|(_, batch)| batch.entity)
+            .and_then(|(_, batch)| batch.entity())
             .expect("the moved record should live in a spawned destination batch");
         assert_ne!(destination_entity, origin_entity);
         assert_ignores_picking(&app, destination_entity);
@@ -6723,5 +8981,64 @@ mod tests {
             "the emptied destination batch should be retired",
         );
         assert_eq!(image_records(&app), records_before);
+    }
+
+    /// Reverse-Z depth steps from `behind` up to `front`.
+    fn depth_ulps_between(behind: f32, front: f32) -> u32 { front.to_bits() - behind.to_bits() }
+
+    #[test]
+    fn tooltip_shadow_sits_whole_ulps_behind_its_body_inside_the_tooltip_band() {
+        let margin = TOOLTIP_SHADOW_BEHIND_BODY_LAYERS * SDF_CLIP_DEPTH_NUDGE_PER_LAYER;
+        // Screen-ortho panels sit near 0.53; the top of the range has the widest ulp.
+        for body_depth in [0.53_f32, 0.999_9, 1.0, 0.25, 0.001] {
+            let shadow_depth = body_depth - margin;
+            assert!(
+                depth_ulps_between(shadow_depth, body_depth)
+                    >= TOOLTIP_SHADOW_BEHIND_BODY_DEPTH_ULPS.to_u32(),
+                "shadow at {shadow_depth} is not {TOOLTIP_SHADOW_BEHIND_BODY_DEPTH_ULPS} ulps \
+                 behind its body at {body_depth}",
+            );
+        }
+        assert!(
+            margin < 0.01 * render::TOOLTIP_NDC_DEPTH_PRIORITY,
+            "the shadow margin {margin} leaves the tooltip band",
+        );
+    }
+
+    #[test]
+    fn tooltip_shadow_sorts_between_its_host_text_and_next_rank_at_its_body_hardware_bias() {
+        let rank = DrawZIndexRank::default();
+        for host in [0_usize, 3] {
+            let shadow = SdfBatchKey {
+                transparent_sort: SdfTransparentSort::OverHost(DrawZIndexRank::from(host)),
+                ..test_batch_key()
+            };
+            let host_text = DrawZIndexRank::from(host).screen_text_depth_bias().get();
+            let next_fill = DrawZIndexRank::from(host + 1).screen_depth_bias().get();
+            assert!(
+                (host_text..next_fill).contains(&shadow.sort_depth_bias())
+                    && shadow.sort_depth_bias() > host_text,
+                "shadow over a rank-{host} host sorts at {}, not between {host_text} and {next_fill}",
+                shadow.sort_depth_bias()
+            );
+        }
+        let shadow = SdfBatchKey {
+            transparent_sort: SdfTransparentSort::OverHost(rank),
+            ..test_batch_key()
+        };
+        let material = sdf_batch_material(SdfBatchMaterialInput {
+            key:           shadow,
+            records:       Handle::default(),
+            mesh_records:  Handle::default(),
+            display_table: Handle::default(),
+        });
+        assert_eq!(
+            material.extension.hardware_depth_bias,
+            rank.hardware_depth_bias()
+        );
+        assert_eq!(
+            material.extension.hardware_depth_bias,
+            test_batch_key().sort_depth_bias().to_i32(),
+        );
     }
 }

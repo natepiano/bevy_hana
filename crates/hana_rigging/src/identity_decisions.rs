@@ -601,6 +601,7 @@ fn apply_recorded_answers(
                     Ok(()) => {
                         hardware_inventory
                             .readdress(&recorded_answer.saved, recorded_answer.candidate.clone());
+                        commands.trigger(crate::HardwareInventoryChanged);
                         identity_decisions.settled.push(SettledCandidate {
                             role:      recorded_answer.role,
                             saved:     recorded_answer.saved,

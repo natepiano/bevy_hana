@@ -17,6 +17,7 @@ pub use bindings::FreeCamPreset;
 pub use bindings::FreeCamPresetKind;
 pub use bindings::FreeCamRollActionBindings;
 pub use bindings::FreeCamRollBinding;
+pub use bindings::FreeCamTrackpadLook;
 pub use bindings::FreeCamTranslateActionBindings;
 pub use bindings::FreeCamTranslateBinding;
 pub use bindings::FreeCamTranslateKeys;

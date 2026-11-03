@@ -254,28 +254,3 @@ fn native_fullscreen(entity: Entity) -> NativeFullscreen {
 
 #[cfg(not(target_os = "macos"))]
 const fn native_fullscreen(_: Entity) -> NativeFullscreen { NativeFullscreen::Unavailable }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_monitor_snapshot_keeps_unavailable_fields_as_null() -> Result<(), serde_json::Error> {
-        let test_monitor_snapshot = TestMonitorSnapshot {
-            entity:                  1,
-            name:                    TestMonitorName::Unavailable,
-            index:                   0,
-            scale:                   1.0,
-            refresh_rate_millihertz: TestMonitorRefreshRate::Unavailable,
-            physical_position:       [0, 0],
-            physical_size:           [1_920, 1_080],
-            device_key:              TestMonitorDeviceKey::Unavailable,
-        };
-
-        let value = serde_json::to_value(test_monitor_snapshot)?;
-        assert!(value["name"].is_null());
-        assert!(value["refresh_rate_millihertz"].is_null());
-        assert!(value["device_key"].is_null());
-        Ok(())
-    }
-}

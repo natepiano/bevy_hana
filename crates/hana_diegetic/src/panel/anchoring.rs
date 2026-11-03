@@ -37,13 +37,13 @@ use bevy::prelude::Vec3;
 use bevy::prelude::With;
 use bevy::prelude::Without;
 use bevy::prelude::warn;
-use bevy::transform::helper::TransformHelper;
 use hana_valence::AnchorResolveDiagnostics;
 use hana_valence::AnchorSite;
 use hana_valence::AnchoredTo as ValenceAnchoredTo;
 use hana_valence::Displacement;
 use hana_valence::ResolvedAnchorGeometry;
 use hana_valence::ResolvedAnchorOffset;
+use smallvec::SmallVec;
 
 use super::CoordinateSpace;
 use super::DiegeticPanel;
@@ -52,6 +52,7 @@ use super::WidgetEntity;
 use super::coordinate_space::PanelSpace;
 use super::lifecycle;
 use super::lifecycle::PanelComponentOwnership;
+use crate::constants::DIAGNOSTIC_LOG_TARGET;
 use crate::layout::Anchor;
 use crate::layout::Dimension;
 use crate::layout::Unit;
@@ -424,23 +425,23 @@ fn warn_rejected_attachment(operation: PanelAttachmentOperation, reason: &str) {
     let source = operation.source().entity;
     if let Some(target) = operation.target() {
         warn!(
-            "panel attachment operation `{}` rejected for source {source:?} and target {:?}: \
+            target: DIAGNOSTIC_LOG_TARGET, "panel attachment operation `{}` rejected for source {source:?} and target {:?}: \
              {reason}",
             operation.name(),
             target.entity(),
         );
     } else {
         warn!(
-            "panel attachment operation `{}` rejected for source {source:?}: {reason}",
+            target: DIAGNOSTIC_LOG_TARGET, "panel attachment operation `{}` rejected for source {source:?}: {reason}",
             operation.name(),
         );
     }
 }
 
 /// Shared panel attachment authoring read by screen and world positioners.
-#[derive(Component, Clone, Copy, Debug, PartialEq)]
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
 #[component(immutable)]
-pub(crate) struct PanelAttachmentAuthored {
+pub struct PanelAttachmentAuthored {
     target:        Entity,
     source:        Anchor,
     target_anchor: Anchor,
@@ -457,7 +458,7 @@ impl PanelAttachmentAuthored {
 
     /// Target panel or reified widget entity.
     #[must_use]
-    pub(crate) const fn target(&self) -> Entity { self.target }
+    pub const fn target(&self) -> Entity { self.target }
 
     /// Anchor point on the source panel.
     #[must_use]
@@ -469,7 +470,7 @@ impl PanelAttachmentAuthored {
 
     /// Returns a copy that points at `target`.
     #[must_use]
-    pub(crate) const fn retargeted(mut self, target: Entity) -> Self {
+    const fn retargeted(mut self, target: Entity) -> Self {
         self.target = target;
         self
     }
@@ -499,13 +500,16 @@ pub(crate) fn world_attachment_is_ready(
 /// Without this pre-resolve refresh, a target whose local [`Transform`] changed
 /// earlier in the frame still presents its previous-frame [`GlobalTransform`]
 /// to Valence, making every dependent trail by one frame. Computing the current
-/// value from the target's local hierarchy between animation and resolution
-/// lets the resolver place dependents from the same-frame target pose. Only
-/// roots without [`ValenceAnchoredTo`] are refreshed here; Valence computes
-/// attached dependents in graph order during its following resolve pass. The
-/// equality gate preserves quiet change ticks when the pose is unchanged.
+/// value from the target's local hierarchy between animation and resolution,
+/// in the same parent-first order as Bevy's later transform propagation, lets
+/// the resolver place dependents from the same-frame target pose without a
+/// rounding-only rewrite of still targets. Only roots without
+/// [`ValenceAnchoredTo`] are refreshed here; Valence computes attached
+/// dependents in graph order during its following resolve pass. The equality
+/// gate preserves quiet change ticks when the pose is unchanged.
 pub(crate) fn refresh_world_anchor_globals(
-    transforms: TransformHelper,
+    local_transforms: Query<&Transform>,
+    parents: Query<&ChildOf>,
     mut participants: Query<
         (Entity, &mut GlobalTransform),
         (
@@ -516,9 +520,31 @@ pub(crate) fn refresh_world_anchor_globals(
     >,
 ) {
     for (entity, mut global_transform) in &mut participants {
-        let Ok(current) = transforms.compute_global_transform(entity) else {
+        let Ok(local_transform) = local_transforms.get(entity) else {
             continue;
         };
+
+        let mut local_chain = SmallVec::<[Transform; 8]>::new();
+        local_chain.push(*local_transform);
+        let mut hierarchy_is_complete = true;
+        for ancestor in parents.iter_ancestors(entity) {
+            let Ok(ancestor_transform) = local_transforms.get(ancestor) else {
+                hierarchy_is_complete = false;
+                break;
+            };
+            local_chain.push(*ancestor_transform);
+        }
+        if !hierarchy_is_complete {
+            continue;
+        }
+
+        let Some(root_transform) = local_chain.pop() else {
+            continue;
+        };
+        let mut current = GlobalTransform::from(root_transform);
+        while let Some(local_transform) = local_chain.pop() {
+            current = current.mul_transform(local_transform);
+        }
         global_transform.set_if_neq(current);
     }
 }
@@ -621,7 +647,7 @@ pub(super) struct AnchoredWorldPanelPose {
 
 /// Inserts the valence world relation for world-space panel attachments.
 pub(super) fn on_panel_attachment_inserted(
-    inserted: On<Insert, PanelAttachmentAuthored>,
+    inserted: On<Insert<PanelAttachmentAuthored>>,
     attachments: Query<(
         &PanelAttachmentAuthored,
         Option<&DiegeticPanel>,
@@ -678,7 +704,7 @@ fn reconcile_panel_anchor(
 
 /// Removes valence world-only state when panel attachment authoring is removed.
 pub(super) fn on_panel_attachment_removed(
-    removed: On<Remove, PanelAttachmentAuthored>,
+    removed: On<Remove<PanelAttachmentAuthored>>,
     mut commands: Commands,
 ) {
     commands
@@ -790,30 +816,44 @@ pub(crate) fn write_panel_anchor_offsets(
         Ref<ValenceAnchoredTo>,
         Option<&PanelComponentOwnership<ValenceAnchoredTo>>,
         Option<&MaterializedTooltip>,
+        Option<&ResolvedAnchorOffset>,
     )>,
     panel_targets: Query<(&DiegeticPanel, &GlobalTransform)>,
     widget_targets: Query<&WidgetOf, With<PanelWidget>>,
     general_targets: Query<(), With<ResolvedAnchorGeometry>>,
 ) {
-    for (entity, authored, offset, source_panel, relation, ownership, materialized) in &attachments
+    for (
+        entity,
+        authored,
+        offset,
+        source_panel,
+        relation,
+        ownership,
+        materialized,
+        current_resolved_offset,
+    ) in &attachments
     {
         if !ownership.is_some_and(|ownership| ownership.owns(entity, relation.last_changed())) {
-            lifecycle::remove_owned_component::<ResolvedAnchorOffset>(
-                &mut commands,
-                entity,
-                entity,
-            );
+            if current_resolved_offset.is_some() {
+                lifecycle::remove_owned_component::<ResolvedAnchorOffset>(
+                    &mut commands,
+                    entity,
+                    entity,
+                );
+            }
             continue;
         }
         if !matches!(
             source_panel.coordinate_space(),
             CoordinateSpace::World { .. }
         ) {
-            lifecycle::remove_owned_component::<ResolvedAnchorOffset>(
-                &mut commands,
-                entity,
-                entity,
-            );
+            if current_resolved_offset.is_some() {
+                lifecycle::remove_owned_component::<ResolvedAnchorOffset>(
+                    &mut commands,
+                    entity,
+                    entity,
+                );
+            }
             continue;
         }
         let Some(offset) = lowered_world_offset(
@@ -824,19 +864,20 @@ pub(crate) fn write_panel_anchor_offsets(
             &widget_targets,
             &general_targets,
         ) else {
-            lifecycle::remove_owned_component::<ResolvedAnchorOffset>(
-                &mut commands,
-                entity,
-                entity,
-            );
+            if current_resolved_offset.is_some() {
+                lifecycle::remove_owned_component::<ResolvedAnchorOffset>(
+                    &mut commands,
+                    entity,
+                    entity,
+                );
+            }
             continue;
         };
-        lifecycle::write_owned_component(
-            &mut commands,
-            entity,
-            entity,
-            ResolvedAnchorOffset::from(Displacement::from(offset)),
-        );
+        let resolved_offset = ResolvedAnchorOffset::from(Displacement::from(offset));
+        if current_resolved_offset == Some(&resolved_offset) {
+            continue;
+        }
+        lifecycle::write_owned_component(&mut commands, entity, entity, resolved_offset);
     }
 }
 
@@ -976,13 +1017,16 @@ mod tests {
     use bevy::prelude::AppTypeRegistry;
     use bevy::prelude::ChildOf;
     use bevy::prelude::Commands;
+    use bevy::prelude::DetectChanges;
     use bevy::prelude::Entity;
     use bevy::prelude::GlobalTransform;
     use bevy::prelude::IntoScheduleConfigs;
+    use bevy::prelude::Last;
     use bevy::prelude::MinimalPlugins;
     use bevy::prelude::PostUpdate;
     use bevy::prelude::Quat;
     use bevy::prelude::Query;
+    use bevy::prelude::Ref;
     use bevy::prelude::Res;
     use bevy::prelude::ResMut;
     use bevy::prelude::Resource;
@@ -1023,6 +1067,8 @@ mod tests {
     use crate::layout::Unit;
     use crate::panel::DiegeticPanel;
     use crate::panel::DiegeticPanelCommands;
+    use crate::panel::lifecycle;
+    use crate::panel::lifecycle::PanelComponentOwnership;
     use crate::text::DiegeticTextMeasurer;
     use crate::widgets::PanelWidget;
     use crate::widgets::PanelWidgetIndex;
@@ -1145,7 +1191,7 @@ mod tests {
         assert!(app.world().get_entity(widget).is_ok());
         assert!(app.world().get::<PanelAttachmentAuthored>(source).is_none());
         assert!(app.world().get::<ScreenWidgetAnchoredTo>(source).is_none());
-        assert!(screen_reverse_sources(app.world(), widget).is_empty());
+        assert_eq!(screen_reverse_sources(app.world(), widget), []);
     }
 
     #[test]
@@ -1188,7 +1234,7 @@ mod tests {
             Some(original_target),
         );
         assert!(app.world().get::<ScreenWidgetAnchoredTo>(source).is_none());
-        assert!(screen_reverse_sources(app.world(), widget).is_empty());
+        assert_eq!(screen_reverse_sources(app.world(), widget), []);
     }
 
     #[test]
@@ -1268,7 +1314,7 @@ mod tests {
         apply_attachment_commands(&mut app, |attachments| {
             attachments.retarget_to_widget(source_handle, second_handle);
         });
-        assert!(screen_reverse_sources(app.world(), first_widget).is_empty());
+        assert_eq!(screen_reverse_sources(app.world(), first_widget), []);
         assert_eq!(
             screen_reverse_sources(app.world(), second_widget),
             vec![source]
@@ -1277,7 +1323,7 @@ mod tests {
         apply_attachment_commands(&mut app, |attachments| {
             attachments.retarget_to_panel(source_handle, panel_handle);
         });
-        assert!(screen_reverse_sources(app.world(), second_widget).is_empty());
+        assert_eq!(screen_reverse_sources(app.world(), second_widget), []);
         assert!(app.world().get::<ScreenWidgetAnchoredTo>(source).is_none());
         assert_eq!(
             app.world()
@@ -1292,7 +1338,7 @@ mod tests {
         apply_attachment_commands(&mut app, |attachments| {
             attachments.detach(source_handle);
         });
-        assert!(screen_reverse_sources(app.world(), first_widget).is_empty());
+        assert_eq!(screen_reverse_sources(app.world(), first_widget), []);
         assert!(app.world().get::<ScreenWidgetAnchoredTo>(source).is_none());
         assert!(app.world().get::<PanelAttachmentAuthored>(source).is_none());
     }
@@ -1321,7 +1367,7 @@ mod tests {
             screen_reverse_sources(app.world(), first_widget),
             vec![source]
         );
-        assert!(screen_reverse_sources(app.world(), second_widget).is_empty());
+        assert_eq!(screen_reverse_sources(app.world(), second_widget), []);
         assert_eq!(
             app.world()
                 .get::<ScreenWidgetAnchoredTo>(source)
@@ -1530,6 +1576,245 @@ mod tests {
             panel_anchor_point(&app, source, Anchor::Center),
             target_pin + Vec3::Z * 0.5,
         );
+    }
+
+    #[test]
+    fn unrelated_transform_changes_leave_still_world_anchor_global_unchanged() {
+        let mut app = app_with_world_anchoring();
+        let (_, _, target) = spawn_pocket_like_anchor_chain(&mut app);
+        let unrelated = app.world_mut().spawn(Transform::default()).id();
+        app.insert_resource(WorldAnchorGlobalProbe::new(target));
+        app.add_systems(Last, record_world_anchor_global);
+
+        for _ in 0..4 {
+            app.world_mut()
+                .get_mut::<Transform>(unrelated)
+                .expect("unrelated entity has Transform")
+                .translation
+                .x += 0.25;
+            app.update();
+        }
+
+        let observations = &app
+            .world()
+            .resource::<WorldAnchorGlobalProbe>()
+            .observations;
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| observation.changed)
+                .collect::<Vec<_>>(),
+            [true, false, false, false],
+        );
+        assert!(
+            observations
+                .windows(2)
+                .all(|pair| pair[0].transform == pair[1].transform),
+            "a still anchor should retain Bevy's propagated world pose",
+        );
+    }
+
+    #[test]
+    fn moved_world_anchor_global_is_current_before_resolve() {
+        let mut app = app_with_world_anchoring();
+        let (root, parent, target) = spawn_pocket_like_anchor_chain(&mut app);
+        app.insert_resource(WorldAnchorGlobalProbe::new(target));
+        app.add_systems(
+            PostUpdate,
+            record_world_anchor_global
+                .after(super::refresh_world_anchor_globals)
+                .before(AnchorSystems::Resolve),
+        );
+        app.update();
+
+        app.world_mut()
+            .get_mut::<Transform>(target)
+            .expect("target has Transform")
+            .translation += Vec3::new(0.31, -0.27, 0.19);
+        let expected = propagated_global_transform(&app, root, parent, target);
+        assert_ne!(
+            expected,
+            child_first_global_transform(&app, root, parent, target),
+            "fixture must expose multiplication-order rounding",
+        );
+
+        app.update();
+
+        assert_eq!(
+            app.world()
+                .resource::<WorldAnchorGlobalProbe>()
+                .observations
+                .last()
+                .expect("the pre-resolve probe ran")
+                .transform,
+            expected,
+        );
+    }
+
+    #[test]
+    fn moved_world_anchor_ancestor_is_current_before_resolve() {
+        let mut app = app_with_world_anchoring();
+        let (root, parent, target) = spawn_pocket_like_anchor_chain(&mut app);
+        app.insert_resource(WorldAnchorGlobalProbe::new(target));
+        app.add_systems(
+            PostUpdate,
+            record_world_anchor_global
+                .after(super::refresh_world_anchor_globals)
+                .before(AnchorSystems::Resolve),
+        );
+        app.update();
+
+        app.world_mut()
+            .get_mut::<Transform>(parent)
+            .expect("ancestor has Transform")
+            .rotate_local_y(0.23);
+        let expected = propagated_global_transform(&app, root, parent, target);
+        assert_ne!(
+            expected,
+            child_first_global_transform(&app, root, parent, target),
+            "fixture must expose multiplication-order rounding",
+        );
+
+        app.update();
+
+        assert_eq!(
+            app.world()
+                .resource::<WorldAnchorGlobalProbe>()
+                .observations
+                .last()
+                .expect("the pre-resolve probe ran")
+                .transform,
+            expected,
+        );
+    }
+
+    #[test]
+    fn still_world_anchor_leaves_resolved_offset_unchanged() {
+        let mut app = app_with_world_anchoring();
+        let target = app
+            .world_mut()
+            .spawn((world_panel(Anchor::Center), Transform::default()))
+            .id();
+        let source = app
+            .world_mut()
+            .spawn((
+                world_panel(Anchor::Center),
+                Transform::default(),
+                test_attachment(target, Anchor::Center, Anchor::Center),
+            ))
+            .id();
+        app.insert_resource(ResolvedOffsetChangeProbe::new(source));
+        app.add_systems(Last, record_resolved_offset_change);
+
+        for _ in 0..4 {
+            app.update();
+        }
+
+        assert_eq!(
+            app.world()
+                .resource::<ResolvedOffsetChangeProbe>()
+                .observations,
+            [
+                ResolvedOffsetChangeState::Changed,
+                ResolvedOffsetChangeState::Unchanged,
+                ResolvedOffsetChangeState::Unchanged,
+                ResolvedOffsetChangeState::Unchanged,
+            ],
+        );
+    }
+
+    #[test]
+    fn changed_world_anchor_offset_is_written_in_the_same_frame() {
+        let mut app = app_with_world_anchoring();
+        let target = app
+            .world_mut()
+            .spawn((world_panel(Anchor::Center), Transform::default()))
+            .id();
+        let source = app
+            .world_mut()
+            .spawn((
+                world_panel(Anchor::Center),
+                Transform::default(),
+                test_attachment(target, Anchor::Center, Anchor::Center),
+            ))
+            .id();
+        app.insert_resource(ResolvedOffsetChangeProbe::new(source));
+        app.add_systems(Last, record_resolved_offset_change);
+
+        app.update();
+        app.world_mut()
+            .entity_mut(source)
+            .insert(PanelAnchorOffset::new(Mm(50.0), Mm(25.0)).with_z(Mm(10.0)));
+        app.update();
+
+        assert_close_3d(resolved_offset(&app, source), Vec3::new(0.5, -0.25, 0.1));
+        assert_eq!(
+            app.world()
+                .resource::<ResolvedOffsetChangeProbe>()
+                .observations,
+            [
+                ResolvedOffsetChangeState::Changed,
+                ResolvedOffsetChangeState::Changed,
+            ],
+        );
+
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<ResolvedOffsetChangeProbe>()
+                .observations,
+            [
+                ResolvedOffsetChangeState::Changed,
+                ResolvedOffsetChangeState::Changed,
+                ResolvedOffsetChangeState::Unchanged,
+            ],
+        );
+    }
+
+    #[test]
+    fn screen_attachment_without_offset_queues_no_cleanup() {
+        let mut app = app_with_world_anchoring();
+        let target = app
+            .world_mut()
+            .spawn((screen_panel(), Transform::default()))
+            .id();
+        let authored = PanelAttachmentAuthored::new(target, Anchor::Center, Anchor::Center);
+        let source = app
+            .world_mut()
+            .spawn((
+                screen_panel(),
+                Transform::default(),
+                authored,
+                PanelAnchorOffset::ZERO,
+                authored.valence_relation(),
+            ))
+            .id();
+        lifecycle::seed_owned_component(
+            app.world_mut(),
+            source,
+            source,
+            ResolvedAnchorOffset::from(Displacement::from(Vec3::ZERO)),
+        );
+        app.world_mut()
+            .entity_mut(source)
+            .remove::<ResolvedAnchorOffset>();
+        assert!(
+            app.world()
+                .get::<PanelComponentOwnership<ResolvedAnchorOffset>>(source)
+                .is_some(),
+            "the ownership record is a canary for an executed cleanup command",
+        );
+
+        for _ in 0..3 {
+            app.update();
+            assert!(app.world().get::<ResolvedAnchorOffset>(source).is_none());
+            assert!(
+                app.world()
+                    .get::<PanelComponentOwnership<ResolvedAnchorOffset>>(source)
+                    .is_some(),
+                "an offset-less attachment should not execute cleanup",
+            );
+        }
     }
 
     #[test]
@@ -1837,6 +2122,49 @@ mod tests {
     struct PoseLift(f32);
 
     #[derive(Resource)]
+    struct ResolvedOffsetChangeProbe {
+        entity:       Entity,
+        observations: Vec<ResolvedOffsetChangeState>,
+    }
+
+    impl ResolvedOffsetChangeProbe {
+        const fn new(entity: Entity) -> Self {
+            Self {
+                entity,
+                observations: Vec::new(),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ResolvedOffsetChangeState {
+        Missing,
+        Changed,
+        Unchanged,
+    }
+
+    #[derive(Resource)]
+    struct WorldAnchorGlobalProbe {
+        entity:       Entity,
+        observations: Vec<WorldAnchorGlobalObservation>,
+    }
+
+    impl WorldAnchorGlobalProbe {
+        const fn new(entity: Entity) -> Self {
+            Self {
+                entity,
+                observations: Vec::new(),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct WorldAnchorGlobalObservation {
+        transform: GlobalTransform,
+        changed:   bool,
+    }
+
+    #[derive(Resource)]
     struct PendingWidgetTarget {
         owner_panel:  Entity,
         source_panel: Entity,
@@ -1868,6 +2196,37 @@ mod tests {
         let authored = PanelAttachment::new(Anchor::Center, Anchor::TopRight).with_offset(offset);
         attachments.attach_to_widget(source, widget, authored);
         pending.widget = Some(widget.entity());
+    }
+
+    fn record_resolved_offset_change(
+        mut probe: ResMut<ResolvedOffsetChangeProbe>,
+        offsets: Query<Ref<ResolvedAnchorOffset>>,
+    ) {
+        let observation =
+            offsets
+                .get(probe.entity)
+                .map_or(ResolvedOffsetChangeState::Missing, |offset| {
+                    if offset.is_changed() {
+                        ResolvedOffsetChangeState::Changed
+                    } else {
+                        ResolvedOffsetChangeState::Unchanged
+                    }
+                });
+        probe.observations.push(observation);
+    }
+
+    fn record_world_anchor_global(
+        mut probe: ResMut<WorldAnchorGlobalProbe>,
+        transforms: Query<Ref<GlobalTransform>>,
+    ) {
+        let transform = transforms
+            .get(probe.entity)
+            .expect("world anchor has GlobalTransform");
+        let observation = WorldAnchorGlobalObservation {
+            transform: *transform,
+            changed:   transform.is_changed(),
+        };
+        probe.observations.push(observation);
     }
 
     fn expected_widget_center_and_corner(
@@ -1911,6 +2270,58 @@ mod tests {
         });
         app.add_plugins(HeadlessLayoutPlugin);
         app
+    }
+
+    fn spawn_pocket_like_anchor_chain(app: &mut App) -> (Entity, Entity, Entity) {
+        let root = app
+            .world_mut()
+            .spawn(
+                Transform::from_xyz(12.4, 5.2, -0.2)
+                    .with_rotation(Quat::from_rotation_y(0.041_99))
+                    .with_scale(Vec3::new(1.172_636_9, 1.172_636_9, 1.172_636_9)),
+            )
+            .id();
+        let parent = app
+            .world_mut()
+            .spawn((
+                Transform::from_xyz(-0.340_474_9, 0.010_594_409, 0.07)
+                    .with_rotation(Quat::from_rotation_z(-0.37))
+                    .with_scale(Vec3::new(0.91, 1.13, 0.82)),
+                ChildOf(root),
+            ))
+            .id();
+        let target = app
+            .world_mut()
+            .spawn((
+                world_panel(Anchor::Center),
+                Transform::from_xyz(0.29, -0.53, 0.11)
+                    .with_rotation(Quat::from_rotation_x(0.28))
+                    .with_scale(Vec3::new(0.73, 1.21, 0.94)),
+                ChildOf(parent),
+            ))
+            .id();
+        (root, parent, target)
+    }
+
+    fn propagated_global_transform(
+        app: &App,
+        root: Entity,
+        parent: Entity,
+        target: Entity,
+    ) -> GlobalTransform {
+        GlobalTransform::from(transform(app, root))
+            .mul_transform(transform(app, parent))
+            .mul_transform(transform(app, target))
+    }
+
+    fn child_first_global_transform(
+        app: &App,
+        root: Entity,
+        parent: Entity,
+        target: Entity,
+    ) -> GlobalTransform {
+        transform(app, root)
+            * (transform(app, parent) * GlobalTransform::from(transform(app, target)))
     }
 
     fn world_panel(anchor: Anchor) -> DiegeticPanel {

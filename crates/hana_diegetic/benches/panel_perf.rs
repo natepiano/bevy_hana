@@ -34,9 +34,15 @@ use criterion::criterion_group;
 use criterion::criterion_main;
 use criterion::measurement::WallTime;
 use fixtures::app::create_bench_app;
+use fixtures::panels::FOOTER_PANEL_SIZE;
 use fixtures::panels::PANEL_SIZE;
+use fixtures::panels::RESIZED_FOOTER_PANEL_SIZE;
 use fixtures::panels::RESIZED_PANEL_SIZE;
 use fixtures::panels::bench_panel;
+use fixtures::panels::build_diegetic_footer_rich_tree;
+use fixtures::panels::build_diegetic_footer_rich_tree_with_dim_color;
+use fixtures::panels::build_diegetic_footer_sibling_tree;
+use fixtures::panels::build_diegetic_footer_sibling_tree_with_dim_color;
 use fixtures::panels::build_diegetic_status_tree;
 use fixtures::panels::build_diegetic_status_tree_with_text_color;
 use fixtures::rows::ROW_COUNTS;
@@ -193,5 +199,318 @@ fn bench_visual_only_rebuild(group: &mut PanelBenchGroup<'_>, rows: &[StatusRow]
     });
 }
 
-criterion_group!(benches, bench_panel_layout);
+fn bench_footer_sibling_layout(c: &mut Criterion) {
+    for row_count in ROW_COUNTS {
+        let mut group = c.benchmark_group(format!("footer_sibling_{row_count}_rows"));
+        bench_footer_cold(&mut group, row_count);
+        bench_footer_no_change_update(&mut group, row_count);
+        bench_footer_resize_only(&mut group, row_count);
+        bench_footer_warm(&mut group, row_count);
+        bench_footer_color_change_full_rebuild(&mut group, row_count);
+        bench_footer_visual_only_rebuild(&mut group, row_count);
+        group.finish();
+    }
+}
+
+fn bench_footer_cold(group: &mut PanelBenchGroup<'_>, rows: usize) {
+    group.bench_function("cold", |b| {
+        b.iter_with_setup(
+            || {
+                let mut app = create_bench_app();
+                let tree = build_diegetic_footer_sibling_tree(rows);
+                let entity = app
+                    .world_mut()
+                    .spawn(bench_panel(tree, FOOTER_PANEL_SIZE))
+                    .id();
+                (app, entity)
+            },
+            |(mut app, entity)| {
+                app.update();
+                black_box(app.world().get::<ComputedDiegeticPanel>(entity));
+            },
+        );
+    });
+}
+
+fn bench_footer_no_change_update(group: &mut PanelBenchGroup<'_>, rows: usize) {
+    group.bench_function("no_change_update", |b| {
+        let mut app = create_bench_app();
+        let tree = build_diegetic_footer_sibling_tree(rows);
+        let entity = app
+            .world_mut()
+            .spawn(bench_panel(tree, FOOTER_PANEL_SIZE))
+            .id();
+        app.update();
+        b.iter(|| {
+            app.update();
+            black_box(app.world().get::<ComputedDiegeticPanel>(entity));
+        });
+    });
+}
+
+fn bench_footer_resize_only(group: &mut PanelBenchGroup<'_>, rows: usize) {
+    group.bench_function("resize_only", |b| {
+        let mut app = create_bench_app();
+        let tree = build_diegetic_footer_sibling_tree(rows);
+        let entity = app
+            .world_mut()
+            .spawn(bench_panel(tree, FOOTER_PANEL_SIZE))
+            .id();
+        app.update();
+        let mut expanded = false;
+        b.iter(|| {
+            expanded = !expanded;
+            let size = if expanded {
+                RESIZED_FOOTER_PANEL_SIZE
+            } else {
+                FOOTER_PANEL_SIZE
+            };
+            let mut panel = app
+                .world_mut()
+                .get_mut::<DiegeticPanel>(entity)
+                .expect("entity must exist");
+            panel.set_width(size);
+            panel.set_height(size);
+            app.update();
+            black_box(app.world().get::<ComputedDiegeticPanel>(entity));
+        });
+    });
+}
+
+fn bench_footer_warm(group: &mut PanelBenchGroup<'_>, rows: usize) {
+    group.bench_function("warm", |b| {
+        let mut app = create_bench_app();
+        let tree = build_diegetic_footer_sibling_tree(rows);
+        let entity = app
+            .world_mut()
+            .spawn(bench_panel(tree, FOOTER_PANEL_SIZE))
+            .id();
+        app.update();
+        b.iter(|| {
+            let tree = build_diegetic_footer_sibling_tree(rows);
+            app.world_mut()
+                .get_mut::<DiegeticPanel>(entity)
+                .expect("entity must exist")
+                .set_tree_full_rebuild(tree);
+            app.update();
+            black_box(app.world().get::<ComputedDiegeticPanel>(entity));
+        });
+    });
+}
+
+fn bench_footer_color_change_full_rebuild(group: &mut PanelBenchGroup<'_>, rows: usize) {
+    group.bench_function("color_change_full_rebuild", |b| {
+        let mut app = create_bench_app();
+        let tree = build_diegetic_footer_sibling_tree(rows);
+        let entity = app
+            .world_mut()
+            .spawn(bench_panel(tree, FOOTER_PANEL_SIZE))
+            .id();
+        app.update();
+        let mut toggle = false;
+        b.iter(|| {
+            toggle = !toggle;
+            let color = if toggle {
+                Color::srgb(0.6, 0.0, 0.0)
+            } else {
+                Color::srgb(0.0, 0.0, 0.6)
+            };
+            let tree = build_diegetic_footer_sibling_tree_with_dim_color(rows, color);
+            app.world_mut()
+                .get_mut::<DiegeticPanel>(entity)
+                .expect("entity must exist")
+                .set_tree_full_rebuild(tree);
+            app.update();
+            black_box(app.world().get::<ComputedDiegeticPanel>(entity));
+        });
+    });
+}
+
+fn bench_footer_visual_only_rebuild(group: &mut PanelBenchGroup<'_>, rows: usize) {
+    group.bench_function("visual_only_rebuild", |b| {
+        let mut app = create_bench_app();
+        let tree = build_diegetic_footer_sibling_tree(rows);
+        let entity = app
+            .world_mut()
+            .spawn(bench_panel(tree, FOOTER_PANEL_SIZE))
+            .id();
+        app.update();
+        let mut toggle = false;
+        b.iter(|| {
+            toggle = !toggle;
+            let color = if toggle {
+                Color::srgb(0.6, 0.0, 0.0)
+            } else {
+                Color::srgb(0.0, 0.0, 0.6)
+            };
+            let tree = build_diegetic_footer_sibling_tree_with_dim_color(rows, color);
+            if let Err(error) = app.world_mut().commands().set_tree(entity, tree) {
+                error!("failed to replace benchmark footer tree: {error}");
+            }
+            app.update();
+            black_box(app.world().get::<ComputedDiegeticPanel>(entity));
+        });
+    });
+}
+
+fn bench_footer_rich_layout(c: &mut Criterion) {
+    for row_count in ROW_COUNTS {
+        let mut group = c.benchmark_group(format!("footer_rich_{row_count}_rows"));
+        bench_footer_rich_cold(&mut group, row_count);
+        bench_footer_rich_no_change_update(&mut group, row_count);
+        bench_footer_rich_resize_only(&mut group, row_count);
+        bench_footer_rich_warm(&mut group, row_count);
+        bench_footer_rich_color_change_full_rebuild(&mut group, row_count);
+        bench_footer_rich_visual_only_rebuild(&mut group, row_count);
+        group.finish();
+    }
+}
+
+fn bench_footer_rich_cold(group: &mut PanelBenchGroup<'_>, rows: usize) {
+    group.bench_function("cold", |b| {
+        b.iter_with_setup(
+            || {
+                let mut app = create_bench_app();
+                let tree = build_diegetic_footer_rich_tree(rows);
+                let entity = app
+                    .world_mut()
+                    .spawn(bench_panel(tree, FOOTER_PANEL_SIZE))
+                    .id();
+                (app, entity)
+            },
+            |(mut app, entity)| {
+                app.update();
+                black_box(app.world().get::<ComputedDiegeticPanel>(entity));
+            },
+        );
+    });
+}
+
+fn bench_footer_rich_no_change_update(group: &mut PanelBenchGroup<'_>, rows: usize) {
+    group.bench_function("no_change_update", |b| {
+        let mut app = create_bench_app();
+        let tree = build_diegetic_footer_rich_tree(rows);
+        let entity = app
+            .world_mut()
+            .spawn(bench_panel(tree, FOOTER_PANEL_SIZE))
+            .id();
+        app.update();
+        b.iter(|| {
+            app.update();
+            black_box(app.world().get::<ComputedDiegeticPanel>(entity));
+        });
+    });
+}
+
+fn bench_footer_rich_resize_only(group: &mut PanelBenchGroup<'_>, rows: usize) {
+    group.bench_function("resize_only", |b| {
+        let mut app = create_bench_app();
+        let tree = build_diegetic_footer_rich_tree(rows);
+        let entity = app
+            .world_mut()
+            .spawn(bench_panel(tree, FOOTER_PANEL_SIZE))
+            .id();
+        app.update();
+        let mut expanded = false;
+        b.iter(|| {
+            expanded = !expanded;
+            let size = if expanded {
+                RESIZED_FOOTER_PANEL_SIZE
+            } else {
+                FOOTER_PANEL_SIZE
+            };
+            let mut panel = app
+                .world_mut()
+                .get_mut::<DiegeticPanel>(entity)
+                .expect("entity must exist");
+            panel.set_width(size);
+            panel.set_height(size);
+            app.update();
+            black_box(app.world().get::<ComputedDiegeticPanel>(entity));
+        });
+    });
+}
+
+fn bench_footer_rich_warm(group: &mut PanelBenchGroup<'_>, rows: usize) {
+    group.bench_function("warm", |b| {
+        let mut app = create_bench_app();
+        let tree = build_diegetic_footer_rich_tree(rows);
+        let entity = app
+            .world_mut()
+            .spawn(bench_panel(tree, FOOTER_PANEL_SIZE))
+            .id();
+        app.update();
+        b.iter(|| {
+            let tree = build_diegetic_footer_rich_tree(rows);
+            app.world_mut()
+                .get_mut::<DiegeticPanel>(entity)
+                .expect("entity must exist")
+                .set_tree_full_rebuild(tree);
+            app.update();
+            black_box(app.world().get::<ComputedDiegeticPanel>(entity));
+        });
+    });
+}
+
+fn bench_footer_rich_color_change_full_rebuild(group: &mut PanelBenchGroup<'_>, rows: usize) {
+    group.bench_function("color_change_full_rebuild", |b| {
+        let mut app = create_bench_app();
+        let tree = build_diegetic_footer_rich_tree(rows);
+        let entity = app
+            .world_mut()
+            .spawn(bench_panel(tree, FOOTER_PANEL_SIZE))
+            .id();
+        app.update();
+        let mut toggle = false;
+        b.iter(|| {
+            toggle = !toggle;
+            let color = if toggle {
+                Color::srgb(0.6, 0.0, 0.0)
+            } else {
+                Color::srgb(0.0, 0.0, 0.6)
+            };
+            let tree = build_diegetic_footer_rich_tree_with_dim_color(rows, color);
+            app.world_mut()
+                .get_mut::<DiegeticPanel>(entity)
+                .expect("entity must exist")
+                .set_tree_full_rebuild(tree);
+            app.update();
+            black_box(app.world().get::<ComputedDiegeticPanel>(entity));
+        });
+    });
+}
+
+fn bench_footer_rich_visual_only_rebuild(group: &mut PanelBenchGroup<'_>, rows: usize) {
+    group.bench_function("visual_only_rebuild", |b| {
+        let mut app = create_bench_app();
+        let tree = build_diegetic_footer_rich_tree(rows);
+        let entity = app
+            .world_mut()
+            .spawn(bench_panel(tree, FOOTER_PANEL_SIZE))
+            .id();
+        app.update();
+        let mut toggle = false;
+        b.iter(|| {
+            toggle = !toggle;
+            let color = if toggle {
+                Color::srgb(0.6, 0.0, 0.0)
+            } else {
+                Color::srgb(0.0, 0.0, 0.6)
+            };
+            let tree = build_diegetic_footer_rich_tree_with_dim_color(rows, color);
+            if let Err(error) = app.world_mut().commands().set_tree(entity, tree) {
+                error!("failed to replace benchmark footer tree: {error}");
+            }
+            app.update();
+            black_box(app.world().get::<ComputedDiegeticPanel>(entity));
+        });
+    });
+}
+
+criterion_group!(
+    benches,
+    bench_panel_layout,
+    bench_footer_sibling_layout,
+    bench_footer_rich_layout
+);
 criterion_main!(benches);

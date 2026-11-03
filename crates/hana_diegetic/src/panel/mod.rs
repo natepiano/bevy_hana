@@ -16,9 +16,12 @@ mod gizmos;
 mod lifecycle;
 mod perf;
 mod precompose;
-mod scroll;
+pub(crate) mod scroll;
+pub(crate) mod scroll_motion;
+pub(crate) mod scroll_view;
 mod sizing;
 mod valence_provider;
+mod visible_bounds;
 
 pub use anchor_geometry::PanelAnchorEdge;
 pub use anchor_geometry::PanelAnchorEdgeEndpoints;
@@ -32,7 +35,7 @@ pub use anchor_geometry::ResolvedPanelAnchorGeometry;
 pub(crate) use anchor_geometry::screen_anchor_position;
 pub use anchoring::PanelAnchorOffset;
 pub use anchoring::PanelAttachment;
-pub(crate) use anchoring::PanelAttachmentAuthored;
+pub use anchoring::PanelAttachmentAuthored;
 pub(crate) use anchoring::ResolvedScreenPanelPosition;
 pub(crate) use anchoring::WidgetOwnerLayout;
 pub(crate) use anchoring::refresh_world_anchor_globals;
@@ -56,6 +59,8 @@ pub use builder::PanelEntityReader;
 pub use builder::Screen;
 pub use builder::WidgetEntity;
 pub use builder::World;
+use compute_layout::LateEditorLayoutNeeded;
+pub(crate) use compute_layout::late_editor_layout_needed;
 pub use conversion::PanelProjectionError;
 pub use conversion::PanelProjectionParam;
 pub use conversion::PanelScreenConversion;
@@ -97,7 +102,10 @@ use hana_valence::AnchorSystems;
 use hana_valence::HingePlugin;
 pub(crate) use lifecycle::PanelComponentOwnership;
 pub(crate) use lifecycle::PanelOwned;
+use lifecycle::PanelOwnershipTracking;
 pub(crate) use lifecycle::PanelRenderLayersOwnership;
+#[cfg(test)]
+use lifecycle::PanelSeedInsertCount;
 pub(crate) use lifecycle::remove_owned_component;
 pub(crate) use lifecycle::write_owned_component;
 pub(crate) use lifecycle::write_owned_render_layers;
@@ -118,6 +126,8 @@ pub(crate) use precompose::PrecomposeCacheEntry;
 pub use precompose::PrecomposeHelper;
 pub use scroll::ComputedScrollRecord;
 pub use scroll::ScrollExtent;
+pub use scroll::ScrollIndicatorState;
+pub use scroll::ScrollRecordDrive;
 pub use scroll::ScrollRecordUnderPoint;
 pub use sizing::AnyUnit;
 pub use sizing::CompatibleUnits;
@@ -143,6 +153,7 @@ use crate::cascade::SdfMaterial;
 use crate::cascade::ShapeMaterial;
 use crate::cascade::TextAlpha;
 use crate::cascade::TextMaterial;
+use crate::ime::ImeSystemSet;
 use crate::layout::GlyphShadowMode;
 use crate::layout::Lighting;
 use crate::layout::ShadowCasting;
@@ -170,6 +181,8 @@ pub enum PanelSystems {
     ApplyConversions,
     /// Runs `compute_panel_layouts`.
     ComputeLayout,
+    /// Solves tree edits made by IME input after the regular widget pass.
+    ComputeEditedLayout,
     /// Runs `resolve_world_panel_fit`
     /// — shrinks world panels with `Fit` axes to their content bounds.
     ResolveWorldFit,
@@ -187,17 +200,19 @@ pub enum PanelSystems {
     AnimateAnchorPose,
 }
 
-macro_rules! add_cascade_ownership_observers {
+macro_rules! add_cascade_ownership_tracking {
     ($app:expr, $($attribute:ty),+ $(,)?) => {
         $(
-            $app.add_observer(lifecycle::record_resolved_ownership::<$attribute>);
+            crate::cascade::Resolved::<$attribute>::set_insert_listener(
+                $app, lifecycle::record_resolved_ownership::<$attribute>,
+            );
             $app.add_observer(lifecycle::restore_preserved_resolved::<$attribute>);
         )+
     };
 }
 
-fn register_cascade_ownership_observers(app: &mut App) {
-    add_cascade_ownership_observers!(
+fn register_cascade_ownership_tracking(app: &mut App) {
+    add_cascade_ownership_tracking!(
         app,
         FontUnit,
         AntiAlias,
@@ -235,11 +250,17 @@ pub struct HeadlessLayoutPlugin;
 
 impl Plugin for HeadlessLayoutPlugin {
     fn build(&self, app: &mut App) {
+        #[cfg(test)]
+        app.init_resource::<PanelSeedInsertCount>();
+
         // Panels hinge onto panels, so this crate owns the hinge driver
         // rather than leaving every application to remember it. `HingePlugin`
-        // needs neither assets nor scenes, so it composes headlessly.
-        app.add_plugins(HingePlugin)
-            .add_plugins(DiagnosticsPlugin)
+        // needs neither assets nor scenes, so it composes headlessly. Another
+        // crate's plugin may have installed it first.
+        if !app.is_plugin_added::<HingePlugin>() {
+            app.add_plugins(HingePlugin);
+        }
+        app.add_plugins(DiagnosticsPlugin)
             .add_plugins(cascade::cascade_plugin::<FontUnit>())
             // `HeadlessLayoutPlugin` registers the attribute cascades because
             // `DiegeticPanel` participates even when `RenderPlugin` is absent.
@@ -250,15 +271,16 @@ impl Plugin for HeadlessLayoutPlugin {
             .add_observer(diegetic_panel::seed_panel_overrides)
             .add_observer(diegetic_panel::sync_panel_picking_on_insert);
 
-        register_cascade_ownership_observers(app);
+        register_cascade_ownership_tracking(app);
 
         app.add_observer(
             lifecycle::finalize_panel_widgets_before_despawn
                 .run_if(resource_exists::<WidgetFocusAuthority>),
         );
-        app.add_observer(lifecycle::finalize_orphaned_panel_owned)
-            .add_observer(lifecycle::teardown_panel_role)
+        app.init_resource::<PanelOwnershipTracking>();
+        app.add_observer(lifecycle::teardown_panel_role)
             .init_resource::<DiegeticPerfStats>()
+            .init_resource::<LateEditorLayoutNeeded>()
             .init_resource::<ShapedTextCache>()
             .init_resource::<PanelDefaults>()
             .init_resource::<AnchorResolveDiagnostics>()
@@ -272,6 +294,9 @@ impl Plugin for HeadlessLayoutPlugin {
                     PanelSystems::ApplyConversions.before(CascadeSet::Propagate),
                     CascadeSet::Propagate.before(PanelSystems::ComputeLayout),
                     PanelSystems::ResolveWorldFit.after(PanelSystems::ComputeLayout),
+                    PanelSystems::ComputeEditedLayout
+                        .after(ImeSystemSet::Input)
+                        .before(ImeSystemSet::UpdateEditorGeometry),
                 ),
             )
             .add_systems(
@@ -279,7 +304,26 @@ impl Plugin for HeadlessLayoutPlugin {
                 (
                     ApplyDeferred.in_set(PanelSystems::ApplyTreeChanges),
                     ApplyDeferred.in_set(PanelSystems::ApplyConversions),
+                    scroll_view::advance_scroll_views
+                        .before(PanelSystems::ComputeLayout)
+                        .run_if(
+                            bevy::ecs::schedule::common_conditions::any_with_component::<
+                                scroll_view::ScrollViewsInMotion,
+                            >,
+                        ),
                     compute_layout::compute_panel_layouts.in_set(PanelSystems::ComputeLayout),
+                    (
+                        // The text-changed observer can queue set_tree while
+                        // applying input's deferred trigger. Flush that world
+                        // queue before deciding whether layout is needed.
+                        ApplyDeferred,
+                        compute_layout::flush_editor_tree_replacements,
+                        compute_layout::mark_late_editor_layout,
+                        compute_layout::compute_panel_layouts
+                            .run_if(compute_layout::late_editor_layout_needed),
+                    )
+                        .chain()
+                        .in_set(PanelSystems::ComputeEditedLayout),
                     compute_layout::resolve_world_panel_fit.in_set(PanelSystems::ResolveWorldFit),
                 ),
             )

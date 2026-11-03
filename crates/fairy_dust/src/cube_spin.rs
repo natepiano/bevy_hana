@@ -6,6 +6,7 @@ use bevy::prelude::App;
 use bevy::prelude::Commands;
 use bevy::prelude::Component;
 use bevy::prelude::DetectChanges;
+use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::KeyCode;
 use bevy::prelude::On;
 use bevy::prelude::Quat;
@@ -23,14 +24,16 @@ use bevy::prelude::Update;
 use bevy::prelude::Vec3;
 use bevy::prelude::Virtual;
 use bevy::prelude::With;
+use bevy::prelude::related;
 use bevy_enhanced_input::prelude::Action;
 use bevy_enhanced_input::prelude::ActionSpawner;
 use bevy_enhanced_input::prelude::Actions;
+use bevy_enhanced_input::prelude::Binding;
+use bevy_enhanced_input::prelude::Bindings;
 use bevy_enhanced_input::prelude::EnhancedInputPlugin;
 use bevy_enhanced_input::prelude::InputAction;
 use bevy_enhanced_input::prelude::InputContextAppExt;
 use bevy_enhanced_input::prelude::Start;
-use bevy_enhanced_input::prelude::bindings;
 
 use crate::constants::CUBE_SPIN_PAUSE_CONTROL_ID;
 use crate::constants::CUBE_SPIN_PAUSE_CONTROL_LABEL;
@@ -40,6 +43,7 @@ use crate::ensure_plugin;
 use crate::screen_panels;
 use crate::screen_panels::ControlActivation;
 use crate::screen_panels::TitleBarControlState;
+use crate::screen_panels::TitleBarOverflowSystems;
 use crate::screen_panels::TitleChip;
 use crate::screen_panels::TitleChipActivation;
 use crate::shortcuts;
@@ -53,6 +57,66 @@ pub struct FairyDustCubeSpinTarget;
 #[derive(Component)]
 struct CubeSpinContext<M> {
     marker: PhantomData<M>,
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy::prelude::Component;
+    use bevy::prelude::Res;
+    use bevy::prelude::ResMut;
+    use bevy::prelude::Resource;
+    use bevy::prelude::Update;
+    use hana_diegetic::DiegeticPanel;
+
+    use super::*;
+    use crate::screen_panels::TitleBar;
+
+    #[derive(Component)]
+    struct SpinningCube;
+
+    #[derive(Resource, Default)]
+    struct PauseOnUpdate(bool);
+
+    fn pause_on_update(pause: Res<PauseOnUpdate>, mut spin: ResMut<CubeSpinControl<SpinningCube>>) {
+        if pause.0 && spin.mode() == CubeSpinMode::Spinning {
+            spin.toggle();
+        }
+    }
+
+    #[test]
+    fn cube_spin_change_redraws_its_chip_in_the_same_update() -> Result<(), String> {
+        let mut app = crate::sprinkle_example()
+            .with_title_bar(TitleBar::new().with_title("Spin"))
+            .with_cube_spin_config::<SpinningCube>(CubeSpinConfig::new().without_key())
+            .init_resource::<PauseOnUpdate>()
+            .add_systems(Update, pause_on_update.in_set(crate::TitleBarStateWriters))
+            .build();
+        app.update();
+        let mut panels = app.world_mut().query::<(&TitleBar, &DiegeticPanel)>();
+        let before = format!(
+            "{:?}",
+            panels
+                .single(app.world())
+                .map_err(|error| error.to_string())?
+                .1
+                .tree()
+        );
+        app.world_mut().resource_mut::<PauseOnUpdate>().0 = true;
+        app.update();
+        let after = format!(
+            "{:?}",
+            panels
+                .single(app.world())
+                .map_err(|error| error.to_string())?
+                .1
+                .tree()
+        );
+        assert_ne!(
+            before, after,
+            "cube spin chip did not redraw in the same update"
+        );
+        Ok(())
+    }
 }
 
 /// Toggle action for the cube-spin keybinding, scoped to marker `M`. Only ever
@@ -277,7 +341,13 @@ pub(crate) fn install<M: Component>(app: &mut App, config: CubeSpinConfig) {
     app.insert_resource(CubeSpinControl::<M>::new(&config));
     app.add_input_context::<CubeSpinContext<M>>();
     app.add_systems(Startup, spawn_cube_spin_action::<M>);
-    app.add_systems(Update, (sync_cube_spin_chip::<M>, spin_cube_targets::<M>));
+    app.add_systems(
+        Update,
+        (
+            sync_cube_spin_chip::<M>.in_set(TitleBarOverflowSystems::WriteState),
+            spin_cube_targets::<M>,
+        ),
+    );
     app.add_observer(toggle_cube_spin_on_start::<M>);
 }
 
@@ -291,7 +361,10 @@ fn spawn_cube_spin_action<M: Component>(mut commands: Commands, control: Res<Cub
         },
         Actions::<CubeSpinContext<M>>::spawn(SpawnWith(
             move |spawner: &mut ActionSpawner<CubeSpinContext<M>>| {
-                spawner.spawn((Action::<ToggleCubeSpin<M>>::new(), bindings![key]));
+                spawner.spawn((
+                    Action::<ToggleCubeSpin<M>>::new(),
+                    related!(Bindings[Binding::from(key)]),
+                ));
             },
         )),
     ));

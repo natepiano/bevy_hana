@@ -195,7 +195,7 @@ fn empty_member_association_produces_an_empty_typed_plan() {
     ));
 
     assert!(members.is_empty());
-    assert!(plan.connections().is_empty());
+    assert_eq!(plan.connections(), []);
 }
 
 #[test]

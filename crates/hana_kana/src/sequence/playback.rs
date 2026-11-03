@@ -3,6 +3,7 @@ use std::time::Duration;
 use bevy::ecs::component::Component;
 use bevy::ecs::reflect::ReflectComponent;
 use bevy::reflect::Reflect;
+use bevy::reflect::ReflectSerialize;
 use thiserror::Error;
 
 use super::time::SequenceTime;
@@ -30,8 +31,8 @@ pub enum SequenceCommandOutcome {
 }
 
 /// Validated normalized position within one sequence.
-#[derive(Clone, Copy, Debug, Default, PartialEq, PartialOrd, Reflect)]
-#[reflect(opaque)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, PartialOrd, Reflect, serde::Serialize)]
+#[reflect(opaque, Serialize)]
 pub struct SequencePosition(f32);
 
 impl SequencePosition {

@@ -14,6 +14,7 @@
 mod overlay_metrics;
 mod readiness;
 
+use bevy::camera::primitives::Aabb;
 use bevy::prelude::Component;
 use bevy::prelude::Reflect;
 use bevy::prelude::Transform;
@@ -26,6 +27,24 @@ pub(crate) use readiness::emit_world_text_ready;
 
 use crate::layout::ShapedLineMetrics;
 use crate::layout::TextStyle;
+
+/// The rendered glyph quads' union in a text run's local coordinates.
+///
+/// Present on a [`TextContent`] entity after its layout is shaped. The bounds
+/// include the renderer's quad padding and clipping, and refresh only when
+/// glyph geometry changes.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct DrawnTextBounds {
+    local_aabb: Aabb,
+}
+
+impl DrawnTextBounds {
+    /// Returns the union of the visible glyph quads relative to this text entity.
+    #[must_use]
+    pub const fn local_aabb(&self) -> Aabb { self.local_aabb }
+
+    pub(super) const fn new(local_aabb: Aabb) -> Self { Self { local_aabb } }
+}
 
 /// Computed layout data for a [`TextContent`] entity, read by the typography
 /// debug overlay to draw glyph bounding boxes and metric lines aligned with the
@@ -43,7 +62,7 @@ use crate::layout::TextStyle;
 /// them, which keeps its boxes and metric lines on the rendered glyphs.
 #[cfg(feature = "typography_overlay")]
 #[derive(Component, Clone, Debug)]
-pub struct ComputedWorldText {
+pub(crate) struct ComputedWorldText {
     /// `Anchor` offset Y in layout points (the panel's layout-local anchor).
     pub anchor_y:     f32,
     /// Layout-points-to-world-meters scale (the panel's `points_to_world`).
@@ -62,7 +81,7 @@ pub struct ComputedWorldText {
 /// Overlay-only metrics for one visible glyph in a [`TextContent`] run.
 #[cfg(feature = "typography_overlay")]
 #[derive(Clone, Debug)]
-pub struct ComputedGlyphMetrics {
+pub(crate) struct ComputedGlyphMetrics {
     /// Ink bounding box `[x, y, width, height]` in world units.
     pub rect:      [f32; 4],
     /// Glyph origin X for overlay callouts, in world units.
@@ -89,6 +108,7 @@ pub struct ComputedGlyphMetrics {
 /// (added with defaults if not specified).
 #[derive(Component, Clone, Debug, Reflect)]
 #[require(TextStyle, Transform, Visibility)]
+#[component(on_add = crate::render::panel_text::seed_panel_text_cascades)]
 pub struct TextContent {
     text: String,
 }

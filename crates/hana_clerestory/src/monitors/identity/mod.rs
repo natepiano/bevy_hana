@@ -147,7 +147,7 @@ pub(super) enum MonitorIdentificationError {
 pub(super) enum OperatingSystemQueryError {
     /// The platform display-configuration query failed.
     #[cfg(not(target_os = "macos"))]
-    #[error("display-configuration query failed")]
+    #[error("monitor configuration query failed")]
     DisplayConfiguration,
     /// A display-configuration notification operation failed.
     #[error(transparent)]
@@ -189,8 +189,8 @@ impl From<ConfigurationNotificationError> for MonitorIdentificationError {
 /// adapter value written by state format v4.
 ///
 /// The reporter evidence is the only input that can produce a `DeviceKey`. `DisplayIdentity`
-/// remains here only so an existing v4 file can be decoded before its entries are converted to
-/// the reporter's exact key.
+/// remains here only so a v5 or v6 record still holding v4 evidence can be matched to a live
+/// display and converted to the reporter's exact key.
 pub(super) fn classify_display_evidence(
     evidence: &native::QualifiedEvidence,
 ) -> (DisplayIdentityEvidence, DisplayIdentity) {

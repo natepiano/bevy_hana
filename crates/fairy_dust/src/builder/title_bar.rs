@@ -1,19 +1,25 @@
 //! `TitleBarBuilder` impls.
 
+use std::marker::PhantomData;
+
 use bevy::app::Plugins;
+use bevy::ecs::change_detection::Tick;
 use bevy::ecs::schedule::IntoScheduleConfigs;
 use bevy::ecs::schedule::ScheduleLabel;
 use bevy::ecs::system::ScheduleSystem;
+use bevy::ecs::system::SystemChangeTick;
 use bevy::prelude::AppExit;
 use bevy::prelude::Bundle;
 use bevy::prelude::Component;
 use bevy::prelude::DetectChanges;
 use bevy::prelude::FromWorld;
+use bevy::prelude::Last;
 use bevy::prelude::On;
-use bevy::prelude::PostUpdate;
 use bevy::prelude::Query;
 use bevy::prelude::Res;
+use bevy::prelude::ResMut;
 use bevy::prelude::Resource;
+use bevy::prelude::Update;
 use bevy::prelude::With;
 use hana_lagrange::AnimationBegin;
 use hana_lagrange::AnimationEnd;
@@ -33,6 +39,7 @@ use crate::screen_panels::ControlActivation;
 use crate::screen_panels::DescriptionPanel;
 use crate::screen_panels::TitleBar;
 use crate::screen_panels::TitleBarControlState;
+use crate::screen_panels::TitleBarOverflowSystems;
 use crate::screen_panels::TitleChipActivation;
 
 /// Builder returned by [`SprinkleBuilder::with_title_bar`] for wiring chip
@@ -46,6 +53,54 @@ use crate::screen_panels::TitleChipActivation;
 /// and returns to the normal [`SprinkleBuilder`] chain.
 pub struct TitleBarBuilder<S> {
     pub(super) parent: SprinkleBuilder<S>,
+}
+
+#[derive(Resource)]
+struct WiredChipRead<R: Resource> {
+    first_read_tick:  Tick,
+    read_this_update: bool,
+    warned:           bool,
+    late_writes:      usize,
+    resource:         PhantomData<fn() -> R>,
+}
+
+impl<R: Resource> Default for WiredChipRead<R> {
+    fn default() -> Self {
+        Self {
+            first_read_tick:  Tick::default(),
+            read_this_update: false,
+            warned:           false,
+            late_writes:      0,
+            resource:         PhantomData,
+        }
+    }
+}
+
+/// Warns once when `R` changes after the first chip sync read it this update.
+/// It runs in `Last`, so a `Last` system ordered after it, and a removal of
+/// `R`, are outside its reach.
+fn check_wired_chip_write<R: Resource>(
+    state: Option<Res<R>>,
+    mut read: ResMut<WiredChipRead<R>>,
+    tick: SystemChangeTick,
+) {
+    if read.read_this_update {
+        if let Some(state) = state
+            && state
+                .last_changed()
+                .is_newer_than(read.first_read_tick, tick.this_run())
+        {
+            read.late_writes += 1;
+            if !read.warned {
+                bevy::log::warn!(
+                    "{} changed after its title-bar chip sync; put its writer in TitleBarStateWriters",
+                    std::any::type_name::<R>()
+                );
+                read.warned = true;
+            }
+        }
+        read.read_this_update = false;
+    }
 }
 
 impl<S> TitleBarBuilder<S> {
@@ -86,7 +141,10 @@ impl<S> TitleBarBuilder<S> {
     /// chip is updated whenever `R` changes (including the first frame after
     /// the resource is inserted). Use this for sticky toggles like
     /// "debug outlines on/off" — pair an enum resource with a closure that
-    /// matches on its variants.
+    /// matches on its variants. Put other systems that write `R` in
+    /// [`crate::TitleBarStateWriters`] for a redraw in the same update.
+    /// Fairy Dust shortcut handlers already run before the chip sync; callers
+    /// never join them to that set by hand.
     #[must_use]
     pub fn wire_chip_to_state<R, F>(mut self, chip: impl Into<String>, extractor: F) -> Self
     where
@@ -94,9 +152,27 @@ impl<S> TitleBarBuilder<S> {
         F: Fn(&R) -> ControlActivation + Send + Sync + 'static,
     {
         let chip = chip.into();
+        if !self
+            .parent
+            .app
+            .world()
+            .contains_resource::<WiredChipRead<R>>()
+        {
+            self.parent.app.init_resource::<WiredChipRead<R>>();
+            self.parent
+                .app
+                .add_systems(Last, check_wired_chip_write::<R>);
+        }
         self.parent.app.add_systems(
-            PostUpdate,
-            move |state: Option<Res<R>>, mut bars: Query<&mut TitleBarControlState>| {
+            Update,
+            (move |state: Option<Res<R>>,
+                   mut bars: Query<&mut TitleBarControlState>,
+                   mut read: ResMut<WiredChipRead<R>>,
+                   tick: SystemChangeTick| {
+                if !read.read_this_update {
+                    read.first_read_tick = tick.this_run();
+                    read.read_this_update = true;
+                }
                 let Some(state) = state else { return };
                 if !state.is_changed() {
                     return;
@@ -105,7 +181,8 @@ impl<S> TitleBarBuilder<S> {
                 for mut bar in &mut bars {
                     bar.set_active(&chip, activation);
                 }
-            },
+            })
+            .in_set(TitleBarOverflowSystems::WriteState),
         );
         self
     }
@@ -281,11 +358,9 @@ impl<S> TitleBarBuilder<S> {
 
     /// Finalizes the title bar and mirrors [`App::add_observer`](bevy::app::App::add_observer).
     #[must_use]
-    pub fn add_observer<E, B, M, I>(self, observer: I) -> SprinkleBuilder<S>
+    pub fn add_observer<M, I>(self, observer: I) -> SprinkleBuilder<S>
     where
-        E: bevy::ecs::event::Event,
-        B: Bundle,
-        I: bevy::ecs::system::IntoObserverSystem<E, B, M>,
+        I: bevy::ecs::observer::IntoObserver<M>,
     {
         self.finish().add_observer(observer)
     }
@@ -447,5 +522,189 @@ impl TitleBarBuilder<WithOrbitCam> {
     #[must_use]
     pub fn with_stable_transparency(self) -> SprinkleBuilder<WithOrbitCam> {
         self.finish().with_stable_transparency()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy::input::InputSystems;
+    use bevy::prelude::App;
+    use bevy::prelude::ButtonInput;
+    use bevy::prelude::Commands;
+    use bevy::prelude::KeyCode;
+    use bevy::prelude::PreUpdate;
+    use bevy::prelude::Res;
+    use bevy::prelude::ResMut;
+    use bevy::prelude::Resource;
+    use hana_diegetic::DiegeticPanel;
+
+    use super::*;
+    use crate::TitleBarStateWriters;
+
+    #[derive(Resource, Default)]
+    struct ModeActive(bool);
+
+    #[derive(Resource, Default)]
+    struct ChangeModeOnUpdate(bool);
+
+    fn change_mode_on_update(change: Res<ChangeModeOnUpdate>, mut commands: Commands) {
+        if change.0 {
+            commands.insert_resource(ModeActive(true));
+        }
+    }
+
+    fn set_mode(change: Res<ChangeModeOnUpdate>, mut mode: ResMut<ModeActive>) {
+        if change.0 {
+            mode.0 = true;
+        }
+    }
+
+    fn toggle_mode(mut mode: ResMut<ModeActive>) { mode.0 = !mode.0; }
+
+    fn wired_test_app() -> App {
+        crate::sprinkle_example()
+            .with_title_bar(TitleBar::new().with_title("State").control("M Mode"))
+            .wire_chip_to_state::<ModeActive, _>("M Mode", |mode| {
+                if mode.0 {
+                    ControlActivation::Active
+                } else {
+                    ControlActivation::Inactive
+                }
+            })
+            .init_resource::<ModeActive>()
+            .init_resource::<ChangeModeOnUpdate>()
+            .build()
+    }
+
+    fn late_writes(app: &App) -> usize {
+        app.world()
+            .resource::<WiredChipRead<ModeActive>>()
+            .late_writes
+    }
+
+    #[test]
+    fn update_writer_after_chip_sync_is_detected() {
+        let mut app = wired_test_app();
+        app.add_systems(Update, set_mode.after(TitleBarOverflowSystems::Read));
+        app.update();
+        app.world_mut().resource_mut::<ChangeModeOnUpdate>().0 = true;
+        app.update();
+        assert_eq!(late_writes(&app), 1);
+    }
+
+    #[test]
+    fn joined_update_writer_does_not_trigger_late_write_check() {
+        let mut app = wired_test_app();
+        app.add_systems(Update, set_mode.in_set(TitleBarStateWriters));
+        app.update();
+        app.world_mut().resource_mut::<ChangeModeOnUpdate>().0 = true;
+        app.update();
+        assert_eq!(late_writes(&app), 0);
+    }
+
+    #[test]
+    fn pre_update_writer_does_not_trigger_late_write_check() {
+        let mut app = wired_test_app();
+        app.add_systems(PreUpdate, set_mode);
+        app.update();
+        app.world_mut().resource_mut::<ChangeModeOnUpdate>().0 = true;
+        app.update();
+        assert_eq!(late_writes(&app), 0);
+    }
+
+    #[test]
+    fn resource_change_between_updates_does_not_trigger_late_write_check() {
+        let mut app = wired_test_app();
+        app.update();
+        app.world_mut().resource_mut::<ModeActive>().0 = true;
+        app.update();
+        assert_eq!(late_writes(&app), 0);
+    }
+
+    #[test]
+    fn shortcut_updates_wired_chip_without_a_late_write() -> Result<(), String> {
+        let mut app = crate::sprinkle_example()
+            .with_title_bar(TitleBar::new().with_title("State").control("M Mode"))
+            .wire_chip_to_state::<ModeActive, _>("M Mode", |mode| {
+                if mode.0 {
+                    ControlActivation::Active
+                } else {
+                    ControlActivation::Inactive
+                }
+            })
+            .init_resource::<ModeActive>()
+            .with_shortcut(KeyCode::KeyJ, toggle_mode)
+            .build();
+        app.update();
+
+        app.add_systems(
+            PreUpdate,
+            (|mut keys: ResMut<ButtonInput<KeyCode>>| keys.press(KeyCode::KeyJ))
+                .after(InputSystems),
+        );
+        app.update();
+
+        assert!(app.world().resource::<ModeActive>().0);
+        assert_eq!(late_writes(&app), 0);
+        let mut states = app.world_mut().query::<&TitleBarControlState>();
+        assert_eq!(
+            states
+                .single(app.world())
+                .map_err(|error| error.to_string())?
+                .activation("M Mode"),
+            ControlActivation::Active
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wired_resource_redraws_its_chip_in_the_same_update() -> Result<(), String> {
+        let mut app = crate::sprinkle_example()
+            .with_title_bar(TitleBar::new().with_title("State").control("M Mode"))
+            .wire_chip_to_state::<ModeActive, _>("M Mode", |mode| {
+                if mode.0 {
+                    ControlActivation::Active
+                } else {
+                    ControlActivation::Inactive
+                }
+            })
+            .init_resource::<ModeActive>()
+            .init_resource::<ChangeModeOnUpdate>()
+            .add_systems(Update, change_mode_on_update.in_set(TitleBarStateWriters))
+            .build();
+        app.update();
+        let mut panels = app.world_mut().query::<(&TitleBar, &DiegeticPanel)>();
+        let before = format!(
+            "{:?}",
+            panels
+                .single(app.world())
+                .map_err(|error| error.to_string())?
+                .1
+                .tree()
+        );
+
+        app.world_mut().resource_mut::<ChangeModeOnUpdate>().0 = true;
+        app.update();
+        let after = format!(
+            "{:?}",
+            panels
+                .single(app.world())
+                .map_err(|error| error.to_string())?
+                .1
+                .tree()
+        );
+        assert_ne!(
+            before, after,
+            "chip tree did not redraw with resource change"
+        );
+        let mut states = app.world_mut().query::<&TitleBarControlState>();
+        assert_eq!(
+            states
+                .single(app.world())
+                .map_err(|error| error.to_string())?
+                .activation("M Mode"),
+            ControlActivation::Active
+        );
+        Ok(())
     }
 }

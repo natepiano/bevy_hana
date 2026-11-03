@@ -1,11 +1,12 @@
 use bevy::prelude::Event;
 use bevy::prelude::Reflect;
 use bevy::prelude::World;
-use bevy::reflect::FromType;
+use bevy::reflect::CreateTypeData;
 use bevy_enhanced_input::prelude::CustomInput;
 
 use super::Capability;
 use super::HoldPhase;
+use super::capability::CommandToggleState;
 use super::registry;
 
 /// Metadata declaration for a semantic event that can be invoked from a keymap.
@@ -21,6 +22,12 @@ pub trait KeymapCommand: Event + Reflect {
     const DESCRIPTION: &'static str;
     /// Keymap binding capability declared for this command.
     const CAPABILITY: Capability;
+
+    /// Reads the current feature state, or identifies a command without toggle behavior.
+    ///
+    /// A `command!` declaration with `toggle_state: reader` calls that reader with the live world.
+    #[must_use]
+    fn toggle_state(_world: &World) -> CommandToggleState { CommandToggleState::NotToggle }
 
     /// Constructs this event when the command registry dispatches it.
     #[must_use]
@@ -46,24 +53,34 @@ pub struct ReflectKeymapCommand {
     pub description:                   &'static str,
     /// Keymap binding capability.
     pub capability:                    Capability,
+    read_toggle_state:                 fn(&World) -> CommandToggleState,
     pub(super) dispatch:               fn(&mut World),
     pub(super) register_held_observer: fn(&mut World, CustomInput),
 }
 
-impl<T> FromType<T> for ReflectKeymapCommand
+impl<T> CreateTypeData<T> for ReflectKeymapCommand
 where
     T: KeymapCommand,
     for<'a> T::Trigger<'a>: Default,
 {
-    fn from_type() -> Self {
+    fn create_type_data(_input: ()) -> Self {
         Self {
             id:                     T::ID,
             title:                  T::TITLE,
             description:            T::DESCRIPTION,
             capability:             T::CAPABILITY,
+            read_toggle_state:      T::toggle_state,
             dispatch:               dispatch_command::<T>,
             register_held_observer: registry::register_held_observer::<T>,
         }
+    }
+}
+
+impl ReflectKeymapCommand {
+    /// Reads this command's declared On/Off state from the live application world.
+    #[must_use]
+    pub fn toggle_state(&self, world: &World) -> CommandToggleState {
+        (self.read_toggle_state)(world)
     }
 }
 
@@ -114,6 +131,10 @@ where
 /// ```
 ///
 /// The expansion reaches the local `$crate::action!` and `$crate::event!` macros.
+///
+/// Commands that toggle a feature add `toggle_state: path_to_reader` after their description or
+/// capability. The reader takes `&World` and returns whether the feature is currently on.
+/// Binding capability remains independent of this declaration.
 #[macro_export]
 macro_rules! command {
     (
@@ -141,7 +162,7 @@ macro_rules! command {
         id: $id:literal,
         title: $title:literal,
         description: $description:literal,
-        capability: Held $(,)?
+        capability: Held $(, toggle_state: $toggle_state:path)? $(,)?
     ) => {
         compile_error!(
             "declare a hold-to-act command with `command! { held, ... }`; \
@@ -154,7 +175,7 @@ macro_rules! command {
         id: $id:literal,
         title: $title:literal,
         description: $description:literal,
-        capability: $capability:ident $(,)?
+        capability: $capability:ident $(, toggle_state: $toggle_state:path)? $(,)?
     ) => {
         $crate::command!(
             @declare
@@ -165,6 +186,7 @@ macro_rules! command {
             $title,
             $description,
             $crate::Capability::$capability
+            $(, toggle_state: $toggle_state)?
         );
     };
     (
@@ -172,7 +194,7 @@ macro_rules! command {
         event: $event:ident,
         id: $id:literal,
         title: $title:literal,
-        description: $description:literal $(,)?
+        description: $description:literal $(, toggle_state: $toggle_state:path)? $(,)?
     ) => {
         $crate::command!(
             @declare
@@ -183,9 +205,10 @@ macro_rules! command {
             $title,
             $description,
             $crate::Capability::OneShot
+            $(, toggle_state: $toggle_state)?
         );
     };
-    (@declare $event_kind:ident, $action:ident, $event:ident, $id:literal, $title:literal, $description:literal, $capability:path) => {
+    (@declare $event_kind:ident, $action:ident, $event:ident, $id:literal, $title:literal, $description:literal, $capability:path $(, toggle_state: $toggle_state:path)?) => {
         $crate::action!($action);
         $crate::command!(@event $event_kind, $event);
 
@@ -196,6 +219,11 @@ macro_rules! command {
             const TITLE:       &'static str = $title;
             const DESCRIPTION: &'static str = $description;
             const CAPABILITY:  $crate::Capability = $capability;
+            $(
+                fn toggle_state(world: &::bevy::prelude::World) -> $crate::CommandToggleState {
+                    $crate::CommandToggleState::from_enabled($toggle_state(world))
+                }
+            )?
             $crate::command!(@build $event_kind);
             $crate::command!(@hold_phase $event_kind);
         }

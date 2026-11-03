@@ -58,9 +58,6 @@ pub(crate) fn get_state_path_for_app(app_name: &str) -> Option<PathBuf> {
 }
 /// Load all window states from the given path.
 ///
-/// Supports migration from the old single-window format: if the file contains
-/// a single `PersistedWindowState`, it is wrapped as `{"primary": state}`.
-///
 /// A file that exists but cannot be decoded is copied aside first — see
 /// [`back_up_unreadable_state_file`].
 pub(super) fn load_all_states(
@@ -88,9 +85,11 @@ pub(super) fn decode_roles(
 /// Copy a state file aside before the app starts writing over it.
 ///
 /// `decode` reports a whole-file rejection for an unsupported version, an invalid envelope, or
-/// truncated RON. The caller then seeds an empty state, and the first frame that marks any window
-/// dirty writes that empty state over the file — so without this copy the user's saved positions
-/// are gone with no way back and no message saying so.
+/// truncated RON. An unsupported version includes every file older than v5, and a file with no
+/// version at all has none to probe, so it is copied under the corrupt label. The caller then seeds
+/// an empty state, and the first frame that marks any window dirty writes that empty state over the
+/// file — so without this copy the user's saved positions are gone with no way back and no message
+/// saying so.
 ///
 /// Saving is deliberately **not** suppressed afterwards. The copy already preserves the data, and
 /// refusing to write would silently stop saving window positions for the rest of the session
@@ -243,7 +242,11 @@ mod tests {
 
     #[test]
     fn save_then_load_roundtrip() {
-        let file = match NamedTempFile::new() {
+        let directory = match tempfile::tempdir() {
+            Ok(directory) => directory,
+            Err(error) => panic!("failed to create temp directory: {error}"),
+        };
+        let file = match NamedTempFile::new_in(directory.path()) {
             Ok(file) => file,
             Err(error) => panic!("failed to create temp file: {error}"),
         };
@@ -262,53 +265,87 @@ mod tests {
         assert!(loaded.contains_key(&managed_role("primary")));
     }
 
+    /// A file older than v5 is no longer read: it is copied aside under its version, and the next
+    /// save writes a current file in its place.
     #[test]
-    fn legacy_single_window_read_then_save_rewrites_in_the_current_format() {
-        let file = match NamedTempFile::new() {
-            Ok(file) => file,
-            Err(error) => panic!("failed to create temp file: {error}"),
-        };
-        let path = file.path();
-        // Legacy format uses `width`/`height` field names (pre-multi-window era)
-        let legacy_contents = "\
+    fn a_v1_or_v4_state_file_is_copied_aside_and_replaced_by_the_next_save() {
+        let v1_contents = "\
 (
-    position: Some((10, 20)),
-    width: 800,
-    height: 600,
-    monitor_index: 0,
-    mode: Windowed,
-    app_name: \"test-app\",
+    version: 1,
+    entries: [(
+        key: Primary,
+        state: (position: Some((10, 20)), width: 800, height: 600, monitor_index: 0, mode: Windowed),
+    )],
+)";
+        let v4_contents = "\
+(
+    version: 4,
+    entries: [(
+        key: Primary,
+        state: (
+            position: MonitorOffset((10, 20)),
+            logical_width: 800,
+            logical_height: 600,
+            monitor_panel: Anonymous,
+            mode: Windowed,
+        ),
+    )],
 )";
 
-        if let Err(error) = fs::write(path, legacy_contents) {
-            panic!("failed to write legacy content: {error}");
-        }
+        for (version_label, old_contents) in [("v1", v1_contents), ("v4", v4_contents)] {
+            let directory = match tempfile::tempdir() {
+                Ok(directory) => directory,
+                Err(error) => panic!("failed to create temp directory: {error}"),
+            };
+            let file = match NamedTempFile::new_in(directory.path()) {
+                Ok(file) => file,
+                Err(error) => panic!("failed to create temp file: {error}"),
+            };
+            let path = file.path();
+            if let Err(error) = fs::write(path, old_contents) {
+                panic!("failed to write {version_label} content: {error}");
+            }
 
-        let states = load_states(path);
-        assert!(states.is_some(), "expected legacy content to decode");
-        let mut states = states.unwrap_or_default();
-        for placement in states.values_mut() {
-            placement.loaded_binding_policy = LoadedBindingPolicy::Saved(sample_policy());
-        }
-        save::save_all_states(path, &states);
+            assert!(
+                load_states(path).is_none(),
+                "a {version_label} file must not decode"
+            );
 
-        let contents = fs::read_to_string(path);
-        assert!(contents.is_ok(), "expected rewritten file to be readable");
-        let contents = contents.unwrap_or_default();
-        assert!(
-            contents.contains(&format!("version: {CURRENT_STATE_VERSION}")),
-            "expected rewritten file to contain current version marker"
-        );
-        assert!(!contents.contains("monitor_index"));
-        assert!(
-            contents.contains("logical_width: 800"),
-            "expected rewritten file to contain logical_width"
-        );
+            let backup_path = path.with_file_name(format!(
+                "{}.bak.{version_label}",
+                match path.file_name().and_then(|name| name.to_str()) {
+                    Some(name) => name,
+                    None => panic!("temp file should have a name"),
+                }
+            ));
+            let backup = fs::read_to_string(&backup_path);
+            assert!(
+                backup.is_ok(),
+                "expected a backup at {backup_path:?} naming the version it could not read"
+            );
+            assert_eq!(backup.unwrap_or_default(), old_contents);
+
+            save::save_all_states(path, &HashMap::from([(primary_role(), saved_state())]));
+
+            let contents = fs::read_to_string(path).unwrap_or_default();
+            assert!(
+                contents.contains(&format!("version: {CURRENT_STATE_VERSION}")),
+                "expected the save after a {version_label} file to write the current version"
+            );
+            assert!(
+                load_states(path).is_some(),
+                "expected the save after a {version_label} file to load"
+            );
+        }
     }
 
     #[test]
     fn startup_loader_reads_and_seeds_once() {
-        let file = match NamedTempFile::new() {
+        let directory = match tempfile::tempdir() {
+            Ok(directory) => directory,
+            Err(error) => panic!("failed to create temp directory: {error}"),
+        };
+        let file = match NamedTempFile::new_in(directory.path()) {
             Ok(file) => file,
             Err(error) => panic!("failed to create temp file: {error}"),
         };
@@ -340,7 +377,11 @@ mod tests {
     /// seeds an empty state, and the first dirty frame writes that empty state over the file.
     #[test]
     fn an_undecodable_state_file_is_copied_aside_before_it_is_replaced() {
-        let file = match NamedTempFile::new() {
+        let directory = match tempfile::tempdir() {
+            Ok(directory) => directory,
+            Err(error) => panic!("failed to create temp directory: {error}"),
+        };
+        let file = match NamedTempFile::new_in(directory.path()) {
             Ok(file) => file,
             Err(error) => panic!("failed to create temp file: {error}"),
         };
@@ -368,13 +409,16 @@ mod tests {
             "expected a backup at {backup_path:?} naming the version it could not read"
         );
         assert_eq!(backup.unwrap_or_default(), future_contents);
-        let _ = fs::remove_file(&backup_path);
     }
 
     /// A file too damaged to probe still gets a backup, under a name that says so.
     #[test]
     fn an_unparseable_state_file_is_copied_aside_under_a_corrupt_label() {
-        let file = match NamedTempFile::new() {
+        let directory = match tempfile::tempdir() {
+            Ok(directory) => directory,
+            Err(error) => panic!("failed to create temp directory: {error}"),
+        };
+        let file = match NamedTempFile::new_in(directory.path()) {
             Ok(file) => file,
             Err(error) => panic!("failed to create temp file: {error}"),
         };
@@ -396,13 +440,16 @@ mod tests {
             backup_path.exists(),
             "expected a corrupt-labelled backup at {backup_path:?}"
         );
-        let _ = fs::remove_file(&backup_path);
     }
 
     /// A second failure of the same version must not overwrite the first backup.
     #[test]
     fn a_second_backup_of_the_same_version_gets_its_own_name() {
-        let file = match NamedTempFile::new() {
+        let directory = match tempfile::tempdir() {
+            Ok(directory) => directory,
+            Err(error) => panic!("failed to create temp directory: {error}"),
+        };
+        let file = match NamedTempFile::new_in(directory.path()) {
             Ok(file) => file,
             Err(error) => panic!("failed to create temp file: {error}"),
         };
@@ -425,14 +472,16 @@ mod tests {
         let second = path.with_file_name(format!("{file_name}.bak.v250.1"));
         assert!(first.exists(), "first backup missing");
         assert!(second.exists(), "second backup overwrote the first");
-        let _ = fs::remove_file(&first);
-        let _ = fs::remove_file(&second);
     }
 
     /// A readable file is never backed up — the copy is a failure path, not a save hook.
     #[test]
     fn a_decodable_state_file_is_not_copied_aside() {
-        let file = match NamedTempFile::new() {
+        let directory = match tempfile::tempdir() {
+            Ok(directory) => directory,
+            Err(error) => panic!("failed to create temp directory: {error}"),
+        };
+        let file = match NamedTempFile::new_in(directory.path()) {
             Ok(file) => file,
             Err(error) => panic!("failed to create temp file: {error}"),
         };
@@ -446,7 +495,7 @@ mod tests {
             Some(name) => name.to_string(),
             None => panic!("temp file should have a name"),
         };
-        for label in ["v3", "corrupt"] {
+        for label in [format!("v{CURRENT_STATE_VERSION}"), String::from("corrupt")] {
             let backup = path.with_file_name(format!("{file_name}.bak.{label}"));
             assert!(!backup.exists(), "unexpected backup at {backup:?}");
         }
@@ -455,7 +504,11 @@ mod tests {
     /// The write lands via a temporary file, and that temporary is gone once it succeeds.
     #[test]
     fn a_successful_save_leaves_no_temporary_file_behind() {
-        let file = match NamedTempFile::new() {
+        let directory = match tempfile::tempdir() {
+            Ok(directory) => directory,
+            Err(error) => panic!("failed to create temp directory: {error}"),
+        };
+        let file = match NamedTempFile::new_in(directory.path()) {
             Ok(file) => file,
             Err(error) => panic!("failed to create temp file: {error}"),
         };

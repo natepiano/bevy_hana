@@ -22,7 +22,7 @@ tween = ["dep:bevy_tween"]
 bevy_app       = { workspace = true }
 bevy_asset     = { workspace = true }
 bevy_ecs       = { workspace = true }
-bevy_math      = { workspace = true, features = ["curve"] }
+bevy_math      = { workspace = true }
 bevy_platform  = { workspace = true }
 bevy_reflect   = { workspace = true }
 bevy_scene     = { workspace = true }
@@ -40,6 +40,7 @@ tracing        = { workspace = true }
 # startup opens ALSA -> PipeWire -> D-Bus and asks the realtime portal for
 # priority with no timeout, which strands headless test processes forever.
 bevy                = { workspace = true, features = ["2d", "3d", "ui"] }
+bevy_curve          = { workspace = true }
 bevy_enhanced_input = { workspace = true }
 fairy_dust          = { workspace = true }
 hana_diegetic       = { workspace = true }

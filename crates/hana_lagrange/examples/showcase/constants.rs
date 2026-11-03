@@ -1,6 +1,6 @@
 use std::f32::consts::PI;
 
-use bevy::math::curve::easing::EaseFunction;
+use bevy::curve::easing::EaseFunction;
 use bevy::prelude::Color;
 use bevy::prelude::Vec3;
 
@@ -84,7 +84,7 @@ pub(super) const EVENT_LOG_WIDTH: f32 = 272.0;
 pub(super) const EVENT_LOG_ZOOM_CANCELLED: &str = "ZoomEnd\n  reason=Cancelled";
 pub(super) const EVENT_LOG_ZOOM_COMPLETED: &str = "ZoomEnd\n  reason=Completed";
 pub(super) const LOG_CLEAR_HINT_TEXT: &str = "⌫ clear";
-pub(super) const LOG_SCROLL_HINT_TEXT: &str = "↑↓ scroll log";
+pub(super) const LOG_SCROLL_HINT_TEXT: &str = "↑ / ↓ scroll log";
 
 // gizmos
 pub(super) const GIZMO_DEPTH_BIAS: f32 = -0.005;

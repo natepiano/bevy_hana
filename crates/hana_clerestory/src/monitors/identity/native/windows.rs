@@ -47,6 +47,7 @@ use super::MonitorEvidenceObservation;
 use super::attachment_path_when_unreported;
 use crate::Platform;
 use crate::constants::DISPLAY_CONFIG_ACQUISITION_ATTEMPTS;
+use crate::monitors::DisplayPhysicalSize;
 use crate::monitors::DisplayProductName;
 #[cfg(any(test, feature = "test"))]
 use crate::monitors::identity;
@@ -59,7 +60,7 @@ use crate::monitors::identity::edid::EdidIdentityEvidence;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(in crate::monitors) enum QualifiedEvidence {
-    WindowsEdid(EdidIdentityEvidence),
+    WindowsEdid(EdidIdentityEvidence, DisplayPhysicalSize),
     #[cfg(any(test, feature = "test"))]
     Synthetic(Vec<u8>),
 }
@@ -68,7 +69,7 @@ impl QualifiedEvidence {
     /// Bytes that identify the physical display and nothing about this process or this boot.
     pub(in crate::monitors::identity) fn stable_bytes(&self) -> &[u8] {
         match self {
-            Self::WindowsEdid(edid) => edid.stable_bytes(),
+            Self::WindowsEdid(edid, _) => edid.stable_bytes(),
             #[cfg(any(test, feature = "test"))]
             Self::Synthetic(bytes) => bytes,
         }
@@ -80,9 +81,17 @@ impl QualifiedEvidence {
         fingerprint: DisplayFingerprint,
     ) -> DisplayIdentityEvidence {
         match self {
-            Self::WindowsEdid(edid) => edid.identity_evidence(fingerprint),
+            Self::WindowsEdid(edid, _) => edid.identity_evidence(fingerprint),
             #[cfg(any(test, feature = "test"))]
             Self::Synthetic(_) => identity::synthesized_without_serial(fingerprint),
+        }
+    }
+
+    pub(in crate::monitors) const fn physical_size(&self) -> DisplayPhysicalSize {
+        match self {
+            Self::WindowsEdid(_, size) => *size,
+            #[cfg(any(test, feature = "test"))]
+            Self::Synthetic(_) => DisplayPhysicalSize::NotReported,
         }
     }
 }
@@ -96,7 +105,7 @@ pub(in crate::monitors) fn monitor_evidence(
 ) -> MonitorEvidenceObservation {
     match platform {
         Platform::Windows => MonitorEvidenceObservation {
-            identity:   windows_display_evidence(handle).map(QualifiedEvidence::WindowsEdid),
+            identity:   windows_display_evidence(handle),
             attachment: attachment_path_when_unreported(platform),
         },
         Platform::MacOs | Platform::X11 | Platform::Wayland => MonitorEvidenceObservation {
@@ -120,7 +129,7 @@ pub(in crate::monitors) const fn product_name(_: Option<&MonitorHandle>) -> Disp
 
 fn windows_display_evidence(
     handle: &MonitorHandle,
-) -> Result<EdidIdentityEvidence, MonitorIdentificationError> {
+) -> Result<QualifiedEvidence, MonitorIdentificationError> {
     let native_id = windows_native_id(handle)?;
     let mut matched_path = None;
     for path in windows_display_config_paths()? {
@@ -142,7 +151,10 @@ fn windows_display_evidence(
 
     let device_path = terminated_utf16(&target.monitorDevicePath)
         .ok_or(MonitorIdentificationError::InvalidStableIdentity)?;
-    qualify_edid(windows_edid(&device_path))
+    let edid = windows_edid(&device_path)?;
+    let physical_size = EdidEvidence::image_size(&edid);
+    EdidEvidence::qualify(edid)
+        .map(|identity| QualifiedEvidence::WindowsEdid(identity, physical_size))
 }
 
 fn windows_native_id(handle: &MonitorHandle) -> Result<String, MonitorIdentificationError> {
@@ -421,6 +433,7 @@ fn terminated_utf16(code_units: &[u16]) -> Option<Vec<u16>> {
     (terminator > 0).then(|| code_units[..=terminator].to_vec())
 }
 
+#[cfg(test)]
 fn qualify_edid(
     query: Result<Vec<u8>, MonitorIdentificationError>,
 ) -> Result<EdidIdentityEvidence, MonitorIdentificationError> {
@@ -456,7 +469,7 @@ mod tests {
     #[test]
     fn qualified_edid_variants_retain_the_extracted_serial_tier() {
         let identity = qualify_edid(Ok(serial_edid())).expect("fixture EDID should qualify");
-        let windows = QualifiedEvidence::WindowsEdid(identity);
+        let windows = QualifiedEvidence::WindowsEdid(identity, DisplayPhysicalSize::NotReported);
 
         assert_eq!(windows.stable_bytes(), b"42");
     }

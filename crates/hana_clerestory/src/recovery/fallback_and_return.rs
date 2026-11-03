@@ -857,7 +857,7 @@ mod tests {
             binding: first_entity,
         });
         harness.advance(2);
-        assert!(harness.applied_values(&first_device).is_empty());
+        assert_eq!(harness.applied_values(&first_device), Vec::<u8>::new());
 
         harness.report(std::slice::from_ref(&second_device));
         harness.reach_waiting_work(&first_role, WaitingWork::ReapplyRequestOwed)?;
@@ -871,21 +871,21 @@ mod tests {
         );
         harness.report(&[first_device.clone(), second_device.clone()]);
         harness.advance(4);
-        assert!(harness.applied_values(&first_device).is_empty());
+        assert_eq!(harness.applied_values(&first_device), Vec::<u8>::new());
 
         harness.app.world_mut().trigger(ReapplyConfiguration {
             binding: second_entity,
         });
         harness.advance(2);
-        assert!(harness.applied_values(&first_device).is_empty());
-        assert!(harness.applied_values(&second_device).is_empty());
+        assert_eq!(harness.applied_values(&first_device), Vec::<u8>::new());
+        assert_eq!(harness.applied_values(&second_device), Vec::<u8>::new());
 
         harness.app.world_mut().trigger(ReapplyConfiguration {
             binding: first_entity,
         });
         harness.reach_apply(&first_device)?;
         assert_eq!(harness.applied_values(&first_device), vec![7]);
-        assert!(harness.applied_values(&second_device).is_empty());
+        assert_eq!(harness.applied_values(&second_device), Vec::<u8>::new());
         Ok(())
     }
 

@@ -135,6 +135,7 @@ pub use monitors::CurrentMonitorIndex;
 pub use monitors::DisplayEnumerationSource;
 pub use monitors::DisplayFingerprint;
 pub use monitors::DisplayIdentity;
+pub use monitors::DisplayPhysicalSize;
 pub use monitors::DisplayProductName;
 pub use monitors::LiveDisplayContradictionCount;
 pub use monitors::LiveDisplayDevices;
@@ -469,7 +470,7 @@ impl Plugin for ConfiguredWindowManagerPlugin {
 /// Applications never add [`ManagedWindow`] to the primary window, so every `With<ManagedWindow>`
 /// query would skip it without this. The paired build-time pass covers a primary window that
 /// `WindowPlugin` spawned before this observer was registered.
-fn mark_primary_window_as_managed(added: On<Add, PrimaryWindow>, mut commands: Commands) {
+fn mark_primary_window_as_managed(added: On<Add<PrimaryWindow>>, mut commands: Commands) {
     commands.entity(added.entity).insert(ManagedWindow);
 }
 
@@ -487,14 +488,14 @@ fn mark_existing_primary_windows_as_managed(app: &mut App) {
 }
 
 fn mark_primary_window_for_recovery_on_return(
-    added: On<Add, PrimaryWindow>,
+    added: On<Add<PrimaryWindow>>,
     mut commands: Commands,
 ) {
     commands.entity(added.entity).insert(RecoverOnReturn);
 }
 
 fn mark_primary_window_for_recovery_on_request(
-    added: On<Add, PrimaryWindow>,
+    added: On<Add<PrimaryWindow>>,
     mut commands: Commands,
 ) {
     commands.entity(added.entity).insert(RecoverOnRequest);
@@ -603,6 +604,7 @@ pub(crate) mod tests {
     use hana_rigging::prelude::AttemptLookup;
     use hana_rigging::prelude::AttemptRef;
     use hana_rigging::prelude::AuthoredId;
+    use hana_rigging::prelude::AvailableConfiguration;
     use hana_rigging::prelude::BindingAuthoring;
     use hana_rigging::prelude::BindingPolicy;
     use hana_rigging::prelude::Bindings;
@@ -646,6 +648,7 @@ pub(crate) mod tests {
     use managed::WindowRiggingRole;
     use monitors::DisplayFingerprint;
     use monitors::MonitorReporterId;
+    use monitors::ProvisionalCurrentMonitor;
     use persistence::EstablishedWindowPlacement;
     use persistence::PersistedDisplayFingerprintV4;
     use persistence::PersistedDisplayIdentityV4;
@@ -659,6 +662,7 @@ pub(crate) mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::constants::CURRENT_STATE_VERSION;
     use crate::constants::EXACT_DISPLAY_WAIT_TIMEOUT_SECS;
     use crate::constants::SETTLE_STABILITY_SECS;
     use crate::driver::RestoreRecord;
@@ -933,11 +937,21 @@ pub(crate) mod tests {
     #[derive(Default, Resource)]
     struct PrimaryRecoveryMarkerWarnings(usize);
 
+    #[derive(Default, Resource)]
+    struct WindowRestoreMismatchObservations(usize);
+
     fn record_primary_recovery_marker_warning(
-        _added: On<Add, RecoveryMarkerConflictWarned>,
+        _added: On<Add<RecoveryMarkerConflictWarned>>,
         mut primary_recovery_marker_warnings: ResMut<PrimaryRecoveryMarkerWarnings>,
     ) {
         primary_recovery_marker_warnings.0 += 1;
+    }
+
+    fn record_window_restore_mismatch(
+        _mismatch: On<WindowRestoreMismatch>,
+        mut observations: ResMut<WindowRestoreMismatchObservations>,
+    ) {
+        observations.0 += 1;
     }
 
     fn finish_scheduled_window_completion(world: &mut World) {
@@ -1317,8 +1331,7 @@ pub(crate) mod tests {
             display_fingerprint: DisplayFingerprint,
         ) -> Result<(), String> {
             let contents = format!(
-                "(\n    version: {},\n    entries: [\n        (\n            key: Primary,\n            state: (\n                position: MonitorOffset((40, 30)),\n                logical_width: 640,\n                logical_height: 480,\n                monitor_panel: Fingerprinted(({})),\n                mode: Windowed,\n                app_name: \"startup-test\",\n            ),\n        ),\n    ],\n)\n",
-                4,
+                "(\n    version: 5,\n    entries: [\n        (\n            key: Primary,\n            state: (\n                target: AwaitingLegacyEvidence(Fingerprinted({})),\n                position: MonitorOffset((40, 30)),\n                logical_width: 640,\n                logical_height: 480,\n                mode: Windowed,\n                app_name: \"startup-test\",\n            ),\n        ),\n    ],\n)\n",
                 display_fingerprint.get(),
             );
             let PersistedWindowStateDecodeOutcome::Decoded(decoded) =
@@ -1349,7 +1362,8 @@ pub(crate) mod tests {
         fn write_classified_primary_placement(&self, evidence: &[u8]) -> Result<DeviceKey, String> {
             let display_fingerprint = DisplayFingerprint::from_evidence_bytes(evidence);
             let contents = format!(
-                "(\n    version: 5,\n    entries: [\n        (\n            key: Primary,\n            state: (\n                target: Classified((kind: Display, id: Synthesized(digest: {}))),\n                position: MonitorOffset(({}, {})),\n                logical_width: 640,\n                logical_height: 480,\n                mode: Windowed,\n                app_name: \"startup-test\",\n            ),\n        ),\n    ],\n)\n",
+                "(\n    version: {},\n    entries: [\n        (\n            key: Primary,\n            state: (\n                target: Classified((kind: Display, id: Synthesized(digest: {}))),\n                position: MonitorOffset(({}, {})),\n                logical_width: 640,\n                logical_height: 480,\n                mode: Windowed,\n                app_name: \"startup-test\",\n            ),\n        ),\n    ],\n)\n",
+                CURRENT_STATE_VERSION,
                 display_fingerprint.get(),
                 LEFT_DISPLAY_WINDOW_POSITION.x,
                 LEFT_DISPLAY_WINDOW_POSITION.y,
@@ -1407,20 +1421,21 @@ pub(crate) mod tests {
             Ok(device)
         }
 
-        /// Write a v2 file, the format that upgrades to a target no live monitor can ever match.
+        /// Write a v5 record whose target no live monitor can ever match.
         ///
-        /// `convert_v2_state_to_v4` has no display evidence to carry forward, so every v2 record
-        /// becomes `PersistedDisplayIdentityV4::Anonymous`. This fixture is that state, asserted
-        /// after decode so the test cannot silently start exercising a resolvable target.
-        /// `logical_position` decides whether the record's reconstructed window center lies on a
-        /// live display, which selects the monitor its binding is authored against.
+        /// The target is `PersistedDisplayIdentityV4::Anonymous`, which carries no display
+        /// evidence, and the position is an `Unrebased` desktop coordinate captured at scale 1.
+        /// The target is asserted after decode so the test cannot silently start exercising a
+        /// resolvable target. `logical_position` decides whether the record's reconstructed
+        /// window center lies on a live display, which selects the monitor its binding is
+        /// authored against.
         fn write_legacy_anonymous_primary_placement(
             &self,
             logical_position: IVec2,
         ) -> Result<(), String> {
             let contents = format!(
-                "(\n    version: {},\n    entries: [\n        (\n            key: Primary,\n            state: (\n                logical_position: Some(({}, {})),\n                logical_width: 640,\n                logical_height: 480,\n                monitor_scale: 1.0,\n                monitor_index: 0,\n                mode: Windowed,\n                app_name: \"startup-test\",\n            ),\n        ),\n    ],\n)\n",
-                2, logical_position.x, logical_position.y,
+                "(\n    version: 5,\n    entries: [\n        (\n            key: Primary,\n            state: (\n                target: AwaitingLegacyEvidence(Anonymous),\n                position: Unrebased((logical: ({}, {}), captured_scale: 1.0)),\n                logical_width: 640,\n                logical_height: 480,\n                mode: Windowed,\n                app_name: \"startup-test\",\n            ),\n        ),\n    ],\n)\n",
+                logical_position.x, logical_position.y,
             );
             let PersistedWindowStateDecodeOutcome::Decoded(decoded) =
                 persistence::decode_persisted_state_for_test(&contents)
@@ -1439,7 +1454,7 @@ pub(crate) mod tests {
                     PersistedDisplayIdentityV4::Anonymous,
                 )
             {
-                return Err("decoded v2 fixture did not become an anonymous target".into());
+                return Err("decoded fixture did not keep its anonymous target".into());
             }
             fs::write(self.directory.path().join("windows.ron"), contents)
                 .map_err(|error| format!("failed to write legacy persisted state: {error}"))
@@ -1774,6 +1789,18 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    fn primary_window_position(
+        harness: &ProductionPluginHarness,
+        primary_window: Entity,
+    ) -> Result<WindowPosition, String> {
+        harness
+            .app
+            .world()
+            .get::<Window>(primary_window)
+            .map(|window| window.position)
+            .ok_or_else(|| String::from("primary window entity lost its Window"))
+    }
+
     fn set_primary_window_monitor(
         harness: &mut ProductionPluginHarness,
         primary_window: Entity,
@@ -2049,6 +2076,12 @@ pub(crate) mod tests {
         harness.report_identified_display_departure(survivor_monitor)?;
         wait_for_device_unavailability(&mut harness, &departed_device)?;
         wait_for_primary_waiting_work(&mut harness, &role, recovery_marker.unavailability_work())?;
+        harness
+            .app
+            .world_mut()
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
+                SETTLE_STABILITY_SECS,
+            )));
         set_primary_window_monitor(
             &mut harness,
             primary_window,
@@ -2152,6 +2185,19 @@ pub(crate) mod tests {
             .resource::<Bindings>()
             .role_entity(role)
             .map_err(|_| format!("primary role {role} has no binding entity"))
+    }
+
+    fn primary_binding_device(
+        harness: &ProductionPluginHarness,
+        role: &RoleKey,
+    ) -> Result<DeviceKey, String> {
+        harness
+            .app
+            .world()
+            .resource::<Bindings>()
+            .binding(role)
+            .map(|binding| binding.endpoint.device.clone())
+            .map_err(|error| format!("primary window binding disappeared: {error}"))
     }
 
     fn wait_for_binding_endpoint(
@@ -3400,15 +3446,15 @@ pub(crate) mod tests {
         )
     }
 
-    /// A v1 or v2 file must still restore, which requires a `Binding` to exist for its role.
+    /// A saved record with an anonymous target must still restore, which requires a `Binding` to
+    /// exist for its role.
     ///
-    /// `device_for_legacy_display` compares a saved fingerprint against a live one, so the
-    /// `Anonymous` target every v1/v2 file upgrades into matches no monitor and
-    /// `resolve_pending` can never reclassify it. Without adopting the occupied monitor,
-    /// `author_window_binding` returns `None` forever: the window is never restored, and
-    /// `project_established` reports `AbsentBinding` so the file is never rewritten either. The
-    /// saved coordinate lies on no display, so it cannot name a monitor in place of the occupied
-    /// one.
+    /// `key_for_legacy_identity` compares a saved fingerprint against a live one, so an
+    /// `Anonymous` target matches no monitor and `resolve_pending` can never reclassify it. Without
+    /// adopting the occupied monitor, `author_window_binding` returns `None` forever: the
+    /// window is never restored, and `project_established` reports `AbsentBinding` so the file
+    /// is never rewritten either. The saved coordinate lies on no display, so it cannot name a
+    /// monitor in place of the occupied one.
     #[test]
     fn anonymous_legacy_placement_adopts_the_monitor_the_window_occupies() -> Result<(), String> {
         let mut harness = ProductionPluginHarness::new(KernelInstallation::WindowManagerOwned)?;
@@ -4116,6 +4162,118 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// A startup with no display leaves the open primary window without a binding.
+    ///
+    /// `update_current_monitor` returns early while `Monitors` is empty, so the window never gets a
+    /// `CurrentMonitor` and `author_window_bindings` never binds it. The window is still open, so
+    /// `ActiveOnly` must keep its saved record rather than read the missing binding as a closed
+    /// window.
+    #[test]
+    fn active_only_keeps_the_saved_record_for_a_primary_window_with_no_display()
+    -> Result<(), String> {
+        let mut harness = ProductionPluginHarness::new(KernelInstallation::WindowManagerOwned)?;
+        let saved_device =
+            harness.write_classified_primary_placement(IDENTIFIED_DISPLAY_EVIDENCE)?;
+        harness
+            .app
+            .insert_resource(ManagedWindowPersistence::ActiveOnly);
+        let role = persistence::primary_window_role()
+            .map_err(|error| format!("failed to create primary role: {error}"))?;
+
+        for _ in 0..STARTUP_RESTORE_UPDATE_LIMIT {
+            harness.app.update();
+        }
+
+        harness.primary_window()?;
+        assert!(harness.app.world().resource::<Monitors>().is_empty());
+        assert!(
+            harness
+                .app
+                .world()
+                .resource::<Bindings>()
+                .binding(&role)
+                .is_err()
+        );
+        let contents = fs::read_to_string(harness.directory.path().join("windows.ron"))
+            .map_err(|error| format!("no-display primary state file is unreadable: {error}"))?;
+        let PersistedWindowStateDecodeOutcome::Decoded(decoded) =
+            persistence::decode_persisted_state_for_test(&contents)
+        else {
+            return Err(String::from("no-display primary state file did not decode"));
+        };
+        let persisted = decoded.get(&role).ok_or_else(|| {
+            String::from("ActiveOnly removed the saved record of an open primary window")
+        })?;
+        assert_eq!(
+            persisted.target,
+            PersistedWindowTargetV5::Classified(saved_device)
+        );
+        assert_eq!(
+            persisted.position,
+            persistence::PersistedPosition::MonitorOffset(LEFT_DISPLAY_WINDOW_POSITION)
+        );
+        assert_eq!(
+            (persisted.logical_width, persisted.logical_height),
+            (640, 480)
+        );
+        assert_eq!(persisted.saved_window_mode, SavedWindowMode::Windowed);
+        Ok(())
+    }
+
+    /// Closing a primary window that never had a binding drops its `ActiveOnly` record on the next
+    /// update.
+    ///
+    /// The save's change guard does not watch windows. It wakes here because
+    /// `on_primary_window_removed` retires the unbound role as `RecoveryPolicy::Forget` and
+    /// `on_managed_window_removed` releases the window from `ManagedWindowRegistry`; both take
+    /// their resource mutably, which marks it changed even though neither held anything for
+    /// this window.
+    #[test]
+    fn active_only_drops_the_saved_record_when_an_unbound_primary_window_closes()
+    -> Result<(), String> {
+        let mut harness = ProductionPluginHarness::new(KernelInstallation::WindowManagerOwned)?;
+        harness.write_classified_primary_placement(IDENTIFIED_DISPLAY_EVIDENCE)?;
+        harness
+            .app
+            .insert_resource(ManagedWindowPersistence::ActiveOnly);
+        let role = persistence::primary_window_role()
+            .map_err(|error| format!("failed to create primary role: {error}"))?;
+        let state_path = harness.directory.path().join("windows.ron");
+        let decode_state_file = |stage: &str| {
+            let contents = fs::read_to_string(&state_path)
+                .map_err(|error| format!("{stage} state file is unreadable: {error}"))?;
+            match persistence::decode_persisted_state_for_test(&contents) {
+                PersistedWindowStateDecodeOutcome::Decoded(decoded) => Ok(decoded),
+                PersistedWindowStateDecodeOutcome::WholeFileRejected => {
+                    Err(format!("{stage} state file did not decode"))
+                },
+            }
+        };
+
+        for _ in 0..STARTUP_RESTORE_UPDATE_LIMIT {
+            harness.app.update();
+        }
+        let primary_window = harness.primary_window()?;
+        assert!(
+            harness
+                .app
+                .world()
+                .resource::<Bindings>()
+                .binding(&role)
+                .is_err()
+        );
+        assert!(decode_state_file("open unbound primary")?.contains_key(&role));
+
+        despawn_primary_window(&mut harness, primary_window)?;
+        harness.app.update();
+
+        assert!(
+            !decode_state_file("closed unbound primary")?.contains_key(&role),
+            "ActiveOnly kept the saved record of a closed unbound primary window"
+        );
+        Ok(())
+    }
+
     #[test]
     fn a_late_managed_window_is_authored_revealed_and_only_saves_after_a_move() -> Result<(), String>
     {
@@ -4333,6 +4491,12 @@ pub(crate) mod tests {
                 .map_err(|error| format!("failed to create primary role: {error}"))?;
             establish_window_configuration(&mut harness, &role)?;
             let right_device = device_for_identified_display(SECOND_IDENTIFIED_DISPLAY_EVIDENCE);
+            harness
+                .app
+                .world_mut()
+                .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
+                    SETTLE_STABILITY_SECS,
+                )));
             set_primary_window_monitor(
                 &mut harness,
                 primary_window,
@@ -4349,6 +4513,104 @@ pub(crate) mod tests {
                 .map_err(|error| format!("primary window binding disappeared: {error}"))?;
             assert_eq!(binding.recovery, recovery_marker.recovery_policy());
         }
+        Ok(())
+    }
+
+    /// A cross-display drag is rebound from its resting endpoint, not an intermediate position.
+    #[test]
+    fn a_window_carried_across_displays_rebinds_at_rest_without_a_mismatch() -> Result<(), String> {
+        const P1: IVec2 = IVec2::new(2_020, 120);
+        const P2: IVec2 = IVec2::new(2_100, 140);
+        const P3: IVec2 = IVec2::new(2_162, 162);
+
+        let mut harness = ProductionPluginHarness::new(KernelInstallation::WindowManagerOwned)?;
+        let (_, right) = harness.install_identified_headless_display_pair();
+        let primary_window = harness.primary_window()?;
+        set_primary_window_position(&mut harness, primary_window, LEFT_DISPLAY_WINDOW_POSITION)?;
+        harness.app.update();
+        let role = persistence::primary_window_role()
+            .map_err(|error| format!("failed to create primary role: {error}"))?;
+        establish_window_configuration(&mut harness, &role)?;
+        // The headless harness has no winit placement report to retire startup's provisional
+        // association. Establishment supplies that evidence for this post-startup drag.
+        harness
+            .app
+            .world_mut()
+            .entity_mut(primary_window)
+            .remove::<ProvisionalCurrentMonitor>();
+        let launch_device = primary_binding_device(&harness, &role)?;
+        harness
+            .app
+            .init_resource::<WindowRestoreMismatchObservations>()
+            .add_observer(record_window_restore_mismatch)
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
+                SETTLE_STABILITY_SECS / 2.0,
+            )));
+
+        for position in [P1, P2, P3] {
+            if position == P1 {
+                set_primary_window_monitor(&mut harness, primary_window, right, position)?;
+            } else {
+                set_primary_window_position(&mut harness, primary_window, position)?;
+            }
+            harness.app.update();
+
+            let observed_position = primary_window_position(&harness, primary_window)?;
+            assert_eq!(observed_position, WindowPosition::At(position));
+            let bound_device = primary_binding_device(&harness, &role)?;
+            assert_eq!(
+                bound_device, launch_device,
+                "binding changed before the window rested at {position:?}"
+            );
+        }
+
+        harness
+            .app
+            .world_mut()
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
+                SETTLE_STABILITY_SECS,
+            )));
+        harness.app.update();
+
+        let observed_position = primary_window_position(&harness, primary_window)?;
+        assert_eq!(observed_position, WindowPosition::At(P3));
+        assert_ne!(observed_position, WindowPosition::At(P1));
+        assert_ne!(observed_position, WindowPosition::At(P2));
+        assert_eq!(
+            harness
+                .app
+                .world()
+                .resource::<WindowRestoreMismatchObservations>()
+                .0,
+            0
+        );
+
+        let right_device = device_for_identified_display(SECOND_IDENTIFIED_DISPLAY_EVIDENCE);
+        let bindings = harness.app.world().resource::<Bindings>();
+        let binding = bindings
+            .binding(&role)
+            .map_err(|error| format!("primary window binding disappeared: {error}"))?;
+        assert_eq!(binding.endpoint.device, right_device);
+        let placement = match bindings
+            .configuration_for(&role)
+            .map_err(|error| format!("primary window configuration disappeared: {error}"))?
+        {
+            AvailableConfiguration::LastKnownGood(configuration)
+            | AvailableConfiguration::Requested(configuration) => configuration,
+        }
+        .downcast_ref::<WindowPlacementConfiguration>()
+        .ok_or_else(|| String::from("primary binding did not carry a window placement"))?;
+        let WindowPlacementConfiguration::Established(placement) = placement else {
+            return Err(String::from(
+                "primary binding did not carry an established placement",
+            ));
+        };
+        assert_eq!(
+            placement.position,
+            persistence::EstablishedWindowPosition::Restorable {
+                logical_offset: P3 - IVec2::new(1_920, 0),
+            }
+        );
         Ok(())
     }
 
@@ -4409,6 +4671,12 @@ pub(crate) mod tests {
                 .ok_or_else(|| String::from("primary window entity lost its Window"))?;
             window.position = WindowPosition::At(IVec2::new(2_020, 100));
         }
+        harness
+            .app
+            .world_mut()
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
+                SETTLE_STABILITY_SECS,
+            )));
         harness
             .app
             .world_mut()
@@ -4495,7 +4763,7 @@ pub(crate) mod tests {
     /// An anonymous legacy placement whose coordinate lies on no display follows the first
     /// `OnMonitor` association and keeps its saved geometry.
     ///
-    /// Such a v2 record names no display, so its binding is authored against the display
+    /// Such a record names no display, so its binding is authored against the display
     /// `update_current_monitor` reads from winit's `current_monitor()` query before Bevy inserts
     /// `OnMonitor`. On X11 that query answers before the window manager maps the window, and the
     /// first `OnMonitor` insertion lands while the role is still waiting for its first restore.

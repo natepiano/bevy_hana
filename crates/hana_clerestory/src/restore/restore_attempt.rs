@@ -19,6 +19,7 @@ use hana_rigging::prelude::DeviceAccessError;
 use hana_rigging::prelude::RoleKey;
 
 use super::target_position;
+use super::target_position::NativeWindowReadbackPosition;
 use super::target_position::PreparedPositionMeaning;
 use super::target_position::RestoreDiagnostics;
 use super::target_position::TargetPosition;
@@ -66,6 +67,38 @@ pub(crate) struct RestorePreparation {
 pub(crate) struct WindowRestoreAttempt {
     role:   RoleKey,
     source: RestorePreparationSource,
+}
+
+/// Exact physical readback retained for a windowed return on the same monitor.
+#[derive(Component)]
+pub(crate) struct RetainedWindowedPhysicalPosition {
+    position: NativeWindowReadbackPosition,
+    monitor:  MonitorDescriptor,
+}
+
+impl RetainedWindowedPhysicalPosition {
+    fn apply_to(
+        &self,
+        target: &mut TargetPosition,
+        monitor: &MonitorDescriptor,
+        configuration: &WindowPlacementConfiguration,
+    ) {
+        if self.monitor == *monitor && !configuration.saved_window_mode().is_fullscreen() {
+            target.retain_physical_windowed_position(self.position);
+        }
+    }
+    pub(crate) fn retain(
+        world: &mut World,
+        entity: Entity,
+        position: NativeWindowReadbackPosition,
+        monitor: MonitorDescriptor,
+    ) {
+        world.entity_mut(entity).insert(Self { position, monitor });
+    }
+
+    pub(crate) fn clear(world: &mut World, entity: Entity) {
+        world.entity_mut(entity).remove::<Self>();
+    }
 }
 
 /// Authority that requested one window-specific target preparation.
@@ -182,6 +215,7 @@ pub(crate) fn prepare_driver_restore_targets(
         Option<&OnMonitor>,
         Option<&CurrentMonitor>,
         Has<TargetPosition>,
+        Option<&RetainedWindowedPhysicalPosition>,
     )>,
     monitors: Res<Monitors>,
     winit_monitors: Res<WinitMonitors>,
@@ -191,7 +225,9 @@ pub(crate) fn prepare_driver_restore_targets(
     _: NonSendMarker,
     #[cfg(any(test, feature = "test"))] injected_windows: Option<Res<InjectedWinitWindows>>,
 ) {
-    for (entity, restore_attempt, window, on_monitor, existing, has_target) in &preparations {
+    for (entity, restore_attempt, window, on_monitor, existing, has_target, retained) in
+        &preparations
+    {
         let NativeWindowInfo::Measured(native_window_frame) = winit_info::native_window_info(
             entity,
             #[cfg(any(test, feature = "test"))]
@@ -251,30 +287,28 @@ pub(crate) fn prepare_driver_restore_targets(
             let _ = driver_state.fail_attempt(
                 attempt,
                 DeviceAccessError::Absent {
-                    detail: format!("authorized display for role {role} is no longer live"),
+                    detail: format!("authorized monitor for role {role} is no longer live"),
                 },
             );
             commands.entity(entity).remove::<WindowRestoreAttempt>();
             continue;
         };
-        let target_position = target_position::compute_established_target_position(
+        let mut target_position = target_position::compute_established_target_position(
             &configuration,
             &descriptor,
             native_window_frame.physical_decoration(),
             current_monitor.scale,
             *platform,
         );
+        if let Some(retained) = retained {
+            retained.apply_to(&mut target_position, &descriptor, &configuration);
+        }
         let position_meaning = target_position::prepared_established_position_meaning(
             &configuration,
             &descriptor,
             *platform,
         );
-        let diagnostics = RestoreDiagnostics {
-            starting_monitor_index: current_monitor.index,
-            starting_scale:         current_monitor.scale,
-            target_scale:           target_position.target_scale,
-            monitor_scale_strategy: target_position.monitor_scale_strategy.clone(),
-        };
+        let diagnostics = restore_diagnostics(&current_monitor, &target_position);
         // A windowed X11 restore waits for `compensate_target_position` to subtract the title
         // bar height. Every other restore carries no frame to subtract, so
         // `place_window_at_saved_geometry` may run immediately.
@@ -298,6 +332,15 @@ pub(crate) fn prepare_driver_restore_targets(
         if !awaits_frame_compensation {
             commands.entity(entity).insert(X11FrameCompensated);
         }
+    }
+}
+
+fn restore_diagnostics(current: &CurrentMonitor, target: &TargetPosition) -> RestoreDiagnostics {
+    RestoreDiagnostics {
+        starting_monitor_index: current.index,
+        starting_scale:         current.scale,
+        target_scale:           target.target_scale,
+        monitor_scale_strategy: target.monitor_scale_strategy.clone(),
     }
 }
 

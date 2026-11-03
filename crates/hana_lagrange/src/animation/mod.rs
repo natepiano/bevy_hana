@@ -25,6 +25,7 @@ pub use events::CameraEventTiming;
 pub use events::CameraMoveBegin;
 pub use events::CameraMoveEnd;
 pub use events::CameraRequestPreparationError;
+pub(crate) use events::FitAnimationRequest;
 pub use events::PlayAnimation;
 use hana_kana::SequencePlaybackPlugin;
 use hana_kana::SequencePlaybackSystems;
@@ -57,6 +58,7 @@ impl Plugin for AnimationPlugin {
             .add_observer(sequence::identify_orbit_controller_installation)
             .add_observer(sequence::identify_free_flight_controller_installation)
             .add_observer(sequence::capture_play_animation)
+            .add_observer(sequence::capture_fit_animation)
             .add_observer(sequence::close_discarded_camera_sequence)
             .add_observer(sequence::remove_direct_camera_sequence)
             .add_observer(lifecycle::restore_retained_camera_state)

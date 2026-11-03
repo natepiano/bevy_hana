@@ -12,6 +12,7 @@ use bevy::prelude::Resource;
 use hana_kana::CascadeRootResource;
 
 use super::constants::CASCADE_ATTRIBUTE_BYTES;
+use crate::constants::DIAGNOSTIC_LOG_TARGET;
 use crate::layout::GlyphShadowMode;
 use crate::layout::Lighting;
 use crate::layout::ShadowCasting;
@@ -112,9 +113,9 @@ cascade_attribute!(
 cascade_attribute!(
     /// HDR text coverage-bias cascade attribute.
     ///
-    /// Analytic text automatically gains a bounded coverage adjustment as its
-    /// projected em shrinks. `0.0` leaves that adjustment unchanged. Positive
-    /// values make fractional glyph-edge pixels more opaque beyond it, which
+    /// Analytic text draws its geometric coverage at every size, so small
+    /// words keep thin strokes thin. `0.0` leaves that coverage unchanged.
+    /// Positive values make fractional glyph-edge pixels more opaque, which
     /// can compensate for dark text looking too thin when an HDR camera renders
     /// into a float target. Negative values make fractional edges thinner.
     HdrTextCoverageBias(f32),
@@ -125,8 +126,7 @@ const HDR_TEXT_COVERAGE_BIAS_MIN: f32 = -4.0;
 const HDR_TEXT_COVERAGE_BIAS_MAX: f32 = 4.0;
 
 impl HdrTextCoverageBias {
-    /// No authored HDR compensation; the shader keeps its automatic
-    /// screen-size adjustment.
+    /// No authored HDR compensation; the shader draws geometric coverage.
     pub(crate) const NO_BIAS: Self = Self(0.0);
 
     /// Value sent to `PathRenderRecord::text_coverage_bias`.
@@ -141,7 +141,7 @@ impl HdrTextCoverageBias {
                 .clamp(HDR_TEXT_COVERAGE_BIAS_MIN, HDR_TEXT_COVERAGE_BIAS_MAX)
         } else {
             warn_once!(
-                "HdrTextCoverageBias value {} is not finite; rendering text with automatic coverage adjustment only",
+                target: DIAGNOSTIC_LOG_TARGET, "HdrTextCoverageBias value {} is not finite; rendering text with geometric coverage",
                 self.0
             );
             0.0
@@ -232,9 +232,9 @@ cascade_attribute!(existing Lighting, default = Lighting::Lit);
 // Diegetic shadow-casting cascade attribute. Global default follows Bevy mesh
 // behavior: rendered content casts shadows unless a local override opts out.
 cascade_attribute!(existing ShadowCasting, default = ShadowCasting::On);
-// Glyph-shadow silhouette cascade attribute. Text casts its glyph silhouette
-// when shadow casting is enabled unless a local override opts out.
-cascade_attribute!(existing GlyphShadowMode, default = GlyphShadowMode::Cast);
+// Glyph-shadow silhouette cascade attribute. Text casts no glyph silhouette
+// unless a local override opts in with `Cast` while shadow casting is enabled.
+cascade_attribute!(existing GlyphShadowMode, default = GlyphShadowMode::None);
 // Sidedness cascade attribute. Global default is `BothSides` (world text);
 // the screen-panel construction bridge overrides it to `FrontOnly`. Consumed by
 // both glyph runs and panel lines.

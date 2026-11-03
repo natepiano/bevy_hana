@@ -6,10 +6,10 @@ use std::time::Duration;
 use bevy::camera::CameraProjection;
 use bevy::camera::RenderTarget;
 use bevy::camera::SubCameraView;
+use bevy::curve::easing::EaseFunction;
 use bevy::ecs::reflect::ReflectEvent;
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::input::mouse::AccumulatedMouseScroll;
-use bevy::math::curve::easing::EaseFunction;
 use bevy::prelude::Add;
 use bevy::prelude::App;
 use bevy::prelude::Assets;
@@ -222,7 +222,7 @@ pub(super) struct ObservedDriverRestorations(pub(super) Vec<DriverRestoration>);
 pub(super) struct SelectedDriverDespawn(pub(super) Entity);
 
 pub(super) fn camera_sequence_test_app() -> App {
-    let mut app = App::new();
+    let mut app = crate::test_app();
     app.add_plugins((MinimalPlugins, LagrangePlugin))
         .init_resource::<ButtonInput<KeyCode>>()
         .init_resource::<ButtonInput<MouseButton>>()
@@ -238,28 +238,28 @@ pub(super) fn camera_sequence_test_app() -> App {
 }
 
 pub(super) fn count_controller_override_capture(
-    _: On<Add, OrbitControllerOverrideRestoration>,
+    _: On<Add<OrbitControllerOverrideRestoration>>,
     mut counts: ResMut<ControllerOverrideTransitionCounts>,
 ) {
     counts.captured += 1;
 }
 
 pub(super) fn count_controller_override_release(
-    _: On<Remove, OrbitControllerOverrideRestoration>,
+    _: On<Remove<OrbitControllerOverrideRestoration>>,
     mut counts: ResMut<ControllerOverrideTransitionCounts>,
 ) {
     counts.released += 1;
 }
 
 pub(super) fn count_free_controller_override_capture(
-    _: On<Add, FreeFlightControllerOverrideRestoration>,
+    _: On<Add<FreeFlightControllerOverrideRestoration>>,
     mut counts: ResMut<ControllerOverrideTransitionCounts>,
 ) {
     counts.captured += 1;
 }
 
 pub(super) fn count_free_controller_override_release(
-    _: On<Remove, FreeFlightControllerOverrideRestoration>,
+    _: On<Remove<FreeFlightControllerOverrideRestoration>>,
     mut counts: ResMut<ControllerOverrideTransitionCounts>,
 ) {
     counts.released += 1;
@@ -859,12 +859,7 @@ pub(super) fn assert_selected_direct_replacement_state(
         app.world().resource::<LifecycleEventOrder>().0,
         Vec::<&str>::new()
     );
-    assert!(
-        app.world()
-            .resource::<CameraBoundaryEventOrder>()
-            .0
-            .is_empty()
-    );
+    assert_eq!(app.world().resource::<CameraBoundaryEventOrder>().0, []);
     let transitions = app.world().resource::<ControllerOverrideTransitionCounts>();
     assert_eq!((transitions.captured, transitions.released), (1, 0));
     let stash = app
@@ -931,12 +926,7 @@ pub(super) fn assert_restored_takeover_state(
         app.world().resource::<LifecycleEventOrder>().0,
         Vec::<&str>::new()
     );
-    assert!(
-        app.world()
-            .resource::<CameraBoundaryEventOrder>()
-            .0
-            .is_empty()
-    );
+    assert_eq!(app.world().resource::<CameraBoundaryEventOrder>().0, []);
     let transitions = app.world().resource::<ControllerOverrideTransitionCounts>();
     assert_eq!((transitions.captured, transitions.released), (1, 0));
     let orbit = app
@@ -1024,12 +1014,7 @@ pub(super) fn release_restored_driver_and_assert_idle(
         app.world().resource::<LifecycleEventOrder>().0,
         Vec::<&str>::new()
     );
-    assert!(
-        app.world()
-            .resource::<CameraBoundaryEventOrder>()
-            .0
-            .is_empty()
-    );
+    assert_eq!(app.world().resource::<CameraBoundaryEventOrder>().0, []);
     Ok(())
 }
 
@@ -1051,12 +1036,7 @@ pub(super) fn assert_orbit_replacement_state(
         app.world().resource::<LifecycleEventOrder>().0,
         Vec::<&str>::new()
     );
-    assert!(
-        app.world()
-            .resource::<CameraBoundaryEventOrder>()
-            .0
-            .is_empty()
-    );
+    assert_eq!(app.world().resource::<CameraBoundaryEventOrder>().0, []);
     let stash = app
         .world()
         .get::<OrbitControllerOverrideRestoration>(camera)
@@ -1151,12 +1131,7 @@ pub(super) fn assert_cross_kind_replacement_state(
         app.world().resource::<LifecycleEventOrder>().0,
         Vec::<&str>::new()
     );
-    assert!(
-        app.world()
-            .resource::<CameraBoundaryEventOrder>()
-            .0
-            .is_empty()
-    );
+    assert_eq!(app.world().resource::<CameraBoundaryEventOrder>().0, []);
     assert!(
         app.world()
             .get::<OrbitControllerOverrideRestoration>(camera)

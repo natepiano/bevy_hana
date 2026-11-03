@@ -5,6 +5,7 @@ use std::time::Duration;
 use bevy::ecs::component::Component;
 use bevy::ecs::reflect::ReflectComponent;
 use bevy::reflect::Reflect;
+use bevy::reflect::ReflectSerialize;
 use thiserror::Error;
 
 use super::playback::SequencePosition;
@@ -16,13 +17,13 @@ static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
 ///
 /// Replacing a target's [`SequenceStages`] produces a new revision, so a scope
 /// resolved against the previous description is detectably stale.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Reflect)]
-#[reflect(opaque)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Reflect, serde::Serialize)]
+#[reflect(opaque, Serialize)]
 pub struct SequenceStagesRevision(u64);
 
 /// Stable identity of one stage within one authored description.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Reflect)]
-#[reflect(opaque)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Reflect, serde::Serialize)]
+#[reflect(opaque, Serialize)]
 pub struct SequenceStageId {
     revision: SequenceStagesRevision,
     ordinal:  usize,

@@ -1,11 +1,11 @@
 //! World conversion target builder and recipes.
 
-use bevy::math::primitives::InfinitePlane3d;
 use bevy::prelude::Camera;
 use bevy::prelude::GlobalTransform;
 use bevy::prelude::Transform;
 use bevy::prelude::Vec2;
 use bevy::prelude::Vec3;
+use bevy::shape::InfinitePlane3d;
 
 use super::PanelProjectionError;
 use super::PanelScreenConversion;

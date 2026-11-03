@@ -1,9 +1,10 @@
 use bevy::app::App;
 use bevy::app::Plugin;
+use bevy::curve::Curve;
+use bevy::curve::EaseFunction;
 use bevy::math::Vec2;
-use bevy::math::curve::Curve;
-use bevy::math::curve::EaseFunction;
 use bevy::reflect::Reflect;
+use bevy::reflect::ReflectSerialize;
 use bevy_lookup_curve::Knot;
 use bevy_lookup_curve::KnotInterpolation;
 use bevy_lookup_curve::LookupCurve;
@@ -25,8 +26,8 @@ impl Plugin for EasingPlugin {
 }
 
 /// A finite normalized coordinate at which an [`EasingCurve`] is sampled.
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Reflect)]
-#[reflect(opaque)]
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Reflect, serde::Serialize)]
+#[reflect(opaque, Serialize)]
 pub struct EasingInput(f32);
 
 impl EasingInput {
@@ -54,8 +55,8 @@ impl EasingInput {
 /// A finite authored easing output.
 ///
 /// Outputs deliberately retain anticipation, overshoot, and reversal values.
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Reflect)]
-#[reflect(opaque)]
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Reflect, serde::Serialize)]
+#[reflect(opaque, Serialize)]
 pub struct EasingOutput(f32);
 
 impl EasingOutput {
@@ -78,8 +79,8 @@ impl EasingOutput {
 }
 
 /// A finite tangent slope for cubic [`EasingInterpolation`].
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Reflect)]
-#[reflect(opaque)]
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Reflect, serde::Serialize)]
+#[reflect(opaque, Serialize)]
 pub struct EasingSlope(f32);
 
 impl EasingSlope {
@@ -102,7 +103,7 @@ impl EasingSlope {
 }
 
 /// Interpolation applied between one [`EasingKnot`] and the next.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Reflect)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Reflect, serde::Serialize)]
 pub enum EasingInterpolation {
     /// Hold the knot's output until the next knot.
     Constant,
@@ -114,8 +115,8 @@ pub enum EasingInterpolation {
 }
 
 /// Incoming and outgoing tangent slopes used by cubic interpolation.
-#[derive(Clone, Copy, Debug, PartialEq, Reflect)]
-#[reflect(opaque)]
+#[derive(Clone, Copy, Debug, PartialEq, Reflect, serde::Serialize)]
+#[reflect(opaque, Serialize)]
 pub struct EasingSlopes {
     incoming: EasingSlope,
     outgoing: EasingSlope,
@@ -155,8 +156,8 @@ impl EasingSlopes {
 }
 
 /// One validated authored point of an [`EasingCurve`].
-#[derive(Clone, Copy, Debug, PartialEq, Reflect)]
-#[reflect(opaque)]
+#[derive(Clone, Copy, Debug, PartialEq, Reflect, serde::Serialize)]
+#[reflect(opaque, Serialize)]
 pub struct EasingKnot {
     input:         EasingInput,
     output:        EasingOutput,
@@ -318,11 +319,13 @@ fn slope_stays_nonnegative(linear: f64, quadratic: f64, cubic: f64) -> bool {
 /// curve keeps at least two knots, strictly increasing normalized inputs, and
 /// exact `0` and `1` endpoints. A future editable or asset-backed source must
 /// use a distinct [`Easing`] variant with its own availability contract.
-#[derive(Clone, Debug, Reflect)]
-#[reflect(opaque)]
+#[derive(Clone, Debug, Reflect, serde::Serialize)]
+#[reflect(opaque, Serialize)]
 pub struct EasingCurve {
     knots:   Vec<EasingKnot>,
+    #[serde(skip)]
     mapping: EasingMapping,
+    #[serde(skip)]
     lookup:  LookupCurve,
 }
 
@@ -457,8 +460,8 @@ impl EasingCurveBuilder {
 }
 
 /// Authored choice between a stock Bevy easing and an immutable lookup curve.
-#[derive(Clone, Debug, PartialEq, Reflect)]
-#[reflect(opaque)]
+#[derive(Clone, Debug, PartialEq, Reflect, serde::Serialize)]
+#[reflect(opaque, Serialize)]
 pub enum Easing {
     /// One of Bevy's built-in easing functions.
     Bevy(EaseFunction),

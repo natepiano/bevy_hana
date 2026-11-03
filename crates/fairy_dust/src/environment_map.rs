@@ -37,7 +37,7 @@ pub(crate) fn install(app: &mut App) {
 }
 
 fn insert_environment_map(
-    trigger: On<Add, FairyDustOrbitCam>,
+    trigger: On<Add<FairyDustOrbitCam>>,
     asset_server: Res<AssetServer>,
     mut commands: Commands,
 ) {

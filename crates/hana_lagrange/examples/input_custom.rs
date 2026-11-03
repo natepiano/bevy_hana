@@ -20,6 +20,7 @@ use bevy::prelude::Color;
 use bevy::prelude::Commands;
 use bevy::prelude::Component;
 use bevy::prelude::Entity;
+use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::KeyCode;
 use bevy::prelude::MouseButton;
 use bevy::prelude::Name;
@@ -59,9 +60,7 @@ use fairy_dust::cube_face_transform;
 use hana_diegetic::DiegeticPanelCommands;
 use hana_lagrange::BindingsError;
 use hana_lagrange::CameraInputDisabled;
-use hana_lagrange::CameraInputRoutingConfig;
 use hana_lagrange::InteractionSources;
-use hana_lagrange::NoPositionFallback;
 use hana_lagrange::OrbitCam;
 use hana_lagrange::OrbitCamBindings;
 use hana_lagrange::OrbitCamControlSummary;
@@ -75,6 +74,7 @@ use hana_lagrange::OrbitCamPinchZoom;
 use hana_lagrange::OrbitCamTrackpadScroll;
 use hana_lagrange::ZoomDirection;
 use hana_lagrange::ZoomInversion;
+use hana_lagrange::ZoomRowFilter;
 use hana_lagrange::describe_orbit_cam_controls;
 
 const EXAMPLE_TITLE: &str = "Custom Bindings";
@@ -86,10 +86,6 @@ fn main() {
     };
 
     fairy_dust::sprinkle_example()
-        .insert_resource(
-            CameraInputRoutingConfig::cursor_hit_test()
-                .with_no_position_fallback(NoPositionFallback::OnlyEligibleCamera),
-        )
         .insert_resource(CustomBindings(bindings))
         .init_resource::<InputDisabledState>()
         .with_brp_extras()
@@ -118,7 +114,13 @@ fn main() {
         .add_systems(Startup, spawn_camera)
         .add_systems(PostStartup, spawn_face_labels)
         .insert_resource(FaceLabelHold::default())
-        .add_systems(Update, (toggle_camera_controls, update_face_labels))
+        .add_systems(
+            Update,
+            (
+                toggle_camera_controls.in_set(fairy_dust::TitleBarStateWriters),
+                update_face_labels,
+            ),
+        )
         .add_observer(capture_zoom_started)
         .run();
 }
@@ -464,10 +466,10 @@ fn active_labels(
 /// direction matches the live one. While the live direction is unknown — a
 /// zero-delta frame before the sign resolves — directional rows are kept so the
 /// zoom face never blanks mid-gesture.
-fn row_matches_zoom_direction(row: Option<ZoomDirection>, live: Option<ZoomDirection>) -> bool {
+fn row_matches_zoom_direction(row: ZoomRowFilter, live: Option<ZoomDirection>) -> bool {
     match (row, live) {
-        (None, _) | (Some(_), None) => true,
-        (Some(row), Some(live)) => row == live,
+        (ZoomRowFilter::Unrestricted, _) | (ZoomRowFilter::Only(_), None) => true,
+        (ZoomRowFilter::Only(row), Some(live)) => row == live,
     }
 }
 

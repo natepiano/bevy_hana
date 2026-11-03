@@ -23,6 +23,7 @@ use crate::Diagnostic;
 use crate::DiagnosticKind;
 use crate::DiagnosticOrigin;
 use crate::DiagnosticSeverity;
+use crate::PaletteTitleMatch;
 use crate::keymap;
 use crate::keymap::KeymapRuntime;
 
@@ -164,7 +165,7 @@ impl CommandRegistry {
         entries.into_iter()
     }
 
-    /// Walks matching command declarations in immutable authored title/ID order.
+    /// Walks matching commands with title prefixes, then word prefixes, then other matches.
     ///
     /// Palette callers normalize a query once before using this iterator. Each index entry retains
     /// normalized command text built with the registry, so the walk never needs to normalize
@@ -176,10 +177,18 @@ impl CommandRegistry {
         #[cfg(test)]
         record_ordered_palette_search_pass();
 
-        self.palette_search_index
-            .iter()
-            .filter(move |entry| entry.matches(normalized_query))
-            .map(CommandPaletteSearchEntry::palette_invocability)
+        let mut ranked = [Vec::new(), Vec::new(), Vec::new()];
+        for entry in &self.palette_search_index {
+            let (rank, title_match) = entry.match_title(normalized_query);
+            let bucket = match rank {
+                PaletteSearchRank::TitlePrefix => 0,
+                PaletteSearchRank::WordPrefix => 1,
+                PaletteSearchRank::OtherMatch => 2,
+                PaletteSearchRank::NoMatch => continue,
+            };
+            ranked[bucket].push(entry.palette_invocability(title_match));
+        }
+        ranked.into_iter().flatten()
     }
 
     /// Resolves `command_id` to the metadata the registry declared for it.
@@ -273,46 +282,128 @@ struct CommandPaletteSearchEntry {
 
 /// Normalized command metadata retained for palette substring matching.
 struct NormalizedCommandText {
-    title: String,
-    id:    String,
+    title:         String,
+    title_sources: Vec<usize>,
+    id:            String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PaletteSearchRank {
+    TitlePrefix,
+    WordPrefix,
+    OtherMatch,
+    NoMatch,
 }
 
 impl CommandPaletteSearchEntry {
     fn from_entries(entries: &HashMap<CommandId, CommandEntry>) -> Vec<Self> {
         let mut search_index = entries
             .iter()
-            .map(|(command_id, command)| Self {
-                command_id:      command_id.clone(),
-                title:           command.title,
-                description:     command.description,
-                capability:      command.capability,
-                normalized_text: NormalizedCommandText {
-                    title: normalize_palette_search_text(command.title),
-                    id:    normalize_palette_search_text(command_id.as_str()),
-                },
+            .map(|(command_id, command)| {
+                let mut title_sources = Vec::new();
+                let title =
+                    normalize_palette_text(command.title, |source| title_sources.push(source));
+                Self {
+                    command_id:      command_id.clone(),
+                    title:           command.title,
+                    description:     command.description,
+                    capability:      command.capability,
+                    normalized_text: NormalizedCommandText {
+                        title,
+                        title_sources,
+                        id: normalize_palette_search_text(command_id.as_str()),
+                    },
+                }
             })
             .collect::<Vec<_>>();
         search_index.sort_by(|left, right| {
             left.title
-                .cmp(right.title)
+                .chars()
+                .flat_map(char::to_lowercase)
+                .cmp(right.title.chars().flat_map(char::to_lowercase))
+                .then_with(|| left.title.cmp(right.title))
                 .then_with(|| left.command_id.as_str().cmp(right.command_id.as_str()))
         });
         search_index
     }
 
-    fn matches(&self, normalized_query: &str) -> bool {
-        self.normalized_text.title.contains(normalized_query)
-            || self.normalized_text.id.contains(normalized_query)
+    fn match_title(&self, normalized_query: &str) -> (PaletteSearchRank, PaletteTitleMatch) {
+        #[cfg(test)]
+        record_palette_entry_match();
+
+        let mut rank = PaletteSearchRank::TitlePrefix;
+        let mut title_match = PaletteTitleMatch::None;
+        for word in normalized_query.split_whitespace() {
+            let (word_rank, word_match) = self.match_word(word);
+            if word_rank == PaletteSearchRank::NoMatch {
+                return (PaletteSearchRank::NoMatch, PaletteTitleMatch::None);
+            }
+            rank = rank.max(word_rank);
+            for run in word_match.runs() {
+                title_match.include(run.clone());
+            }
+        }
+        // A contiguous title prefix keeps priority over separated word matches.
+        // For example, "Add screen" must precede "Add missing screens".
+        if self.normalized_text.title.starts_with(normalized_query) {
+            rank = PaletteSearchRank::TitlePrefix;
+        }
+        (rank, title_match)
+    }
+
+    fn match_word(&self, query_word: &str) -> (PaletteSearchRank, PaletteTitleMatch) {
+        let title = self.normalized_text.title.as_str();
+        if title.starts_with(query_word) {
+            return (
+                PaletteSearchRank::TitlePrefix,
+                self.title_run(0, query_word),
+            );
+        }
+        for (separator, _) in title.match_indices(' ') {
+            let start = separator + 1;
+            let word = title[start..].split_whitespace().next().unwrap_or_default();
+            if word.starts_with(query_word) {
+                return (
+                    PaletteSearchRank::WordPrefix,
+                    self.title_run(start, query_word),
+                );
+            }
+        }
+        if let Some(start) = title.find(query_word) {
+            return (
+                PaletteSearchRank::OtherMatch,
+                self.title_run(start, query_word),
+            );
+        }
+        if self.normalized_text.id.contains(query_word) {
+            return (PaletteSearchRank::OtherMatch, PaletteTitleMatch::None);
+        }
+        (PaletteSearchRank::NoMatch, PaletteTitleMatch::None)
+    }
+
+    fn title_run(&self, byte_start: usize, query: &str) -> PaletteTitleMatch {
+        let start = self.normalized_text.title[..byte_start].chars().count();
+        let end = start + query.chars().count();
+        PaletteTitleMatch::from_runs(std::iter::once(
+            self.normalized_text.title_sources[start]
+                ..self.normalized_text.title_sources[end - 1] + 1,
+        ))
     }
 
     /// States whether this matching declaration is eligible for palette invocation.
-    const fn palette_invocability(&self) -> PaletteSearchMatchInvocability<'_> {
+    fn palette_invocability(
+        &self,
+        title_match: PaletteTitleMatch,
+    ) -> PaletteSearchMatchInvocability<'_> {
         if self.capability.is_palette_invocable() {
-            PaletteSearchMatchInvocability::Invocable(PaletteInvocableCommand {
-                command_id:  &self.command_id,
-                title:       self.title,
-                description: self.description,
-            })
+            PaletteSearchMatchInvocability::Invocable(
+                PaletteInvocableCommand {
+                    command_id:  &self.command_id,
+                    title:       self.title,
+                    description: self.description,
+                },
+                title_match,
+            )
         } else {
             PaletteSearchMatchInvocability::Held
         }
@@ -322,7 +413,7 @@ impl CommandPaletteSearchEntry {
 /// Whether a declaration matching a palette query can be invoked from the palette.
 pub(crate) enum PaletteSearchMatchInvocability<'registry> {
     /// The matching declaration can produce a palette row and selection.
-    Invocable(PaletteInvocableCommand<'registry>),
+    Invocable(PaletteInvocableCommand<'registry>, PaletteTitleMatch),
     /// The matching declaration is held and therefore cannot be palette-invocable.
     Held,
 }
@@ -332,23 +423,32 @@ pub(crate) enum PaletteSearchMatchInvocability<'registry> {
 /// Case folds and reduces `::`, `_`, `-`, and whitespace runs to a single space, so an authored
 /// identifier such as `camera::reset_home` matches `camera reset home` and `Reset Home`.
 pub(crate) fn normalize_palette_search_text(text: &str) -> String {
+    normalize_palette_text(text, |_| {})
+}
+
+/// Normalizes once, recording the authored source of each emitted character when requested.
+fn normalize_palette_text(text: &str, mut record_source: impl FnMut(usize)) -> String {
     #[cfg(test)]
     record_palette_normalization();
 
     let mut normalized = String::with_capacity(text.len());
     let mut separator = PaletteSearchSeparator::Absent;
-    for character in text.chars() {
+    for (source, character) in text.chars().enumerate() {
         if character == ':' || character == '_' || character == '-' || character.is_whitespace() {
-            if !normalized.is_empty() {
-                separator = PaletteSearchSeparator::Pending;
+            if !normalized.is_empty() && matches!(separator, PaletteSearchSeparator::Absent) {
+                separator = PaletteSearchSeparator::Pending(source);
             }
             continue;
         }
-        if matches!(separator, PaletteSearchSeparator::Pending) {
+        if let PaletteSearchSeparator::Pending(source) = separator {
             normalized.push(' ');
+            record_source(source);
             separator = PaletteSearchSeparator::Absent;
         }
-        normalized.extend(character.to_lowercase());
+        for lowercase in character.to_lowercase() {
+            normalized.push(lowercase);
+            record_source(source);
+        }
     }
     normalized
 }
@@ -356,7 +456,7 @@ pub(crate) fn normalize_palette_search_text(text: &str) -> String {
 /// Whether normalized palette text needs a separator before the next word.
 enum PaletteSearchSeparator {
     Absent,
-    Pending,
+    Pending(usize),
 }
 
 /// Test-only call counts for [`normalize_palette_search_text`] and
@@ -366,6 +466,7 @@ enum PaletteSearchSeparator {
 pub(super) struct PaletteSearchObservations {
     normalizations:        usize,
     ordered_search_passes: usize,
+    entry_matches:         usize,
 }
 
 #[cfg(test)]
@@ -374,6 +475,7 @@ thread_local! {
         Cell::new(PaletteSearchObservations {
             normalizations: 0,
             ordered_search_passes: 0,
+            entry_matches: 0,
         })
     };
 }
@@ -396,6 +498,15 @@ fn record_palette_normalization() {
         let mut observations = palette_search_observations.get();
         observations.normalizations += 1;
         palette_search_observations.set(observations);
+    });
+}
+
+#[cfg(test)]
+fn record_palette_entry_match() {
+    PALETTE_SEARCH_OBSERVATIONS.with(|counts| {
+        let mut observations = counts.get();
+        observations.entry_matches += 1;
+        counts.set(observations);
     });
 }
 
@@ -722,6 +833,30 @@ mod tests {
         id:          "registry::palette_second",
         title:       "Registry Palette Entry",
         description: "Sorts after the matching duplicate palette title.",
+    }
+
+    crate::command! {
+        action:      RegistryFactoryResetAction,
+        event:       RegistryFactoryReset,
+        id:          "registry::factory_reset",
+        title:       "Factory Reset",
+        description: "Exercises a word-prefix match.",
+    }
+
+    crate::command! {
+        action:      RegistryCameraHomeAction,
+        event:       RegistryCameraHome,
+        id:          "registry::camera_home",
+        title:       "Reset Camera to Home",
+        description: "Exercises a title-prefix match.",
+    }
+
+    crate::command! {
+        action:      RegistryPresetAction,
+        event:       RegistryPreset,
+        id:          "registry::preset",
+        title:       "A Preset",
+        description: "Exercises a non-prefix match.",
     }
 
     #[derive(Event, Reflect)]
@@ -1180,6 +1315,7 @@ mod tests {
             super::PaletteSearchObservations {
                 normalizations:        4,
                 ordered_search_passes: 0,
+                entry_matches:         0,
             }
         );
 
@@ -1188,7 +1324,7 @@ mod tests {
         let matching_ids = command_registry
             .palette_search(&normalized_query)
             .filter_map(|matching_command| match matching_command {
-                super::PaletteSearchMatchInvocability::Invocable(command) => {
+                super::PaletteSearchMatchInvocability::Invocable(command, _) => {
                     Some(command.id().as_str())
                 },
                 super::PaletteSearchMatchInvocability::Held => None,
@@ -1204,8 +1340,161 @@ mod tests {
             super::PaletteSearchObservations {
                 normalizations:        1,
                 ordered_search_passes: 1,
+                entry_matches:         2,
             }
         );
         Ok(())
+    }
+
+    #[test]
+    fn each_entry_is_matched_once_per_query() -> Result<(), String> {
+        let mut types = TypeRegistry::default();
+        types.register::<RegistryPaletteFirst>();
+        types.register::<RegistryPaletteSecond>();
+        let registry = CommandRegistry::build(&types, &mut CustomInputs::default())
+            .map_err(|diagnostics| format!("palette registry: {diagnostics:?}"))?;
+        for query in ["", "entry", "no match"] {
+            super::reset_palette_search_observations();
+            let _ = registry.palette_search(query).count();
+            assert_eq!(super::palette_search_observations().entry_matches, 2);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn palette_rows_sort_alphabetically_ignoring_letter_case() {
+        let mut registry = CommandRegistry::empty();
+        for (id, title) in [
+            ("registry::bravo", "Bravo"),
+            ("registry::alpha_lower", "alpha"),
+            ("registry::alpha_upper_z", "Alpha"),
+            ("registry::alpha_upper_a", "Alpha"),
+            ("registry::alpha_hyphen", "Alpha-z"),
+            ("registry::alpha_space", "alpha z"),
+        ] {
+            registry.entries.insert(
+                CommandId::try_from(id).expect("the fixture command ID is valid"),
+                super::CommandEntry {
+                    title,
+                    description: "Exercises alphabetical palette ordering.",
+                    capability: Capability::OneShot,
+                    dispatch: |_| {},
+                    invocation: Invocation::OneShot,
+                },
+            );
+        }
+        registry.palette_search_index =
+            super::CommandPaletteSearchEntry::from_entries(&registry.entries);
+
+        let rows = registry
+            .palette_search("")
+            .filter_map(|entry| match entry {
+                super::PaletteSearchMatchInvocability::Invocable(command, _) => {
+                    Some((command.id().as_str(), command.title()))
+                },
+                super::PaletteSearchMatchInvocability::Held => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            [
+                ("registry::alpha_upper_a", "Alpha"),
+                ("registry::alpha_upper_z", "Alpha"),
+                ("registry::alpha_lower", "alpha"),
+                ("registry::alpha_space", "alpha z"),
+                ("registry::alpha_hyphen", "Alpha-z"),
+                ("registry::bravo", "Bravo"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_typed_prefix_ranks_its_title_first() -> Result<(), String> {
+        let mut type_registry = TypeRegistry::default();
+        type_registry.register::<RegistryFactoryReset>();
+        type_registry.register::<RegistryCameraHome>();
+        type_registry.register::<RegistryPreset>();
+        let registry = CommandRegistry::build(&type_registry, &mut CustomInputs::default())
+            .map_err(|diagnostics| format!("palette registry: {diagnostics:?}"))?;
+        let matching = registry
+            .palette_search(&super::normalize_palette_search_text("Rese"))
+            .filter_map(|entry| match entry {
+                super::PaletteSearchMatchInvocability::Invocable(command, _) => {
+                    Some(command.id().as_str())
+                },
+                super::PaletteSearchMatchInvocability::Held => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching,
+            [
+                RegistryCameraHome::ID,
+                RegistryFactoryReset::ID,
+                RegistryPreset::ID,
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn multiword_rank_uses_the_weakest_word_and_keeps_title_order() {
+        let mut registry = CommandRegistry::empty();
+        for (id, title) in [
+            ("rank::inside", "A maze"),
+            ("rank::second", "Amazing zulu"),
+            ("rank::first", "A zulu"),
+            ("rank::z", "An id match"),
+        ] {
+            registry.entries.insert(
+                CommandId::try_from(id).expect("fixture id"),
+                super::CommandEntry {
+                    title,
+                    description: "Tests the weakest word rank.",
+                    capability: Capability::OneShot,
+                    dispatch: |_| {},
+                    invocation: Invocation::OneShot,
+                },
+            );
+        }
+        registry.palette_search_index =
+            super::CommandPaletteSearchEntry::from_entries(&registry.entries);
+        for query in ["a z", "z a"] {
+            let titles = registry
+                .palette_search(query)
+                .filter_map(|entry| match entry {
+                    super::PaletteSearchMatchInvocability::Invocable(command, _) => {
+                        Some(command.title())
+                    },
+                    super::PaletteSearchMatchInvocability::Held => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(titles, ["A zulu", "Amazing zulu", "A maze", "An id match"]);
+        }
+    }
+
+    #[test]
+    fn two_title_runs_do_not_allocate_for_each_entry() {
+        let mut registry = CommandRegistry::empty();
+        registry.entries.insert(
+            CommandId::try_from("fixture::finder").expect("fixture id"),
+            super::CommandEntry {
+                title:       "Add viewfinder",
+                description: "Tests inline title runs.",
+                capability:  Capability::OneShot,
+                dispatch:    |_| {},
+                invocation:  Invocation::OneShot,
+            },
+        );
+        let entries = super::CommandPaletteSearchEntry::from_entries(&registry.entries);
+        let entry = &entries[0];
+        assert!(matches!(
+            entry.match_title("add fin").0,
+            super::PaletteSearchRank::OtherMatch
+        ));
+        let before = crate::TEST_ALLOCATOR.allocation_count();
+        for _ in 0..100 {
+            std::hint::black_box(entry.match_title("add fin"));
+        }
+        assert_eq!(crate::TEST_ALLOCATOR.allocation_count() - before, 0);
     }
 }

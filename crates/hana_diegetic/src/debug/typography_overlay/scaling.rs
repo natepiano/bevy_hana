@@ -64,3 +64,30 @@ pub(super) fn metric_line_border_width(
 ) -> f32 {
     METRIC_LINE_BORDER_MULT * bbox_border_width(overlay, font_size, scale)
 }
+
+/// Shared arrow columns for the metric guide, its labels, and its bounds.
+pub(super) struct MetricArrowColumns {
+    pub(super) left_inner:  f32,
+    pub(super) left_outer:  f32,
+    pub(super) right_inner: f32,
+    pub(super) right_outer: f32,
+}
+
+pub(super) fn metric_arrow_columns(
+    first_left: f32,
+    last_right: f32,
+    spacing: f32,
+    left_label_width: f32,
+    right_label_width: f32,
+    label_gap: f32,
+) -> MetricArrowColumns {
+    let left_inner = first_left - spacing;
+    let right_inner = last_right + spacing;
+    MetricArrowColumns {
+        left_inner,
+        left_outer: left_inner - (2.0 * spacing).max(2.0_f32.mul_add(label_gap, left_label_width)),
+        right_inner,
+        right_outer: right_inner
+            + (2.0 * spacing).max(2.0_f32.mul_add(label_gap, right_label_width)),
+    }
+}

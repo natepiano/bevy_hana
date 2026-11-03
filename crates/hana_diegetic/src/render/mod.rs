@@ -1,12 +1,27 @@
 //! Rendering systems for diegetic UI panels and text.
 
+/// The encase storage writer is the byte-layout oracle for direct GPU records.
+#[cfg(test)]
+pub(crate) fn encase_storage_bytes<T>(value: &T) -> Result<Vec<u8>, String>
+where
+    T: ?Sized
+        + bevy::render::render_resource::ShaderType
+        + bevy::render::render_resource::encase::internal::WriteInto,
+{
+    let mut buffer = bevy::render::render_resource::encase::StorageBuffer::new(Vec::new());
+    buffer.write(value).map_err(|error| error.to_string())?;
+    Ok(buffer.into_inner())
+}
+
 mod analytic_line_probe;
 mod analytic_paths;
+mod ancestor_visibility;
 mod batch_key;
 mod batch_store;
-mod clip;
+pub(crate) mod clip;
 mod constants;
 mod dirty;
+pub(crate) mod display_compensation;
 mod draw_order;
 mod fill_batch;
 mod image_batch;
@@ -19,16 +34,21 @@ mod panel_geometry;
 mod panel_shapes;
 mod panel_text;
 mod precompose;
-mod text_shaping;
+pub(crate) mod text_shaping;
 mod transparency;
+mod view_layers;
 mod world_text;
 
 pub use analytic_line_probe::AnalyticLine;
 pub use analytic_line_probe::AnalyticLineProbe;
 pub use analytic_line_probe::AnalyticLineProbePlugin;
 use analytic_paths::AnalyticPathPlugin;
+pub(crate) use analytic_paths::AtlasPublication;
+pub(crate) use analytic_paths::AtlasPublicationError;
+pub(crate) use analytic_paths::AtlasState;
 pub(crate) use analytic_paths::BandRecord;
 pub(crate) use analytic_paths::Bounds;
+pub(crate) use analytic_paths::ContourRole;
 pub(crate) use analytic_paths::CurveRecord;
 pub(crate) use analytic_paths::DEFAULT_BAND_COUNT;
 pub(crate) use analytic_paths::GeometryDirty;
@@ -48,33 +68,109 @@ pub(crate) use analytic_paths::PathOutline;
 pub(crate) use analytic_paths::PathQuadRecord;
 pub(crate) use analytic_paths::PathRenderRecord;
 pub(crate) use analytic_paths::PlacementDirty;
+pub use analytic_paths::PostOitResolveText3d;
 pub(crate) use analytic_paths::QuadraticSegment;
 pub(crate) use analytic_paths::RenderMode;
+pub(crate) use analytic_paths::TextFitMode;
 pub(crate) use analytic_paths::TextRunBatchStore;
 pub(crate) use analytic_paths::analytic_material_slot_candidate;
 pub(crate) use analytic_paths::build_packed_path;
+pub use analytic_paths::draws_analytic_paths;
 #[cfg(test)]
-pub(crate) use analytic_paths::path_material_oit_depth_offset;
+pub(crate) use analytic_paths::path_material_oit_paint_order;
 pub(crate) use analytic_paths::set_path_material_atlas;
 pub(crate) use analytic_paths::set_path_material_record_buffers;
 pub(crate) use analytic_paths::set_path_material_table_buffer;
+
+/// Routes a live text batch for atlas publication tests.
+#[cfg(test)]
+pub(crate) fn glyph_atlas_test_batch(
+    batches: &mut TextRunBatchStore,
+    materials: &mut Assets<PathExtendedMaterial>,
+    atlas: &PathAtlasHandles,
+) -> Result<Handle<PathExtendedMaterial>, &'static str> {
+    let base = default_panel_material();
+    let key = PathBatchKey {
+        display_target:         PanelDisplayTarget::World,
+        z_index:                0.into(),
+        z_index_rank:           DrawZIndexRank::default(),
+        batch_family:           DrawBatchFamily::Text,
+        shadow:                 VisualShadow::Cast,
+        layers:                 BatchRenderLayers(bevy::camera::visibility::RenderLayers::default()),
+        pipeline_compatibility: batch_key::PipelineCompatibility::from(&base),
+        resource_compatibility: batch_key::ResourceCompatibility::from(&base),
+    };
+    let material = materials.add(PathExtendedMaterial {
+        base,
+        extension: analytic_paths::text_vertex_pull(
+            AlphaMode::Blend,
+            0.0,
+            AntiAlias::default(),
+            PathMaterialBuffers {
+                curves:       atlas.curves.clone(),
+                bands:        atlas.bands.clone(),
+                path_records: atlas.path_records.clone(),
+                // Publication tests do not upload the per-batch record buffers.
+                instances:    atlas.curves.clone(),
+                run_records:  atlas.path_records.clone(),
+            },
+        ),
+    });
+    batches.upsert_run(
+        key.clone(),
+        crate::text::RunStorageKey::from(Entity::from_bits(1)),
+        DrawOrderIndex::default(),
+        vec![PathQuadRecord {
+            rect_size: Vec2::ONE,
+            uv_size: Vec2::ONE,
+            box_uv_size: Vec2::ONE,
+            ..PathQuadRecord::zeroed()
+        }],
+        PathRenderRecord {
+            transform: Mat4::IDENTITY,
+            ..PathRenderRecord::zeroed()
+        },
+    );
+    let batch = batches.get_mut(&key).ok_or("routed batch is missing")?;
+    batch.entity = Some(Entity::from_bits(2));
+    batch.gpu = Some(PathBatchResources {
+        instances:    atlas.curves.clone(),
+        run_table:    atlas.path_records.clone(),
+        mesh:         Handle::default(),
+        material:     material.clone(),
+        capacity:     1,
+        run_capacity: 1,
+    });
+    Ok(material)
+}
+pub use ancestor_visibility::AncestorVisibility;
 pub(crate) use batch_key::BatchAlphaMode;
 pub(crate) use batch_key::BatchRenderLayers;
 pub(crate) use batch_key::VisualShadow;
 pub(crate) use batch_key::batch_summary;
+use bevy::camera::CameraUpdateSystems;
 use bevy::core_pipeline::oit::OrderIndependentTransparencySettings;
+use bevy::extract::ExtractSchedule;
 use bevy::log::warn_once;
+#[cfg(test)]
+use bevy::prelude::AlphaMode;
 use bevy::prelude::App;
 use bevy::prelude::AssetApp;
 use bevy::prelude::AssetEvent;
 use bevy::prelude::AssetId;
 use bevy::prelude::Assets;
+use bevy::prelude::Component;
 use bevy::prelude::DetectChanges;
+#[cfg(test)]
+use bevy::prelude::Entity;
 use bevy::prelude::Handle;
 use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::Local;
+#[cfg(test)]
+use bevy::prelude::Mat4;
 use bevy::prelude::MessageReader;
 use bevy::prelude::Plugin;
+use bevy::prelude::PostUpdate;
 use bevy::prelude::Query;
 use bevy::prelude::Reflect;
 use bevy::prelude::ReflectComponent;
@@ -85,12 +181,25 @@ use bevy::prelude::Resource;
 use bevy::prelude::StandardMaterial;
 use bevy::prelude::SystemSet;
 use bevy::prelude::Update;
+#[cfg(test)]
+use bevy::prelude::Vec2;
 use bevy::prelude::Window;
 use bevy::prelude::With;
+use bevy::render::Render;
+use bevy::render::RenderApp;
+use bevy::render::RenderSystems;
 use bevy::window::PrimaryWindow;
+#[cfg(test)]
+use bytemuck::Zeroable;
 pub(crate) use dirty::Dirty;
+use display_compensation::DisplayCompensationPlugin;
+pub use display_compensation::DisplayCompensationReadiness;
 pub(crate) use draw_order::CommandIndex;
 pub(crate) use draw_order::DrawOrder;
+#[cfg(test)]
+use draw_order::DrawOrderIndex;
+#[cfg(test)]
+use draw_order::DrawZIndexRank;
 pub(crate) use draw_order::ElementIndex;
 #[expect(
     unused_imports,
@@ -107,14 +216,17 @@ pub(crate) use fill_batch::SdfExtendedMaterial;
 pub(crate) use fill_batch::set_sdf_material_table_buffer;
 use hana_kana::CascadeRootResource;
 use image_batch::ImageBatchPlugin;
+#[cfg(test)]
+use material::PanelDisplayTarget;
 pub(crate) use material::apply_sidedness;
 pub use material::default_panel_material;
 pub(crate) use material::material_asset_for_frame;
 pub(crate) use material_table::MaterialTableAppendReady;
 use material_table::MaterialTablePlugin;
 pub(crate) use panel_geometry::CapturedCameraRay;
+pub use panel_geometry::PanelGeometryBuild;
 pub(crate) use panel_geometry::PanelGeometryPlugin;
-pub(crate) use panel_geometry::PanelInteractionMesh;
+pub use panel_geometry::PanelInteractionMesh;
 pub(crate) use panel_geometry::ResolvedSdfSurfaceRegistry;
 pub(crate) use panel_geometry::SurfaceEvictionCause;
 pub(crate) use panel_geometry::project_flat_panel_hit;
@@ -123,16 +235,27 @@ use panel_shapes::PanelShapePlugin;
 pub(crate) use panel_shapes::remove_panel_relationship as remove_panel_shape_relationship;
 pub use panel_text::DiegeticTextBatch;
 pub use panel_text::DiegeticTextMut;
+pub use panel_text::FirstTextBatchPipeline;
 pub use panel_text::PanelText;
 pub use panel_text::PanelTextLayout;
 pub use panel_text::PanelTextReader;
 pub use panel_text::PanelTextRuns;
+pub use panel_text::QueuedTextPipelineCandidate;
+pub(in crate::render) use panel_text::TextBatchPhaseMembership;
 pub use panel_text::TextEdit;
+pub use panel_text::TextPipelineStartup;
 use panel_text::TextRenderPlugin;
 pub use panel_text::TextRunOf;
+pub(in crate::render) use panel_text::extract_text_batch_entities;
+pub(in crate::render) use panel_text::observe_first_text_phase_item;
+pub(in crate::render) use panel_text::warm_text_pipeline;
 pub use transparency::StableTransparency;
+pub(crate) use view_layers::PrivateViewLayer;
+pub(crate) use view_layers::PrivateViewLayerAllocator;
+pub(crate) use view_layers::PrivateViewLayers;
 #[cfg(feature = "typography_overlay")]
-pub use world_text::ComputedWorldText;
+pub(crate) use world_text::ComputedWorldText;
+pub use world_text::DrawnTextBounds;
 pub use world_text::TextContent;
 pub use world_text::WorldTextReady;
 #[cfg(feature = "typography_overlay")]
@@ -143,6 +266,21 @@ use crate::cascade::CascadeSet;
 use crate::cascade::SdfMaterial;
 use crate::cascade::ShapeMaterial;
 use crate::cascade::TextMaterial;
+use crate::constants::DIAGNOSTIC_LOG_TARGET;
+#[cfg(test)]
+use crate::layout::DrawBatchFamily;
+
+/// Marks a world tooltip whose SDF, text, and OIT draws share a front depth band.
+#[derive(Component)]
+pub(crate) struct TooltipDepthPriority;
+
+/// Reverse-Z depth added to world tooltip draws after panel-local ordering.
+const TOOLTIP_NDC_DEPTH_PRIORITY: f32 = 0.000_1;
+
+/// Mirrors the non-OIT path shader's per-layer clip-depth spacing in tests.
+#[cfg(test)]
+const TEXT_CLIP_DEPTH_NUDGE_PER_LAYER: f32 = 0.000_002;
+
 /// `PostUpdate` phase that spawns and despawns a panel's child entities —
 /// text runs, glyph meshes, and SDF geometry.
 ///
@@ -209,11 +347,11 @@ pub enum AntiAlias {
 }
 
 /// `PathRenderRecord::aa_flags` bit for footprint supersampling. Mirrored by
-/// `AA_FLAG_SUPERSAMPLE` in `analytic_path.wgsl`.
+/// `AA_FLAG_SUPERSAMPLE` in `analytic_path.wesl`.
 const AA_FLAG_SUPERSAMPLE: u32 = 1;
 
 /// `PathRenderRecord::aa_flags` bit for the screen-space anisotropic edge band.
-/// Mirrored by `AA_FLAG_BAND` in `analytic_path.wgsl`.
+/// Mirrored by `AA_FLAG_BAND` in `analytic_path.wesl`.
 const AA_FLAG_BAND: u32 = 1 << 1;
 
 impl AntiAlias {
@@ -330,7 +468,7 @@ impl HairlineFade {
                     exponent
                 } else {
                     warn_once!(
-                        "HairlineFade::Fade exponent {exponent} is not positive and finite; \
+                        target: DIAGNOSTIC_LOG_TARGET, "HairlineFade::Fade exponent {exponent} is not positive and finite; \
                          rendering as HairlineFade::Full"
                     );
                     0.0
@@ -383,6 +521,41 @@ fn sync_hairline_width(
     for id in added {
         if let Some(mut material) = materials.get_mut(id) {
             analytic_paths::set_path_material_hairline(&mut material, device_px);
+        }
+    }
+}
+
+/// Mirrors the primary window's device pixels per logical pixel into every
+/// SDF material: all materials when the value changes, plus newly added ones.
+fn sync_sdf_logical_pixel_scale(
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut materials: ResMut<Assets<SdfExtendedMaterial>>,
+    mut material_events: MessageReader<AssetEvent<SdfExtendedMaterial>>,
+    mut applied_scale: Local<Option<f32>>,
+) {
+    let scale = windows
+        .iter()
+        .next()
+        .map_or(1.0, Window::scale_factor)
+        .max(1.0);
+    if *applied_scale != Some(scale) {
+        *applied_scale = Some(scale);
+        material_events.clear();
+        for (_, material) in materials.iter_mut() {
+            fill_batch::set_sdf_material_logical_pixel_scale(material, scale);
+        }
+        return;
+    }
+    let added: Vec<AssetId<SdfExtendedMaterial>> = material_events
+        .read()
+        .filter_map(|event| match event {
+            AssetEvent::Added { id } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    for id in added {
+        if let Some(mut material) = materials.get_mut(id) {
+            fill_batch::set_sdf_material_logical_pixel_scale(&mut material, scale);
         }
     }
 }
@@ -444,6 +617,7 @@ fn holds_empty_handle(current: Option<&Handle<StandardMaterial>>) -> bool {
 impl Plugin for RenderPlugin {
     fn build(&self, app: &mut App) {
         seed_default_material_cascades(app);
+        transparency::install_oit_depth_precision(app);
 
         app.add_plugins((
             cascade::cascade_plugin::<SdfMaterial>(),
@@ -451,6 +625,7 @@ impl Plugin for RenderPlugin {
             cascade::cascade_plugin::<ShapeMaterial>(),
         ));
 
+        app.add_plugins(DisplayCompensationPlugin);
         app.add_plugins((
             MaterialTablePlugin,
             AnalyticPathPlugin,
@@ -469,10 +644,36 @@ impl Plugin for RenderPlugin {
         // change reaches every `Resolved<A>` the same frame.
         .add_systems(
             Update,
-            (sync_anti_alias, sync_hairline_width).before(CascadeSet::Propagate),
+            (
+                sync_anti_alias,
+                sync_hairline_width,
+                sync_sdf_logical_pixel_scale,
+            )
+                .before(CascadeSet::Propagate),
+        )
+        .add_systems(
+            PostUpdate,
+            transparency::fit_oit_fragment_pool_to_device.after(CameraUpdateSystems),
         )
         .add_observer(transparency::on_stable_transparency_added)
         .add_observer(transparency::on_stable_transparency_removed)
         .add_observer(transparency::on_screen_space_camera_added);
+
+        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            render_app
+                .init_resource::<TextBatchPhaseMembership>()
+                .init_resource::<TextPipelineStartup>()
+                .add_systems(ExtractSchedule, extract_text_batch_entities)
+                .add_systems(
+                    Render,
+                    warm_text_pipeline.in_set(RenderSystems::CreateViews),
+                )
+                .add_systems(
+                    Render,
+                    observe_first_text_phase_item
+                        .after(RenderSystems::PhaseSort)
+                        .before(RenderSystems::Prepare),
+                );
+        }
     }
 }

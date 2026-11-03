@@ -1598,14 +1598,20 @@ pub(crate) fn project_device_entities(world: &mut World) {
         }
     }
     if !reconciled_device_changes.connections.is_empty() {
-        let mut hardware_inventory = world.resource_mut::<HardwareInventory>();
-        for connection_change in &reconciled_device_changes.connections {
-            // A key can leave the inventory between the merge and here; the conclusion is then
-            // about a device nobody authored any more, and dropping it is the whole response.
-            drop(
-                hardware_inventory
-                    .set_connection(&connection_change.key, connection_change.connection),
-            );
+        let changed = {
+            let mut changed = false;
+            let mut hardware_inventory = world.resource_mut::<HardwareInventory>();
+            for connection_change in &reconciled_device_changes.connections {
+                // A key can leave the inventory between the merge and here; the conclusion is then
+                // about a device nobody authored any more, and dropping it is the whole response.
+                changed |= hardware_inventory
+                    .set_connection(&connection_change.key, connection_change.connection)
+                    .is_ok();
+            }
+            changed
+        };
+        if changed {
+            world.trigger(crate::HardwareInventoryChanged);
         }
     }
 
@@ -2316,10 +2322,17 @@ fn planned_configuration_mirrors<'a>(
         if already_mirrored {
             continue;
         }
+        let configuration_value = match configuration.as_partial_reflect().to_dynamic() {
+            Ok(configuration_value) => configuration_value,
+            Err(clone_error) => {
+                warn!("role `{role:?}` driver configuration cannot be mirrored: {clone_error}");
+                continue;
+            },
+        };
         planned_mirrors.push(PlannedConfigurationMirror::Write {
             binding_entity,
             reflect_component,
-            configuration: configuration.as_partial_reflect().to_dynamic(),
+            configuration: configuration_value,
             type_path: configuration.reflect_type_path().to_owned(),
         });
     }
@@ -5291,7 +5304,7 @@ mod tests {
             resolved_binding_entities(&app, source_entity),
             vec![binding_entity]
         );
-        assert!(resolved_binding_entities(&app, destination_entity).is_empty());
+        assert_eq!(resolved_binding_entities(&app, destination_entity), []);
 
         // The role is re-authored onto the other endpoint while both units stay plugged in, so the
         // only thing that changes is which live device entity the durable endpoint resolves to.

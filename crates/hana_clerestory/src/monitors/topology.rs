@@ -38,6 +38,7 @@ use hana_rigging::prelude::PlatformDeviceHandle;
 use hana_rigging::prelude::ReportedSerial;
 use winit::monitor::MonitorHandle;
 
+use super::DisplayPhysicalSize;
 use super::DisplayProductName;
 use super::MonitorDiscoveryRequestCoverage;
 use super::current_monitor;
@@ -184,11 +185,13 @@ impl MonitorDescriptor {
 #[derive(Clone, Copy, Debug)]
 pub struct LiveMonitor<'a> {
     /// Bevy monitor entity for the current monitor lifetime.
-    pub entity:       Entity,
+    pub entity:        Entity,
     /// Geometry and adapter data copied for the current monitor lifetime.
-    pub descriptor:   &'a MonitorDescriptor,
+    pub descriptor:    &'a MonitorDescriptor,
     /// Product name the operating system shows the user for this display.
-    pub product_name: &'a DisplayProductName,
+    pub product_name:  &'a DisplayProductName,
+    /// Physical image dimensions reported by the display's EDID.
+    pub physical_size: &'a DisplayPhysicalSize,
 }
 
 /// Monotonic version of the installed monitor entity, geometry, and reporter-evidence topology.
@@ -243,12 +246,12 @@ pub(crate) struct MonitorDisconnected {
 
 impl Monitors {
     /// Iterate over all current monitor entities and their metadata.
-    #[must_use]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = LiveMonitor<'_>> + '_ {
         self.live.iter().map(|monitor| LiveMonitor {
-            entity:       monitor.entity,
-            descriptor:   &monitor.descriptor,
-            product_name: &monitor.product_name,
+            entity:        monitor.entity,
+            descriptor:    &monitor.descriptor,
+            product_name:  &monitor.product_name,
+            physical_size: &monitor.physical_size,
         })
     }
 
@@ -375,6 +378,27 @@ impl Monitors {
                 entity,
                 descriptor,
                 product_name,
+                physical_size: DisplayPhysicalSize::NotReported,
+                device_evidence: DisplayDeviceEvidence::unavailable(),
+                legacy_identity: DisplayIdentity::Anonymous,
+            })
+            .collect();
+        Self { live }
+    }
+
+    /// Builds a regression topology with explicit EDID image dimensions.
+    #[cfg(any(test, feature = "test"))]
+    #[must_use]
+    pub fn from_test_monitors_with_physical_sizes(
+        monitors: impl IntoIterator<Item = (Entity, MonitorDescriptor, DisplayPhysicalSize)>,
+    ) -> Self {
+        let live = monitors
+            .into_iter()
+            .map(|(entity, descriptor, physical_size)| InstalledMonitor {
+                entity,
+                descriptor,
+                physical_size,
+                product_name: DisplayProductName::PlatformHasNoConcept,
                 device_evidence: DisplayDeviceEvidence::unavailable(),
                 legacy_identity: DisplayIdentity::Anonymous,
             })
@@ -388,6 +412,7 @@ pub(super) struct InstalledMonitor {
     pub(super) entity:          Entity,
     pub(super) descriptor:      MonitorDescriptor,
     pub(super) product_name:    DisplayProductName,
+    pub(super) physical_size:   DisplayPhysicalSize,
     pub(super) device_evidence: DisplayDeviceEvidence,
     pub(super) legacy_identity: DisplayIdentity,
 }
@@ -628,6 +653,7 @@ fn installed_topology_changed(previous: &Monitors, rebuilt: &Monitors) -> bool {
                     rebuilt_monitor.entity != previous_monitor.entity
                         || rebuilt_monitor.descriptor != previous_monitor.descriptor
                         || rebuilt_monitor.product_name != previous_monitor.product_name
+                        || rebuilt_monitor.physical_size != previous_monitor.physical_size
                         || rebuilt_monitor.device_evidence != previous_monitor.device_evidence
                         || rebuilt_monitor.legacy_identity != previous_monitor.legacy_identity
                 })
@@ -695,7 +721,7 @@ fn display_evidence(
     configuration: MonitorConfigurationState,
     platform: Platform,
     #[cfg(any(test, feature = "test"))] injected_evidence: Option<&mut InjectedMonitorEvidence>,
-) -> (DisplayDeviceEvidence, DisplayIdentity) {
+) -> (DisplayDeviceEvidence, DisplayIdentity, DisplayPhysicalSize) {
     let unavailable = |attachment| {
         (
             DisplayDeviceEvidence {
@@ -706,77 +732,18 @@ fn display_evidence(
                 attachment,
             },
             DisplayIdentity::Anonymous,
+            DisplayPhysicalSize::NotReported,
         )
     };
-
     #[cfg(any(test, feature = "test"))]
     if let Some(injected_evidence) = injected_evidence {
-        injected_evidence.activity.identity_requests += 1;
-        // A scripted display publishes its capture address through the injection rather than
-        // through a `MonitorHandle` it does not have, and every branch below reports the same one.
-        let scripted_device_handle = injected_evidence
-            .device_handles
-            .get(&monitor.entity)
-            .cloned()
-            .unwrap_or_else(|| identity::platform_device_handle(monitor.handle.as_ref()));
-        let scripted_unavailable = |attachment| {
-            (
-                DisplayDeviceEvidence {
-                    identity_evidence: DisplayIdentityEvidence::Unavailable {
-                        serial: ReportedSerial::PlatformCannotReport,
-                    },
-                    platform_device_handle: scripted_device_handle.clone(),
-                    attachment,
-                },
-                DisplayIdentity::Anonymous,
-            )
-        };
-        if monitor.cached_index.is_none() {
-            injected_evidence.activity.handle_lookups += 1;
-            return scripted_unavailable(identity::attachment_path_when_unreported(platform));
-        }
-        if injected_evidence.missing_handles.contains(&monitor.entity) {
-            injected_evidence.activity.handle_lookups += 1;
-            return scripted_unavailable(identity::attachment_path_when_unreported(platform));
-        }
-        let attachment = injected_evidence
-            .attachments
-            .get(&monitor.entity)
-            .cloned()
-            .unwrap_or_else(|| identity::attachment_path_when_unreported(platform));
-        let evidence = injected_evidence
-            .evidence
-            .get(&monitor.entity)
-            .cloned()
-            .unwrap_or(Err(
-                MonitorIdentificationError::StablePhysicalIdentityUnavailable,
-            ));
-        injected_evidence.activity.handle_lookups += 1;
-        injected_evidence.activity.evidence_loads += 1;
-        return evidence.map_or_else(
-            |_| scripted_unavailable(attachment.clone()),
-            |bytes| {
-                let qualified = QualifiedEvidence::Synthetic(bytes);
-                let (identity_evidence, legacy_identity) =
-                    identity::classify_display_evidence(&qualified);
-                (
-                    DisplayDeviceEvidence {
-                        identity_evidence,
-                        platform_device_handle: scripted_device_handle.clone(),
-                        attachment: attachment.clone(),
-                    },
-                    legacy_identity,
-                )
-            },
-        );
+        return scripted_display_evidence(monitor, platform, injected_evidence);
     }
-
     if monitor.cached_index.is_none()
         || matches!(configuration, MonitorConfigurationState::Unavailable(_))
     {
         return unavailable(identity::attachment_path_when_unreported(platform));
     }
-
     let Some(handle) = monitor.handle.as_ref() else {
         return unavailable(identity::attachment_path_when_unreported(platform));
     };
@@ -796,6 +763,70 @@ fn display_evidence(
                     attachment: attachment.clone(),
                 },
                 legacy_identity,
+                evidence.physical_size(),
+            )
+        },
+    )
+}
+
+#[cfg(any(test, feature = "test"))]
+fn scripted_display_evidence(
+    monitor: &ScannedMonitor,
+    platform: Platform,
+    injected: &mut InjectedMonitorEvidence,
+) -> (DisplayDeviceEvidence, DisplayIdentity, DisplayPhysicalSize) {
+    injected.activity.identity_requests += 1;
+    // Scripted capture addresses come from injection, not from a MonitorHandle.
+    let device_handle = injected
+        .device_handles
+        .get(&monitor.entity)
+        .cloned()
+        .unwrap_or_else(|| identity::platform_device_handle(monitor.handle.as_ref()));
+    let unavailable = |attachment| {
+        (
+            DisplayDeviceEvidence {
+                identity_evidence: DisplayIdentityEvidence::Unavailable {
+                    serial: ReportedSerial::PlatformCannotReport,
+                },
+                platform_device_handle: device_handle.clone(),
+                attachment,
+            },
+            DisplayIdentity::Anonymous,
+            DisplayPhysicalSize::NotReported,
+        )
+    };
+    if monitor.cached_index.is_none() || injected.missing_handles.contains(&monitor.entity) {
+        injected.activity.handle_lookups += 1;
+        return unavailable(identity::attachment_path_when_unreported(platform));
+    }
+    let attachment = injected
+        .attachments
+        .get(&monitor.entity)
+        .cloned()
+        .unwrap_or_else(|| identity::attachment_path_when_unreported(platform));
+    let evidence = injected
+        .evidence
+        .get(&monitor.entity)
+        .cloned()
+        .unwrap_or(Err(
+            MonitorIdentificationError::StablePhysicalIdentityUnavailable,
+        ));
+    injected.activity.handle_lookups += 1;
+    injected.activity.evidence_loads += 1;
+    evidence.map_or_else(
+        |_| unavailable(attachment.clone()),
+        |bytes| {
+            let qualified = QualifiedEvidence::Synthetic(bytes);
+            let (identity_evidence, legacy_identity) =
+                identity::classify_display_evidence(&qualified);
+            (
+                DisplayDeviceEvidence {
+                    identity_evidence,
+                    platform_device_handle: device_handle.clone(),
+                    attachment: attachment.clone(),
+                },
+                legacy_identity,
+                DisplayPhysicalSize::NotReported,
             )
         },
     )
@@ -878,7 +909,7 @@ fn build_monitors(
     let live = scanned
         .into_iter()
         .map(|monitor| {
-            let (device_evidence, legacy_identity) =
+            let (device_evidence, legacy_identity, physical_size) =
                 evidence.get(&monitor.entity).cloned().unwrap_or_else(|| {
                     display_evidence(
                         &monitor,
@@ -903,6 +934,7 @@ fn build_monitors(
                     monitor.physical_size,
                 ),
                 product_name,
+                physical_size,
                 device_evidence,
                 legacy_identity,
             }
@@ -1108,9 +1140,45 @@ mod tests {
             entity,
             descriptor: descriptor(index),
             product_name: DisplayProductName::PlatformHasNoConcept,
+            physical_size: DisplayPhysicalSize::NotReported,
             device_evidence: DisplayDeviceEvidence::unavailable(),
             legacy_identity,
         }
+    }
+
+    #[test]
+    fn a_live_monitor_carries_its_edid_physical_size() {
+        let size = DisplayPhysicalSize::Reported {
+            width_mm:  600,
+            height_mm: 340,
+        };
+        let mut installed = retained(Entity::from_bits(1), 0, DisplayIdentity::Anonymous);
+        installed.physical_size = size;
+        let monitors = Monitors {
+            live: vec![installed],
+        };
+        assert_eq!(
+            monitors.iter().next().map(|monitor| *monitor.physical_size),
+            Some(size)
+        );
+    }
+
+    #[test]
+    fn an_edid_physical_size_change_replaces_the_installed_topology() {
+        let entity = Entity::from_bits(1);
+        let previous = Monitors {
+            live: vec![retained(entity, 0, DisplayIdentity::Anonymous)],
+        };
+        let mut changed = retained(entity, 0, DisplayIdentity::Anonymous);
+        changed.physical_size = DisplayPhysicalSize::Reported {
+            width_mm:  750,
+            height_mm: 420,
+        };
+        let rebuilt = Monitors {
+            live: vec![changed],
+        };
+
+        assert!(installed_topology_changed(&previous, &rebuilt));
     }
 
     #[test]

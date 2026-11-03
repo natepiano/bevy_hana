@@ -82,7 +82,7 @@ impl FoldTiming {
 
 #[cfg(test)]
 mod tests {
-    use bevy_math::curve::EaseFunction;
+    use bevy_curve::EaseFunction;
 
     use super::*;
 

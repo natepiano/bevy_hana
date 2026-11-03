@@ -32,6 +32,7 @@ pub(crate) use current_monitor::exact_monitor_association;
 pub(crate) use current_monitor::install_current_monitor_from_association;
 use current_monitor::record_window_manager_placement;
 pub(crate) use current_monitor::update_current_monitor;
+pub use display_product_name::DisplayPhysicalSize;
 pub use display_product_name::DisplayProductName;
 use hana_rigging::prelude::AuthoritativeReporterCoverage;
 use hana_rigging::prelude::CoveredDeviceIdentitySpace;

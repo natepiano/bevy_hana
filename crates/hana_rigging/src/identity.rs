@@ -101,7 +101,7 @@ impl DeviceKey {
 impl Display for DeviceKey {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         let kind = match self.kind {
-            DeviceKind::Display => "display",
+            DeviceKind::Display => "monitor",
             DeviceKind::Camera => "camera",
             DeviceKind::AudioInterface => "audio interface",
             DeviceKind::DmxUniverse => "DMX universe",

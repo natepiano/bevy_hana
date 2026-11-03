@@ -21,6 +21,7 @@
 //! to read.
 
 use bevy::prelude::AlphaMode;
+use bevy::prelude::App;
 use bevy::prelude::Assets;
 use bevy::prelude::Color;
 use bevy::prelude::Commands;
@@ -37,7 +38,6 @@ use bevy::prelude::Startup;
 use bevy::prelude::Transform;
 use bevy::prelude::Update;
 use bevy::prelude::Vec2;
-use bevy::prelude::Vec3;
 use bevy::prelude::World;
 use bevy::prelude::error;
 use bevy::prelude::warn;
@@ -54,6 +54,7 @@ use hana_diegetic::CascadeSet;
 use hana_diegetic::CornerRadius;
 use hana_diegetic::DiegeticPanel;
 use hana_diegetic::DiegeticText;
+use hana_diegetic::DiegeticTextMeasurer;
 use hana_diegetic::DiegeticTextMut;
 use hana_diegetic::El;
 use hana_diegetic::Fit;
@@ -87,7 +88,7 @@ const PANEL_ALPHA_PREFIX: &str = "panel alpha";
 const PANEL_LOCAL_PREFIX: &str = "local alpha";
 const PANEL_UNIT_PREFIX: &str = "panel unit";
 const SCREEN_OVERRIDE_NOTE: &str =
-    "This screen legend keeps Blend + Points; G/U affect the world examples above.";
+    "This screen legend keeps Blend + Points; G / U affect the world examples above.";
 const PANEL_ALPHA_VALUE_ID: &str = "panel_alpha_value";
 const PANEL_LOCAL_VALUE_ID: &str = "panel_local_value";
 const PANEL_UNIT_VALUE_ID: &str = "panel_unit_value";
@@ -122,12 +123,6 @@ const STANDALONE_ALPHA: AlphaMode = AlphaMode::Add;
 const GLOBAL_UNIT_A: Unit = Unit::Millimeters;
 const GLOBAL_UNIT_B: Unit = Unit::Points;
 const STANDALONE_UNIT: Unit = Unit::Points;
-
-const GROUND_PLANE_SIZE: f32 = 3.2;
-const GROUND_PLANE_WIDTH_SCALE: f32 = 1.18;
-const GROUND_PLANE_DEPTH_SCALE: f32 = 0.42;
-const GROUND_PLANE_Z_OFFSET: f32 = -0.35;
-const GROUND_PLANE_Z: f32 = SCENE_Z + GROUND_PLANE_Z_OFFSET;
 
 const SCENE_FRAME_WIDTH: Mm = Mm(2460.0);
 const SCENE_FRAME_HEIGHT: Mm = Mm(620.0);
@@ -171,30 +166,19 @@ const PANEL_INNER_BORDER_WIDTH: Mm = Mm(3.0);
 const HUD_PADDING: Px = Px(10.0);
 const HUD_RADIUS: Px = Px(8.0);
 const HUD_BORDER_WIDTH: Px = Px(1.0);
-const HUD_CONTROL_CELL_GAP: Px = Px(6.0);
+const HUD_CONTROL_CELL_GAP: Px = Px(44.0);
 const HUD_ROW_GAP: Px = Px(4.0);
 const HUD_SECTION_GAP: Px = Px(8.0);
-const HUD_CONTROL_KEY_WIDTH: Px = Px(28.0);
-const HUD_CONTROL_LABEL_WIDTH: Px = Px(130.0);
-const HUD_CONTROL_AUTHORING_WIDTH: Px = Px(150.0);
-const HUD_CONTROL_VALUE_WIDTH: Px = Px(150.0);
 
-fn main() {
+fn main() { build_app().run(); }
+
+fn build_app() -> App {
     // `hana_diegetic::DiegeticUiPlugin` is registered automatically by
     // `fairy_dust::sprinkle_example`.
     fairy_dust::sprinkle_example()
         .with_brp_extras()
         .with_save_window_position()
         .with_studio_lighting()
-        .with_ground_plane()
-        .size(GROUND_PLANE_SIZE)
-        .transform(
-            Transform::from_xyz(0.0, 0.0, GROUND_PLANE_Z).with_scale(Vec3::new(
-                GROUND_PLANE_WIDTH_SCALE,
-                1.0,
-                GROUND_PLANE_DEPTH_SCALE,
-            )),
-        )
         .with_orbit_cam_preset(|_| {}, OrbitCamPreset::blender_like())
         .with_stable_transparency()
         .with_camera_home()
@@ -225,7 +209,7 @@ fn main() {
                 .after(CascadeSet::Propagate)
                 .before(PanelSystems::ComputeLayout),
         )
-        .run();
+        .build()
 }
 
 #[derive(Resource, Clone, Copy)]
@@ -304,7 +288,27 @@ impl Default for CascadeDemoState {
 }
 
 #[derive(Resource, Default)]
-struct HudSnapshotCache(Option<HudSnapshot>);
+struct HudSnapshotCache(HudSnapshotState);
+
+#[derive(Default)]
+enum HudSnapshotState {
+    #[default]
+    Pending,
+    Ready(HudSnapshot),
+}
+
+#[derive(Default)]
+enum LastAppliedHudSnapshot {
+    #[default]
+    NeverApplied,
+    Applied(HudSnapshot),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum LocalLabelAlpha {
+    Absent,
+    Resolved(AlphaMode),
+}
 
 #[derive(Clone, PartialEq)]
 struct HudSnapshot {
@@ -313,8 +317,8 @@ struct HudSnapshot {
     standalone_alpha:      AlphaMode,
     standalone_unit:       Unit,
     panel_unit:            Unit,
-    panel_inherited_alpha: Option<AlphaMode>,
-    panel_local_alpha:     Option<AlphaMode>,
+    panel_inherited_alpha: AlphaMode,
+    panel_local_alpha:     LocalLabelAlpha,
 }
 
 impl Default for HudSnapshot {
@@ -325,13 +329,17 @@ impl Default for HudSnapshot {
             standalone_alpha:      STANDALONE_ALPHA,
             standalone_unit:       GLOBAL_UNIT_A,
             panel_unit:            GLOBAL_UNIT_A,
-            panel_inherited_alpha: Some(PANEL_ALPHA),
-            panel_local_alpha:     Some(LABEL_ALPHA),
+            panel_inherited_alpha: PANEL_ALPHA,
+            panel_local_alpha:     LocalLabelAlpha::Resolved(LABEL_ALPHA),
         }
     }
 }
 
-fn setup(mut commands: Commands, mut materials: ResMut<Assets<StandardMaterial>>) {
+fn setup(
+    mut commands: Commands,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    text_measurer: Res<DiegeticTextMeasurer>,
+) {
     let initial = HudSnapshot::default();
     let scene_frame = build_scene_frame_panel(&mut materials, &initial).map(|panel| {
         commands
@@ -411,7 +419,7 @@ fn setup(mut commands: Commands, mut materials: ResMut<Assets<StandardMaterial>>
         .inherit_font_unit()
         .id();
 
-    let hud = build_hud_panel(&mut materials, &initial)
+    let hud = build_hud_panel(&mut materials, &initial, &text_measurer)
         .map(|panel| commands.spawn((HudPanel, panel, Transform::default())).id());
 
     match (scene_frame, hud) {
@@ -499,6 +507,7 @@ fn build_scene_frame_tree(snapshot: &HudSnapshot) -> LayoutTree {
 fn build_hud_panel(
     materials: &mut Assets<StandardMaterial>,
     snapshot: &HudSnapshot,
+    text_measurer: &DiegeticTextMeasurer,
 ) -> Result<DiegeticPanel, PanelBuildError> {
     let unlit = StandardMaterial {
         unlit: true,
@@ -510,7 +519,7 @@ fn build_hud_panel(
         .anchor(Anchor::BottomLeft)
         .material(unlit.clone())
         .text_material(unlit)
-        .with_tree(build_hud_tree(snapshot))
+        .with_tree(build_hud_tree(snapshot, text_measurer))
         .build()
 }
 
@@ -679,27 +688,29 @@ fn refresh_hud(world: &mut World) {
         standalone_alpha: resolved_text_alpha(world, entities.standalone_alpha),
         standalone_unit: resolved_font_unit(world, entities.standalone_unit),
         panel_unit: resolved_font_unit(world, entities.panel),
-        panel_inherited_alpha: Some(resolved_text_alpha(world, entities.panel)),
+        panel_inherited_alpha: resolved_text_alpha(world, entities.panel),
         panel_local_alpha: find_text_entity_by_prefix(world, PANEL_LOCAL_PREFIX)
-            .map(|entity| resolved_text_alpha(world, entity)),
+            .map_or(LocalLabelAlpha::Absent, |entity| {
+                LocalLabelAlpha::Resolved(resolved_text_alpha(world, entity))
+            }),
     };
 
     let mut cache = world.resource_mut::<HudSnapshotCache>();
-    if cache.0.as_ref() == Some(&snapshot) {
+    if matches!(&cache.0, HudSnapshotState::Ready(current) if current == &snapshot) {
         return;
     }
-    cache.0 = Some(snapshot);
+    cache.0 = HudSnapshotState::Ready(snapshot);
 }
 
 fn refresh_world_text(
     cache: Res<HudSnapshotCache>,
-    mut applied: Local<Option<HudSnapshot>>,
+    mut applied: Local<LastAppliedHudSnapshot>,
     mut lines: DiegeticTextMut<WorldTextLine>,
 ) {
-    let Some(snapshot) = cache.0.as_ref() else {
+    let HudSnapshotState::Ready(snapshot) = &cache.0 else {
         return;
     };
-    if applied.as_ref() == Some(snapshot) {
+    if matches!(&*applied, LastAppliedHudSnapshot::Applied(current) if current == snapshot) {
         return;
     }
     let visited = lines.for_each_mut(|line, text_edit| {
@@ -715,20 +726,20 @@ fn refresh_world_text(
         text_edit.set_text(text);
     });
     if visited == WORLD_TEXT_LINE_COUNT {
-        *applied = Some(snapshot.clone());
+        *applied = LastAppliedHudSnapshot::Applied(snapshot.clone());
     }
 }
 
 fn refresh_panel_text(
     cache: Res<HudSnapshotCache>,
     entities: Option<Res<CascadeDemoEntities>>,
-    mut applied: Local<Option<HudSnapshot>>,
+    mut applied: Local<LastAppliedHudSnapshot>,
     mut panel_text: PanelText,
 ) {
-    let (Some(snapshot), Some(entities)) = (cache.0.as_ref(), entities) else {
+    let (HudSnapshotState::Ready(snapshot), Some(entities)) = (&cache.0, entities) else {
         return;
     };
-    if applied.as_ref() == Some(snapshot) {
+    if matches!(&*applied, LastAppliedHudSnapshot::Applied(current) if current == snapshot) {
         return;
     }
 
@@ -820,7 +831,7 @@ fn refresh_panel_text(
         ),
     ];
     if updates.into_iter().all(|updated| updated) {
-        *applied = Some(snapshot.clone());
+        *applied = LastAppliedHudSnapshot::Applied(snapshot.clone());
     }
 }
 
@@ -834,17 +845,89 @@ fn find_text_entity_by_prefix(world: &mut World, prefix: &str) -> Option<Entity>
 #[derive(Component)]
 struct HudPanel;
 
-fn build_hud_tree(snapshot: &HudSnapshot) -> LayoutTree {
+const AUTHORING_LABELS: [&str; 5] = [
+    "Authoring",
+    CascadeAuthorship::GlobalDefault.label(),
+    CascadeAuthorship::Override.label(),
+    CascadeAuthorship::InheritedGlobal.label(),
+    CascadeAuthorship::InheritedPanel.label(),
+];
+
+fn longest_control_label_width(
+    text_measurer: &DiegeticTextMeasurer,
+    style: &TextStyle,
+    labels: &[&str],
+) -> Px {
+    let measure = style
+        .as_measure()
+        .scaled(Unit::Points.meters_per_unit() / Unit::Pixels.meters_per_unit());
+    Px(labels
+        .iter()
+        .map(|label| (text_measurer.measure_fn)(label, &measure).width)
+        .fold(0.0, f32::max))
+}
+
+#[derive(Clone, Copy)]
+struct ControlColumnWidths {
+    key:       Px,
+    property:  Px,
+    authoring: Px,
+    resolved:  Px,
+}
+
+fn control_column_widths(
+    text_measurer: &DiegeticTextMeasurer,
+    style: &TextStyle,
+) -> ControlColumnWidths {
+    let width = |labels| longest_control_label_width(text_measurer, style, labels);
+    ControlColumnWidths {
+        key:       width(&["Key", "G", "U", "S", "F", "P", "L"]),
+        property:  width(&[
+            "Property",
+            "text alpha",
+            "font unit",
+            "panel alpha",
+            "label alpha",
+        ]),
+        authoring: width(&AUTHORING_LABELS),
+        resolved:  width(&[
+            "Resolved",
+            "Opaque",
+            "Mask",
+            "Blend",
+            "Premultiplied",
+            "Add",
+            "Multiply",
+            "AlphaToCoverage",
+            "Meters",
+            "Millimeters",
+            "Points",
+            "Pixels",
+            "Inches",
+            "Custom",
+        ]),
+    }
+}
+
+fn build_hud_tree(snapshot: &HudSnapshot, text_measurer: &DiegeticTextMeasurer) -> LayoutTree {
     let mut builder = LayoutBuilder::with_root(El::new().width(Sizing::FIT).height(Sizing::FIT));
     let header = TextStyle::new(LABEL_SIZE).with_color(HUD_HEADER_COLOR);
     let control_key = TextStyle::new(LABEL_SIZE).with_color(HUD_KEY_COLOR);
     let control_text = TextStyle::new(LABEL_SIZE).with_color(HUD_CONTROL_COLOR);
+    let column_widths = control_column_widths(text_measurer, &control_text);
 
     builder.with(
         El::row().width(Sizing::FIT).height(Sizing::FIT),
         |builder| {
             build_hud_card(builder, |builder| {
-                build_controls_table(builder, snapshot, &header, &control_key, &control_text);
+                build_controls_table(
+                    builder,
+                    snapshot,
+                    &header,
+                    &control_key,
+                    &control_text,
+                    column_widths,
+                );
             });
         },
     );
@@ -871,6 +954,7 @@ fn build_controls_table(
     header: &TextStyle,
     control_key: &TextStyle,
     control_text: &TextStyle,
+    column_widths: ControlColumnWidths,
 ) {
     builder.with(
         El::column()
@@ -879,7 +963,7 @@ fn build_controls_table(
             .gap(HUD_SECTION_GAP),
         |builder| {
             builder.text(("World cascade controls", header.clone()));
-            controls_header_row(builder, control_text);
+            controls_header_row(builder, control_text, column_widths);
             controls_section(builder, "Global defaults", header, |builder| {
                 controls_row(
                     builder,
@@ -891,6 +975,7 @@ fn build_controls_table(
                     HUD_GLOBAL_ALPHA_VALUE_ID,
                     control_key,
                     control_text,
+                    column_widths,
                 );
                 controls_row(
                     builder,
@@ -902,6 +987,7 @@ fn build_controls_table(
                     HUD_GLOBAL_UNIT_VALUE_ID,
                     control_key,
                     control_text,
+                    column_widths,
                 );
             });
             controls_section(builder, STANDALONE_TITLE_TEXT, header, |builder| {
@@ -915,6 +1001,7 @@ fn build_controls_table(
                     HUD_STANDALONE_ALPHA_VALUE_ID,
                     control_key,
                     control_text,
+                    column_widths,
                 );
                 controls_row(
                     builder,
@@ -926,6 +1013,7 @@ fn build_controls_table(
                     HUD_STANDALONE_UNIT_VALUE_ID,
                     control_key,
                     control_text,
+                    column_widths,
                 );
             });
             controls_section(builder, "Panel Text", header, |builder| {
@@ -939,6 +1027,7 @@ fn build_controls_table(
                     HUD_PANEL_ALPHA_VALUE_ID,
                     control_key,
                     control_text,
+                    column_widths,
                 );
                 controls_row(
                     builder,
@@ -950,6 +1039,7 @@ fn build_controls_table(
                     HUD_PANEL_LOCAL_VALUE_ID,
                     control_key,
                     control_text,
+                    column_widths,
                 );
             });
             builder.text((SCREEN_OVERRIDE_NOTE, control_text.clone()));
@@ -957,12 +1047,16 @@ fn build_controls_table(
     );
 }
 
-fn controls_header_row(builder: &mut LayoutBuilder, style: &TextStyle) {
+fn controls_header_row(
+    builder: &mut LayoutBuilder,
+    style: &TextStyle,
+    widths: ControlColumnWidths,
+) {
     builder.with(controls_row_layout(), |builder| {
-        controls_cell(builder, HUD_CONTROL_KEY_WIDTH, "Key", style);
-        controls_cell(builder, HUD_CONTROL_LABEL_WIDTH, "Property", style);
-        controls_cell(builder, HUD_CONTROL_AUTHORING_WIDTH, "Authoring", style);
-        controls_cell(builder, HUD_CONTROL_VALUE_WIDTH, "Resolved", style);
+        controls_cell(builder, widths.key, "Key", style);
+        controls_cell(builder, widths.property, "Property", style);
+        controls_cell(builder, widths.authoring, "Authoring", style);
+        controls_cell(builder, widths.resolved, "Resolved", style);
     });
 }
 
@@ -994,24 +1088,19 @@ fn controls_row(
     value_id: &str,
     key_style: &TextStyle,
     text_style: &TextStyle,
+    widths: ControlColumnWidths,
 ) {
     builder.with(controls_row_layout(), |builder| {
-        controls_cell(builder, HUD_CONTROL_KEY_WIDTH, key, key_style);
-        controls_cell(builder, HUD_CONTROL_LABEL_WIDTH, label, text_style);
+        controls_cell(builder, widths.key, key, key_style);
+        controls_cell(builder, widths.property, label, text_style);
         controls_named_cell(
             builder,
-            HUD_CONTROL_AUTHORING_WIDTH,
+            widths.authoring,
             cascade_authorship.label(),
             authorship_id,
             text_style,
         );
-        controls_named_cell(
-            builder,
-            HUD_CONTROL_VALUE_WIDTH,
-            value,
-            value_id,
-            text_style,
-        );
+        controls_named_cell(builder, widths.resolved, value, value_id, text_style);
     });
 }
 
@@ -1132,10 +1221,8 @@ const fn panel_alpha_authorship(snapshot: &HudSnapshot) -> CascadeAuthorship {
     }
 }
 
-fn resolved_panel_alpha(snapshot: &HudSnapshot) -> AlphaMode {
-    snapshot
-        .panel_inherited_alpha
-        .unwrap_or(snapshot.state.global_alpha)
+const fn resolved_panel_alpha(snapshot: &HudSnapshot) -> AlphaMode {
+    snapshot.panel_inherited_alpha
 }
 
 fn panel_local_text(snapshot: &HudSnapshot) -> String {
@@ -1157,10 +1244,11 @@ const fn panel_local_authorship(snapshot: &HudSnapshot) -> CascadeAuthorship {
     }
 }
 
-fn resolved_panel_local_alpha(snapshot: &HudSnapshot) -> AlphaMode {
-    snapshot
-        .panel_local_alpha
-        .unwrap_or(snapshot.state.global_alpha)
+const fn resolved_panel_local_alpha(snapshot: &HudSnapshot) -> AlphaMode {
+    match snapshot.panel_local_alpha {
+        LocalLabelAlpha::Absent => snapshot.state.global_alpha,
+        LocalLabelAlpha::Resolved(alpha) => alpha,
+    }
 }
 
 fn panel_unit_text(snapshot: &HudSnapshot) -> String {

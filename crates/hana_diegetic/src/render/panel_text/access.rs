@@ -21,11 +21,14 @@ use bevy::prelude::Entity;
 use bevy::prelude::Mut;
 use bevy::prelude::Query;
 use bevy::prelude::RelationshipTarget;
+#[cfg(debug_assertions)]
 use bevy::prelude::warn;
 
 use super::PanelTextLayout;
 use super::PanelTextRuns;
 use crate::PanelElementId;
+#[cfg(debug_assertions)]
+use crate::constants::DIAGNOSTIC_LOG_TARGET;
 use crate::layout::TextStyle;
 use crate::panel::DiegeticPanel;
 use crate::panel::DiegeticPanelChangeClassification;
@@ -299,7 +302,7 @@ fn resolve_run_entity(
     }
     #[cfg(debug_assertions)]
     if !data.tree().contains_text_id(id) {
-        warn!("no text run with id {id}");
+        warn!(target: DIAGNOSTIC_LOG_TARGET, "no text run with id {id}");
     }
     None
 }

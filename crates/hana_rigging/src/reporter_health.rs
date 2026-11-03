@@ -6,8 +6,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use bevy::ecs::reflect::ReflectComponent;
-use bevy::log::info;
-use bevy::log::warn;
+use bevy::log::debug;
 use bevy::prelude::Component;
 use bevy::prelude::Reflect;
 use bevy::prelude::Resource;
@@ -584,7 +583,7 @@ fn log_reporter_failure_decision(
         .last_failure_at
         .elapsed()
         .saturating_sub(run.first_failure_at.elapsed());
-    warn!(
+    debug!(
         "[hana_rigging] reporter {} ({}) {reason}: batch {}, duration {duration:?}, error {:?}, \
          consecutive {}, retained {}, failure run {failure_elapsed:?}, affected roles: {}",
         reporter_health.identity.reporter_ref.get(),
@@ -624,7 +623,7 @@ pub(crate) fn log_reporter_success(
         | ReporterLogDecision::FirstCompleteSetOverdue => "",
     };
     if decisions.info != ReporterLogDecision::NoLog {
-        info!(
+        debug!(
             "[hana_rigging] reporter {} ({}) accepted {reason}: batch {}, duration {duration:?}, \
              records {records}",
             reporter_health.identity.reporter_ref.get(),
@@ -633,7 +632,7 @@ pub(crate) fn log_reporter_success(
         );
     }
     if decisions.empty_warning == ReporterLogDecision::BecameEmpty {
-        warn!(
+        debug!(
             "[hana_rigging] reporter {} ({}) retained record count changed from nonzero to zero: \
              batch {}, duration {duration:?}, roles waiting: {}",
             reporter_health.identity.reporter_ref.get(),
@@ -651,7 +650,7 @@ pub(crate) fn log_reporter_deferral(
     duration: Duration,
     deferral: ReporterDeferral,
 ) {
-    info!(
+    debug!(
         "[hana_rigging] reporter {} ({}) deferred: batch {}, duration {duration:?}, {deferral:?}",
         reporter_health.identity.reporter_ref.get(),
         reporter_health.identity.name,
@@ -676,7 +675,7 @@ pub(crate) fn log_first_complete_set_overdue(
     else {
         return;
     };
-    warn!(
+    debug!(
         "[hana_rigging] reporter {} ({}) exceeded its first complete set bound: waiting since \
          {:?}, deadline {:?}, crossed at {:?}, roles waiting: {}",
         reporter_health.identity.reporter_ref.get(),
@@ -708,7 +707,7 @@ pub(crate) fn log_unsupported_reporter_failure(
         | ReporterLogDecision::BecameEmpty
         | ReporterLogDecision::FirstCompleteSetOverdue => return,
     };
-    warn!(
+    debug!(
         "[hana_rigging] reporter {} ({}) stopped after {reason}: batch {}, duration {duration:?}, \
          error {error:?}, retained {}, affected roles: {}",
         reporter_health.identity.reporter_ref.get(),

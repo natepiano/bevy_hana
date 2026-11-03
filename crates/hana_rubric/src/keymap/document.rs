@@ -1772,7 +1772,7 @@ mod tests {
         let (document, diagnostics) =
             KeymapDocument::parse(&keymap_file(), source).expect("JSONC keymap document");
 
-        assert!(diagnostics.is_empty());
+        assert_eq!(diagnostics, []);
         assert_eq!(document.blocks.len(), 1);
         assert_eq!(document.blocks[0].bindings.len(), 1);
     }
@@ -1784,7 +1784,7 @@ mod tests {
         let (document, diagnostics) =
             KeymapDocument::parse(&keymap_file(), source).expect("null binding tombstone");
 
-        assert!(diagnostics.is_empty());
+        assert_eq!(diagnostics, []);
         assert_eq!(document.blocks.len(), 1);
         assert_eq!(document.blocks[0].bindings.len(), 1);
         assert_eq!(document.blocks[0].bindings[0].edit, BindingEdit::Unbind);
@@ -2071,7 +2071,7 @@ mod tests {
         let (document, diagnostics) =
             KeymapDocument::parse(&keymap_file(), source).expect("object predicates parse");
 
-        assert!(diagnostics.is_empty());
+        assert_eq!(diagnostics, []);
         assert!(matches!(
             document.blocks[0].scope,
             super::KeymapBlockScope::Global

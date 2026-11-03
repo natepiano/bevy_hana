@@ -46,8 +46,10 @@ use super::PathQuadRecord;
 use super::PathRenderRecord;
 use super::QuadraticSegment;
 use super::RenderMode;
+use super::TextFitMode;
 use super::analytic_material_slot_candidate;
 use super::analytic_paths;
+use super::fill_batch::WorldPanelPlane;
 use super::material_table;
 use super::material_table::BatchMaterialTableRegistry;
 use super::material_table::FrameMaterialTableBuild;
@@ -56,6 +58,7 @@ use super::material_table::MaterialSlotCandidate;
 use super::material_table::MaterialSlotId;
 use super::material_table::MaterialSlotInput;
 use super::material_table::MaterialTableAppendReady;
+use super::material_table::MaterialTableBufferPrepared;
 use super::material_table::MaterialTableUpdatedToCurrent;
 use crate::layout::Lighting;
 use crate::layout::Sidedness;
@@ -127,6 +130,7 @@ impl Plugin for AnalyticLineProbePlugin {
             PostUpdate,
             build_analytic_lines
                 .after(MaterialTableAppendReady)
+                .before(MaterialTableBufferPrepared)
                 .before(MaterialTableUpdatedToCurrent),
         );
     }
@@ -161,7 +165,7 @@ fn build_analytic_lines(
                 .remove::<(Mesh3d, MeshMaterial3d<PathExtendedMaterial>)>();
             continue;
         };
-        let Some(built) = build_line(
+        let built = match build_line(
             line,
             place,
             appended.slot,
@@ -169,7 +173,14 @@ fn build_analytic_lines(
             &mut meshes,
             &mut materials,
             &mut storage_buffers,
-        ) else {
+        ) {
+            Ok(built) => built,
+            Err(error) => {
+                bevy::log::error!("cannot build analytic line {entity:?}: {error}");
+                None
+            },
+        };
+        let Some(built) = built else {
             registry.unregister_path(entity);
             commands
                 .entity(entity)
@@ -223,11 +234,11 @@ fn build_line(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<PathExtendedMaterial>,
     storage_buffers: &mut Assets<ShaderBuffer>,
-) -> Option<BuiltLine> {
+) -> Result<Option<BuiltLine>, String> {
     let delta = line.end - line.start;
     let length = delta.length();
     if length <= MIN_EXTENT || line.width <= MIN_EXTENT {
-        return None;
+        return Ok(None);
     }
     let direction = delta / length;
     let midpoint = (line.start + line.end) * 0.5;
@@ -243,7 +254,8 @@ fn build_line(
     // default 96 bands starve the distance scan (see
     // PANEL_LINE_BAND_TARGET_DESIGN_UNITS).
     let packed = super::build_packed_path(rectangle_outline(design), 1);
-    let band_count = u32::try_from(packed.bands().len() / 2).ok()?;
+    let band_count = u32::try_from(packed.bands().len() / 2)
+        .map_err(|error| format!("analytic line band count exceeds u32: {error}"))?;
     let path_record = PackedPathRecord::new(
         packed.bounds(),
         0,
@@ -253,9 +265,9 @@ fn build_line(
         design.x.min(design.y),
     );
 
-    let curves = storage_buffers.add(ShaderBuffer::from(packed.curves().to_vec()));
-    let bands = storage_buffers.add(ShaderBuffer::from(packed.bands().to_vec()));
-    let path_records = storage_buffers.add(ShaderBuffer::from(vec![path_record]));
+    let curves = ShaderBuffer::from(packed.curves().to_vec());
+    let bands = ShaderBuffer::from(packed.bands().to_vec());
+    let path_records = ShaderBuffer::from(vec![path_record]);
 
     // Local frame: origin at the segment midpoint, +X along the segment, +Y
     // across the stroke. The run transform rotates and places that frame into
@@ -264,40 +276,51 @@ fn build_line(
     let padding = PADDING_DESIGN_UNITS * design_to_world;
     let half = Vec2::new(length, line.width) * 0.5;
     let instance = PathQuadRecord {
-        rect_min:          -half - Vec2::splat(padding),
-        rect_size:         half * 2.0 + Vec2::splat(padding * 2.0),
-        uv_min:            Vec2::new(
+        rect_min:           -half - Vec2::splat(padding),
+        rect_size:          half * 2.0 + Vec2::splat(padding * 2.0),
+        uv_min:             Vec2::new(
             -PADDING_DESIGN_UNITS / design.x,
             -PADDING_DESIGN_UNITS / design.y,
         ),
-        uv_size:           Vec2::new(
+        uv_size:            Vec2::new(
             1.0 + 2.0 * PADDING_DESIGN_UNITS / design.x,
             1.0 + 2.0 * PADDING_DESIGN_UNITS / design.y,
         ),
-        box_uv_min:        Vec2::ZERO,
-        box_uv_size:       Vec2::ONE,
-        packed_path_index: 0,
-        render_index:      0,
-        box_uv_flip_x:     0,
+        box_uv_min:         Vec2::ZERO,
+        box_uv_size:        Vec2::ONE,
+        packed_path_index:  0,
+        render_index:       0,
+        box_uv_flip_x:      0,
+        clip_edges:         0,
+        text_fit_mode:      TextFitMode::SmallGlyph.shader_value(),
+        padding_before_fit: 0,
+        text_fit_offset:    Vec2::ZERO,
     };
 
     let run_transform = place
         * Mat4::from_translation(midpoint.extend(0.0))
         * Mat4::from_rotation_z(direction.to_angle());
     let run = PathRenderRecord {
-        transform:          run_transform,
-        material:           material_slot.into(),
-        render_mode:        u32::from(RenderMode::Text),
-        clip_depth_nudge:   0.0,
-        oit_depth_offset:   0.0,
+        panel_plane:            WorldPanelPlane::from_matrix(place, 0.0).coefficients,
+        transform:              run_transform,
+        material:               material_slot.into(),
+        render_mode:            u32::from(RenderMode::Text),
+        clip_depth_nudge:       0.0,
+        oit_paint_order:        0.0,
         // Matches the probe material's supersample + aa_band settings.
-        aa_flags:           AntiAlias::Both.aa_flags(),
-        text_coverage_bias: 0.0,
-        text_em_height:     0.0,
+        aa_flags:               AntiAlias::Both.aa_flags(),
+        text_coverage_bias:     0.0,
+        padding:                0,
+        tooltip_depth_priority: 0,
     };
 
-    let instances = storage_buffers.add(ShaderBuffer::from(vec![instance]));
-    let run_records = storage_buffers.add(ShaderBuffer::from(vec![run]));
+    let instances = ShaderBuffer::from(vec![instance]);
+    let run_records = ShaderBuffer::from(vec![run]);
+    let curves = storage_buffers.add(curves);
+    let bands = storage_buffers.add(bands);
+    let path_records = storage_buffers.add(path_records);
+    let instances = storage_buffers.add(instances);
+    let run_records = storage_buffers.add(run_records);
     let mesh = meshes.add(inert_quad_mesh());
     let material = materials.add(PathExtendedMaterial {
         base:      base_material,
@@ -314,7 +337,7 @@ fn build_line(
             },
         ),
     });
-    Some(BuiltLine { mesh, material })
+    Ok(Some(BuiltLine { mesh, material }))
 }
 
 fn rectangle_outline(design: Vec2) -> PathOutline {
@@ -332,6 +355,7 @@ fn rectangle_outline(design: Vec2) -> PathOutline {
         contours: vec![PathContour {
             minimum_feature_size: design.x.min(design.y),
             fade_exponent:        0.0,
+            role:                 super::ContourRole::Ink,
             segments:             corners
                 .iter()
                 .copied()

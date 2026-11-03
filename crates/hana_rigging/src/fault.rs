@@ -7,11 +7,21 @@ pub(crate) enum ApplyFailureDisposition {
     /// failure.
     Reconsider,
     /// Retry behind the pacing gate without counting a failure against the device.
-    AwaitClearance,
+    AwaitClearance(ClearanceWaitBound),
     /// Count the failure, pace the retry, and surface the fault.
     Fault,
     /// End driver work without scheduling another apply.
     Stop(DriverStopReason),
+}
+
+/// Whether a clearance wait counts against the role's waiting bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClearanceWaitBound {
+    /// Another application holds the device until that application releases it, so reaching
+    /// the retry instant is the next retry, not a stall.
+    ExemptWhileHeldElsewhere,
+    /// Hana's own hold or a platform block. Reaching the retry instant crosses the bound.
+    Enforced,
 }
 
 /// Why a driver failure ends apply work without retrying.
@@ -183,14 +193,16 @@ impl DeviceAccessError {
                     detail: detail.clone(),
                 })
             },
+            Self::Contended { .. } => ApplyFailureDisposition::AwaitClearance(
+                ClearanceWaitBound::ExemptWhileHeldElsewhere,
+            ),
             // Unresponsive and Releasing both name a device that is held rather than broken: a
             // camera that opened without starting its stream, or a node Hana's own earlier open
             // still holds while it waits on the driver. The clearance re-probe answers Free once
             // that hold ends, so neither spends the device's retry budget waiting for it.
-            Self::Contended { .. }
-            | Self::Blocked { .. }
-            | Self::Unresponsive { .. }
-            | Self::Releasing { .. } => ApplyFailureDisposition::AwaitClearance,
+            Self::Blocked { .. } | Self::Unresponsive { .. } | Self::Releasing { .. } => {
+                ApplyFailureDisposition::AwaitClearance(ClearanceWaitBound::Enforced)
+            },
             Self::Absent { .. } => ApplyFailureDisposition::Reconsider,
             Self::Transport { .. } => ApplyFailureDisposition::Fault,
             Self::Unsupported { detail } => {
@@ -211,6 +223,7 @@ mod tests {
     use bevy::ecs::reflect::ReflectComponent;
 
     use super::ApplyFailureDisposition;
+    use super::ClearanceWaitBound;
     use super::DeviceAccessClass;
     use super::DeviceAccessError;
     use super::DriverStopReason;
@@ -222,7 +235,7 @@ mod tests {
                 detail: String::new(),
             }
             .apply_failure_disposition(),
-            ApplyFailureDisposition::AwaitClearance
+            ApplyFailureDisposition::AwaitClearance(ClearanceWaitBound::ExemptWhileHeldElsewhere)
         );
     }
 
@@ -233,7 +246,7 @@ mod tests {
                 detail: String::new(),
             }
             .apply_failure_disposition(),
-            ApplyFailureDisposition::AwaitClearance
+            ApplyFailureDisposition::AwaitClearance(ClearanceWaitBound::Enforced)
         );
     }
 
@@ -255,7 +268,7 @@ mod tests {
                 detail: String::new(),
             }
             .apply_failure_disposition(),
-            ApplyFailureDisposition::AwaitClearance
+            ApplyFailureDisposition::AwaitClearance(ClearanceWaitBound::Enforced)
         );
     }
 
@@ -266,7 +279,7 @@ mod tests {
                 detail: String::new(),
             }
             .apply_failure_disposition(),
-            ApplyFailureDisposition::AwaitClearance
+            ApplyFailureDisposition::AwaitClearance(ClearanceWaitBound::Enforced)
         );
     }
 

@@ -11,8 +11,8 @@ use bevy::color::palettes::css::SEA_GREEN;
 use bevy::color::palettes::css::SILVER;
 use bevy::color::palettes::css::SKY_BLUE;
 use bevy::color::palettes::css::TURQUOISE;
+use bevy::curve::EaseFunction;
 use bevy::math::Dir3;
-use bevy::math::curve::EaseFunction;
 use bevy::prelude::Assets;
 use bevy::prelude::Bundle;
 use bevy::prelude::Color;
@@ -46,7 +46,6 @@ use fairy_dust::CameraHomeTarget;
 use fairy_dust::DescriptionPanel;
 use fairy_dust::TitleBar;
 use hana_diegetic::DiegeticText;
-use hana_diegetic::Sidedness;
 use hana_kana::ToF32;
 use hana_lagrange::OrbitCamPreset;
 use hana_valence::AnchorPose;
@@ -457,7 +456,7 @@ fn spawn_panel_details(
 
 fn hinge_knuckle_height() -> f32 {
     let gaps = (HINGE_KNUCKLE_COUNT - 1).to_f32();
-    (HINGE_HEIGHT - gaps * HINGE_KNUCKLE_GAP) / HINGE_KNUCKLE_COUNT.to_f32()
+    gaps.mul_add(-HINGE_KNUCKLE_GAP, HINGE_HEIGHT) / HINGE_KNUCKLE_COUNT.to_f32()
 }
 
 fn panel_label(number: usize, face: Face) -> impl Bundle {
@@ -471,7 +470,6 @@ fn panel_label(number: usize, face: Face) -> impl Bundle {
     DiegeticText::world(number.to_string())
         .size(LABEL_SIZE)
         .color(LABEL_COLOR)
-        .sidedness(Sidedness::FrontOnly)
         .transform(Transform::from_xyz(0.0, 0.0, offset).with_rotation(facing))
         .build()
 }
@@ -480,7 +478,6 @@ fn fixed_root_label() -> impl Bundle {
     DiegeticText::world(FIXED_ROOT_LABEL)
         .size(FIXED_ROOT_LABEL_SIZE)
         .color(Color::from(GOLD))
-        .sidedness(Sidedness::FrontOnly)
         .transform(Transform::from_translation(FIXED_ROOT_LABEL_OFFSET))
         .build()
 }

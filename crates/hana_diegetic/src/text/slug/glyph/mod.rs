@@ -2,10 +2,14 @@
 mod coverage_probe;
 mod outline;
 
-use outline::Glyph;
+pub(super) use outline::Glyph;
+pub(super) use outline::GlyphOutline;
 pub(super) use outline::OutlineError;
-pub(super) use outline::font_glyph_id_has_visible_outline;
-pub(super) use outline::load_glyph_by_id_from_face;
+pub(in crate::text) use outline::font_glyph_id_has_visible_outline;
+pub(in crate::text) use outline::load_glyph_by_id_from_face;
+#[cfg(test)]
+pub(super) use outline::load_glyph_from_face;
+pub(super) use outline::prepare_glyph_outline;
 
 use crate::render;
 use crate::render::PackedPath;

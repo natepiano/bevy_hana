@@ -961,7 +961,7 @@ mod tests {
     use std::time::Duration;
 
     use bevy::camera::RenderTarget;
-    use bevy::math::curve::easing::EaseFunction;
+    use bevy::curve::easing::EaseFunction;
     use bevy::prelude::Bundle;
     use bevy::prelude::Camera;
     use bevy::prelude::In;

@@ -50,14 +50,15 @@ mod manual;
 mod metrics;
 mod mode_reconciliation;
 mod modes;
+mod pointer_motion;
 mod routing;
+mod scroll;
 mod source_input_gain;
 mod sources;
 mod touch;
 
 pub(super) use action_resolution::CameraActionResolutionContext;
 pub(super) use action_resolution::CameraActionResolutionKind;
-pub(super) use action_resolution::NoActionFrameState;
 pub(super) use action_resolution::resolve_actions_into_camera_input;
 pub use actions::CameraSemanticAction;
 pub(super) use actions::FreeCamGateAction;
@@ -91,13 +92,17 @@ pub(super) use actions::OrbitCamZoomSmoothSlowAction;
 pub use axis_response::AxisResponse;
 pub use axis_response::Damping;
 pub use axis_response::Sensitivity;
+use bevy::input::InputSystems;
 use bevy::input::gestures::PinchGesture;
 use bevy::input::touch::Touches;
 use bevy::prelude::App;
 use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::Plugin;
 use bevy::prelude::PreUpdate;
+use bevy::window::CursorMoved;
+use bevy_enhanced_input::prelude::CustomInputs;
 use bevy_enhanced_input::prelude::EnhancedInputPlugin;
+use bevy_enhanced_input::prelude::InputConditionAppExt;
 pub use bindings::ActionBindingDescriptor;
 pub use bindings::BindingEngagement;
 pub use bindings::BindingGate;
@@ -157,18 +162,23 @@ pub(super) use constants::ZOOM_COARSE_ACTION_NAME;
 pub(super) use constants::ZOOM_SMOOTH_ACTION_NAME;
 pub use context::FreeCamInputContext;
 pub use context::OrbitCamInputContext;
+pub use control_summary::ActionColumnLabel;
 pub use control_summary::CameraControlAction;
 pub use control_summary::CameraControlActivation;
 pub use control_summary::CameraControlBinding;
 pub use control_summary::CameraControlBindingKind;
 pub use control_summary::CameraControlSummary;
 pub use control_summary::ControlSpeed;
+pub use control_summary::FreeCamDirectionFilter;
 pub use control_summary::OrbitCamControlRow;
 pub use control_summary::OrbitCamControlSummary;
+pub use control_summary::SlowModeHint;
 pub use control_summary::ZoomDirection;
+pub use control_summary::ZoomRowFilter;
 pub use control_summary::describe_controls;
 pub use control_summary::describe_controls_for;
 pub use control_summary::describe_orbit_cam_controls;
+pub use disabled::CameraDragClaim;
 pub use disabled::CameraInputDisabled;
 pub use disabled::CameraScrollInputDisabled;
 pub use events::CameraHomed;
@@ -186,7 +196,10 @@ pub use events::OrbitCamInteractionStarted;
 pub use events::ResetFreeCamToHome;
 pub use events::ResetOrbitCamToHome;
 pub(super) use install::CameraBindingGateCondition;
+use install::CameraCursorModifierCondition;
+pub(super) use install::CameraDragBindingCondition;
 pub(super) use install::CameraInstallKind;
+use install::CameraMotionSourceCondition;
 pub(super) use install::CameraWheelBindingCondition;
 pub(super) use install::GateActionCache;
 pub(super) use install::MotionActions;
@@ -196,6 +209,7 @@ pub(super) use install::spawn_action;
 pub(super) use install::spawn_binding;
 pub(super) use install::spawn_held_bindings;
 pub(super) use install::spawn_single_binding;
+pub(super) use install::withhold_drag_bindings_of_claimed_cameras;
 pub(super) use install::withhold_wheel_bindings_of_scroll_blocked_cameras;
 pub use intent::CameraInputKind;
 pub use intent::InputIntent;
@@ -229,6 +243,10 @@ pub(super) use modes::CameraManual;
 pub use modes::FreeCamInputMode;
 pub use modes::InputMode;
 pub use modes::OrbitCamInputMode;
+use pointer_motion::CursorDragInput;
+use pointer_motion::DragMotionLatch;
+pub(crate) use pointer_motion::RoutedDragMotion;
+use pointer_motion::StagedCursorMotion;
 pub(super) use routing::CameraInputBlockers;
 pub(super) use routing::CameraInputContextGated;
 pub use routing::CameraInputRouting;
@@ -239,6 +257,7 @@ pub(crate) use routing::CameraSlowModeLatches;
 pub use routing::CameraSlowModeState;
 pub use routing::NoPositionFallback;
 pub use routing::ResolvedCameraInputRoute;
+pub(crate) use scroll::FrameScrollInput;
 pub use source_input_gain::GamepadInputGain;
 pub use source_input_gain::MouseInputGain;
 pub use source_input_gain::SmoothScrollInputGain;
@@ -266,12 +285,56 @@ impl Plugin for InputPlugin {
         if !app.is_plugin_added::<EnhancedInputPlugin>() {
             app.add_plugins(EnhancedInputPlugin);
         }
+        let cursor_input = app
+            .world_mut()
+            .resource_mut::<CustomInputs>()
+            .register_input();
+        app.insert_resource(CursorDragInput(cursor_input));
         app.add_plugins((
             CameraInputModesPlugin,
             CameraInputRoutingPlugin,
             CameraInputLifecyclePlugin,
         ))
         .init_resource::<TouchTracker>()
+        .init_resource::<CameraDragClaim>()
+        .init_resource::<StagedCursorMotion>()
+        .init_resource::<DragMotionLatch>()
+        .init_resource::<RoutedDragMotion>()
+        .init_resource::<FrameScrollInput>()
+        .add_input_condition::<CameraDragBindingCondition>()
+        .add_input_condition::<CameraMotionSourceCondition>()
+        .add_input_condition::<CameraCursorModifierCondition>()
+        .add_message::<CursorMoved>()
+        .add_systems(
+            PreUpdate,
+            pointer_motion::stage_cursor_motion
+                .after(InputSystems)
+                .before(CameraInputPhase::PreInput),
+        )
+        .add_systems(
+            PreUpdate,
+            scroll::stage_frame_scroll_input
+                .after(InputSystems)
+                .before(CameraInputInternalSet::AdapterInjection),
+        )
+        .add_systems(
+            PreUpdate,
+            (
+                pointer_motion::select_drag_motion,
+                install::refresh_cursor_modifiers,
+            )
+                .chain()
+                .in_set(CameraInputPhase::PreInput)
+                .after(CameraInputInternalSet::Routing)
+                .after(CameraInputInternalSet::Installation)
+                .before(CameraInputInternalSet::AdapterInjection),
+        )
+        .add_systems(
+            PreUpdate,
+            withhold_drag_bindings_of_claimed_cameras
+                .in_set(CameraInputPhase::PreInput)
+                .after(CameraInputInternalSet::Installation),
+        )
         .init_resource::<Touches>()
         .add_message::<PinchGesture>()
         .add_systems(

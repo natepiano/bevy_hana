@@ -199,6 +199,7 @@ fn resolve_attachment_candidates<R, F>(
         cycle_path,
         path_indices,
     );
+    diagnostics.finish_frame();
     scratch.clear();
 }
 
@@ -451,10 +452,14 @@ fn apply_fallback<R>(
 }
 
 /// Bounded history of attachment resolution failures.
+///
+/// Active skips remain tracked independently until they clear, even after
+/// their diagnostic entries have been evicted from the history.
 #[derive(Resource, Debug)]
 pub struct AttachmentResolveDiagnostics<R: Send + Sync + 'static> {
     current_frame: u64,
     entries:       VecDeque<AttachmentResolveDiagnostic<R>>,
+    active_skips:  Vec<AttachmentResolveDiagnostic<R>>,
     capacity:      usize,
 }
 
@@ -462,38 +467,73 @@ impl<R: Send + Sync + 'static> AttachmentResolveDiagnostics<R> {
     /// Default number of diagnostic entries retained in insertion order.
     pub const DEFAULT_CAPACITY: usize = 128;
 
-    const fn begin_frame(&mut self) { self.current_frame = self.current_frame.saturating_add(1); }
+    pub(crate) const fn begin_frame(&mut self) {
+        self.current_frame = self.current_frame.saturating_add(1);
+    }
 
-    fn record(&mut self, source: Entity, target: Entity, reason: R)
+    pub(crate) fn record(&mut self, source: Entity, target: Entity, reason: R)
     where
         R: Copy + Debug + Eq,
     {
-        if let Some(entry) = self.entries.iter_mut().find(|entry| {
+        let matches = |entry: &&mut AttachmentResolveDiagnostic<R>| {
             entry.source == source && entry.target == target && entry.reason == reason
-        }) {
-            entry.last_seen_frame = self.current_frame;
-            entry.count = entry.count.saturating_add(1);
-            tracing::warn!(
+        };
+        if let Some(active) = self.active_skips.iter_mut().find(matches) {
+            active.last_seen_frame = self.current_frame;
+            active.count = active.count.saturating_add(1);
+            if let Some(entry) = self.entries.iter_mut().find(matches) {
+                *entry = *active;
+            }
+            tracing::warn!(target: "hana_valence::diagnostics",
                 source = ?source,
                 target = ?target,
                 reason = ?reason,
-                count = entry.count,
+                count = active.count,
                 "attachment skip repeated"
             );
             return;
         }
 
-        self.entries.push_back(AttachmentResolveDiagnostic {
-            source,
-            target,
-            reason,
-            first_seen_frame: self.current_frame,
-            last_seen_frame: self.current_frame,
-            count: 1,
-        });
+        tracing::warn!(?source, ?target, ?reason, "attachment skipped");
+        let diagnostic = if let Some(entry) = self.entries.iter_mut().find(matches) {
+            entry.last_seen_frame = self.current_frame;
+            entry.count = entry.count.saturating_add(1);
+            *entry
+        } else {
+            let entry = AttachmentResolveDiagnostic {
+                source,
+                target,
+                reason,
+                first_seen_frame: self.current_frame,
+                last_seen_frame: self.current_frame,
+                count: 1,
+            };
+            self.entries.push_back(entry);
+            entry
+        };
+        self.active_skips.push(diagnostic);
         while self.entries.len() > self.capacity {
             self.entries.pop_front();
         }
+    }
+
+    pub(crate) fn finish_frame(&mut self)
+    where
+        R: Debug,
+    {
+        self.active_skips.retain(|diagnostic| {
+            if diagnostic.last_seen_frame != self.current_frame {
+                tracing::info!(
+                    source = ?diagnostic.source,
+                    target = ?diagnostic.target,
+                    reason = ?diagnostic.reason,
+                    count = diagnostic.count,
+                    "attachment skip cleared"
+                );
+                return false;
+            }
+            true
+        });
     }
 
     /// Iterates over every retained diagnostic entry.
@@ -503,8 +543,7 @@ impl<R: Send + Sync + 'static> AttachmentResolveDiagnostics<R> {
 
     /// Iterates over diagnostic entries recorded in the current resolve frame.
     pub fn current(&self) -> impl Iterator<Item = &AttachmentResolveDiagnostic<R>> {
-        self.entries
-            .iter()
+        self.entries()
             .filter(|entry| entry.last_seen_frame == self.current_frame)
     }
 
@@ -522,6 +561,7 @@ impl<R: Send + Sync + 'static> Default for AttachmentResolveDiagnostics<R> {
         Self {
             current_frame: 0,
             entries:       VecDeque::new(),
+            active_skips:  Vec::new(),
             capacity:      Self::DEFAULT_CAPACITY,
         }
     }
@@ -546,7 +586,17 @@ pub struct AttachmentResolveDiagnostic<R> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use bevy::log::tracing_subscriber::Layer;
+    use bevy::log::tracing_subscriber::Registry;
+    use bevy::log::tracing_subscriber::layer::Context;
+    use bevy::log::tracing_subscriber::layer::SubscriberExt;
     use bevy_ecs::entity::Entity;
+    use tracing::Event;
+    use tracing::Level;
+    use tracing::Subscriber;
 
     use super::AttachmentResolveAction;
     use super::AttachmentResolveCandidate;
@@ -558,6 +608,158 @@ mod tests {
     use super::resolve_attachments_with_scratch;
     use crate::AnchorSite;
     use crate::AnchoredTo;
+
+    #[derive(Clone, Default)]
+    struct SkipTransitionLog(Arc<Mutex<Vec<Level>>>);
+
+    impl<S: Subscriber> Layer<S> for SkipTransitionLog {
+        fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+            if event.metadata().target() == "hana_valence::attachment" {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(*event.metadata().level());
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_skips_log_once_until_they_clear_or_change_reason() {
+        let log = SkipTransitionLog::default();
+        let subscriber = Registry::default().with(log.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let source = entity(1);
+            let target = entity(2);
+            let mut diagnostics = AttachmentResolveDiagnostics::default();
+            for _ in 0..10 {
+                resolve_attachments(
+                    vec![AttachmentResolveCandidate::Skipped {
+                        source,
+                        target,
+                        reason: TestSkip::PlacementFailed,
+                    }],
+                    test_reasons(),
+                    &mut diagnostics,
+                    |_| Ok(()),
+                );
+            }
+            assert_eq!(
+                *log.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                [Level::WARN]
+            );
+            assert_eq!(
+                diagnostics
+                    .current()
+                    .map(|entry| (entry.first_seen_frame, entry.last_seen_frame, entry.count))
+                    .collect::<Vec<_>>(),
+                [(1, 10, 10)]
+            );
+
+            resolve_attachments(
+                vec![AttachmentResolveCandidate::Skipped {
+                    source,
+                    target,
+                    reason: TestSkip::MissingTarget,
+                }],
+                test_reasons(),
+                &mut diagnostics,
+                |_| Ok(()),
+            );
+            assert_eq!(
+                *log.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                [Level::WARN, Level::WARN, Level::INFO]
+            );
+            for _ in 0..2 {
+                resolve_attachments(Vec::new(), test_reasons(), &mut diagnostics, |_| Ok(()));
+            }
+            assert_eq!(
+                *log.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                [Level::WARN, Level::WARN, Level::INFO, Level::INFO]
+            );
+            resolve_attachments(
+                vec![AttachmentResolveCandidate::Skipped {
+                    source,
+                    target,
+                    reason: TestSkip::PlacementFailed,
+                }],
+                test_reasons(),
+                &mut diagnostics,
+                |_| Ok(()),
+            );
+            assert_eq!(
+                *log.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                [
+                    Level::WARN,
+                    Level::WARN,
+                    Level::INFO,
+                    Level::INFO,
+                    Level::WARN
+                ]
+            );
+            assert_eq!(
+                diagnostics
+                    .current()
+                    .map(|entry| entry.count)
+                    .collect::<Vec<_>>(),
+                [11]
+            );
+        });
+    }
+
+    #[test]
+    fn persistent_skips_log_once_and_clear_even_when_the_history_overflows() {
+        let log = SkipTransitionLog::default();
+        let subscriber = Registry::default().with(log.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let capacity = AttachmentResolveDiagnostics::<TestSkip>::DEFAULT_CAPACITY;
+            let skip_count = capacity + 1;
+            let mut diagnostics = AttachmentResolveDiagnostics::default();
+            for _ in 0..10 {
+                let candidates = (1..)
+                    .take(skip_count)
+                    .map(|index| AttachmentResolveCandidate::Skipped {
+                        source: entity(index),
+                        target: entity(1_000),
+                        reason: TestSkip::PlacementFailed,
+                    })
+                    .collect();
+                resolve_attachments(candidates, test_reasons(), &mut diagnostics, |_| Ok(()));
+            }
+            assert_eq!(diagnostics.len(), capacity);
+            assert_eq!(
+                diagnostics
+                    .current()
+                    .map(|entry| (entry.last_seen_frame, entry.count))
+                    .collect::<Vec<_>>(),
+                vec![(10, 10); capacity]
+            );
+            assert_eq!(
+                *log.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                vec![Level::WARN; skip_count]
+            );
+
+            for _ in 0..2 {
+                resolve_attachments(Vec::new(), test_reasons(), &mut diagnostics, |_| Ok(()));
+            }
+            let expected = [vec![Level::WARN; skip_count], vec![Level::INFO; skip_count]].concat();
+            assert_eq!(
+                *log.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                expected
+            );
+        });
+    }
 
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
     enum TestSkip {
@@ -721,7 +923,7 @@ mod tests {
         let first_storage = observe_storage(&scratch);
         let candidate_storage = allocation(&candidates);
 
-        assert!(candidates.is_empty());
+        assert_eq!(candidates, []);
         assert!(first_storage.queue > 0);
         assert!(first_storage.unresolved > 0);
         assert!(first_storage.cycle_members > 0);
@@ -758,7 +960,7 @@ mod tests {
 
         assert_eq!(observe_storage(&scratch), first_storage);
         assert_eq!(allocation(&candidates), candidate_storage);
-        assert!(candidates.is_empty());
+        assert_eq!(candidates, []);
         assert!(second_actions.contains(&AttachmentResolveAction::Fallback { source: blocked }));
         assert!(diagnostics.current().any(|entry| {
             entry.source == blocked

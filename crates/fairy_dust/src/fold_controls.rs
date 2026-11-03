@@ -12,13 +12,13 @@ use bevy::prelude::Has;
 use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::KeyCode;
 use bevy::prelude::On;
-use bevy::prelude::PostUpdate;
 use bevy::prelude::Query;
 use bevy::prelude::ResMut;
 use bevy::prelude::Resource;
 use bevy::prelude::SpawnRelated;
 use bevy::prelude::SpawnWith;
 use bevy::prelude::Startup;
+use bevy::prelude::Update;
 use bevy::prelude::With;
 use bevy::prelude::warn;
 use bevy_enhanced_input::prelude::ActionSettings;
@@ -32,6 +32,7 @@ use hana_rubric::Keybindings;
 use hana_valence::FoldCommands;
 use hana_valence::FoldPlugin;
 use hana_valence::FoldSequencePlayback;
+use hana_valence::FoldSystems;
 use hana_valence::SequenceCommand;
 use hana_valence::SequenceCommandResponse;
 use hana_valence::SequenceOwner;
@@ -49,6 +50,7 @@ use crate::ensure_plugin;
 use crate::screen_panels;
 use crate::screen_panels::ControlActivation;
 use crate::screen_panels::TitleBarControlState;
+use crate::screen_panels::TitleBarOverflowSystems;
 use crate::screen_panels::TitleChip;
 use crate::shortcuts;
 
@@ -121,7 +123,7 @@ enum FoldStation {
 
 /// What the fold controls last recorded about one retained sequence.
 ///
-/// [`sync_fold_control_chips`] writes this in `PostUpdate` from
+/// [`sync_fold_control_chips`] writes this in `Update` from
 /// [`FoldSequencePlayback`]. The input observers read it instead of playback
 /// itself, because a system that holds [`FoldCommands`] already borrows every
 /// [`FoldSequencePlayback`] mutably and cannot borrow one again.
@@ -283,8 +285,10 @@ pub(crate) fn install(app: &mut App) {
         .add_input_context::<FoldControlContext>()
         .add_systems(Startup, spawn_fold_control_actions)
         .add_systems(
-            PostUpdate,
-            sync_fold_control_chips.before(screen_panels::refresh_changed_title_bar),
+            Update,
+            sync_fold_control_chips
+                .after(FoldSystems::Advance)
+                .in_set(TitleBarOverflowSystems::WriteState),
         )
         .add_observer(on_fold_step)
         .add_observer(on_unfold_step)
@@ -568,7 +572,7 @@ mod tests {
 
     use bevy::app::TaskPoolPlugin;
     use bevy::asset::AssetPlugin;
-    use bevy::math::curve::EaseFunction;
+    use bevy::curve::EaseFunction;
     use bevy::prelude::App;
     use bevy::prelude::ButtonInput;
     use bevy::prelude::Component;
@@ -577,13 +581,15 @@ mod tests {
     use bevy::prelude::Startup;
     use bevy::prelude::Time;
     use bevy::prelude::Virtual;
+    use bevy::prelude::related;
     use bevy_enhanced_input::prelude::Action;
+    use bevy_enhanced_input::prelude::Binding;
+    use bevy_enhanced_input::prelude::Bindings;
     use bevy_enhanced_input::prelude::EnhancedInputPlugin;
     use bevy_enhanced_input::prelude::InputAction;
     use bevy_enhanced_input::prelude::InputContextAppExt;
     use bevy_enhanced_input::prelude::Start;
-    use bevy_enhanced_input::prelude::actions;
-    use bevy_enhanced_input::prelude::bindings;
+    use hana_diegetic::DiegeticPanel;
     use hana_valence::FoldSequenceBuilder;
     use hana_valence::FoldTiming;
 
@@ -607,7 +613,7 @@ mod tests {
     struct AlgorithmToggles(usize);
 
     fn test_app() -> App {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.add_plugins((TaskPoolPlugin::default(), AssetPlugin::default()))
             .init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<Time>()
@@ -670,6 +676,11 @@ mod tests {
             .resource_mut::<Time<Virtual>>()
             .advance_by(delta);
         app.update();
+        // These manually driven frames have no InputPlugin to clear transient
+        // presses. Enhanced input also reads just_pressed, even after release.
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .clear();
     }
 
     fn position(app: &App, sequence: Entity) -> f64 {
@@ -693,8 +704,54 @@ mod tests {
     }
 
     #[test]
+    fn fold_play_chip_redraws_when_playback_starts_in_one_update() -> Result<(), String> {
+        let mut app = crate::sprinkle_example()
+            .with_fold_controls()
+            .with_title_bar(
+                crate::TitleBar::new()
+                    .with_title("Fold")
+                    .control(FOLD_PLAY_CONTROL_ID),
+            )
+            .init_resource::<ButtonInput<KeyCode>>()
+            .build();
+        app.finish();
+        app.update();
+        let sequence = spawn_sequence(&mut app, 2);
+        let mut panels = app
+            .world_mut()
+            .query::<(&crate::TitleBar, &DiegeticPanel)>();
+        let before = format!(
+            "{:?}",
+            panels
+                .single(app.world())
+                .map_err(|error| error.to_string())?
+                .1
+                .tree()
+        );
+
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyP);
+        app.update();
+        assert_eq!(routed(&app, sequence), Some(FoldControlAction::Play));
+        let after = format!(
+            "{:?}",
+            panels
+                .single(app.world())
+                .map_err(|error| error.to_string())?
+                .1
+                .tree()
+        );
+        assert_ne!(
+            before, after,
+            "fold chip tree did not redraw on playback start"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn fold_control_installation_is_idempotent() {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.add_plugins((TaskPoolPlugin::default(), AssetPlugin::default()))
             .init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<Time>()
@@ -758,7 +815,7 @@ mod tests {
 
     #[test]
     fn cube_spin_play_key_conflicts_with_fold_play() {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.add_plugins((TaskPoolPlugin::default(), AssetPlugin::default()));
         install(&mut app);
 
@@ -986,7 +1043,7 @@ mod tests {
 
     #[test]
     fn fold_controls_coexist_with_an_example_owned_bei_action() {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.add_plugins((TaskPoolPlugin::default(), AssetPlugin::default()))
             .init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<Time>()
@@ -1015,8 +1072,11 @@ mod tests {
     fn spawn_algorithm_action(mut commands: Commands) {
         commands.spawn((
             AlgorithmContext,
-            actions!(
-                AlgorithmContext[(Action::<ToggleAlgorithm>::new(), bindings![KeyCode::KeyT],)]
+            related!(
+                Actions<AlgorithmContext>[(
+                    Action::<ToggleAlgorithm>::new(),
+                    related!(Bindings[Binding::from(KeyCode::KeyT)]),
+                )]
             ),
         ));
     }

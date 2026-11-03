@@ -1246,7 +1246,7 @@ pub enum DeviceStateLookup<'a> {
 /// freshness and run reconciliation, but it does not advance this counter.
 ///
 /// Reacquisition does not read this counter. It compares each device's presence reading from one
-/// pass to the next, and attempt staleness keys on the per-device [`DeviceRevision`].
+/// pass to the next, and attempt staleness keys on the per-device `DeviceRevision`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Resource, Reflect)]
 #[reflect(opaque)]
 #[reflect(Resource)]
@@ -1731,7 +1731,7 @@ mod tests {
             devices.resolve(&unplugged),
             DeviceResolution::Resolved(unplugged_handle)
         );
-        assert!(replacement.changes.orphaned_entities.is_empty());
+        assert_eq!(replacement.changes.orphaned_entities, []);
 
         Ok(())
     }

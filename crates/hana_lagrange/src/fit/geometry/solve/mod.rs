@@ -4,6 +4,7 @@
 //! loop that finds the optimal camera radius and focus to frame a set of mesh vertices
 //! with a specified margin.
 
+mod fit_region;
 mod fit_solution;
 mod focus;
 mod margins;

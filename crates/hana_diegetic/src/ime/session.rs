@@ -31,11 +31,16 @@ use super::ImeStarted;
 use super::ImeTarget;
 use super::ImeTextChanged;
 use super::ImeValidationRejected;
+use super::activation;
+use super::activation::ActivatedImeFields;
+use super::activation::ActivationSelection;
 use super::buffer;
 use super::buffer::ImeBufferEdit;
 use super::buffer::ImeEditBuffer;
 use super::buffer::ImeEditCommand;
 use super::buffer::ImePreedit;
+use super::editor::PendingImePanelAnchor;
+use super::field::ImeBlurBehavior;
 
 /// Request event that opens an IME session for an already-resolved target.
 #[derive(Event, Clone, Debug)]
@@ -50,6 +55,15 @@ pub struct ImeOpenSession {
     pub field_spec:   ImeEditableFieldSpec,
     /// Optional screen-space anchor for app-owned sessions.
     pub anchor:       Option<ImeSessionAnchor>,
+}
+
+/// Request event that inserts committed text into one active IME session.
+#[derive(Event, Clone, Debug)]
+pub struct ImeInsertText {
+    /// Session that receives the text if it is still active.
+    pub session_id: ImeSessionId,
+    /// Committed text inserted at the session's current selection.
+    pub text:       String,
 }
 
 /// Request event that asks the active session to commit.
@@ -201,8 +215,22 @@ impl ActiveImeSession {
         self.active.as_ref().and_then(|session| session.anchor)
     }
 
+    pub(super) fn active_text(&self) -> Option<&str> {
+        self.active
+            .as_ref()
+            .map(|session| session.buffer.committed_text())
+    }
+
     pub(super) fn active_target(&self) -> Option<&ImeTarget> {
         self.active.as_ref().map(|session| &session.target)
+    }
+
+    pub(super) fn blur_behavior(&self) -> ImeBlurBehavior {
+        self.active
+            .as_ref()
+            .map_or(ImeBlurBehavior::Commit, |session| {
+                session.field_spec.blur_behavior()
+            })
     }
 
     pub(super) fn is_composing(&self) -> bool {
@@ -221,6 +249,12 @@ impl ActiveImeSession {
         self.active.as_ref().is_some_and(|session| {
             input_blocker.matches_session_window(session.session_id, session.window)
         })
+    }
+
+    pub(super) fn commits_on_tab(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|session| session.field_spec.commits_on_tab())
     }
 
     pub(super) fn apply_keyboard_text(
@@ -356,6 +390,8 @@ pub(super) fn open_session(
     mut active_session: ResMut<ActiveImeSession>,
     mut input_blocker: ResMut<ImeInputBlocker>,
     mut authority: ResMut<ImeCommitAuthority>,
+    mut pending_anchor: ResMut<PendingImePanelAnchor>,
+    mut field_activations: Query<Option<&mut ActivatedImeFields>>,
     frame_count: Option<Res<FrameCount>>,
     mut commands: Commands,
 ) {
@@ -371,12 +407,26 @@ pub(super) fn open_session(
     }
 
     let session_id = active_session.next_session_id();
-    let buffer = match &request.target {
-        ImeTarget::WorldPanelField { .. } | ImeTarget::ScreenPanelField { .. } => {
-            ImeEditBuffer::new_selected(request.initial_text.clone())
-        },
-        ImeTarget::AppOwned { .. } => ImeEditBuffer::new(request.initial_text.clone()),
+    let first_selection =
+        activation::first_activation_selection(request, &mut field_activations, &mut commands);
+    let select_all = match first_selection {
+        ActivationSelection::DefaultSelection => matches!(
+            request.target,
+            ImeTarget::WorldPanelField { .. } | ImeTarget::ScreenPanelField { .. }
+        ),
+        ActivationSelection::PlaceCaret => false,
+        ActivationSelection::SelectAll => true,
     };
+    let mut buffer = if select_all {
+        ImeEditBuffer::new_selected(request.initial_text.clone())
+    } else {
+        ImeEditBuffer::new(request.initial_text.clone())
+    };
+    if let Some(command) = pending_anchor.take_pointer_edit(&request.target, request.window)
+        && first_selection != ActivationSelection::SelectAll
+    {
+        buffer.apply(command);
+    }
     let session = ImeSession {
         session_id,
         target: request.target.clone(),
@@ -395,6 +445,25 @@ pub(super) fn open_session(
         target: request.target.clone(),
     });
     commands.trigger(changed);
+}
+
+pub(super) fn insert_text(
+    request: On<ImeInsertText>,
+    mut active_session: ResMut<ActiveImeSession>,
+    input_blocker: Res<ImeInputBlocker>,
+    mut commands: Commands,
+) {
+    let request = request.event();
+    if active_session.active_session_id() != Some(request.session_id) {
+        return;
+    }
+    let changed = active_session.apply_edit_command(
+        ImeEditCommand::InsertText(request.text.clone()),
+        &input_blocker,
+    );
+    if let Some(changed) = changed {
+        commands.trigger(changed);
+    }
 }
 
 pub(super) fn request_commit(

@@ -5,15 +5,19 @@ use bevy::prelude::Assets;
 use bevy::prelude::Children;
 use bevy::prelude::Entity;
 use bevy::prelude::GlobalTransform;
+use bevy::prelude::Has;
 use bevy::prelude::Mesh;
 use bevy::prelude::Mesh3d;
 use bevy::prelude::Projection;
 use bevy::prelude::Query;
 use bevy::prelude::Vec2;
 use bevy::prelude::Vec3;
+use bevy::prelude::Visibility;
 use hana_kana::Position;
 use hana_kana::ToF32;
 
+use crate::FitBounds;
+use crate::OutsideFitBounds;
 use crate::fit::constants::MIN_VISIBLE_DEPTH;
 
 // ============================================================================
@@ -280,49 +284,79 @@ impl ScreenSpaceBounds {
 // Mesh utilities
 // ============================================================================
 
-/// Extracts world-space vertex positions from all meshes on an entity and its descendants.
+/// What a fit reads from each entity it walks: its mesh, explicit bounds, visibility,
+/// and whether its mesh is marked [`OutsideFitBounds`].
+pub(in crate::fit) type FitMeshQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Option<&'static Mesh3d>,
+        Option<&'static FitBounds>,
+        Option<&'static Visibility>,
+        Has<OutsideFitBounds>,
+    ),
+>;
+
+/// Extracts world-space mesh vertices and [`FitBounds`] corners from an entity and its
+/// descendants, leaving out meshes marked [`OutsideFitBounds`] and geometry hidden below `entity`.
+/// Visibility counts from `entity` down: the target itself always counts, even when hidden,
+/// because the caller named it. Below it, [`Visibility::Hidden`] hides an entity and its
+/// subtree, [`Visibility::Visible`] shows one again, and an entity without [`Visibility`]
+/// inherits, as Bevy propagates it.
 /// Returns `(vertices, geometric_center)` where `geometric_center` is the root entity's
 /// `GlobalTransform` translation.
 pub(in crate::fit) fn extract_mesh_vertices(
     entity: Entity,
     children_query: &Query<&Children>,
-    mesh_query: &Query<&Mesh3d>,
+    mesh_query: &FitMeshQuery,
     global_transform_query: &Query<&GlobalTransform>,
     meshes: &Assets<Mesh>,
 ) -> Option<(Vec<Vec3>, Vec3)> {
-    let mesh_entities: Vec<Entity> = std::iter::once(entity)
-        .chain(children_query.iter_descendants(entity))
-        .filter(|e| mesh_query.get(*e).is_ok())
-        .collect();
-
-    if mesh_entities.is_empty() {
-        return None;
-    }
-
     let mut all_vertices = Vec::new();
-
-    for mesh_entity in &mesh_entities {
-        let Ok(mesh3d) = mesh_query.get(*mesh_entity) else {
+    let mut pending = vec![(entity, true)];
+    while let Some((current, shown)) = pending.pop() {
+        let Ok((mesh3d, bounds, _, outside_fit_bounds)) = mesh_query.get(current) else {
             continue;
         };
-        let Some(mesh) = meshes.get(&mesh3d.0) else {
+        if shown
+            && (bounds.is_some() || (mesh3d.is_some() && !outside_fit_bounds))
+            && let Ok(global_transform) = global_transform_query.get(current)
+        {
+            if let Some(bounds) = bounds {
+                for x in [-1.0, 1.0] {
+                    for y in [-1.0, 1.0] {
+                        for z in [-1.0, 1.0] {
+                            let corner = bounds.center + bounds.half_extents * Vec3::new(x, y, z);
+                            all_vertices.push(global_transform.transform_point(corner));
+                        }
+                    }
+                }
+            }
+            if !outside_fit_bounds
+                && let Some(mesh3d) = mesh3d
+                && let Some(mesh) = meshes.get(&mesh3d.0)
+                && let Some(positions) = mesh
+                    .attribute(Mesh::ATTRIBUTE_POSITION)
+                    .and_then(VertexAttributeValues::as_float3)
+            {
+                all_vertices.extend(
+                    positions
+                        .iter()
+                        .map(|pos| global_transform.transform_point(Vec3::from_array(*pos))),
+                );
+            }
+        }
+        let Ok(children) = children_query.get(current) else {
             continue;
         };
-        let Ok(global_transform) = global_transform_query.get(*mesh_entity) else {
-            continue;
-        };
-        let Some(positions) = mesh
-            .attribute(Mesh::ATTRIBUTE_POSITION)
-            .and_then(VertexAttributeValues::as_float3)
-        else {
-            continue;
-        };
-
-        all_vertices.extend(
-            positions
-                .iter()
-                .map(|pos| global_transform.transform_point(Vec3::from_array(*pos))),
-        );
+        pending.extend(children.iter().map(|&child| {
+            let child_shown = match mesh_query.get(child) {
+                Ok((_, _, Some(Visibility::Hidden), _)) => false,
+                Ok((_, _, Some(Visibility::Visible), _)) => true,
+                _ => shown,
+            };
+            (child, child_shown)
+        }));
     }
 
     if all_vertices.is_empty() {

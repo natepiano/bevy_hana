@@ -92,6 +92,14 @@ impl PaletteRowCursor {
             },
             (Some(row), PaletteRowStep::Previous) => row.checked_sub(1).unwrap_or(last),
         };
+        self.highlight(row, rows);
+    }
+
+    /// Highlights a clicked row and scrolls just far enough to keep it visible.
+    pub fn highlight(&mut self, row: usize, rows: PaletteRowList) {
+        if row >= rows.len || rows.visible_len == 0 {
+            return;
+        }
         let visible = self.visible_rows(rows);
         self.first_visible_row = if row < visible.start {
             row
@@ -101,6 +109,20 @@ impl PaletteRowCursor {
             visible.start
         };
         self.highlight = PaletteRowHighlight::Row(row);
+    }
+    /// Scrolls the visible list by rows and carries its highlight into view.
+    pub fn scroll(&mut self, rows_delta: isize, rows: PaletteRowList) {
+        if rows_delta == 0 || rows.visible_len == 0 || rows.len <= rows.visible_len {
+            return;
+        }
+        let visible = self.visible_rows(rows);
+        self.first_visible_row = visible
+            .start
+            .saturating_add_signed(rows_delta)
+            .min(rows.len - rows.visible_len);
+        let visible = self.visible_rows(rows);
+        let row = self.highlighted_row(rows).unwrap_or(visible.start);
+        self.highlight = PaletteRowHighlight::Row(row.clamp(visible.start, visible.end - 1));
     }
 }
 
@@ -203,5 +225,51 @@ mod tests {
             stepped(&[PaletteRowStep::Next], list),
             PaletteRowCursor::default()
         );
+    }
+    #[test]
+    fn highlight_moves_to_the_clicked_row_and_keeps_it_visible() {
+        let list = rows(8, Some(0));
+        let mut cursor = PaletteRowCursor::default();
+        cursor.highlight(6, list);
+        assert_eq!(cursor.highlighted_row(list), Some(6));
+        assert_eq!(cursor.visible_rows(list), 4..7);
+        cursor.highlight(1, list);
+        assert_eq!(cursor.visible_rows(list), 1..4);
+        cursor.highlight(99, list);
+        assert_eq!(cursor.highlighted_row(list), Some(1));
+    }
+
+    #[test]
+    fn scroll_clamps_to_the_list_ends() {
+        let list = rows(8, Some(0));
+        let mut cursor = PaletteRowCursor::default();
+        cursor.scroll(isize::MAX, list);
+        assert_eq!(cursor.visible_rows(list), 5..8);
+        cursor.scroll(isize::MIN, list);
+        assert_eq!(cursor.visible_rows(list), 0..3);
+    }
+
+    #[test]
+    fn scroll_leaves_a_short_list_still() {
+        for len in 0..=3 {
+            let mut cursor = PaletteRowCursor::default();
+            cursor.scroll(1, rows(len, Some(0)));
+            assert_eq!(cursor, PaletteRowCursor::default());
+        }
+    }
+
+    #[test]
+    fn scroll_carries_the_highlight_into_view() {
+        let list = rows(8, Some(0));
+        let mut cursor = PaletteRowCursor::default();
+        cursor.scroll(4, list);
+        assert_eq!(cursor.highlighted_row(list), Some(4));
+        cursor.highlight(6, list);
+        cursor.scroll(-3, list);
+        assert_eq!(cursor.highlighted_row(list), Some(3));
+        let list = rows(8, None);
+        let mut cursor = PaletteRowCursor::default();
+        cursor.scroll(2, list);
+        assert_eq!(cursor.highlighted_row(list), Some(2));
     }
 }

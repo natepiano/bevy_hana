@@ -6,8 +6,10 @@ use bevy::prelude::Color;
 use bevy::prelude::GamepadButton;
 use bevy::prelude::KeyCode;
 use bevy::prelude::Vec3;
+use hana_diegetic::ControlMetrics;
 use hana_diegetic::Pt;
 use hana_diegetic::Px;
+use hana_diegetic::SpacingMetrics;
 
 // aabb
 /// The 8 corner sign-patterns of a unit AABB, used by lighting and camera-home
@@ -62,11 +64,8 @@ pub(crate) const POSE_FIELD_SEPARATOR: char = ',';
 pub(crate) const RESTART_CAMERA_RESTORE_DURATION: Duration = Duration::from_secs(2);
 
 // cascade shadow
-// An orthographic `OrbitCam` parks at a fixed `(near + far) / 2` distance that a
-// small scene's radius-based fit can't reach, so the cascade also extends to
-// cover the camera. This headroom keeps the scene's far edge inside the last
-// cascade rather than exactly on its boundary; it must stay small enough that
-// larger scenes (where the radius term already dominates) are left untouched.
+// Keep the scene's far edge inside the last cascade rather than exactly on
+// its boundary as the camera moves in either projection.
 pub(crate) const CASCADE_CAMERA_HEADROOM: f32 = 1.2;
 // Matches Bevy's non-webgl default. The auto-fit only narrows the cascade
 // distances; the count must stay constant after spawn, because changing the
@@ -113,8 +112,6 @@ pub const EXAMPLE_CUBE_SIZE: f32 = CUBE_DEFAULT_SIZE;
 // cube face panel
 pub(crate) const CUBE_FACE_PANEL_ACTIVE_BODY_SIZE: f32 = 52.0;
 pub(crate) const CUBE_FACE_PANEL_BODY_SIZE: f32 = 44.0;
-pub(crate) const CUBE_FACE_PANEL_PADDING_FRACTION: f32 = 0.06;
-pub(crate) const CUBE_FACE_PANEL_ROW_GAP_FRACTION: f32 = 0.02;
 pub(crate) const CUBE_FACE_PANEL_SIZE_FRACTION: f32 = 0.88;
 pub(crate) const CUBE_FACE_PANEL_TITLE_SIZE: f32 = 72.0;
 
@@ -156,15 +153,15 @@ pub(crate) const FOLD_PLAY_CONTROL_ID: &str = "fold_play";
 pub(crate) const FOLD_PLAY_CONTROL_LABEL: &str = "P Play";
 pub(crate) const FOLD_PLAY_RESERVE_LABEL: &str = "fold play";
 pub(crate) const UNFOLD_CONTROL_ID: &str = "unfold_step";
-pub(crate) const UNFOLD_CONTROL_LABEL: &str = "Shift+Space Unfold";
+pub(crate) const UNFOLD_CONTROL_LABEL: &str = "Shift Space Unfold";
 
 // ground plane defaults
 pub(crate) const GROUND_PLANE_ALPHA: f32 = 0.78;
 pub(crate) const GROUND_PLANE_DEFAULT_COLOR: Color = Color::srgb(0.125, 0.14, 0.16);
 pub(crate) const GROUND_PLANE_DEFAULT_SIZE: f32 = 8.0;
 pub(crate) const GROUND_PLANE_METALLIC: f32 = 0.0;
-pub(crate) const GROUND_PLANE_REFLECTANCE: f32 = 0.45;
-pub(crate) const GROUND_PLANE_ROUGHNESS: f32 = 0.40;
+pub(crate) const GROUND_PLANE_REFLECTANCE: f32 = 0.0;
+pub(crate) const GROUND_PLANE_ROUGHNESS: f32 = 1.0;
 
 // key light
 pub(crate) const KEY_LIGHT_ILLUMINANCE: f32 = 13_500.0;
@@ -216,24 +213,22 @@ pub(crate) const TARGET: Vec3 = Vec3::new(0.0, 0.45, 0.0);
 
 // theme borders
 pub(crate) const BORDER: Px = Px(2.0);
-pub(crate) const BORDER_ACCENT: Color = Color::srgba(0.15, 0.7, 0.9, 0.5);
+pub(crate) const BORDER_ACCENT: Color = Color::srgb(0.50, 0.75, 0.89);
 pub(crate) const BORDER_DIM: Color = Color::srgba(0.1, 0.4, 0.6, 0.3);
 pub(crate) const INNER_BORDER_WIDTH: Px = Px(1.0);
 
 // theme colors
 /// Default inner background color for `fairy_dust` screen panels.
 ///
-/// Used by the title bar, description panel, and camera control panel.
-/// Exposed publicly so callers tweaking only the alpha can do:
-/// `panel.with_background_color(DEFAULT_PANEL_BACKGROUND.with_alpha(0.85))`.
-pub const DEFAULT_PANEL_BACKGROUND: Color = Color::srgba(0.02, 0.03, 0.07, 0.80);
+/// Used by the title bar, description panel, and performance panel.
+/// Screen panel fills are opaque so text keeps contrast over bright scenes.
+pub const DEFAULT_PANEL_BACKGROUND: Color = Color::srgb(0.02, 0.03, 0.07);
 pub(crate) const INNER_BACKGROUND: Color = DEFAULT_PANEL_BACKGROUND;
 /// Canonical HUD title/header color used by Fairy Dust screen panels.
 pub const TITLE_COLOR: Color = Color::srgb(0.9, 0.95, 1.0);
 
 // theme padding
 pub(crate) const FRAME_PAD: Px = Px(2.0);
-pub(crate) const INNER_PAD: Px = Px(10.0);
 const INSET: Px = Px(FRAME_PAD.0 + BORDER.0);
 
 // theme radius
@@ -244,6 +239,12 @@ pub(crate) const RADIUS: Px = Px(12.0);
 /// Canonical HUD body / label size. Used by `fairy_dust` panels and re-exported
 /// so ad-hoc panels can match the built-in look.
 pub const LABEL_SIZE: Pt = Pt(11.0);
+/// Minimum screen-panel row height; wrapped description rows can grow beyond it.
+pub(crate) const SCREEN_PANEL_ROW_HEIGHT: Px = Px(LABEL_SIZE.0 + 5.0);
+/// Screen-panel spacing in logical pixels, derived from the canonical label size.
+pub(crate) fn screen_spacing() -> SpacingMetrics<Px> {
+    ControlMetrics::from_label_size(Px(LABEL_SIZE.0 * 4.0 / 3.0)).spacing
+}
 /// Canonical HUD title size. Used by `fairy_dust` panels and re-exported
 /// so ad-hoc panels can match the built-in look.
 pub const TITLE_SIZE: Pt = Pt(14.0);

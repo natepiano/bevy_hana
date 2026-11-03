@@ -3,7 +3,9 @@
 use std::marker::PhantomData;
 use std::ops::Deref;
 
+use bevy::ecs::lifecycle::HookContext;
 use bevy::ecs::system::EntityCommands;
+use bevy::ecs::world::DeferredWorld;
 use bevy::log::warn;
 use bevy::platform::collections::HashSet;
 use bevy::prelude::App;
@@ -12,12 +14,9 @@ use bevy::prelude::Commands;
 use bevy::prelude::Component;
 use bevy::prelude::DetectChanges;
 use bevy::prelude::Entity;
-use bevy::prelude::EntityEvent;
 use bevy::prelude::FromReflect;
 use bevy::prelude::FromWorld;
-use bevy::prelude::Insert;
 use bevy::prelude::IntoScheduleConfigs;
-use bevy::prelude::On;
 use bevy::prelude::Plugin;
 use bevy::prelude::Query;
 use bevy::prelude::Reflect;
@@ -47,6 +46,7 @@ pub const CASCADE_DEPTH_LIMIT: usize = 64;
 /// [`Resolved<T>`] cache.
 #[derive(Clone, Component, Copy, Debug, Default, Eq, Hash, PartialEq, Reflect)]
 #[reflect(Component)]
+#[component(on_insert = resolve_inserted_cascade::<T>)]
 pub enum Cascade<T> {
     /// Inherit from the next lower-precedence scope.
     #[default]
@@ -266,6 +266,15 @@ pub struct CascadeDefault<A: CascadeAttribute>(pub A);
 #[derive(Resource)]
 struct CascadeCombine<A: CascadeAttribute>(fn(A, &A) -> A);
 
+/// The plugin-selected root resource used by an authored component's hook.
+/// Keeping this separate from the component lets pure cascades and entities
+/// created before their plugin keep working without a root resource.
+#[derive(Resource)]
+struct CascadeInsertionResolver<A: 'static> {
+    seed:      fn(DeferredWorld<'_>, Entity),
+    attribute: PhantomData<fn() -> A>,
+}
+
 /// Resource holding attribute `A`'s root value.
 ///
 /// [`CascadeDefault<A>`] implements this for every attribute. A crate with its own
@@ -286,14 +295,44 @@ impl<A: CascadeAttribute> CascadeRootResource<A> for CascadeDefault<A> {
 }
 
 /// Cached effective value for a participating cascade attribute.
+///
+/// The type declares its own insert hook, so registering another `on_insert`
+/// hook for it panics; react to insertion with an observer instead.
 #[derive(Clone, Component, Debug, Reflect)]
 #[reflect(Component)]
+#[component(on_insert = notify_resolved_insertion::<A>)]
 pub struct Resolved<A: CascadeAttribute>(pub A);
+
+#[derive(Resource)]
+struct ResolvedInsertionListener<A: CascadeAttribute> {
+    listener:  fn(DeferredWorld<'_>, HookContext),
+    attribute: PhantomData<fn() -> A>,
+}
 
 impl<A: CascadeAttribute> Resolved<A> {
     /// Borrows the effective value.
     #[must_use]
     pub const fn value(&self) -> &A { &self.0 }
+
+    /// Sets the callback for writes to this attribute's resolved cache.
+    ///
+    /// The type's intrinsic hook dispatches through a resource, so this works
+    /// even after caches have been spawned. A later call replaces the listener.
+    pub fn set_insert_listener(app: &mut App, listener: fn(DeferredWorld<'_>, HookContext)) {
+        app.insert_resource(ResolvedInsertionListener::<A> {
+            listener,
+            attribute: PhantomData,
+        });
+    }
+}
+
+fn notify_resolved_insertion<A: CascadeAttribute>(world: DeferredWorld, context: HookContext) {
+    if let Some(listener) = world
+        .get_resource::<ResolvedInsertionListener<A>>()
+        .map(|registration| registration.listener)
+    {
+        listener(world, context);
+    }
 }
 
 /// System ordering for shared cascade propagation.
@@ -367,10 +406,13 @@ impl<A: CascadeAttribute, R: CascadeRootResource<A>> Plugin for CascadePlugin<A,
         if !app.world().contains_resource::<CascadeCombine<A>>() {
             app.insert_resource(CascadeCombine(self.combine));
         }
+        app.insert_resource(CascadeInsertionResolver::<A> {
+            seed:      seed_inserted_cascade::<A, R>,
+            attribute: PhantomData,
+        });
         app.register_type::<Cascade<A>>()
             .register_type::<Resolved<A>>()
             .register_type::<R>()
-            .add_observer(resolve_inserted_cascade::<A, R>)
             .add_systems(
                 Update,
                 propagate_cascade::<A, R>.in_set(CascadeSet::Propagate),
@@ -434,14 +476,47 @@ pub fn resolve_entity_cascade<A: CascadeAttribute, R: CascadeRootResource<A>>(
     Some(resolve_from_world::<A>(world, entity, root, combine))
 }
 
-/// Seeds or refreshes one participant after all commands queued alongside the
-/// authored insert have applied.
-fn resolve_inserted_cascade<A: CascadeAttribute, R: CascadeRootResource<A>>(
-    inserted: On<Insert, Cascade<A>>,
-    mut commands: Commands,
+/// Resolves an entity as though `authored` were its local cascade value,
+/// without inserting either the authored value or its resolved cache.
+///
+/// Returns `None` when [`CascadePlugin`] has not installed the `R` resource.
+#[must_use]
+pub fn resolve_entity_cascade_with<A: CascadeAttribute, R: CascadeRootResource<A>>(
+    world: &World,
+    entity: Entity,
+    authored: &Cascade<A>,
+) -> Option<A> {
+    let root = world.get_resource::<R>()?.root();
+    let combine = world
+        .get_resource::<CascadeCombine<A>>()
+        .map_or(replace_cascade_value::<A> as fn(A, &A) -> A, |resource| {
+            resource.0
+        });
+    Some(resolve_from_world_with::<A>(
+        world, entity, authored, root, combine,
+    ))
+}
+
+/// Dispatches only when the attribute's plugin has installed its root reader.
+fn resolve_inserted_cascade<A: 'static>(world: DeferredWorld, context: HookContext) {
+    if let Some(seed) = world
+        .get_resource::<CascadeInsertionResolver<A>>()
+        .map(|reader| reader.seed)
+    {
+        seed(world, context.entity);
+    }
+}
+
+/// Complete bundles already carry the right cache. Only incomplete or edited
+/// participants queue a resolution after the surrounding commands have applied.
+fn seed_inserted_cascade<A: CascadeAttribute, R: CascadeRootResource<A>>(
+    mut world: DeferredWorld,
+    entity: Entity,
 ) {
-    let entity = inserted.event_target();
-    commands.queue(move |world: &mut World| {
+    if has_current_direct_cache::<A, R>(&world, entity) {
+        return;
+    }
+    world.commands().queue(move |world: &mut World| {
         if world.get::<Cascade<A>>(entity).is_none() {
             return;
         }
@@ -456,6 +531,44 @@ fn resolve_inserted_cascade<A: CascadeAttribute, R: CascadeRootResource<A>>(
         }
         world.entity_mut(entity).insert(Resolved(value));
     });
+}
+
+/// Reified labels link directly to their panel. Check those two authored scopes
+/// and the root without walking relationships, allocating, or trusting another
+/// cache. Missing links must defer: a construction bridge may still add one.
+fn has_current_direct_cache<A: CascadeAttribute, R: CascadeRootResource<A>>(
+    world: &World,
+    entity: Entity,
+) -> bool {
+    let Some(current) = world.get::<Resolved<A>>(entity) else {
+        return false;
+    };
+    let Some(parent) = world.get::<CascadeFrom>(entity).map(CascadeFrom::target) else {
+        return false;
+    };
+    if world.get::<CascadeFrom>(parent).is_some() {
+        return false;
+    }
+    let Some(default) = world.get_resource::<R>() else {
+        return false;
+    };
+    let combine = world
+        .get_resource::<CascadeCombine<A>>()
+        .map_or(replace_cascade_value::<A> as fn(A, &A) -> A, |resource| {
+            resource.0
+        });
+    let local = world
+        .get::<Cascade<A>>(entity)
+        .and_then(Cascade::as_override);
+    let inherited = world
+        .get::<Cascade<A>>(parent)
+        .and_then(Cascade::as_override);
+    let accumulated = match (local, inherited) {
+        (Some(local), Some(inherited)) => Some(combine(local.clone(), inherited)),
+        (Some(value), None) | (None, Some(value)) => Some(value.clone()),
+        (None, None) => None,
+    };
+    current.0 == resolve_accumulated(accumulated, default.root(), combine)
 }
 
 fn propagate_cascade<A: CascadeAttribute, R: CascadeRootResource<A>>(
@@ -558,6 +671,33 @@ fn resolve_from_world<A: CascadeAttribute>(
     root: A,
     combine: fn(A, &A) -> A,
 ) -> A {
+    resolve_from_world_layers(world, entity, None, root, combine)
+}
+
+fn resolve_from_world_with<A: CascadeAttribute>(
+    world: &World,
+    entity: Entity,
+    authored: &Cascade<A>,
+    root: A,
+    combine: fn(A, &A) -> A,
+) -> A {
+    resolve_from_world_layers(world, entity, Some(authored), root, combine)
+}
+
+#[cfg(test)]
+thread_local! {
+    static FULL_CASCADE_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn resolve_from_world_layers<A: CascadeAttribute>(
+    world: &World,
+    entity: Entity,
+    mut local_authored: Option<&Cascade<A>>,
+    root: A,
+    combine: fn(A, &A) -> A,
+) -> A {
+    #[cfg(test)]
+    FULL_CASCADE_RESOLUTIONS.set(FULL_CASCADE_RESOLUTIONS.get() + 1);
     let mut visited = HashSet::new();
     let mut current = entity;
     let mut accumulated = None;
@@ -569,7 +709,10 @@ fn resolve_from_world<A: CascadeAttribute>(
             );
             return resolve_accumulated(accumulated, root, combine);
         }
-        if let Some(Cascade::Override(value)) = world.get::<Cascade<A>>(current) {
+        let authored = local_authored
+            .take()
+            .or_else(|| world.get::<Cascade<A>>(current));
+        if let Some(Cascade::Override(value)) = authored {
             accumulated =
                 Some(accumulated.map_or_else(|| value.clone(), |lower| combine(lower, value)));
         }
@@ -659,6 +802,116 @@ mod tests {
         let entity = app.world_mut().spawn(Cascade::Override(TestValue(4))).id();
 
         assert_eq!(read(&app, entity), Some(TestValue(4)));
+    }
+
+    #[test]
+    fn supplied_cache_and_later_edits_resolve_before_update() {
+        let mut app = test_app();
+        let entity = app
+            .world_mut()
+            .spawn((Cascade::Override(TestValue(4)), Resolved(TestValue(4))))
+            .id();
+        assert_eq!(read(&app, entity), Some(TestValue(4)));
+        app.world_mut()
+            .entity_mut(entity)
+            .insert(Cascade::Override(TestValue(5)));
+        assert_eq!(read(&app, entity), Some(TestValue(5)));
+    }
+
+    #[test]
+    fn complete_child_skips_full_cascade_resolution() {
+        let mut app = test_app();
+        let parent = app.world_mut().spawn(Cascade::Override(TestValue(4))).id();
+        FULL_CASCADE_RESOLUTIONS.set(0);
+        let child = app
+            .world_mut()
+            .spawn((
+                CascadeFrom::new(parent),
+                Cascade::<TestValue>::Inherit,
+                Resolved(TestValue(4)),
+            ))
+            .id();
+        assert_eq!(read(&app, child), Some(TestValue(4)));
+        assert_eq!(FULL_CASCADE_RESOLUTIONS.get(), 0);
+    }
+
+    #[test]
+    fn direct_cache_check_preserves_fold_order_and_ignores_stale_parent_cache() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins).add_plugins(
+            CascadePlugin::new(TestValue(1))
+                .with_combine(|lower, higher| TestValue(lower.0 * 10 + higher.0)),
+        );
+        let parent = app.world_mut().spawn(Cascade::Override(TestValue(2))).id();
+        app.world_mut()
+            .entity_mut(parent)
+            .insert(Resolved(TestValue(999)));
+        FULL_CASCADE_RESOLUTIONS.set(0);
+        let child = app
+            .world_mut()
+            .spawn((
+                CascadeFrom::new(parent),
+                Cascade::Override(TestValue(4)),
+                Resolved(TestValue(421)),
+            ))
+            .id();
+        assert_eq!(read(&app, child), Some(TestValue(421)));
+        assert_eq!(FULL_CASCADE_RESOLUTIONS.get(), 0);
+        let stale = app
+            .world_mut()
+            .spawn((
+                CascadeFrom::new(parent),
+                Cascade::Override(TestValue(5)),
+                Resolved(TestValue(0)),
+            ))
+            .id();
+        assert_eq!(read(&app, stale), Some(TestValue(521)));
+        assert_eq!(FULL_CASCADE_RESOLUTIONS.get(), 1);
+    }
+
+    #[test]
+    fn stale_supplied_cache_is_refreshed_before_update() {
+        let mut app = test_app();
+        let entity = app
+            .world_mut()
+            .spawn((Cascade::Override(TestValue(4)), Resolved(TestValue(0))))
+            .id();
+        assert_eq!(read(&app, entity), Some(TestValue(4)));
+    }
+
+    #[test]
+    fn plugin_can_start_after_authored_entities_exist() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        let entity = app.world_mut().spawn(Cascade::Override(TestValue(4))).id();
+        assert_eq!(read(&app, entity), None);
+        app.add_plugins(CascadePlugin::new(TestValue(0)));
+        app.update();
+        assert_eq!(read(&app, entity), Some(TestValue(4)));
+        app.world_mut()
+            .entity_mut(entity)
+            .insert(Cascade::Override(TestValue(5)));
+        assert_eq!(read(&app, entity), Some(TestValue(5)));
+    }
+
+    #[test]
+    fn proposed_authored_value_resolves_without_insertion() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(CascadePlugin::new(TestValue(1)).with_combine(add_test_values));
+        let parent = app.world_mut().spawn(Cascade::Override(TestValue(2))).id();
+        let entity = app.world_mut().spawn(CascadeFrom::new(parent)).id();
+
+        assert_eq!(
+            resolve_entity_cascade_with::<TestValue, CascadeDefault<TestValue>>(
+                app.world(),
+                entity,
+                &Cascade::Override(TestValue(4)),
+            ),
+            Some(TestValue(7)),
+        );
+        assert!(app.world().get::<Cascade<TestValue>>(entity).is_none());
+        assert!(app.world().get::<Resolved<TestValue>>(entity).is_none());
     }
 
     #[test]

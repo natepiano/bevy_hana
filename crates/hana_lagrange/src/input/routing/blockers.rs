@@ -25,6 +25,7 @@ bitflags::bitflags! {
         const ANIMATION_IGNORE = 1 << 2;
         const UNAVAILABLE_OWNER = 1 << 3;
         const SCROLL_DISABLED = 1 << 4;
+        const DRAG_CLAIMED = 1 << 5;
         /// Reasons that withhold every input from the camera.
         const ALL_INPUT = Self::DISABLED.bits()
             | Self::INACTIVE_CAMERA.bits()
@@ -49,6 +50,12 @@ impl CameraInputBlockers {
         )
     }
 
+    pub(crate) const fn blocks_pointer_drag(self) -> bool {
+        self.bits.intersects(
+            CameraInputBlockerBits::ALL_INPUT.union(CameraInputBlockerBits::DRAG_CLAIMED),
+        )
+    }
+
     pub(super) fn from_snapshot(
         snapshot: &CameraRoutingSnapshot,
         routed_camera: Option<Entity>,
@@ -67,6 +74,9 @@ impl CameraInputBlockers {
         }
         if snapshot.has(CameraRoutingSnapshotFlags::SCROLL_DISABLED) {
             bits.insert(CameraInputBlockerBits::SCROLL_DISABLED);
+        }
+        if snapshot.has(CameraRoutingSnapshotFlags::DRAG_CLAIMED) {
+            bits.insert(CameraInputBlockerBits::DRAG_CLAIMED);
         }
         Self { bits }
     }

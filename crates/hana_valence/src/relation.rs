@@ -172,18 +172,18 @@ mod tests {
             AnchorSite::Center,
         ));
         assert_eq!(reverse_targets(world, target_a), vec![source]);
-        assert!(reverse_targets(world, target_b).is_empty());
+        assert_eq!(reverse_targets(world, target_b), []);
 
         world.entity_mut(source).insert(
             AnchoredTo::new(target_a, AnchorSite::EdgeMidpoint(0), AnchorSite::Center)
                 .retargeted(target_b)
                 .with_offset(Displacement::from(Vec3::X)),
         );
-        assert!(reverse_targets(world, target_a).is_empty());
+        assert_eq!(reverse_targets(world, target_a), []);
         assert_eq!(reverse_targets(world, target_b), vec![source]);
 
         world.entity_mut(source).remove::<AnchoredTo>();
-        assert!(reverse_targets(world, target_b).is_empty());
+        assert_eq!(reverse_targets(world, target_b), []);
     }
 
     #[test]

@@ -19,7 +19,6 @@ path = "src/lib.rs"
 name              = "restore_after_reconnect"
 path              = "examples/restore_after_reconnect/main.rs"
 required-features = ["monitor-probe"]
-test              = true
 
 [dependencies]
 bevy = { workspace = true, features = [
@@ -37,7 +36,7 @@ hana_rigging = { workspace = true }
 winit = { workspace = true }
 
 dirs              = { workspace = true }
-raw-window-handle = "0.6"
+raw-window-handle = { workspace = true }
 ron               = { workspace = true }
 serde             = { workspace = true }
 thiserror         = { workspace = true }
@@ -46,14 +45,13 @@ tracing           = { workspace = true, optional = true }
 [dev-dependencies]
 bevy                  = { workspace = true, features = ["bevy_pbr", "bevy_ui", "default_font"] }
 bevy_remote           = { workspace = true }
-fairy_dust            = { workspace = true }
-hana_diegetic         = { workspace = true }
+hana_clerestory       = { path = ".", features = ["test"] }
 hana_rigging_scripted = { workspace = true }
 serde_json            = { workspace = true }
 tempfile              = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", features = [
+windows = { workspace = true, features = [
   "Win32_Devices_DeviceAndDriverInstallation",
   "Win32_Devices_Display",
   "Win32_Foundation",
@@ -67,16 +65,16 @@ windows = { version = "0.62.2", features = [
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-block2 = "0.6.2"
-objc2 = "0.6.4"
-objc2-app-kit = { version = "0.3.2", features = [
+block2 = { workspace = true }
+objc2 = { workspace = true }
+objc2-app-kit = { workspace = true, features = [
   "NSGraphics",
   "NSResponder",
   "NSScreen",
   "NSView",
   "NSWindow",
 ] }
-objc2-foundation = { version = "0.3.2", features = [
+objc2-foundation = { workspace = true, features = [
   "NSNotification",
   "NSOperation",
   "NSString",
@@ -85,10 +83,7 @@ objc2-foundation = { version = "0.3.2", features = [
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-x11rb = { version = "0.13", default-features = false, features = [
-  "dl-libxcb",
-  "randr",
-] }
+x11rb = { workspace = true, features = ["dl-libxcb", "randr"] }
 
 [features]
 default = [

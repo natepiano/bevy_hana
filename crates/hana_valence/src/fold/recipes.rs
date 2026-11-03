@@ -1,17 +1,20 @@
-//! The three fold recipes the library ships.
+//! The four fold recipes the library ships.
 
 use bevy_ecs::entity::Entity;
 use hana_kana::Angle;
 use hana_kana::AngleError;
 use hana_kana::Displacement;
+use thiserror::Error;
 
 use super::FoldAssignment;
 use super::FoldAuthorError;
 use super::FoldGroups;
 use super::FoldRecipe;
 use super::NoCapability;
+use super::ProviderCapability;
 use super::WindingClearance;
 use crate::ArrangementConnection;
+use crate::providers::StackFoldDirection;
 
 /// Half a turn, the default accordion offset whose sign every second group
 /// reverses.
@@ -96,18 +99,32 @@ impl FoldDirectionSign {
 /// range test runs in `f64`, where no sum of two finite `f32` values can
 /// overflow, and only a sum already proven representable is re-entered through
 /// [`Angle::from_radians`].
+fn endpoint(base: Angle, offset: Angle) -> Result<Angle, AngleError> {
+    let wide = f64::from(base.radians()) + f64::from(offset.radians());
+    if wide < f64::from(f32::MIN) || wide > f64::from(f32::MAX) {
+        return Err(AngleError::NonFiniteRadians);
+    }
+
+    Angle::from_radians(base.radians() + offset.radians())
+}
+
 fn folded_endpoint(
     member_entity: Entity,
     base: Angle,
     offset: Angle,
 ) -> Result<Angle, FoldAuthorError> {
-    let wide = f64::from(base.radians()) + f64::from(offset.radians());
-    if wide < f64::from(f32::MIN) || wide > f64::from(f32::MAX) {
-        return Err(FoldAuthorError::AngleOverflow { member_entity });
-    }
+    endpoint(base, offset).map_err(|_| FoldAuthorError::AngleOverflow { member_entity })
+}
 
-    Angle::from_radians(base.radians() + offset.radians())
-        .map_err(|_| FoldAuthorError::AngleOverflow { member_entity })
+pub(crate) fn strip_fold_endpoint(
+    base: Angle,
+    direction: StackFoldDirection,
+) -> Result<Angle, AngleError> {
+    let offset = match direction {
+        StackFoldDirection::Positive => HALF_TURN,
+        StackFoldDirection::Negative => Angle::from_radians(-HALF_TURN.radians())?,
+    };
+    endpoint(base, offset)
 }
 
 /// Folds alternate groups in opposite directions, like a paper fan.
@@ -266,6 +283,146 @@ impl FoldRecipe for Wrap {
 
         Ok(assignments)
     }
+}
+
+/// Per-member pivot displacement that guarantees a sparse strip can fold into
+/// its provider-computed stack without crossing an earlier layer.
+///
+/// The capability is authored by [`crate::CellSheet`] against its retained
+/// strip groups. Each entry couples the guaranteed displacement to the fold
+/// direction for which that clearance was simulated; [`StripFold`] is the
+/// consumer that turns the pair into one complete hinge endpoint.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FoldStackPivotClearance {
+    pivots: Vec<(Entity, StackFoldDirection, Displacement)>,
+}
+
+impl FoldStackPivotClearance {
+    pub(crate) fn try_new(
+        groups: &FoldGroups,
+        pivots: impl IntoIterator<Item = (Entity, StackFoldDirection, Displacement)>,
+    ) -> Result<Self, StripFoldError> {
+        let mut entries = Vec::new();
+        for (member_entity, direction, displacement) in pivots {
+            if !displacement.is_finite() {
+                return Err(StripFoldError::NonFinitePivotClearance { member_entity });
+            }
+            if entries
+                .iter()
+                .any(|(listed, _, _)| *listed == member_entity)
+            {
+                return Err(StripFoldError::DuplicatePivotClearance { member_entity });
+            }
+            if !groups.iter().any(|group| group.contains(member_entity)) {
+                return Err(StripFoldError::ForeignPivotClearance { member_entity });
+            }
+            entries.push((member_entity, direction, displacement));
+        }
+        for group in groups {
+            for member_entity in group {
+                if !entries.iter().any(|(listed, _, _)| listed == member_entity) {
+                    return Err(StripFoldError::MissingPivotClearance {
+                        member_entity: *member_entity,
+                    });
+                }
+            }
+        }
+        Ok(Self { pivots: entries })
+    }
+
+    fn pivot_for(
+        &self,
+        member_entity: Entity,
+    ) -> Result<(StackFoldDirection, Displacement), StripFoldError> {
+        self.pivots
+            .iter()
+            .find(|(listed, _, _)| *listed == member_entity)
+            .map_or(
+                Err(StripFoldError::MissingPivotClearance { member_entity }),
+                |(_, direction, displacement)| Ok((*direction, *displacement)),
+            )
+    }
+}
+
+impl ProviderCapability for FoldStackPivotClearance {}
+
+/// A half-turn fold that closes each [`crate::CellSheet`] strip into its
+/// clearance-guaranteed stack.
+///
+/// Direction alternates down a strip. Where branches leave the same square,
+/// the provider assigns their first hinges opposite directions before reusing
+/// a face, so neighbouring carried branches do not turn through one another.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StripFold;
+
+impl FoldRecipe for StripFold {
+    type Error = StripFoldError;
+    type RequiredCapability = FoldStackPivotClearance;
+
+    fn fold_assignments(
+        &self,
+        groups: &FoldGroups,
+        connections: &[ArrangementConnection],
+        clearance: &Self::RequiredCapability,
+    ) -> Result<Vec<FoldAssignment>, Self::Error> {
+        let mut assignments = Vec::new();
+        for connection in groups
+            .iter()
+            .flat_map(|group| group.connections(connections))
+        {
+            if assignments.iter().any(|assignment: &FoldAssignment| {
+                assignment.member_entity == connection.member_entity
+            }) {
+                continue;
+            }
+            let member_entity = connection.member_entity;
+            let (direction, pivot_offset) = clearance.pivot_for(member_entity)?;
+            let folded_angle = strip_fold_endpoint(connection.base_angle, direction)
+                .map_err(|_| StripFoldError::AngleOverflow { member_entity })?;
+            assignments.push(FoldAssignment {
+                member_entity,
+                folded_angle,
+                pivot_offset,
+            });
+        }
+        Ok(assignments)
+    }
+}
+
+/// A [`StripFold`] authoring failure.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[non_exhaustive]
+pub enum StripFoldError {
+    /// No stack-clearance guarantee covers a selected member.
+    #[error("fold-stack pivot clearance has no entry for member {member_entity:?}")]
+    MissingPivotClearance {
+        /// Selected member without a guarantee.
+        member_entity: Entity,
+    },
+    /// One member received two stack-clearance guarantees.
+    #[error("fold-stack pivot clearance for member {member_entity:?} was supplied twice")]
+    DuplicatePivotClearance {
+        /// Member with duplicate guarantees.
+        member_entity: Entity,
+    },
+    /// A guarantee named a member outside the covered groups.
+    #[error("fold-stack pivot clearance member {member_entity:?} is outside its fold groups")]
+    ForeignPivotClearance {
+        /// Foreign member named by the capability.
+        member_entity: Entity,
+    },
+    /// A guarantee carried NaN or infinity.
+    #[error("fold-stack pivot clearance for member {member_entity:?} is not finite")]
+    NonFinitePivotClearance {
+        /// Member whose guarantee was invalid.
+        member_entity: Entity,
+    },
+    /// Adding the strip half-turn to a connection's base angle overflowed.
+    #[error("strip-fold endpoint for member {member_entity:?} is not representable")]
+    AngleOverflow {
+        /// Member whose derived endpoint overflowed.
+        member_entity: Entity,
+    },
 }
 
 /// Yields every selected connection once, in group then member order.

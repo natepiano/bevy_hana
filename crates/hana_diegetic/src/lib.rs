@@ -39,8 +39,8 @@
 //!         ..default()
 //!     })
 //!     .insert_resource(TextAlpha(AlphaMode::Add))
-//!     // Optional: add coverage compensation beyond the automatic
-//!     // screen-size adjustment when HDR makes text look too thin.
+//!     // Optional: add coverage beyond the glyphs' geometric coverage
+//!     // when HDR makes text look too thin.
 //!     .insert_resource(HdrTextCoverageBias(2.0))
 //!     .add_plugins(DiegeticUiPlugin);
 //! ```
@@ -50,12 +50,17 @@ mod cascade;
 mod constants;
 #[cfg(feature = "typography_overlay")]
 mod debug;
+#[path = "widgets/interaction/fine_adjust.rs"]
+mod fine_adjust;
 mod fluent;
+mod icon;
 mod ime;
 mod layout;
 mod panel;
 mod render;
 mod screen_space;
+#[cfg(test)]
+mod test_support;
 mod text;
 mod widgets;
 
@@ -63,6 +68,9 @@ mod widgets;
 #[doc(hidden)]
 /// Internal exports used by feature-gated benchmarks.
 pub mod bench_support {
+    use std::sync::Arc;
+
+    use crate::TextWrap;
     pub use crate::layout::LayoutEngine;
     pub use crate::layout::LayoutResult;
     pub use crate::layout::LayoutTreeChange;
@@ -70,9 +78,34 @@ pub mod bench_support {
     pub use crate::layout::RectangleSource;
     pub use crate::layout::RenderCommand;
     pub use crate::layout::RenderCommandKind;
+    pub use crate::layout::ShapedTextCache;
+    pub use crate::text::create_parley_measurer;
+
+    /// Resolves authored spans for feature-gated shaping benchmarks.
+    pub fn rich_paragraph(
+        base: crate::TextStyle,
+        spans: impl FnOnce(&mut crate::RichTextBuilder),
+    ) -> crate::RichParagraph {
+        let mut builder =
+            crate::RichTextBuilder::new(base, crate::TextSizing::wrap(TextWrap::None));
+        spans(&mut builder);
+        builder.finish()
+    }
+
+    /// Production paragraph shaper and shared cache, for benchmark workloads.
+    #[must_use]
+    pub fn create_parley_rich_measurer(
+        registry: &crate::FontRegistry,
+        cache: ShapedTextCache,
+    ) -> Arc<dyn Fn(&crate::RichParagraph, f32) -> crate::TextDimensions + Send + Sync> {
+        crate::text::create_parley_rich_measurer(
+            registry.font_context(),
+            registry.family_names(),
+            cache,
+        )
+    }
 }
 
-use bevy::asset::embedded_asset;
 use bevy::prelude::App;
 use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::Plugin;
@@ -100,6 +133,7 @@ pub use cascade::resolved_shape_material;
 pub use cascade::resolved_sidedness;
 pub use cascade::resolved_text_alpha;
 pub use cascade::resolved_text_material;
+pub use constants::DIAGNOSTIC_LOG_TARGET;
 #[cfg(feature = "typography_overlay")]
 pub use debug::GlyphMetricVisibility;
 #[cfg(feature = "typography_overlay")]
@@ -107,9 +141,17 @@ pub use debug::OverlayBoundingBox;
 #[cfg(feature = "typography_overlay")]
 pub use debug::TypographyOverlay;
 use debug::TypographyOverlayPlugin;
+pub use fine_adjust::FineAdjustment;
+pub use fine_adjust::FineAdjustmentPlugin;
+pub use fine_adjust::FineAdjustmentSystems;
 pub use fluent::DiegeticText;
 pub use fluent::DiegeticTextBuilder;
 use fluent::DiegeticTextPlugin;
+pub use icon::DiegeticIcon;
+pub use icon::DiegeticIconBuilder;
+pub use icon::Icon;
+use icon::IconPlugin;
+pub use icon::LucideIcon;
 pub use ime::ImeAcceptCommit;
 pub use ime::ImeAppInputContext;
 pub use ime::ImeAppInputDisposition;
@@ -117,6 +159,7 @@ pub use ime::ImeAppInputDispositionHook;
 pub use ime::ImeAppOwnedFieldSpec;
 pub use ime::ImeApplied;
 pub use ime::ImeAppliedResult;
+pub use ime::ImeAuthoredFieldText;
 pub use ime::ImeBufferBoundary;
 pub use ime::ImeBufferRange;
 pub use ime::ImeBufferSnapshot;
@@ -133,7 +176,10 @@ pub use ime::ImeCommitCause;
 pub use ime::ImeCommitRequested;
 pub use ime::ImeCursorState;
 pub use ime::ImeEditableFieldSpec;
+pub use ime::ImeFieldAuthoringLock;
 pub use ime::ImeInputBlocker;
+pub use ime::ImeInsertText;
+pub use ime::ImeNumberFieldDrag;
 pub use ime::ImeOpenSession;
 pub use ime::ImePanelField;
 use ime::ImePlugin;
@@ -187,7 +233,9 @@ pub use layout::InvalidPanelScalar;
 pub use layout::InvalidSize;
 pub use layout::LayoutBuilder;
 pub use layout::LayoutContentBuilder;
+pub use layout::LayoutEngine;
 pub use layout::LayoutOnly;
+pub use layout::LayoutResult;
 pub use layout::LayoutTree;
 pub use layout::LayoutTreeChange;
 pub use layout::Lighting;
@@ -217,17 +265,29 @@ pub use layout::PressedEditorStateColors;
 pub use layout::PressedPart;
 pub use layout::Pt;
 pub use layout::Px;
+pub use layout::RenderCommand;
+pub use layout::RenderCommandKind;
 pub use layout::ResolvedPanelShape;
 pub use layout::ResolvedPanelShapePrimitive;
 pub use layout::Row;
+pub use layout::ScrollRestEdge;
 pub use layout::ShadowCasting;
+#[doc(hidden)]
+pub use layout::ShapedTextCache;
 pub use layout::Sidedness;
 pub use layout::Sizing;
 pub use layout::SolvedScroll;
+pub use layout::SolvedScrollIndicator;
 pub use layout::Text;
 pub use layout::TextAlign;
 /// Measured width and height of a text string, returned by [`MeasureTextFn`].
 pub use layout::TextDimensions;
+/// Tight bounds of the ink a laid-out string draws, returned by
+/// [`FontRegistry::measure_ink`].
+pub use layout::TextInk;
+/// What [`FontRegistry::measure_ink`] measured: no visible ink, or the bounds
+/// of the ink a laid-out string draws.
+pub use layout::TextInkMeasurement;
 /// Font configuration passed to [`MeasureTextFn`]: font ID, size, weight,
 /// slant, line height, letter/word spacing. The `side_by_side` example uses
 /// this type to feed clay-layout's measurement callback from parley.
@@ -242,6 +302,7 @@ pub use layout::WidgetBuilder;
 pub use layout::WidgetChild;
 pub use layout::WidgetDeclaration;
 pub use layout::WidgetElement;
+pub use layout::WidgetInteractivityOverrideOutcome;
 pub use layout::WidgetOwner;
 pub use layout::WidgetPart;
 pub use layout::WidgetRootSlot;
@@ -279,6 +340,7 @@ pub use panel::PanelAnchorOffset;
 pub use panel::PanelAnchorPoint;
 pub use panel::PanelAnchorPoints;
 pub use panel::PanelAttachment;
+pub use panel::PanelAttachmentAuthored;
 pub use panel::PanelBuildError;
 pub use panel::PanelChangeKind;
 pub use panel::PanelChanged;
@@ -316,6 +378,8 @@ pub use panel::SavedPanelWorldState;
 pub use panel::Screen;
 pub use panel::ScreenPosition;
 pub use panel::ScrollExtent;
+pub use panel::ScrollIndicatorState;
+pub use panel::ScrollRecordDrive;
 pub use panel::ScrollRecordUnderPoint;
 pub use panel::ShowTextGizmos;
 pub use panel::SurfaceShadow;
@@ -327,53 +391,93 @@ pub use render::AnalyticLine;
 pub use render::AnalyticLineProbe;
 #[doc(hidden)]
 pub use render::AnalyticLineProbePlugin;
+pub use render::AncestorVisibility;
 pub use render::AntiAlias;
 pub use render::DiegeticTextBatch;
 pub use render::DiegeticTextMut;
+pub use render::DisplayCompensationReadiness;
+pub use render::DrawnTextBounds;
+pub use render::FirstTextBatchPipeline;
 pub use render::HairlineFade;
 pub use render::HairlineWidth;
+pub use render::PanelGeometryBuild;
+pub use render::PanelInteractionMesh;
 pub use render::PanelText;
 pub use render::PanelTextLayout;
 pub use render::PanelTextReader;
 pub use render::PanelTextRuns;
+pub use render::PostOitResolveText3d;
+pub use render::QueuedTextPipelineCandidate;
 use render::RenderPlugin;
 pub use render::StableTransparency;
 pub use render::TextContent;
 pub use render::TextEdit;
+pub use render::TextPipelineStartup;
 pub use render::TextRunOf;
 pub use render::WorldTextReady;
 pub use render::default_panel_material;
+pub use render::draws_analytic_paths;
 pub use screen_space::ScreenAnchorTarget;
+pub use screen_space::ScreenPixelEdgeSnap;
 pub use screen_space::ScreenSpaceCamera;
 pub use screen_space::ScreenSpaceLight;
 use screen_space::ScreenSpacePlugin;
+pub use text::DecorationLineMetrics;
 pub use text::DiegeticTextMeasurer;
+pub use text::EmbeddedFace;
 pub use text::Font;
+pub use text::FontFailureSource;
 pub use text::FontId;
+pub use text::FontLoadError;
 pub use text::FontLoadFailed;
+pub use text::FontLookupError;
 pub use text::FontMetrics;
+pub use text::FontParseError;
 pub use text::FontRegistered;
+pub use text::FontRegistrationError;
 pub use text::FontRegistry;
+pub use text::FontRegistryError;
 pub use text::FontSource;
 #[cfg(feature = "typography_overlay")]
 pub use text::GlyphBounds;
 #[cfg(feature = "typography_overlay")]
+pub use text::GlyphInkMeasurement;
+#[cfg(feature = "typography_overlay")]
+pub use text::GlyphMetricsError;
+pub use text::GlyphOutline;
+#[cfg(feature = "typography_overlay")]
 pub use text::GlyphTypographyMetrics;
 pub use text::IntegralAdvanceSizeError;
+pub use text::TextOutline;
+pub use text::TextOutlineError;
+pub use text::TextOutlineMeasurement;
 use text::TextPlugin;
+#[doc(hidden)]
+pub use text::reset_drawn_glyph_cache;
 pub use widgets::Appearance;
 pub use widgets::BackgroundColor;
 pub use widgets::BorderColor;
 pub use widgets::Button;
+pub use widgets::ButtonActivationSource;
 pub use widgets::ButtonCancelCause;
 pub use widgets::ButtonCanceled;
 pub use widgets::ButtonClicked;
+pub use widgets::ButtonLatch;
+pub use widgets::ButtonMetrics;
+pub use widgets::ButtonMode;
+pub use widgets::ButtonPressSource;
 pub use widgets::ButtonPressed;
 pub use widgets::ButtonReleased;
+pub use widgets::CapsuleThumb;
 pub use widgets::ClearWidgetFocus;
+pub use widgets::ControlLength;
+pub use widgets::ControlMetrics;
+pub use widgets::ControlPalette;
 pub use widgets::FacePicking;
+pub use widgets::FieldMetrics;
 pub use widgets::HoveredScrollTargets;
 pub use widgets::IntoAppearance;
+pub use widgets::MenuMetrics;
 pub use widgets::MeshAnchorCommandsExt;
 pub use widgets::MeshFace;
 pub use widgets::PanelPicking;
@@ -384,41 +488,58 @@ pub use widgets::PanelWidgetWriter;
 pub use widgets::PanelWidgets;
 pub use widgets::PathColor;
 pub use widgets::PointerScrollTarget;
+pub use widgets::PopUpMetrics;
 pub use widgets::RequestPanelFocus;
 pub use widgets::RequestSliderAdjustment;
 pub use widgets::RequestWidgetFocus;
+pub use widgets::RowMetrics;
 pub use widgets::ScreenAnchorCommandsExt;
+pub use widgets::SizeGateExempt;
 pub use widgets::Slider;
 pub use widgets::SliderAdjustment;
+pub use widgets::SliderAuthoringLock;
 pub use widgets::SliderCancelCause;
 pub use widgets::SliderCanceled;
 pub use widgets::SliderChangeRequested;
 pub use widgets::SliderConfigError;
 pub use widgets::SliderDirection;
 pub use widgets::SliderGrabbed;
+pub use widgets::SliderMetrics;
+pub use widgets::SliderProposalSource;
+pub use widgets::SliderProposalValue;
+pub use widgets::SliderPushedValue;
 pub use widgets::SliderRange;
+pub use widgets::SliderReachableBand;
 pub use widgets::SliderReleased;
-pub use widgets::SliderResetBehavior;
 pub use widgets::SliderState;
 pub use widgets::SliderStep;
+pub use widgets::SliderStepping;
+pub use widgets::SpacingMetrics;
+pub use widgets::Switch;
+pub use widgets::SwitchMetrics;
+pub use widgets::SwitchSide;
+pub use widgets::SwitchState;
+pub use widgets::SwitchToggleRequested;
 pub use widgets::TextColor;
 pub use widgets::Tint;
 pub use widgets::Tooltip;
+pub use widgets::TooltipCardOccupiedRegions;
 pub use widgets::TooltipCommandsExt;
 pub use widgets::TooltipDisabledPolicy;
 pub use widgets::TooltipFor;
 pub use widgets::TooltipHidden;
-pub use widgets::TooltipPlacementPolicy;
 pub use widgets::TooltipShown;
 pub use widgets::TooltipTarget;
 pub use widgets::TooltipTargetEntity;
 pub use widgets::TooltipTargetSpace;
 pub use widgets::Tooltips;
 pub use widgets::WidgetControlSummary;
+pub use widgets::WidgetDimmed;
 pub use widgets::WidgetDisabled;
 pub use widgets::WidgetDisabledAppearance;
 pub use widgets::WidgetFocusChangeCause;
 pub use widgets::WidgetFocusChanged;
+pub use widgets::WidgetFocusTarget;
 pub use widgets::WidgetFocusable;
 pub use widgets::WidgetFocused;
 pub use widgets::WidgetFocusedAppearance;
@@ -431,20 +552,26 @@ pub use widgets::WidgetInputDisabled;
 pub use widgets::WidgetInputMode;
 pub use widgets::WidgetInputPlugin;
 pub use widgets::WidgetInteractivity;
+pub use widgets::WidgetKind;
 pub use widgets::WidgetOf;
 pub use widgets::WidgetPressedAppearance;
+pub use widgets::WidgetPrimaryPressOwnership;
+pub use widgets::WidgetScreenSizeGate;
+pub use widgets::WidgetStepDirection;
 use widgets::WidgetsPlugin;
+pub use widgets::release_button;
 pub use widgets::slider_self_update;
 
-/// Bevy plugin that adds diegetic layout, widgets, and IME behavior without
-/// renderer initialization.
+/// Bevy plugin that adds diegetic layout, widgets, screen-space placement, and
+/// IME behavior without renderer initialization.
 ///
 /// Use this plugin in client tests that need the same panel and widget
 /// behavior as [`DiegeticUiPlugin`] without shaders, render assets, gizmos, or
-/// a render sub-app. Insert a [`DiegeticTextMeasurer`] before adding this
-/// plugin; deterministic tests may use `DiegeticTextMeasurer::default()`.
-/// [`WidgetInputPlugin`] is not required for widget behavior. Add it when
-/// `hana_diegetic` should translate Bevy input bindings into widget focus,
+/// a render sub-app. Screen panels resolve their window positions here, and
+/// screen tooltips reveal through the same overlay views as in a rendered app. Insert a
+/// [`DiegeticTextMeasurer`] before adding this plugin; deterministic tests may use
+/// `DiegeticTextMeasurer::default()`. [`WidgetInputPlugin`] is not required for widget behavior.
+/// Add it when `hana_diegetic` should translate Bevy input bindings into widget focus,
 /// activation, and cancellation requests. Without it, an application or test
 /// can send [`WidgetInput`] requests directly.
 ///
@@ -460,7 +587,12 @@ pub struct HeadlessDiegeticUiPlugin;
 
 impl Plugin for HeadlessDiegeticUiPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins((HeadlessLayoutPlugin, WidgetsPlugin, ImePlugin));
+        app.add_plugins((
+            HeadlessLayoutPlugin,
+            WidgetsPlugin,
+            ScreenSpacePlugin,
+            ImePlugin,
+        ));
     }
 }
 
@@ -485,17 +617,39 @@ impl Plugin for DiegeticUiPlugin {
         bevy::asset::load_internal_asset!(
             app,
             crate::constants::MATERIAL_TABLE_SHADER_HANDLE,
-            "render/material_table.wgsl",
-            bevy::shader::Shader::from_wgsl
+            "render/material_table.wesl",
+            |source, _| bevy::shader::Shader::from_wesl(
+                source,
+                "embedded://hana_diegetic/material_table.wesl"
+            )
         );
         bevy::asset::load_internal_asset!(
             app,
             crate::constants::SDF_MATERIAL_TABLE_SHADER_HANDLE,
-            "shaders/sdf_material_table.wgsl",
-            bevy::shader::Shader::from_wgsl
+            "shaders/sdf_material_table.wesl",
+            |source, _| bevy::shader::Shader::from_wesl(
+                source,
+                "embedded://hana_diegetic/sdf_material_table.wesl"
+            )
         );
-        embedded_asset!(app, "shaders/sdf_panel.wgsl");
-        embedded_asset!(app, "shaders/image_panel.wgsl");
+        bevy::asset::load_internal_asset!(
+            app,
+            crate::constants::SDF_PANEL_SHADER_HANDLE,
+            "shaders/sdf_panel.wesl",
+            |source, _| bevy::shader::Shader::from_wesl(
+                source,
+                "embedded://hana_diegetic/sdf_panel.wesl"
+            )
+        );
+        bevy::asset::load_internal_asset!(
+            app,
+            crate::constants::IMAGE_PANEL_SHADER_HANDLE,
+            "shaders/image_panel.wesl",
+            |source, _| bevy::shader::Shader::from_wesl(
+                source,
+                "embedded://hana_diegetic/image_panel.wesl"
+            )
+        );
 
         app.init_resource::<PanelDefaults>();
         app.configure_sets(
@@ -506,11 +660,18 @@ impl Plugin for DiegeticUiPlugin {
             TextPlugin,
             HeadlessDiegeticUiPlugin,
             PanelPlugin,
-            ScreenSpacePlugin,
             RenderPlugin,
             DiegeticTextPlugin,
+            IconPlugin,
             #[cfg(feature = "typography_overlay")]
             TypographyOverlayPlugin,
         ));
     }
 }
+
+pub use layout::RichParagraph;
+pub use layout::RichRun;
+pub use layout::RichText;
+pub use layout::RichTextBuilder;
+pub use layout::Span;
+pub use layout::SpanStyle;

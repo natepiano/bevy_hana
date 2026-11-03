@@ -91,6 +91,6 @@ mod tests {
         let panel_draw = PanelDraw::default().overflow(DrawOverflow::Visible);
 
         assert_eq!(panel_draw.overflow_policy(), DrawOverflow::Visible);
-        assert!(panel_draw.shapes_ref().is_empty());
+        assert_eq!(panel_draw.shapes_ref(), []);
     }
 }

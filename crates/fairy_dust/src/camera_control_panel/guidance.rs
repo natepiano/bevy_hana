@@ -2,18 +2,21 @@
 
 use bevy::prelude::Component;
 use hana_diegetic::Anchor;
+use hana_lagrange::ActionColumnLabel;
 use hana_lagrange::CameraControlAction;
 use hana_lagrange::CameraControlBinding;
 use hana_lagrange::CameraControlBindingKind;
 use hana_lagrange::CameraControlSummary;
 use hana_lagrange::ControlSpeed;
 use hana_lagrange::FreeCamControlDirection;
+use hana_lagrange::FreeCamDirectionFilter;
 use hana_lagrange::FreeCamInteractionKind;
 use hana_lagrange::InteractionSources;
 use hana_lagrange::OrbitCamInputMode;
 use hana_lagrange::OrbitCamInteractionKind;
 use hana_lagrange::OrbitCamPreset;
 use hana_lagrange::ZoomDirection;
+use hana_lagrange::ZoomRowFilter;
 use hana_lagrange::describe_controls;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,14 +25,29 @@ pub(super) enum CameraGuidanceContent {
     Rows(Vec<CameraGuidanceRow>),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum GuidanceText {
+    FromSummary,
+    Fixed(String),
+}
+
+impl GuidanceText {
+    pub(super) fn resolve<'a>(&'a self, summary: &'a str) -> &'a str {
+        match self {
+            Self::FromSummary => summary,
+            Self::Fixed(text) => text,
+        }
+    }
+}
+
 /// Data-driven camera control metadata shown by [`SprinkleBuilder`](crate::SprinkleBuilder)
 /// examples.
 #[derive(Component, Clone, Debug, PartialEq, Eq)]
 pub struct CameraGuidance {
     pub(super) anchor:     Anchor,
-    pub(super) title:      Option<String>,
-    pub(super) mode_label: Option<String>,
-    pub(super) mode_value: Option<String>,
+    pub(super) title:      GuidanceText,
+    pub(super) mode_label: GuidanceText,
+    pub(super) mode_value: GuidanceText,
     pub(super) settings:   Vec<CameraControlBinding>,
     pub(super) content:    CameraGuidanceContent,
 }
@@ -40,9 +58,9 @@ impl CameraGuidance {
     pub const fn auto() -> Self {
         Self {
             anchor:     Anchor::BottomRight,
-            title:      None,
-            mode_label: None,
-            mode_value: None,
+            title:      GuidanceText::FromSummary,
+            mode_label: GuidanceText::FromSummary,
+            mode_value: GuidanceText::FromSummary,
             settings:   Vec::new(),
             content:    CameraGuidanceContent::Auto,
         }
@@ -59,9 +77,9 @@ impl CameraGuidance {
     pub fn custom(rows: impl IntoIterator<Item = CameraGuidanceRow>) -> Self {
         Self {
             anchor:     Anchor::BottomRight,
-            title:      None,
-            mode_label: None,
-            mode_value: None,
+            title:      GuidanceText::FromSummary,
+            mode_label: GuidanceText::FromSummary,
+            mode_value: GuidanceText::FromSummary,
             settings:   Vec::new(),
             content:    CameraGuidanceContent::Rows(rows.into_iter().collect()),
         }
@@ -77,7 +95,7 @@ impl CameraGuidance {
     /// Replaces the panel title.
     #[must_use]
     pub fn with_title(mut self, title: impl Into<String>) -> Self {
-        self.title = Some(title.into());
+        self.title = GuidanceText::Fixed(title.into());
         self
     }
 
@@ -96,9 +114,9 @@ impl CameraGuidance {
         let (settings, rows) = split_summary_bindings(summary.bindings);
         Self {
             anchor: Anchor::BottomRight,
-            title: Some(summary.camera_label),
-            mode_label: Some(summary.mode_label),
-            mode_value: Some(summary.mode_value),
+            title: GuidanceText::Fixed(summary.camera_label),
+            mode_label: GuidanceText::Fixed(summary.mode_label),
+            mode_value: GuidanceText::Fixed(summary.mode_value),
             settings,
             content: CameraGuidanceContent::Rows(rows),
         }
@@ -167,21 +185,21 @@ impl CameraGuidanceAction {
             Self::Orbit => "Orbit",
             Self::Pan => "Pan",
             Self::Zoom => "Zoom",
-            Self::ZoomIn => "Zoom In",
-            Self::ZoomOut => "Zoom Out",
+            Self::ZoomIn => "Zoom in",
+            Self::ZoomOut => "Zoom out",
             Self::Look => "Look",
-            Self::Translate => "Translate",
+            Self::Translate => "Move",
             Self::Roll => "Roll",
             Self::Home => "Home",
             Self::Other => "Action",
         }
     }
 
-    pub(super) const fn zoom_direction(self) -> Option<ZoomDirection> {
+    pub(super) const fn zoom_direction(self) -> ZoomRowFilter {
         match self {
-            Self::ZoomIn => Some(ZoomDirection::In),
-            Self::ZoomOut => Some(ZoomDirection::Out),
-            _ => None,
+            Self::ZoomIn => ZoomRowFilter::Only(ZoomDirection::In),
+            Self::ZoomOut => ZoomRowFilter::Only(ZoomDirection::Out),
+            _ => ZoomRowFilter::Unrestricted,
         }
     }
 }
@@ -210,8 +228,8 @@ pub struct CameraGuidanceRow {
     label:                      String,
     camera_interaction_sources: InteractionSources,
     speed:                      ControlSpeed,
-    action_label:               Option<String>,
-    direction:                  Option<FreeCamControlDirection>,
+    action_label:               ActionColumnLabel,
+    direction:                  FreeCamDirectionFilter,
 }
 
 impl CameraGuidanceRow {
@@ -223,8 +241,8 @@ impl CameraGuidanceRow {
             label: label.into(),
             camera_interaction_sources: InteractionSources::NONE,
             speed: ControlSpeed::Normal,
-            action_label: None,
-            direction: None,
+            action_label: ActionColumnLabel::ActionName,
+            direction: FreeCamDirectionFilter::AnySourceEngagement,
         }
     }
 
@@ -238,7 +256,7 @@ impl CameraGuidanceRow {
     /// Sets the right-column label shown in place of the action's default name.
     #[must_use]
     pub fn with_action_label(mut self, action_label: impl Into<String>) -> Self {
-        self.action_label = Some(action_label.into());
+        self.action_label = ActionColumnLabel::Replacement(action_label.into());
         self
     }
 
@@ -246,7 +264,7 @@ impl CameraGuidanceRow {
     /// panel lights it only while that direction is engaged.
     #[must_use]
     pub const fn with_direction(mut self, direction: FreeCamControlDirection) -> Self {
-        self.direction = Some(direction);
+        self.direction = FreeCamDirectionFilter::Only(direction);
         self
     }
 
@@ -274,13 +292,13 @@ impl CameraGuidanceRow {
     #[must_use]
     pub fn label(&self) -> &str { &self.label }
 
-    /// Returns the right-column label override, when set.
+    /// Returns the role of the right-column label.
     #[must_use]
-    pub fn action_label(&self) -> Option<&str> { self.action_label.as_deref() }
+    pub const fn action_label(&self) -> &ActionColumnLabel { &self.action_label }
 
-    /// Returns the decomposed direction this row drives, when set.
+    /// Returns the direction filter for this row.
     #[must_use]
-    pub const fn direction(&self) -> Option<FreeCamControlDirection> { self.direction }
+    pub const fn direction(&self) -> FreeCamDirectionFilter { self.direction }
 
     /// Returns the binding speed variant.
     #[must_use]
@@ -311,4 +329,76 @@ pub(super) fn split_summary_bindings(
         }
     }
     (settings, rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use hana_lagrange::OrbitCamInputMode;
+    use hana_lagrange::OrbitCamPreset;
+
+    use super::CameraGuidance;
+    use super::CameraGuidanceAction;
+    use crate::camera_control_panel::snapshot;
+    use crate::camera_control_panel::snapshot::HomeHintLocation;
+
+    #[test]
+    fn authored_title_wins_over_summary_camera_label() {
+        let guidance = CameraGuidance::auto().with_title("My camera");
+        let snapshot = snapshot::resolve_guidance_snapshot(
+            None,
+            Some(&guidance),
+            None,
+            None,
+            None,
+            HomeHintLocation::CameraPanel,
+        );
+        assert_eq!(snapshot.camera_label, "My camera");
+    }
+
+    #[test]
+    fn zoom_guidance_uses_sentence_case() {
+        assert_eq!(CameraGuidanceAction::ZoomIn.label(), "Zoom in");
+        assert_eq!(CameraGuidanceAction::ZoomOut.label(), "Zoom out");
+        assert_eq!(CameraGuidanceAction::Translate.label(), "Move");
+    }
+
+    #[test]
+    fn preset_words_stay_fixed_when_live_summary_changes() {
+        let guidance = CameraGuidance::for_preset(OrbitCamPreset::blender_like());
+        let mode = OrbitCamInputMode::with_preset(OrbitCamPreset::simple_mouse());
+        let snapshot = snapshot::resolve_guidance_snapshot(
+            None,
+            Some(&guidance),
+            Some(&mode),
+            None,
+            None,
+            HomeHintLocation::CameraPanel,
+        );
+        assert_eq!(snapshot.mode_value, "Blender");
+    }
+
+    #[test]
+    fn auto_words_follow_live_summary() {
+        let guidance = CameraGuidance::auto();
+        let blender = OrbitCamInputMode::with_preset(OrbitCamPreset::blender_like());
+        let mouse = OrbitCamInputMode::with_preset(OrbitCamPreset::simple_mouse());
+        let first = snapshot::resolve_guidance_snapshot(
+            None,
+            Some(&guidance),
+            Some(&blender),
+            None,
+            None,
+            HomeHintLocation::CameraPanel,
+        );
+        let second = snapshot::resolve_guidance_snapshot(
+            None,
+            Some(&guidance),
+            Some(&mouse),
+            None,
+            None,
+            HomeHintLocation::CameraPanel,
+        );
+        assert_eq!(first.mode_value, "Blender");
+        assert_eq!(second.mode_value, "Mouse");
+    }
 }

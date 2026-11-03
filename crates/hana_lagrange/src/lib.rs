@@ -6,6 +6,7 @@ mod camera_basis;
 mod camera_home;
 mod camera_kind;
 mod constants;
+mod controller_handover;
 mod fit;
 #[macro_use]
 mod input;
@@ -15,6 +16,8 @@ mod interpolation;
 mod operation;
 mod orbit_cam;
 mod system_sets;
+#[cfg(any(test, feature = "test-support"))]
+mod test_support;
 mod time_source;
 
 pub use animation::AnimationBegin;
@@ -46,16 +49,22 @@ pub use camera_basis::CameraBasis;
 pub use camera_home::CameraHomeKind;
 pub use camera_home::CameraHomePending;
 pub use camera_kind::CameraKind;
+pub use controller_handover::CameraControllerHandover;
+pub use controller_handover::OrbitCamHeldForReturn;
+pub use controller_handover::orbit_pose_for_view;
 pub use fit::AnimateToFit;
 pub use fit::CurrentFitTarget;
 pub use fit::FitAnchor;
+pub use fit::FitBounds;
 #[cfg(feature = "fit_overlay")]
 pub use fit::FitOverlay;
 use fit::FitPlugin;
 #[cfg(feature = "fit_overlay")]
 pub use fit::FitTargetOverlayConfig;
+pub use fit::FitViewportInsets;
 pub use fit::LookAt;
 pub use fit::LookAtAndZoomToFit;
+pub use fit::OutsideFitBounds;
 pub use fit::SetFitTarget;
 pub use fit::ZoomBegin;
 pub use fit::ZoomContext;
@@ -83,6 +92,7 @@ pub use free_cam::FreeCamPreset;
 pub use free_cam::FreeCamPresetKind;
 pub use free_cam::FreeCamRollActionBindings;
 pub use free_cam::FreeCamRollBinding;
+pub use free_cam::FreeCamTrackpadLook;
 pub use free_cam::FreeCamTranslateActionBindings;
 pub use free_cam::FreeCamTranslateBinding;
 pub use free_cam::FreeCamTranslateKeys;
@@ -123,6 +133,7 @@ pub use hana_kana::SequenceStages;
 pub use hana_kana::SequenceTime;
 pub use initialization::Initialization;
 pub use input::ActionBindingDescriptor;
+pub use input::ActionColumnLabel;
 pub use input::AxisResponse;
 pub use input::BindingEngagement;
 pub use input::BindingGate;
@@ -134,6 +145,7 @@ pub use input::CameraControlActivation;
 pub use input::CameraControlBinding;
 pub use input::CameraControlBindingKind;
 pub use input::CameraControlSummary;
+pub use input::CameraDragClaim;
 pub use input::CameraHomed;
 pub use input::CameraInputDisabled;
 pub use input::CameraInputKind;
@@ -153,6 +165,7 @@ pub use input::ControlSpeed;
 pub use input::Damping;
 pub use input::FreeCamActiveDirections;
 pub use input::FreeCamControlDirection;
+pub use input::FreeCamDirectionFilter;
 pub use input::FreeCamInputContext;
 pub use input::FreeCamInputMode;
 pub use input::FreeCamInteractionEnded;
@@ -208,8 +221,10 @@ pub use input::ResetFreeCamToHome;
 pub use input::ResetOrbitCamToHome;
 pub use input::ResolvedCameraInputRoute;
 pub use input::Sensitivity;
+pub use input::SlowModeHint;
 pub use input::SmoothScrollInputGain;
 pub use input::ZoomDirection;
+pub use input::ZoomRowFilter;
 pub use input::describe_controls;
 pub use input::describe_controls_for;
 pub use input::describe_orbit_cam_controls;
@@ -273,9 +288,12 @@ pub use orbit_cam::SmoothZoomDelta;
 pub use orbit_cam::UpsideDownPolicy;
 pub use orbit_cam::ZoomDelta;
 pub use orbit_cam::ZoomInversion;
+pub use orbit_cam::transform_from_orbit;
 pub use system_sets::CameraControllerSystemSet;
 pub use system_sets::CameraInputPhase;
 use system_sets::LagrangeSystemSetsPlugin;
+#[cfg(any(test, feature = "test-support"))]
+pub use test_support::input_test_app;
 pub use time_source::TimeSource;
 
 /// Bevy plugin for the lagrange cameras. Registers shared camera
@@ -295,6 +313,7 @@ pub struct LagrangePlugin;
 
 impl Plugin for LagrangePlugin {
     fn build(&self, app: &mut App) {
+        app.register_type::<OrbitCamHeldForReturn>();
         // Shared camera infrastructure, used across all camera kinds. Each
         // camera kind registers its own enhanced-input context in its plugin.
         app.add_plugins((
@@ -308,3 +327,6 @@ impl Plugin for LagrangePlugin {
         app.add_plugins((OrbitCamPlugin, FreeCamPlugin));
     }
 }
+
+#[cfg(test)]
+use test_support::input_test_app as test_app;

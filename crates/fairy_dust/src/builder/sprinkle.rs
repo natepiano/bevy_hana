@@ -386,11 +386,9 @@ impl<S, Baseline> SprinkleBuilder<S, Baseline> {
 
     /// Mirror of [`App::add_observer`].
     #[must_use]
-    pub fn add_observer<E, BundleType, M, I>(self, observer: I) -> SprinkleBuilder<S>
+    pub fn add_observer<M, I>(self, observer: I) -> SprinkleBuilder<S>
     where
-        E: bevy::ecs::event::Event,
-        BundleType: Bundle,
-        I: bevy::ecs::system::IntoObserverSystem<E, BundleType, M>,
+        I: bevy::ecs::observer::IntoObserver<M>,
     {
         let mut builder = self.into_installed();
         builder.app.add_observer(observer);
@@ -417,10 +415,13 @@ impl<S, Baseline> SprinkleBuilder<S, Baseline> {
     /// `Ctrl+Shift+R` restart command replaces this process with
     /// `cargo run --example <name>` on Unix, or spawns it and exits elsewhere,
     /// so `run` does not return in that case.
-    pub fn run(self) -> AppExit {
+    pub fn run(self) -> AppExit { self.build().run() }
+
+    /// Finish configuring the example and return its Bevy app.
+    pub fn build(self) -> App {
         let mut builder = self.into_installed();
         keymap::install(&mut builder.app);
-        builder.app.run()
+        builder.app
     }
 }
 
@@ -834,6 +835,9 @@ impl SprinkleBuilder<WithOrbitCam> {
 mod tests {
     use bevy::asset::AssetPlugin;
     use bevy::asset::AssetServer;
+    use bevy::prelude::IntoScheduleConfigs;
+    use bevy::prelude::Update;
+    use hana_diegetic::PanelSystems;
     use hana_lagrange::OrbitCamBlenderLikePreset;
 
     use super::CommandPaletteKeymap;
@@ -852,6 +856,20 @@ mod tests {
 
     #[derive(bevy::prelude::Resource)]
     struct BaselineTransitionProbe;
+
+    fn after_panel_changes() {}
+
+    #[test]
+    fn builder_keeps_caller_ordering_after_panel_changes() {
+        let mut app = crate::sprinkle_example()
+            .with_title_bar(crate::TitleBar::new())
+            .add_systems(
+                Update,
+                after_panel_changes.after(PanelSystems::ApplyTreeChanges),
+            )
+            .build();
+        app.update();
+    }
 
     #[test]
     fn ordinary_first_operation_installs_default_baseline() {

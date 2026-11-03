@@ -13,6 +13,7 @@ pub(in crate::animation) use direct::close_discarded_camera_sequence;
 pub(in crate::animation) use direct::prepare_direct_camera_sequences;
 pub(in crate::animation) use direct::remove_direct_camera_sequence;
 use effects::PendingCameraAdmissionEffects;
+pub(in crate::animation) use facade::capture_fit_animation;
 pub(in crate::animation) use facade::capture_play_animation;
 pub(super) use journey::RetainedCameraJourney;
 #[cfg(test)]
@@ -21,6 +22,7 @@ pub(in crate::animation) use rejection::admit_pending_camera_requests;
 
 use super::CameraSequence;
 use crate::animation::events::AnimationSource;
+use crate::fit::FitBoundsSource;
 use crate::fit::ZoomContext;
 
 /// Private camera-domain schedule boundaries inside the shared playback path.
@@ -42,6 +44,7 @@ pub(super) struct PendingCameraRequest {
     source:   AnimationSource,
     target:   Option<Entity>,
     zoom:     Option<ZoomContext>,
+    bounds:   FitBoundsSource,
     effects:  PendingCameraAdmissionEffects,
 }
 

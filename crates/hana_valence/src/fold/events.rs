@@ -404,7 +404,7 @@ impl FoldBoundaryEmitter<'_> {
     /// warning per sequence.
     fn report_skipped(&mut self, lookup: UnansweredBoundaryLookup) {
         if self.boundary_report.report() {
-            tracing::warn!(
+            tracing::warn!(target: "hana_valence::diagnostics",
                 arrangement = ?self.arrangement,
                 lookup = ?lookup,
                 "fold traversal crossed a boundary the authored ledger does not answer",

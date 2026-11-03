@@ -44,45 +44,45 @@ pub(super) const DOT_RADIUS_RATIO: f32 = 0.01;
 
 /// Gap between labels and the elements they annotate, relative to font size.
 /// Multiplied by `font_size * LAYOUT_TO_WORLD` at usage to get world units.
-pub(super) const LABEL_GAP_RATIO: f32 = 0.02;
+pub(super) const LABEL_GAP_RATIO: f32 = 0.08;
 
 /// Font size for metric labels relative to the text's font size.
 /// Apple's reference diagram uses labels roughly 1/10th the display size.
-pub(super) const LABEL_SIZE_RATIO: f32 = 0.06;
+pub(super) const LABEL_SIZE_RATIO: f32 = 0.08;
 
 // label strings
 /// Label for the advancement dimension arrow.
-pub(super) const LABEL_ADVANCEMENT: &str = "advancement";
+pub(super) const LABEL_ADVANCEMENT: &str = "Advancement";
 
 /// Label for the ascent metric line and dimension arrow.
-pub(super) const LABEL_ASCENT: &str = "ascent";
+pub(super) const LABEL_ASCENT: &str = "Ascent";
 
 /// Label for the baseline metric line.
-pub(super) const LABEL_BASELINE: &str = "baseline";
+pub(super) const LABEL_BASELINE: &str = "Baseline";
 
 /// Label for the bottom metric line.
-pub(super) const LABEL_BOTTOM: &str = "bottom";
+pub(super) const LABEL_BOTTOM: &str = "Bottom";
 
 /// Label for the bounding box callout.
-pub(super) const LABEL_BOUNDING_BOX: &str = "bounding box";
+pub(super) const LABEL_BOUNDING_BOX: &str = "Bounding box";
 
 /// Label for the cap height metric line and dimension arrow.
-pub(super) const LABEL_CAP_HEIGHT: &str = "cap height";
+pub(super) const LABEL_CAP_HEIGHT: &str = "Cap height";
 
 /// Label for the descent metric line and dimension arrow.
-pub(super) const LABEL_DESCENT: &str = "descent";
+pub(super) const LABEL_DESCENT: &str = "Descent";
 
 /// Label for the line height dimension arrow.
-pub(super) const LABEL_LINE_HEIGHT: &str = "line height";
+pub(super) const LABEL_LINE_HEIGHT: &str = "Line height";
 
 /// Label for the origin callout.
-pub(super) const LABEL_ORIGIN: &str = "origin";
+pub(super) const LABEL_ORIGIN: &str = "Origin";
 
 /// Label for the top metric line.
-pub(super) const LABEL_TOP: &str = "top";
+pub(super) const LABEL_TOP: &str = "Top";
 
 /// Label for the x-height metric line and dimension arrow.
-pub(super) const LABEL_X_HEIGHT: &str = "x-height";
+pub(super) const LABEL_X_HEIGHT: &str = "X-height";
 
 // line widths
 /// Default line width for overlay guides (in pixels).
@@ -101,3 +101,32 @@ pub(super) const CALLOUT_Z_OFFSET: f32 = 0.0;
 
 /// Z offset for metric lines and vertical dimension arrows.
 pub(super) const METRIC_LINE_Z_OFFSET: f32 = 0.0;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_overlay_label_starts_with_a_capital() {
+        let labels = [
+            LABEL_ADVANCEMENT,
+            LABEL_ASCENT,
+            LABEL_BASELINE,
+            LABEL_BOTTOM,
+            LABEL_BOUNDING_BOX,
+            LABEL_CAP_HEIGHT,
+            LABEL_DESCENT,
+            LABEL_LINE_HEIGHT,
+            LABEL_ORIGIN,
+            LABEL_TOP,
+            LABEL_X_HEIGHT,
+        ];
+
+        for label in labels {
+            assert!(
+                label.starts_with(char::is_uppercase),
+                "overlay label does not start with a capital: {label}"
+            );
+        }
+    }
+}

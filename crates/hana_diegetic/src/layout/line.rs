@@ -1092,8 +1092,8 @@ fn segment_bounds(start: Vec2, end: Vec2, width: f32) -> Option<BoundingBox> {
     Some(BoundingBox {
         x:      start.x.min(end.x) - padding,
         y:      start.y.min(end.y) - padding,
-        width:  (start.x - end.x).abs() + padding * 2.0,
-        height: (start.y - end.y).abs() + padding * 2.0,
+        width:  padding.mul_add(2.0, (start.x - end.x).abs()),
+        height: padding.mul_add(2.0, (start.y - end.y).abs()),
     })
 }
 

@@ -9,14 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `DeviceAccessError::apply_failure_disposition() -> ApplyFailureDisposition`
-  turns a failure class into what the kernel does about it, and is the one
-  place that decision is made — for failures before a driver starts work and
-  after. `Absent` becomes `Reconsider`, `Contended` and `Blocked` become
-  `AwaitClearance`, and `Transport` becomes `Fault`. When the kernel
-  reconsiders a failure that happened before the driver started, it emits no
-  attempt-ending event. Reflected `RoleStatus` now carries the actionable wait,
-  retry run, and last started-attempt ending for operator diagnostics.
+- `DeviceNameDisambiguation::Unshared`: no other unit reports the same name, so the name alone tells the unit apart.
+- The kernel centrally maps device-access failures to reconsideration, clearance
+  waits, faults or stopped apply work. Reflected RoleStatus exposes actionable
+  waits, retry progress and the last started-attempt ending; this policy method
+  is internal.
 
 ### Changed
 
@@ -26,20 +23,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ReportedDeviceName`, `DeviceNameDisambiguationText`, and `OperatorAssignedDeviceName` types
   reject empty text and control characters at construction and deserialization.
 
-- **Breaking:** `EndpointDriver` gains `type Target` and
-  `resolve_target(...) -> TargetResolution<Self::Target>`. The kernel now asks
-  the driver to find the thing it is about to act on before authorizing an
-  apply. Only `TargetResolution::Reached(target)` goes on to `start_apply`,
-  which receives that target; `TargetDetached` and `DeviceUnavailable` tell the
-  kernel the device went away or could not be reached, and no apply starts.
-  Every implementor must add both members.
-- **Breaking:** `DeviceKind::HidPanel` is now `DeviceKind::ControlSurface`. HID
-  is one transport that reaches one kind of these panels; a network-attached
-  dock child is the same physical role over a different one. The variant
-  serializes as its bare name, so a stored `kind: HidPanel` no longer
-  deserializes. `DeviceKind` is `#[non_exhaustive]`, so a downstream match
-  either names the old variant and fails to compile or already carries the
-  required wildcard arm and keeps compiling.
+- **Breaking:** `EndpointDriver` requires `type Target` and `resolve_target(...)
+  -> TargetResolution<Self::Target>`. Only `Reached(target)` authorizes
+  `start_apply`; `Deferred(TargetWait)` names the reporter or application
+  condition that must change before an apply can start.
+- **Breaking:** `DeviceKind::HidPanel` is renamed to
+  `DeviceKind::ControlSurface`; old stored `HidPanel` values remain readable
+  through a serde alias. DeviceKind is exhaustive, so source matches must use
+  the new variant.
 
 ## [0.1.0] - 2026-08-22
 

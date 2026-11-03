@@ -224,7 +224,7 @@ fn recursive_dependencies_gate_and_fail() {
             log.loaded, 0,
             "the set must stay pending while its child is gated"
         );
-        assert!(log.failed_paths.is_empty());
+        assert_eq!(log.failed_paths.len(), 0);
         assert!(world.contains_resource::<LoadProgress>());
     }
 

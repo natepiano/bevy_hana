@@ -186,14 +186,14 @@ impl KeymapPlugin {
             );
     }
 
-    fn finish_assembly(app: &mut App) {
+    fn finalize_keymap_plugin(app: &mut App) {
         #[cfg(test)]
         increment_finish_attempts(app);
 
-        if app.world().contains_resource::<KeymapAssemblyFinished>() {
+        if app.world().contains_resource::<KeymapFinalizationStarted>() {
             return;
         }
-        app.insert_resource(KeymapAssemblyFinished);
+        app.insert_resource(KeymapFinalizationStarted);
         let command_registry = match CommandRegistry::initialize(app.world_mut()) {
             Ok(command_registry) => command_registry,
             Err(diagnostics) => {
@@ -344,7 +344,7 @@ impl Plugin for KeymapPlugin {
         }
     }
 
-    fn finish(&self, app: &mut App) { Self::finish_assembly(app); }
+    fn finish(&self, app: &mut App) { Self::finalize_keymap_plugin(app); }
 
     fn is_unique(&self) -> bool { false }
 }
@@ -463,7 +463,7 @@ struct KeymapDiskWorker {
 }
 
 #[derive(Resource)]
-struct KeymapAssemblyFinished;
+struct KeymapFinalizationStarted;
 
 #[derive(Resource)]
 pub(crate) struct RegistryValidationFailed;
@@ -488,11 +488,9 @@ fn collect_disk_reload(
 }
 
 fn record_startup_diagnostics(app: &mut App, diagnostics: &[Diagnostic]) {
+    // Consumers present the retained diagnostics with their own repair actions.
     for diagnostic in diagnostics {
-        match diagnostic.severity {
-            DiagnosticSeverity::Failure => bevy::log::error!("{}", diagnostic.message),
-            DiagnosticSeverity::Advisory => bevy::log::warn!("{}", diagnostic.message),
-        }
+        crate::log_keymap_diagnostic(diagnostic);
     }
     app.world_mut()
         .resource_mut::<KeymapLoadFailures>()
@@ -502,9 +500,9 @@ fn record_startup_diagnostics(app: &mut App, diagnostics: &[Diagnostic]) {
 
 /// Inserts [`KeymapPathAvailability`] and hands the same value back to the assembly that needs it.
 ///
-/// Every `finish_assembly` outcome inserts it, including the ones that stop before any binding
-/// compiles, so `Res<KeymapPathAvailability>` never distinguishes an application without a keymap
-/// directory from an assembly that has not run.
+/// Every `finalize_keymap_plugin` outcome inserts it, including the ones that stop before any
+/// binding compiles, so `Res<KeymapPathAvailability>` never distinguishes an application without a
+/// keymap directory from an assembly that has not run.
 fn insert_keymap_path_availability(
     app: &mut App,
     keymap_configuration_directory: &KeymapConfigurationDirectory,
@@ -592,7 +590,7 @@ struct FinishAttempts(usize);
 
 #[cfg(test)]
 #[derive(Default, Resource)]
-struct AssemblyRuns(usize);
+struct EmbeddedDefaultsLoadAttempts(usize);
 
 #[cfg(test)]
 fn increment_finish_attempts(app: &mut App) {
@@ -602,8 +600,10 @@ fn increment_finish_attempts(app: &mut App) {
 
 #[cfg(test)]
 fn increment_assembly_runs(app: &mut App) {
-    app.init_resource::<AssemblyRuns>();
-    app.world_mut().resource_mut::<AssemblyRuns>().0 += 1;
+    app.init_resource::<EmbeddedDefaultsLoadAttempts>();
+    app.world_mut()
+        .resource_mut::<EmbeddedDefaultsLoadAttempts>()
+        .0 += 1;
 }
 
 /// Keymap-system ordering points exposed to application context derivation systems.
@@ -913,9 +913,13 @@ mod tests {
                 PluginRecovery::TITLE,
             )
         };
-        assert_eq!(query_result.rows().len(), 1);
+        let recovery_row = query_result
+            .rows()
+            .iter()
+            .find(|row| row.command().id() == &recovery_id)
+            .ok_or("the protected recovery command must appear in the palette")?;
         assert!(matches!(
-            query_result.rows()[0].binding(),
+            recovery_row.binding(),
             PaletteBinding::ApplicationRecovery(keystroke) if keystroke == &recovery_keystroke
         ));
         assert_eq!(

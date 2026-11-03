@@ -85,16 +85,16 @@ use crate::orbit_cam::ZoomInversion;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CameraControlSummary {
     /// Camera type label.
-    pub camera_label:            String,
+    pub camera_label: String,
     /// Label for the selected input mode category.
-    pub mode_label:              String,
+    pub mode_label:   String,
     /// Value for the selected input mode category.
-    pub mode_value:              String,
-    /// Slow-mode toggle binding label, when the mode exposes slow variants.
-    pub slow_mode_binding_label: Option<String>,
+    pub mode_value:   String,
+    /// Whether an enabled control exposes a displayable slow-mode toggle.
+    pub slow_mode:    SlowModeHint,
     /// Display bindings that describe the selected input mode and related
     /// control settings.
-    pub bindings:                Vec<CameraControlBinding>,
+    pub bindings:     Vec<CameraControlBinding>,
 }
 
 /// One displayable control binding in a [`CameraControlSummary`].
@@ -116,15 +116,44 @@ pub struct CameraControlBinding {
     /// Whether this binding directly controls the action or changes a related
     /// setting.
     pub kind:                CameraControlBindingKind,
-    /// Optional right-column label shown in place of the action's default name.
-    /// Set for decomposed rows whose action name alone would be ambiguous — a
+    /// Whether the right column uses the action's name or a replacement.
+    /// Replacements mark decomposed rows whose action name alone would be ambiguous — a
     /// gamepad translate's `Up`/`Down` triggers, its `Boost` gate, or a split
     /// roll's `Roll →`/`Roll ←` directions.
-    pub action_label:        Option<String>,
-    /// Live-highlight discriminator for a decomposed `FreeCam` row, so a panel
-    /// lights only the affordance currently engaged. `None` for rows that match
-    /// on interaction source alone.
-    pub direction:           Option<FreeCamControlDirection>,
+    pub action_label:        ActionColumnLabel,
+    /// Live-highlight filter for a decomposed `FreeCam` row, so a panel
+    /// lights only the direction currently engaged.
+    pub direction:           FreeCamDirectionFilter,
+}
+
+/// A displayable slow-mode toggle, or the absence of one for effective controls.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SlowModeHint {
+    /// The key hint that toggles slow variants.
+    ToggledBy(String),
+    /// No enabled control has a displayable slow toggle.
+    #[default]
+    NoDisplayableSlowToggle,
+}
+
+/// The value displayed in a control row's action column.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ActionColumnLabel {
+    /// Display the action's own name.
+    #[default]
+    ActionName,
+    /// Display a more specific label for a decomposed row.
+    Replacement(String),
+}
+
+/// Which `FreeCam` engagement may highlight a control row.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FreeCamDirectionFilter {
+    /// Any engagement of this row's interaction sources.
+    #[default]
+    AnySourceEngagement,
+    /// Only engagement in this direction.
+    Only(FreeCamControlDirection),
 }
 
 /// Kind of displayable control binding.
@@ -203,9 +232,18 @@ pub struct OrbitCamControlRow {
     pub camera_interaction_sources: InteractionSources,
     /// Whether this binding is the normal or the slow (precise) variant.
     pub speed:                      ControlSpeed,
-    /// The zoom direction this row drives, or `None` for rows that are not
-    /// direction-specific: orbit, pan, or a bidirectional zoom kept as one row.
-    pub zoom_direction:             Option<ZoomDirection>,
+    /// The zoom direction this row drives when it is direction-specific.
+    pub zoom_direction:             ZoomRowFilter,
+}
+
+/// Which zoom engagement may highlight an orbit control row.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ZoomRowFilter {
+    /// Orbit, pan, or a bidirectional zoom kept as one row.
+    #[default]
+    Unrestricted,
+    /// Only zoom in this direction.
+    Only(ZoomDirection),
 }
 
 /// The direction a zoom affordance drives the camera.
@@ -243,7 +281,7 @@ impl OrbitCamControlRow {
     /// Tags this row with the zoom direction it drives.
     #[must_use]
     pub const fn with_zoom_direction(mut self, zoom_direction: ZoomDirection) -> Self {
-        self.zoom_direction = Some(zoom_direction);
+        self.zoom_direction = ZoomRowFilter::Only(zoom_direction);
         self
     }
 }
@@ -259,7 +297,7 @@ impl CameraControlBinding {
     /// Overrides the right-column label shown for this binding.
     #[must_use]
     pub fn with_action_label(mut self, action_label: impl Into<String>) -> Self {
-        self.action_label = Some(action_label.into());
+        self.action_label = ActionColumnLabel::Replacement(action_label.into());
         self
     }
 
@@ -267,7 +305,7 @@ impl CameraControlBinding {
     /// panel lights only this row when that direction is engaged.
     #[must_use]
     pub const fn with_direction(mut self, direction: FreeCamControlDirection) -> Self {
-        self.direction = Some(direction);
+        self.direction = FreeCamDirectionFilter::Only(direction);
         self
     }
 }
@@ -275,16 +313,15 @@ impl CameraControlBinding {
 impl CameraControlAction {
     /// Builds the shared action for an `OrbitCam` row.
     #[must_use]
-    pub const fn from_orbit(
-        kind: OrbitCamInteractionKind,
-        direction: Option<ZoomDirection>,
-    ) -> Self {
+    pub const fn from_orbit(kind: OrbitCamInteractionKind, direction: ZoomRowFilter) -> Self {
         match (kind, direction) {
             (OrbitCamInteractionKind::Orbit, _) => Self::Orbit,
             (OrbitCamInteractionKind::Pan, _) => Self::Pan,
-            (OrbitCamInteractionKind::Zoom, Some(ZoomDirection::In)) => Self::ZoomIn,
-            (OrbitCamInteractionKind::Zoom, Some(ZoomDirection::Out)) => Self::ZoomOut,
-            (OrbitCamInteractionKind::Zoom, None) => Self::Zoom,
+            (OrbitCamInteractionKind::Zoom, ZoomRowFilter::Only(ZoomDirection::In)) => Self::ZoomIn,
+            (OrbitCamInteractionKind::Zoom, ZoomRowFilter::Only(ZoomDirection::Out)) => {
+                Self::ZoomOut
+            },
+            (OrbitCamInteractionKind::Zoom, ZoomRowFilter::Unrestricted) => Self::Zoom,
         }
     }
 
@@ -307,8 +344,8 @@ impl From<OrbitCamControlRow> for CameraControlBinding {
             interaction_sources: row.camera_interaction_sources,
             speed:               row.speed,
             kind:                CameraControlBindingKind::Direct,
-            action_label:        None,
-            direction:           None,
+            action_label:        ActionColumnLabel::ActionName,
+            direction:           FreeCamDirectionFilter::AnySourceEngagement,
         }
     }
 }
@@ -316,11 +353,11 @@ impl From<OrbitCamControlRow> for CameraControlBinding {
 impl From<OrbitCamControlSummary> for CameraControlSummary {
     fn from(summary: OrbitCamControlSummary) -> Self {
         Self {
-            camera_label:            summary.camera_label,
-            mode_label:              summary.mode_label,
-            mode_value:              summary.mode_value,
-            slow_mode_binding_label: None,
-            bindings:                summary.rows.into_iter().map(Into::into).collect(),
+            camera_label: summary.camera_label,
+            mode_label:   summary.mode_label,
+            mode_value:   summary.mode_value,
+            slow_mode:    SlowModeHint::NoDisplayableSlowToggle,
+            bindings:     summary.rows.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -365,9 +402,11 @@ pub fn describe_orbit_cam_controls(mode: &OrbitCamInputMode) -> OrbitCamControlS
 pub(super) fn describe_orbit_camera_controls(mode: &OrbitCamInputMode) -> CameraControlSummary {
     let summary = describe_orbit_cam_controls(mode);
     let has_rows = !summary.rows.is_empty();
-    let slow_mode_binding_label = orbit_slow_mode(mode, has_rows).map(slow_mode_binding_hint);
+    let slow_mode = orbit_slow_mode(mode, has_rows)
+        .map(|slow| SlowModeHint::ToggledBy(slow_mode_binding_hint(slow)))
+        .unwrap_or_default();
     let mut camera_summary: CameraControlSummary = summary.into();
-    camera_summary.slow_mode_binding_label = slow_mode_binding_label;
+    camera_summary.slow_mode = slow_mode;
     camera_summary.bindings.extend(orbit_home_bindings(mode));
     camera_summary
 }
@@ -479,6 +518,13 @@ fn describe_free_bindings(
             entry.sources(),
         )
     }));
+    if bindings.enabled_trackpad_look().next().is_some() {
+        control_bindings.push(camera_control_binding(
+            CameraControlAction::Look,
+            trackpad_stem(ModKeys::empty()),
+            InteractionSources::SMOOTH_SCROLL,
+        ));
+    }
     control_bindings.push(look_pitch_setting_binding(bindings.look_pitch()));
     control_bindings.extend(describe_free_translate_rows(
         bindings.translate().enabled_entries(),
@@ -496,14 +542,15 @@ fn describe_free_bindings(
         },
     }
     control_bindings.extend(home_binding_rows(bindings.home().bindings()));
-    let slow_mode_binding_label = effective_free_slow_mode(bindings)
+    let slow_mode = effective_free_slow_mode(bindings)
         .copied()
-        .map(slow_mode_binding_hint);
+        .map(|slow| SlowModeHint::ToggledBy(slow_mode_binding_hint(slow)))
+        .unwrap_or_default();
     CameraControlSummary {
         camera_label: FREE_CAM_CAMERA_LABEL.to_string(),
         mode_label: mode_label.to_string(),
         mode_value: mode_value.to_string(),
-        slow_mode_binding_label,
+        slow_mode,
         bindings: control_bindings,
     }
 }
@@ -752,8 +799,8 @@ fn look_pitch_setting_binding(look_pitch: FreeCamLookPitch) -> CameraControlBind
             value: INVERT_Y_STATUS_LABEL.to_string(),
             activation,
         },
-        action_label:        None,
-        direction:           None,
+        action_label:        ActionColumnLabel::ActionName,
+        direction:           FreeCamDirectionFilter::AnySourceEngagement,
     }
 }
 
@@ -762,7 +809,7 @@ fn slow_mode_binding_hint(slow_mode: CameraSlowMode) -> String {
     if slow_mode.mod_keys.is_empty() {
         key
     } else {
-        format!("{}-{key}", compact_mod_keys(slow_mode.mod_keys))
+        format!("{} {key}", compact_mod_keys(slow_mode.mod_keys))
     }
 }
 
@@ -779,6 +826,7 @@ pub(super) fn effective_free_slow_mode(bindings: &FreeCamBindings) -> Option<&Ca
 fn has_effective_free_controls(bindings: &FreeCamBindings) -> bool {
     bindings.translate().enabled_entries().next().is_some()
         || bindings.look().enabled_entries().next().is_some()
+        || bindings.enabled_trackpad_look().next().is_some()
         || bindings.roll().enabled_entries().next().is_some()
 }
 
@@ -1046,14 +1094,16 @@ fn push_trackpad_zoom_pair(
     trackpad: OrbitCamBindingWithInputGain<OrbitCamTrackpadScroll>,
     inversion_sign: f32,
 ) {
-    let zoom_in = with_mod_keys(
-        trackpad.binding().mod_keys,
-        SMOOTH_SCROLL_ZOOM_IN_LABEL.to_string(),
-    );
-    let zoom_out = with_mod_keys(
-        trackpad.binding().mod_keys,
-        SMOOTH_SCROLL_ZOOM_OUT_LABEL.to_string(),
-    );
+    let label = |value: &str| {
+        let mod_keys = trackpad.binding().mod_keys;
+        if mod_keys.is_empty() {
+            value.to_string()
+        } else {
+            with_mod_keys(mod_keys, value.to_lowercase())
+        }
+    };
+    let zoom_in = label(SMOOTH_SCROLL_ZOOM_IN_LABEL);
+    let zoom_out = label(SMOOTH_SCROLL_ZOOM_OUT_LABEL);
     push_zoom_pair(
         rows,
         &zoom_in,
@@ -1207,7 +1257,7 @@ fn held_binding_stem<A: HeldCameraAction>(entry: &HeldActionBindingEntry<A>) -> 
             motion
         } else {
             let engagement = descriptor_stem(entry.engagement_descriptor(), entry.sources());
-            format!("{motion} + {engagement}")
+            format!("{motion} {engagement}")
         }
     };
 
@@ -1227,7 +1277,7 @@ fn with_required_gates(gates: &BindingGates, label: String) -> String {
     if required.is_empty() {
         label
     } else {
-        format!("{}+{label}", required.join("+"))
+        format!("{} {label}", required.join(" "))
     }
 }
 
@@ -1241,9 +1291,9 @@ fn mouse_drag_stem(
         return None;
     }
 
-    Some(with_mod_keys(
-        button_mod_keys,
-        format!("{} drag", mouse_button_label(button)),
+    Some(format!(
+        "{} drag",
+        mouse_button_stem(button, button_mod_keys)
     ))
 }
 
@@ -1275,7 +1325,7 @@ fn descriptor_stem(descriptor: &InputBindingDescriptor, sources: InteractionSour
         return label;
     }
     if let Some((button, mod_keys)) = descriptor.enabled_mouse_button_engagement() {
-        return with_mod_keys(mod_keys, mouse_button_label(button));
+        return mouse_button_stem(button, mod_keys);
     }
     if entries.iter().any(|entry| {
         matches!(
@@ -1319,9 +1369,9 @@ fn keyboard_stem(entries: &[&InputBindingEntry]) -> Option<String> {
             key_label(*positive),
             key_label(*negative)
         )),
-        keys if is_arrow_keys(keys) => Some("arrow keys".to_string()),
-        keys if is_wasd(keys) => Some("wasd".to_string()),
-        _ => Some("keyboard keys".to_string()),
+        keys if is_arrow_keys(keys) => Some("Arrow keys".to_string()),
+        keys if is_wasd(keys) => Some("WASD".to_string()),
+        _ => Some("Keyboard keys".to_string()),
     }
 }
 
@@ -1344,11 +1394,11 @@ fn gamepad_axis_stem(entries: &[&InputBindingEntry]) -> Option<String> {
     match gamepad_axes.as_slice() {
         [] => None,
         [GamepadAxis::LeftStickX, GamepadAxis::LeftStickY]
-        | [GamepadAxis::LeftStickY, GamepadAxis::LeftStickX] => Some("ls".to_string()),
+        | [GamepadAxis::LeftStickY, GamepadAxis::LeftStickX] => Some("LS".to_string()),
         [GamepadAxis::RightStickX, GamepadAxis::RightStickY]
-        | [GamepadAxis::RightStickY, GamepadAxis::RightStickX] => Some("rs".to_string()),
+        | [GamepadAxis::RightStickY, GamepadAxis::RightStickX] => Some("RS".to_string()),
         [single_axis] => Some(gamepad_axis_label(*single_axis)),
-        _ => Some("gamepad axes".to_string()),
+        _ => Some("Gamepad axes".to_string()),
     }
 }
 
@@ -1372,7 +1422,7 @@ fn gamepad_button_stem(entries: &[&InputBindingEntry]) -> Option<String> {
         [] => None,
         [GamepadButton::RightTrigger2, GamepadButton::LeftTrigger2]
         | [GamepadButton::LeftTrigger2, GamepadButton::RightTrigger2] => {
-            Some("rt / lt".to_string())
+            Some("RT / LT".to_string())
         },
         [positive, negative] => Some(format!(
             "{} / {}",
@@ -1380,7 +1430,7 @@ fn gamepad_button_stem(entries: &[&InputBindingEntry]) -> Option<String> {
             gamepad_button_label(*negative)
         )),
         [button] => Some(gamepad_button_label(*button)),
-        _ => Some("gamepad buttons".to_string()),
+        _ => Some("Gamepad buttons".to_string()),
     }
 }
 
@@ -1406,7 +1456,11 @@ fn trackpad_stem(mod_keys: ModKeys) -> String {
     if mod_keys.is_empty() {
         TRACKPAD_SOURCE_LABEL.to_string()
     } else {
-        format!("{}+{TRACKPAD_SOURCE_LABEL}", compact_mod_keys(mod_keys))
+        format!(
+            "{} {}",
+            compact_mod_keys(mod_keys),
+            TRACKPAD_SOURCE_LABEL.to_lowercase()
+        )
     }
 }
 
@@ -1414,61 +1468,68 @@ fn with_mod_keys(mod_keys: ModKeys, label: String) -> String {
     if mod_keys.is_empty() {
         label
     } else {
-        format!("{}+{label}", compact_mod_keys(mod_keys))
+        format!("{} {label}", compact_mod_keys(mod_keys))
     }
 }
 
-fn compact_mod_keys(mod_keys: ModKeys) -> String {
-    mod_keys.to_string().replace(" + ", "+").to_lowercase()
-}
+fn compact_mod_keys(mod_keys: ModKeys) -> String { mod_keys.to_string().replace(" + ", " ") }
 
 fn key_label(key: KeyCode) -> String {
     match key {
-        KeyCode::ArrowUp => "up".to_string(),
-        KeyCode::ArrowRight => "right".to_string(),
-        KeyCode::ArrowDown => "down".to_string(),
-        KeyCode::ArrowLeft => "left".to_string(),
-        KeyCode::ControlLeft => "ctrl".to_string(),
+        KeyCode::ArrowUp => "↑".to_string(),
+        KeyCode::ArrowRight => "→".to_string(),
+        KeyCode::ArrowDown => "↓".to_string(),
+        KeyCode::ArrowLeft => "←".to_string(),
+        KeyCode::ControlLeft => "Ctrl".to_string(),
         KeyCode::Equal => "+".to_string(),
         KeyCode::Minus => "-".to_string(),
-        KeyCode::Space => "space".to_string(),
-        KeyCode::KeyA => "a".to_string(),
-        KeyCode::KeyD => "d".to_string(),
-        KeyCode::KeyE => "e".to_string(),
-        KeyCode::KeyH => "h".to_string(),
-        KeyCode::KeyM => "m".to_string(),
-        KeyCode::KeyQ => "q".to_string(),
-        KeyCode::KeyS => "s".to_string(),
-        KeyCode::KeyW => "w".to_string(),
+        KeyCode::Space => "Space".to_string(),
+        KeyCode::KeyA => "A".to_string(),
+        KeyCode::KeyD => "D".to_string(),
+        KeyCode::KeyE => "E".to_string(),
+        KeyCode::KeyH => "H".to_string(),
+        KeyCode::KeyM => "M".to_string(),
+        KeyCode::KeyQ => "Q".to_string(),
+        KeyCode::KeyS => "S".to_string(),
+        KeyCode::KeyW => "W".to_string(),
         _ => debug_name(key, "Key"),
     }
 }
 
 fn mouse_button_label(button: MouseButton) -> String {
     match button {
-        MouseButton::Left => "lmb".to_string(),
-        MouseButton::Right => "rmb".to_string(),
-        MouseButton::Middle => "mmb".to_string(),
-        _ => format!("{button:?}").to_lowercase(),
+        MouseButton::Left => "Left".to_string(),
+        MouseButton::Right => "Right".to_string(),
+        MouseButton::Middle => "Middle".to_string(),
+        _ => format!("{button:?}"),
+    }
+}
+
+fn mouse_button_stem(button: MouseButton, mod_keys: ModKeys) -> String {
+    let label = mouse_button_label(button);
+    if mod_keys.is_empty() {
+        label
+    } else {
+        with_mod_keys(mod_keys, label.to_lowercase())
     }
 }
 
 fn gamepad_axis_label(axis: GamepadAxis) -> String {
     match axis {
-        GamepadAxis::LeftStickX => "ls x".to_string(),
-        GamepadAxis::LeftStickY => "ls y".to_string(),
-        GamepadAxis::RightStickX => "rs x".to_string(),
-        GamepadAxis::RightStickY => "rs y".to_string(),
+        GamepadAxis::LeftStickX => "LS X".to_string(),
+        GamepadAxis::LeftStickY => "LS Y".to_string(),
+        GamepadAxis::RightStickX => "RS X".to_string(),
+        GamepadAxis::RightStickY => "RS Y".to_string(),
         _ => debug_name(axis, ""),
     }
 }
 
 fn gamepad_button_label(button: GamepadButton) -> String {
     match button {
-        GamepadButton::LeftTrigger => "lb".to_string(),
-        GamepadButton::RightTrigger => "rb".to_string(),
-        GamepadButton::LeftTrigger2 => "lt".to_string(),
-        GamepadButton::RightTrigger2 => "rt".to_string(),
+        GamepadButton::LeftTrigger => "LB".to_string(),
+        GamepadButton::RightTrigger => "RB".to_string(),
+        GamepadButton::LeftTrigger2 => "LT".to_string(),
+        GamepadButton::RightTrigger2 => "RT".to_string(),
         GamepadButton::LeftThumb => "L3".to_string(),
         GamepadButton::RightThumb => "R3".to_string(),
         _ => debug_name(button, ""),
@@ -1477,7 +1538,7 @@ fn gamepad_button_label(button: GamepadButton) -> String {
 
 fn debug_name(value: impl std::fmt::Debug, prefix: &str) -> String {
     let name = format!("{value:?}");
-    name.strip_prefix(prefix).unwrap_or(&name).to_lowercase()
+    name.strip_prefix(prefix).unwrap_or(&name).to_string()
 }
 
 const fn source_stem(sources: InteractionSources) -> &'static str {
@@ -1512,7 +1573,7 @@ fn control_row(
         label: label.into(),
         camera_interaction_sources: sources,
         speed: ControlSpeed::Normal,
-        zoom_direction: None,
+        zoom_direction: ZoomRowFilter::Unrestricted,
     }
 }
 
@@ -1527,8 +1588,8 @@ fn camera_control_binding(
         interaction_sources: sources,
         speed: ControlSpeed::Normal,
         kind: CameraControlBindingKind::Direct,
-        action_label: None,
-        direction: None,
+        action_label: ActionColumnLabel::ActionName,
+        direction: FreeCamDirectionFilter::AnySourceEngagement,
     }
 }
 
@@ -1540,6 +1601,7 @@ mod tests {
     use crate::free_cam::FreeCamMouseLook;
     use crate::free_cam::FreeCamPreset;
     use crate::free_cam::FreeCamRollBinding;
+    use crate::free_cam::FreeCamTrackpadLook;
     use crate::free_cam::FreeCamTranslateKeys;
     use crate::input::BindingsError;
     use crate::input::CUSTOM_SLOW_SCALE;
@@ -1557,6 +1619,189 @@ mod tests {
     use crate::orbit_cam::OrbitCamPreset;
     use crate::orbit_cam::OrbitCamTouchBinding;
     use crate::orbit_cam::OrbitCamTrackpadScroll;
+
+    fn assert_either_key_spacing(label: &str) {
+        for (index, character) in label.char_indices() {
+            if character == '/' {
+                assert!(label[..index].ends_with(' '), "{label}");
+                assert!(label[index + 1..].starts_with(' '), "{label}");
+            }
+        }
+        let arrows = ['↑', '↓', '←', '→'];
+        let characters: Vec<_> = label.chars().collect();
+        assert!(
+            !characters
+                .windows(2)
+                .any(|pair| arrows.contains(&pair[0]) && arrows.contains(&pair[1])),
+            "{label}"
+        );
+    }
+
+    #[test]
+    fn every_preset_drawn_key_label_separates_either_keys() {
+        for preset in [
+            OrbitCamPreset::simple_mouse(),
+            OrbitCamPreset::blender_like(),
+            OrbitCamPreset::keyboard(),
+            OrbitCamPreset::simple_mouse_keyboard(),
+            OrbitCamPreset::blender_like_keyboard(),
+            OrbitCamPreset::gamepad(),
+        ] {
+            let summary = describe_orbit_cam_controls(&OrbitCamInputMode::with_preset(preset));
+            for row in summary.rows {
+                assert_either_key_spacing(&row.label);
+            }
+        }
+        for preset in [
+            FreeCamPreset::keyboard_mouse(),
+            FreeCamPreset::gamepad(),
+            FreeCamPreset::gamepad_southpaw(),
+        ] {
+            let summary = describe_free_cam_controls(&FreeCamInputMode::with_preset(preset));
+            for binding in summary.bindings {
+                assert_either_key_spacing(&binding.label);
+            }
+        }
+    }
+
+    #[test]
+    fn every_trackpad_row_names_the_two_finger_drag_source() {
+        for preset in [
+            OrbitCamPreset::simple_mouse(),
+            OrbitCamPreset::blender_like(),
+            OrbitCamPreset::keyboard(),
+            OrbitCamPreset::simple_mouse_keyboard(),
+            OrbitCamPreset::blender_like_keyboard(),
+            OrbitCamPreset::gamepad(),
+        ] {
+            let summary = describe_orbit_cam_controls(&OrbitCamInputMode::with_preset(preset));
+            for row in summary.rows {
+                if row
+                    .camera_interaction_sources
+                    .contains(InteractionSources::SMOOTH_SCROLL)
+                {
+                    assert!(
+                        row.label.to_lowercase().contains("two-finger drag"),
+                        "{}",
+                        row.label
+                    );
+                    assert!(
+                        !row.label.to_lowercase().contains("scroll"),
+                        "{}",
+                        row.label
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_preset_uses_lowercase_mouse_buttons_after_modifiers() {
+        let assert_button_case = |label: &str| {
+            for (index, word) in label.split_whitespace().enumerate() {
+                if index > 0 {
+                    assert!(!["Left", "Right", "Middle"].contains(&word), "{label}");
+                }
+            }
+        };
+        for preset in [
+            OrbitCamPreset::simple_mouse(),
+            OrbitCamPreset::blender_like(),
+            OrbitCamPreset::keyboard(),
+            OrbitCamPreset::simple_mouse_keyboard(),
+            OrbitCamPreset::blender_like_keyboard(),
+            OrbitCamPreset::gamepad(),
+        ] {
+            let summary = describe_orbit_cam_controls(&OrbitCamInputMode::with_preset(preset));
+            for row in summary.rows {
+                assert_button_case(&row.label);
+            }
+        }
+        for preset in [
+            FreeCamPreset::keyboard_mouse(),
+            FreeCamPreset::gamepad(),
+            FreeCamPreset::gamepad_southpaw(),
+        ] {
+            let summary = describe_free_cam_controls(&FreeCamInputMode::with_preset(preset));
+            for binding in summary.bindings {
+                assert_button_case(&binding.label);
+            }
+        }
+        let blender = describe_orbit_cam_controls(&OrbitCamInputMode::with_preset(
+            OrbitCamPreset::blender_like(),
+        ));
+        let labels = summary_labels(&blender);
+        assert!(labels.contains(&"Middle drag"));
+        assert!(labels.contains(&"Shift middle drag"));
+        assert_eq!(
+            mouse_button_stem(MouseButton::Left, ModKeys::CONTROL),
+            "Ctrl left"
+        );
+    }
+
+    #[test]
+    fn camera_summary_uses_plain_panel_labels() {
+        let orbit = describe_orbit_camera_controls(&OrbitCamInputMode::with_preset(
+            OrbitCamPreset::blender_like(),
+        ));
+        assert_eq!(orbit.camera_label, "Orbit camera");
+        assert_eq!(orbit.mode_label, "Controls");
+        assert_eq!(orbit.mode_value, "Blender");
+        assert_eq!(
+            orbit.slow_mode,
+            SlowModeHint::ToggledBy("Alt S".to_string())
+        );
+        assert!(orbit.bindings.iter().any(|row| row.label == "Middle drag"));
+        assert!(
+            orbit
+                .bindings
+                .iter()
+                .any(|row| row.label == "Two-finger drag")
+        );
+
+        let free = describe_free_cam_controls(&FreeCamInputMode::with_preset(
+            FreeCamPreset::keyboard_mouse(),
+        ));
+        assert_eq!(free.camera_label, "Free camera");
+        assert_eq!(free.mode_label, "Controls");
+        assert_eq!(free.mode_value, "Mouse and keyboard");
+        assert_eq!(free.slow_mode, SlowModeHint::ToggledBy("Alt S".to_string()));
+        assert!(free.bindings.iter().any(|row| row.label == "Alt I"));
+
+        let gamepad =
+            describe_orbit_cam_controls(&OrbitCamInputMode::with_preset(OrbitCamPreset::gamepad()));
+        assert!(gamepad.rows.iter().any(|row| row.label == "RB RS"));
+    }
+
+    #[test]
+    fn camera_panel_summary_words_start_with_capitals() {
+        let orbit_modes = [
+            OrbitCamInputMode::with_preset(OrbitCamPreset::blender_like()),
+            OrbitCamInputMode::with_preset(OrbitCamPreset::gamepad()),
+            OrbitCamInputMode::Manual,
+        ];
+        for mode in orbit_modes {
+            let summary = describe_orbit_cam_controls(&mode);
+            assert!(summary.mode_value.starts_with(char::is_uppercase));
+            for row in summary.rows {
+                assert!(row.label.starts_with(char::is_uppercase), "{}", row.label);
+            }
+        }
+        let free = describe_free_cam_controls(&FreeCamInputMode::with_preset(
+            FreeCamPreset::keyboard_mouse(),
+        ));
+        assert!(free.mode_value.starts_with(char::is_uppercase));
+        for binding in free.bindings {
+            assert!(
+                binding.label.starts_with(char::is_uppercase),
+                "{}",
+                binding.label
+            );
+        }
+        assert_eq!(key_label(KeyCode::Space), "Space");
+        assert_eq!(source_stem(InteractionSources::MOUSE), "Mouse binding");
+        assert_eq!(source_stem(InteractionSources::PINCH), "Pinch");
+    }
 
     #[test]
     fn forwarded_trackpad_summary_reports_wheel_modifiers() {
@@ -1590,8 +1835,8 @@ mod tests {
         let preset_summary = describe_orbit_cam_controls(&OrbitCamInputMode::with_preset(
             OrbitCamPreset::blender_like(),
         ));
-        assert_eq!(preset_summary.mode_label, "Preset");
-        assert_eq!(preset_summary.mode_value, "BlenderLike");
+        assert_eq!(preset_summary.mode_label, "Controls");
+        assert_eq!(preset_summary.mode_value, "Blender");
 
         let tuned_bindings = OrbitCamBlenderLikePreset::default()
             .slow_scale(0.25)
@@ -1599,11 +1844,11 @@ mod tests {
         let bindings_summary =
             describe_orbit_cam_controls(&OrbitCamInputMode::Bindings(tuned_bindings));
         assert_eq!(bindings_summary.mode_label, "Input");
-        assert_eq!(bindings_summary.mode_value, "custom bindings");
+        assert_eq!(bindings_summary.mode_value, "Custom controls");
 
         let manual_summary = describe_orbit_cam_controls(&OrbitCamInputMode::Manual);
         assert_eq!(manual_summary.mode_label, "Input");
-        assert_eq!(manual_summary.mode_value, "manual input");
+        assert_eq!(manual_summary.mode_value, "Manual input");
 
         Ok(())
     }
@@ -1615,41 +1860,47 @@ mod tests {
         ));
         let labels = summary_labels(&summary);
 
-        assert_eq!(summary.camera_label, "OrbitCam");
-        assert_eq!(summary.mode_label, "Preset");
-        assert_eq!(summary.mode_value, "BlenderLike");
-        assert!(labels.contains(&"mmb drag"));
-        assert!(labels.contains(&"smooth-scroll"));
-        assert!(labels.contains(&"shift+mmb drag"));
-        assert!(labels.contains(&"shift+smooth-scroll"));
+        assert_eq!(summary.camera_label, "Orbit camera");
+        assert_eq!(summary.mode_label, "Controls");
+        assert_eq!(summary.mode_value, "Blender");
+        assert!(
+            labels
+                .iter()
+                .all(|label| !label.contains('+') || *label == "+"),
+            "{labels:?}"
+        );
+        assert!(labels.contains(&"Middle drag"));
+        assert!(labels.contains(&"Two-finger drag"));
+        assert!(labels.contains(&"Shift middle drag"));
+        assert!(labels.contains(&"Shift two-finger drag"));
         // Zoom sources split into one row per direction.
-        assert!(labels.contains(&"wheel ↑"));
-        assert!(labels.contains(&"wheel ↓"));
-        assert!(labels.contains(&"ctrl+scroll ↑"));
-        assert!(labels.contains(&"ctrl+scroll ↓"));
-        assert!(labels.contains(&"pinch out"));
-        assert!(labels.contains(&"pinch in"));
-        assert_eq!(row_direction(&summary, "wheel ↑"), Some(ZoomDirection::In));
-        assert_eq!(row_direction(&summary, "wheel ↓"), Some(ZoomDirection::Out));
+        assert!(labels.contains(&"Wheel ↑"));
+        assert!(labels.contains(&"Wheel ↓"));
+        assert!(labels.contains(&"Ctrl two-finger drag ↑"));
+        assert!(labels.contains(&"Ctrl two-finger drag ↓"));
+        assert!(labels.contains(&"Pinch out"));
+        assert!(labels.contains(&"Pinch in"));
+        assert_eq!(row_direction(&summary, "Wheel ↑"), Some(ZoomDirection::In));
+        assert_eq!(row_direction(&summary, "Wheel ↓"), Some(ZoomDirection::Out));
         assert_eq!(
-            row_direction(&summary, "ctrl+scroll ↑"),
+            row_direction(&summary, "Ctrl two-finger drag ↑"),
             Some(ZoomDirection::In)
         );
         assert_eq!(
-            row_direction(&summary, "ctrl+scroll ↓"),
+            row_direction(&summary, "Ctrl two-finger drag ↓"),
             Some(ZoomDirection::Out)
         );
         assert_eq!(
-            row_direction(&summary, "pinch out"),
+            row_direction(&summary, "Pinch out"),
             Some(ZoomDirection::In)
         );
         assert_eq!(
-            row_direction(&summary, "pinch in"),
+            row_direction(&summary, "Pinch in"),
             Some(ZoomDirection::Out)
         );
         // Orbit and pan rows stay non-directional.
-        assert_eq!(row_direction(&summary, "mmb drag"), None);
-        assert_eq!(row_direction(&summary, "smooth-scroll"), None);
+        assert_eq!(row_direction(&summary, "Middle drag"), None);
+        assert_eq!(row_direction(&summary, "Two-finger drag"), None);
     }
 
     #[test]
@@ -1661,9 +1912,9 @@ mod tests {
         let labels = summary_labels(&summary);
 
         assert_eq!(summary.mode_label, "Input");
-        assert_eq!(summary.mode_value, "custom bindings");
-        assert!(labels.contains(&"rmb drag"));
-        assert!(!labels.contains(&"mmb drag"));
+        assert_eq!(summary.mode_value, "Custom controls");
+        assert!(labels.contains(&"Right drag"));
+        assert!(!labels.contains(&"Middle drag"));
 
         Ok(())
     }
@@ -1677,7 +1928,7 @@ mod tests {
             .build()?;
         let summary = describe_orbit_cam_controls(&OrbitCamInputMode::Bindings(bindings));
 
-        assert!(summary.rows.is_empty());
+        assert_eq!(summary.rows, []);
 
         Ok(())
     }
@@ -1699,7 +1950,7 @@ mod tests {
             .build()?;
         let summary = describe_orbit_cam_controls(&OrbitCamInputMode::Bindings(bindings));
 
-        assert!(summary.rows.is_empty());
+        assert_eq!(summary.rows, []);
 
         Ok(())
     }
@@ -1719,10 +1970,10 @@ mod tests {
         let labels = summary_labels(&summary);
 
         assert!(effective_slow_mode(&bindings).is_some());
-        assert!(labels.contains(&"pinch out"));
-        assert!(labels.contains(&"pinch in"));
-        assert!(!labels.contains(&"mmb drag"));
-        assert!(!labels.contains(&"smooth-scroll"));
+        assert!(labels.contains(&"Pinch out"));
+        assert!(labels.contains(&"Pinch in"));
+        assert!(!labels.contains(&"Middle drag"));
+        assert!(!labels.contains(&"Two-finger drag"));
         Ok(())
     }
 
@@ -1744,11 +1995,7 @@ mod tests {
         assert!(effective_slow_mode(&bindings).is_none());
         let orbit_cam_input_mode = OrbitCamInputMode::Bindings(bindings);
 
-        assert!(
-            describe_orbit_cam_controls(&orbit_cam_input_mode)
-                .rows
-                .is_empty()
-        );
+        assert_eq!(describe_orbit_cam_controls(&orbit_cam_input_mode).rows, []);
 
         Ok(())
     }
@@ -1781,7 +2028,7 @@ mod tests {
 
         let summary = describe_free_cam_controls(&FreeCamInputMode::Bindings(bindings));
 
-        assert_eq!(summary.slow_mode_binding_label, None);
+        assert_eq!(summary.slow_mode, SlowModeHint::NoDisplayableSlowToggle);
         assert!(
             summary
                 .bindings
@@ -1789,6 +2036,21 @@ mod tests {
                 .all(|binding| binding.kind != CameraControlBindingKind::Direct)
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn free_trackpad_look_appears_in_control_summary() -> Result<(), BindingsError> {
+        let bindings = FreeCamBindings::builder()
+            .look(FreeCamTrackpadLook::default())
+            .build()?;
+        let summary = describe_free_cam_controls(&FreeCamInputMode::Bindings(bindings));
+
+        assert!(summary.bindings.iter().any(|binding| {
+            binding.action == CameraControlAction::Look
+                && binding.label == TRACKPAD_SOURCE_LABEL
+                && binding.interaction_sources == InteractionSources::SMOOTH_SCROLL
+        }));
         Ok(())
     }
 
@@ -1832,8 +2094,8 @@ mod tests {
         let summary = describe_orbit_cam_controls(&OrbitCamInputMode::Bindings(bindings));
         let labels = summary_labels(&summary);
 
-        assert!(labels.contains(&"arrow keys"));
-        assert!(labels.contains(&"wasd"));
+        assert!(labels.contains(&"Arrow keys"));
+        assert!(labels.contains(&"WASD"));
         // The bidirectional zoom key pair splits into one row per direction.
         assert!(labels.contains(&"+"));
         assert!(labels.contains(&"-"));
@@ -1851,33 +2113,33 @@ mod tests {
         let labels = summary_labels(&summary);
 
         assert_eq!(summary.mode_value, "Gamepad");
-        assert!(labels.contains(&"rs"));
-        assert!(labels.contains(&"rb+rs"));
-        assert!(labels.contains(&"ls"));
-        assert!(labels.contains(&"lb+ls"));
-        assert!(labels.contains(&"rt"));
-        assert!(labels.contains(&"lt"));
-        assert!(labels.contains(&"rb+rt"));
-        assert!(labels.contains(&"lb+lt"));
+        assert!(labels.contains(&"RS"));
+        assert!(labels.contains(&"RB RS"));
+        assert!(labels.contains(&"LS"));
+        assert!(labels.contains(&"LB LS"));
+        assert!(labels.contains(&"RT"));
+        assert!(labels.contains(&"LT"));
+        assert!(labels.contains(&"RB RT"));
+        assert!(labels.contains(&"LB LT"));
 
-        assert_eq!(row_speed(&summary, "rs"), Some(ControlSpeed::Normal));
-        assert_eq!(row_speed(&summary, "rb+rs"), Some(ControlSpeed::Slow));
-        assert_eq!(row_speed(&summary, "ls"), Some(ControlSpeed::Normal));
-        assert_eq!(row_speed(&summary, "lb+ls"), Some(ControlSpeed::Slow));
-        assert_eq!(row_speed(&summary, "rt"), Some(ControlSpeed::Normal));
-        assert_eq!(row_speed(&summary, "lt"), Some(ControlSpeed::Normal));
-        assert_eq!(row_speed(&summary, "rb+rt"), Some(ControlSpeed::Slow));
-        assert_eq!(row_speed(&summary, "lb+lt"), Some(ControlSpeed::Slow));
+        assert_eq!(row_speed(&summary, "RS"), Some(ControlSpeed::Normal));
+        assert_eq!(row_speed(&summary, "RB RS"), Some(ControlSpeed::Slow));
+        assert_eq!(row_speed(&summary, "LS"), Some(ControlSpeed::Normal));
+        assert_eq!(row_speed(&summary, "LB LS"), Some(ControlSpeed::Slow));
+        assert_eq!(row_speed(&summary, "RT"), Some(ControlSpeed::Normal));
+        assert_eq!(row_speed(&summary, "LT"), Some(ControlSpeed::Normal));
+        assert_eq!(row_speed(&summary, "RB RT"), Some(ControlSpeed::Slow));
+        assert_eq!(row_speed(&summary, "LB LT"), Some(ControlSpeed::Slow));
 
         // The right triggers zoom in, the left triggers zoom out; the panel
         // highlights only the engaged direction from these tags.
-        assert_eq!(row_direction(&summary, "rt"), Some(ZoomDirection::In));
-        assert_eq!(row_direction(&summary, "lt"), Some(ZoomDirection::Out));
-        assert_eq!(row_direction(&summary, "rb+rt"), Some(ZoomDirection::In));
-        assert_eq!(row_direction(&summary, "lb+lt"), Some(ZoomDirection::Out));
+        assert_eq!(row_direction(&summary, "RT"), Some(ZoomDirection::In));
+        assert_eq!(row_direction(&summary, "LT"), Some(ZoomDirection::Out));
+        assert_eq!(row_direction(&summary, "RB RT"), Some(ZoomDirection::In));
+        assert_eq!(row_direction(&summary, "LB LT"), Some(ZoomDirection::Out));
         // Orbit and pan stick rows are not direction-specific.
-        assert_eq!(row_direction(&summary, "rs"), None);
-        assert_eq!(row_direction(&summary, "ls"), None);
+        assert_eq!(row_direction(&summary, "RS"), None);
+        assert_eq!(row_direction(&summary, "LS"), None);
     }
 
     #[test]
@@ -1886,12 +2148,27 @@ mod tests {
         let labels = summary_labels(&summary);
 
         assert_eq!(summary.mode_label, "Input");
-        assert_eq!(summary.mode_value, "manual input");
-        assert!(labels.contains(&"app-authored input"));
+        assert_eq!(summary.mode_value, "Manual input");
+        assert!(labels.contains(&"App controls"));
         assert!(summary.rows.iter().all(|row| {
             row.camera_interaction_sources
                 .contains(InteractionSources::MANUAL)
         }));
+    }
+
+    #[test]
+    fn gamepad_fallback_uses_plain_words() -> Result<(), BindingsError> {
+        let bindings = OrbitCamBindings::builder()
+            .gamepad(CameraInputGamepadSelectionPolicy::Active)
+            .build()?;
+        let summary = describe_orbit_cam_controls(&OrbitCamInputMode::Bindings(bindings));
+        assert!(
+            summary
+                .rows
+                .iter()
+                .any(|row| row.label == "Gamepad controls")
+        );
+        Ok(())
     }
 
     #[test]
@@ -1937,7 +2214,7 @@ mod tests {
         );
 
         assert!(free_summary_labels(&summary).contains(&ROLL_DISABLED_ROW_LABEL));
-        assert!(!free_summary_labels(&summary).contains(&"q/e"));
+        assert!(!free_summary_labels(&summary).contains(&"Q/E"));
         assert_eq!(
             free_summary_row(&summary, ROLL_DISABLED_ROW_LABEL).map(|row| row.action),
             Some(CameraControlAction::Roll)
@@ -1973,39 +2250,42 @@ mod tests {
         // Translate decomposes into a stick row, a boost-gated stick row, and one
         // row per vertical trigger.
         assert_eq!(
-            free_summary_row(&summary, "ls").map(|row| row.action),
+            free_summary_row(&summary, "LS").map(|row| row.action),
             Some(CameraControlAction::Translate)
         );
-        assert!(free_summary_row(&summary, "ls").is_some_and(|row| row.action_label.is_none()));
+        assert!(
+            free_summary_row(&summary, "LS")
+                .is_some_and(|row| row.action_label == ActionColumnLabel::ActionName)
+        );
         assert_eq!(
-            free_summary_row(&summary, "L3+ls").and_then(|row| row.action_label.as_deref()),
+            free_summary_row(&summary, "L3 LS").and_then(replacement_label),
             Some(TRANSLATE_BOOST_ACTION_LABEL)
         );
         assert_eq!(
-            free_summary_row(&summary, "rt").and_then(|row| row.action_label.as_deref()),
+            free_summary_row(&summary, "RT").and_then(replacement_label),
             Some(TRANSLATE_UP_ACTION_LABEL)
         );
         assert_eq!(
-            free_summary_row(&summary, "lt").and_then(|row| row.action_label.as_deref()),
+            free_summary_row(&summary, "LT").and_then(replacement_label),
             Some(TRANSLATE_DOWN_ACTION_LABEL)
         );
 
         // Roll splits into one row per bumper direction.
         assert_eq!(
-            free_summary_row(&summary, "rb").map(|row| row.action),
+            free_summary_row(&summary, "RB").map(|row| row.action),
             Some(CameraControlAction::Roll)
         );
         assert_eq!(
-            free_summary_row(&summary, "rb").and_then(|row| row.action_label.as_deref()),
+            free_summary_row(&summary, "RB").and_then(replacement_label),
             Some(ROLL_RIGHT_ACTION_LABEL)
         );
         assert_eq!(
-            free_summary_row(&summary, "lb").and_then(|row| row.action_label.as_deref()),
+            free_summary_row(&summary, "LB").and_then(replacement_label),
             Some(ROLL_LEFT_ACTION_LABEL)
         );
 
         // Every decomposed row reports the gamepad as its source.
-        for label in ["ls", "L3+ls", "rt", "lt", "rb", "lb"] {
+        for label in ["LS", "L3 LS", "RT", "LT", "RB", "LB"] {
             assert_eq!(
                 free_summary_row(&summary, label).map(|row| row.interaction_sources),
                 Some(InteractionSources::GAMEPAD),
@@ -2015,7 +2295,7 @@ mod tests {
     }
 
     #[test]
-    fn free_cam_keyboard_roll_stays_single_row() {
+    fn free_cam_keyboard_roll_stays_single_row() -> Result<(), BindingsError> {
         let summary = describe_free_cam_controls(&FreeCamInputMode::with_preset(
             FreeCamPreset::keyboard_mouse(),
         ));
@@ -2026,8 +2306,25 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(roll_rows.len(), 1);
-        assert_eq!(roll_rows[0].label, "q / e");
-        assert!(roll_rows[0].action_label.is_none());
+        assert_eq!(roll_rows[0].label, "Q / E");
+        assert_eq!(roll_rows[0].action_label, ActionColumnLabel::ActionName);
+
+        let arrow_bindings = FreeCamBindings::builder()
+            .roll(FreeCamRollBinding::from(InputBinding::bidirectional_keys(
+                KeyCode::ArrowUp,
+                KeyCode::ArrowDown,
+            )))
+            .build()?;
+        let arrow_summary = describe_free_cam_controls(&FreeCamInputMode::Bindings(arrow_bindings));
+        let arrow_roll = arrow_summary
+            .bindings
+            .iter()
+            .find(|binding| binding.action == CameraControlAction::Roll);
+        assert_eq!(
+            arrow_roll.map(|binding| binding.label.as_str()),
+            Some("↑ / ↓")
+        );
+        Ok(())
     }
 
     #[test]
@@ -2121,6 +2418,13 @@ mod tests {
         }
     }
 
+    fn replacement_label(binding: &CameraControlBinding) -> Option<&str> {
+        match &binding.action_label {
+            ActionColumnLabel::ActionName => None,
+            ActionColumnLabel::Replacement(label) => Some(label),
+        }
+    }
+
     fn setting_activation(binding: &CameraControlBinding) -> Option<CameraControlActivation> {
         match &binding.kind {
             CameraControlBindingKind::Setting { activation, .. } => Some(*activation),
@@ -2141,6 +2445,155 @@ mod tests {
             .rows
             .iter()
             .find(|row| row.label == label)
-            .and_then(|row| row.zoom_direction)
+            .and_then(|row| match row.zoom_direction {
+                ZoomRowFilter::Only(direction) => Some(direction),
+                ZoomRowFilter::Unrestricted => None,
+            })
+    }
+}
+
+#[cfg(test)]
+mod drawn_mouse_label_tests {
+    use std::sync::mpsc;
+
+    use bevy::camera::RenderTarget;
+    use bevy::prelude::*;
+    use bevy::render::RenderPlugin;
+    use bevy::render::render_resource::PollType;
+    use bevy::render::render_resource::TextureFormat;
+    use bevy::render::renderer::RenderDevice;
+    use bevy::render::view::screenshot::Screenshot;
+    use bevy::render::view::screenshot::ScreenshotCaptured;
+    use bevy::window::ExitCondition;
+    use bevy::winit::WinitPlugin;
+    use hana_diegetic::Anchor;
+    use hana_diegetic::CascadeEntityCommandsExt as _;
+    use hana_diegetic::DiegeticPanel;
+    use hana_diegetic::DiegeticUiPlugin;
+    use hana_diegetic::DisplayCompensationReadiness;
+    use hana_diegetic::El;
+    use hana_diegetic::LayoutBuilder;
+    use hana_diegetic::Lighting;
+    use hana_diegetic::Text;
+    use hana_diegetic::TextStyle;
+    use hana_diegetic::Unit;
+
+    use super::OrbitCamInputMode;
+    use super::describe_orbit_cam_controls;
+    use crate::orbit_cam::OrbitCamPreset;
+
+    const WIDTH: u32 = 512;
+    const HEIGHT: u32 = 128;
+
+    fn drawn_label(label: &str) -> Result<Vec<u8>, String> {
+        let mut app = App::new();
+        app.add_plugins(
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: None,
+                    exit_condition: ExitCondition::DontExit,
+                    ..default()
+                })
+                .set(RenderPlugin {
+                    synchronous_pipeline_compilation: true,
+                    ..default()
+                })
+                .disable::<WinitPlugin>(),
+        );
+        app.add_plugins(DiegeticUiPlugin);
+        app.world_mut().insert_resource(Lighting::Unlit);
+        let target =
+            app.world_mut()
+                .resource_mut::<Assets<Image>>()
+                .add(Image::new_target_texture(
+                    WIDTH,
+                    HEIGHT,
+                    TextureFormat::Rgba8UnormSrgb,
+                    None,
+                ));
+        app.world_mut().spawn((
+            Camera3d::default(),
+            RenderTarget::Image(target.clone().into()),
+            Msaa::Off,
+            Transform::from_xyz(0.0, 0.0, 0.9).looking_at(Vec3::ZERO, Vec3::Y),
+        ));
+        let mut layout =
+            LayoutBuilder::with_root(El::column().size(1.2, 0.12).background(Color::BLACK));
+        layout.text(Text::new(
+            label,
+            TextStyle::new(0.014).with_color(Color::WHITE),
+        ));
+        let panel = DiegeticPanel::world()
+            .font_unit(Unit::Meters)
+            .size(1.2, 0.12)
+            .anchor(Anchor::Center)
+            .with_tree(layout.build())
+            .build()
+            .map_err(|error| error.to_string())?;
+        let panel = app.world_mut().spawn((panel, Transform::IDENTITY)).id();
+        app.world_mut()
+            .commands()
+            .entity(panel)
+            .override_lighting(Lighting::Unlit);
+        app.finish();
+        app.cleanup();
+        for _ in 0..50 {
+            if *app.world().resource::<DisplayCompensationReadiness>()
+                == DisplayCompensationReadiness::Compensated
+            {
+                break;
+            }
+            app.update();
+        }
+        for _ in 0..4 {
+            app.update();
+        }
+        let (sender, receiver) = mpsc::channel();
+        app.world_mut().spawn(Screenshot::image(target)).observe(
+            move |event: On<ScreenshotCaptured>| {
+                let _ = sender.send(event.image.data.clone().ok_or("screenshot has no pixels"));
+            },
+        );
+        // Bevy finishes the readback on its async compute pool, which shader
+        // compilation can hold for many frames, so this waits on the capture itself.
+        loop {
+            app.update();
+            app.world()
+                .resource::<RenderDevice>()
+                .wgpu_device()
+                .poll(PollType::Wait {
+                    submission_index: None,
+                    timeout:          None,
+                })
+                .map_err(|error| format!("GPU readback failed: {error}"))?;
+            if let Ok(pixels) = receiver.try_recv() {
+                return pixels.map_err(str::to_string);
+            }
+        }
+    }
+
+    #[test]
+    fn blender_pan_label_draws_lowercase_middle_after_shift() -> Result<(), String> {
+        let summary = describe_orbit_cam_controls(&OrbitCamInputMode::with_preset(
+            OrbitCamPreset::blender_like(),
+        ));
+        let label = summary
+            .rows
+            .iter()
+            .find(|row| row.label.starts_with("Shift ") && row.label.ends_with("iddle drag"))
+            .ok_or("Blender preset has no modified middle drag row")?;
+        let actual = drawn_label(&label.label)?;
+        let expected = drawn_label("Shift middle drag")?;
+        let capitalized = drawn_label("Shift Middle drag")?;
+        assert!(actual.as_chunks::<4>().0.iter().any(|pixel| pixel[0] > 80));
+        assert!(
+            expected != capitalized,
+            "font did not distinguish letter case"
+        );
+        assert!(
+            actual == expected,
+            "Blender pan label drew the wrong letter case"
+        );
+        Ok(())
     }
 }

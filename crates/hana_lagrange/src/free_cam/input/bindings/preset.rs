@@ -19,6 +19,7 @@ use super::FreeCamBindings;
 use super::FreeCamBindingsBuilder;
 use super::FreeCamInputGain;
 use super::builder::FreeCamMouseLook;
+use super::builder::FreeCamTrackpadLook;
 use super::builder::FreeCamTranslateKeys;
 use crate::input::BindingsError;
 use crate::input::CameraInputScalePolicy;
@@ -69,8 +70,42 @@ impl FreeCamPresetKind {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
-            Self::KeyboardMouse => "KeyboardMouse",
+            Self::KeyboardMouse => "Mouse and keyboard",
             Self::Gamepad => "Gamepad",
+        }
+    }
+}
+
+/// How the mouse-and-keyboard preset exposes a slow-mode toggle.
+#[derive(Clone, Copy, Debug, PartialEq, Reflect)]
+enum SlowModeToggle {
+    Bound(KeyCode),
+    Unbound,
+}
+
+/// How the mouse-and-keyboard preset exposes trackpad look.
+#[derive(Clone, Copy, Debug, PartialEq, Reflect)]
+enum TrackpadLookBinding {
+    BoundWithDefaultGain,
+    BoundWithInputGain(f32),
+    Unbound,
+}
+
+/// Home bindings retained by the mouse-and-keyboard preset.
+#[derive(Clone, Copy, Debug, PartialEq, Reflect)]
+enum HomeBindings {
+    Unbound,
+    One(Binding),
+    Two(Binding, Binding),
+}
+
+impl HomeBindings {
+    const fn has_home(self) -> bool { !matches!(self, Self::Unbound) }
+
+    const fn with_home(self, binding: Binding) -> Self {
+        match self {
+            Self::Unbound => Self::One(binding),
+            Self::One(first) | Self::Two(first, _) => Self::Two(first, binding),
         }
     }
 }
@@ -79,12 +114,13 @@ impl FreeCamPresetKind {
 #[derive(Clone, Copy, Debug, PartialEq, Reflect)]
 #[reflect(Default)]
 pub struct FreeCamKeyboardMousePreset {
-    toggle_key:      Option<KeyCode>,
+    toggle_key:      SlowModeToggle,
     toggle_mod_keys: ModKeys,
     scale:           f32,
     input_gain:      FreeCamInputGain,
-    home:            [Option<Binding>; 2],
+    home:            HomeBindings,
     look_pitch:      FreeCamLookPitch,
+    trackpad_look:   TrackpadLookBinding,
 }
 
 impl FreeCamKeyboardMousePreset {
@@ -116,13 +152,22 @@ impl FreeCamKeyboardMousePreset {
                 .with_input_gain(self.input_gain.roll_input_gain().value()),
             )
             .look_pitch(self.look_pitch);
-        let builder = self
-            .home
-            .into_iter()
-            .flatten()
-            .fold(builder, FreeCamBindingsBuilder::home);
+        let builder = match self.trackpad_look {
+            TrackpadLookBinding::BoundWithDefaultGain => {
+                builder.look(FreeCamTrackpadLook::default())
+            },
+            TrackpadLookBinding::BoundWithInputGain(input_gain) => {
+                builder.look(FreeCamTrackpadLook::default().with_input_gain(input_gain))
+            },
+            TrackpadLookBinding::Unbound => builder,
+        };
+        let builder = match self.home {
+            HomeBindings::Unbound => builder,
+            HomeBindings::One(first) => builder.home(first),
+            HomeBindings::Two(first, second) => builder.home(first).home(second),
+        };
         match self.toggle_key {
-            Some(toggle_key) => builder
+            SlowModeToggle::Bound(toggle_key) => builder
                 .slow_mode(CameraSlowMode {
                     toggle_key,
                     mod_keys: self.toggle_mod_keys,
@@ -132,14 +177,21 @@ impl FreeCamKeyboardMousePreset {
                     },
                 })
                 .build(),
-            None => builder.without_slow_mode().build(),
+            SlowModeToggle::Unbound => builder.without_slow_mode().build(),
         }
     }
 
     /// Sets the key that toggles slow mode on or off for this camera.
     #[must_use]
-    pub const fn slow_toggle_key(mut self, slow_toggle_key: Option<KeyCode>) -> Self {
-        self.toggle_key = slow_toggle_key;
+    pub const fn with_slow_toggle_key(mut self, slow_toggle_key: KeyCode) -> Self {
+        self.toggle_key = SlowModeToggle::Bound(slow_toggle_key);
+        self
+    }
+
+    /// Removes the slow-mode toggle from this camera preset.
+    #[must_use]
+    pub const fn without_slow_toggle(mut self) -> Self {
+        self.toggle_key = SlowModeToggle::Unbound;
         self
     }
 
@@ -164,6 +216,20 @@ impl FreeCamKeyboardMousePreset {
         self
     }
 
+    /// Removes smooth-scroll trackpad look from this camera preset.
+    #[must_use]
+    pub const fn without_trackpad_look(mut self) -> Self {
+        self.trackpad_look = TrackpadLookBinding::Unbound;
+        self
+    }
+
+    /// Sets source-side input gain for smooth-scroll trackpad look.
+    #[must_use]
+    pub const fn trackpad_input_gain(mut self, input_gain: f32) -> Self {
+        self.trackpad_look = TrackpadLookBinding::BoundWithInputGain(input_gain);
+        self
+    }
+
     /// Adds a binding that returns the camera to its home pose.
     ///
     /// No home input is bound unless this method is called. The preset holds
@@ -171,17 +237,13 @@ impl FreeCamKeyboardMousePreset {
     /// call replaces the second binding.
     #[must_use]
     pub fn with_home(mut self, home: impl Into<Binding>) -> Self {
-        let home = Some(home.into());
-        match &mut self.home {
-            [first @ None, _] => *first = home,
-            [_, second] => *second = home,
-        }
+        self.home = self.home.with_home(home.into());
         self
     }
 
     /// Returns whether this preset binds home input.
     #[must_use]
-    pub const fn has_home(&self) -> bool { matches!(self.home, [Some(_), _] | [_, Some(_)]) }
+    pub const fn has_home(&self) -> bool { self.home.has_home() }
 
     /// Sets whether mouse Y is passed through or inverted for look input.
     #[must_use]
@@ -198,12 +260,13 @@ impl FreeCamKeyboardMousePreset {
 impl Default for FreeCamKeyboardMousePreset {
     fn default() -> Self {
         Self {
-            toggle_key:      Some(KeyCode::KeyS),
+            toggle_key:      SlowModeToggle::Bound(KeyCode::KeyS),
             toggle_mod_keys: ModKeys::ALT,
             scale:           Self::DEFAULT_SLOW_SCALE,
             input_gain:      FreeCamInputGain::new(),
-            home:            [None; 2],
+            home:            HomeBindings::Unbound,
             look_pitch:      FreeCamLookPitch::Normal,
+            trackpad_look:   TrackpadLookBinding::BoundWithDefaultGain,
         }
     }
 }
@@ -232,12 +295,13 @@ impl FreeCamPreset {
     #[must_use]
     pub const fn keyboard_mouse() -> Self {
         Self::KeyboardMouse(FreeCamKeyboardMousePreset {
-            toggle_key:      Some(KeyCode::KeyS),
+            toggle_key:      SlowModeToggle::Bound(KeyCode::KeyS),
             toggle_mod_keys: ModKeys::ALT,
             scale:           FreeCamKeyboardMousePreset::DEFAULT_SLOW_SCALE,
             input_gain:      FreeCamInputGain::new(),
-            home:            [None; 2],
+            home:            HomeBindings::Unbound,
             look_pitch:      FreeCamLookPitch::Normal,
+            trackpad_look:   TrackpadLookBinding::BoundWithDefaultGain,
         })
     }
 
@@ -270,7 +334,7 @@ impl FreeCamPreset {
             Self::KeyboardMouse(_) => FreeCamPresetKind::KeyboardMouse.name(),
             Self::Gamepad(preset) => match preset.layout {
                 FreeCamGamepadLayout::Standard => FreeCamPresetKind::Gamepad.name(),
-                FreeCamGamepadLayout::Southpaw => "Gamepad Southpaw",
+                FreeCamGamepadLayout::Southpaw => "Gamepad, sticks swapped",
             },
         }
     }
@@ -566,6 +630,7 @@ mod tests {
     const MOUSE_LOOK_INPUT_GAIN: f32 = 0.5;
     const MOUSE_ROLL_INPUT_GAIN: f32 = 0.25;
     const MOUSE_TRANSLATE_INPUT_GAIN: f32 = 0.75;
+    const TRACKPAD_LOOK_INPUT_GAIN: f32 = 0.625;
 
     fn first_move_axis(bindings: &FreeCamBindings) -> Binding {
         bindings.translate().entries()[0]
@@ -601,7 +666,42 @@ mod tests {
         let preset = FreeCamPreset::keyboard_mouse();
 
         assert_eq!(preset.kind(), FreeCamPresetKind::KeyboardMouse);
-        assert_eq!(preset.name(), "KeyboardMouse");
+        assert_eq!(preset.name(), "Mouse and keyboard");
+    }
+
+    #[test]
+    fn preset_names_describe_both_kinds_and_southpaw_layout() {
+        assert_eq!(
+            FreeCamPresetKind::KeyboardMouse.name(),
+            "Mouse and keyboard"
+        );
+        assert_eq!(FreeCamPresetKind::Gamepad.name(), "Gamepad");
+        assert_eq!(
+            FreeCamPreset::gamepad_southpaw().name(),
+            "Gamepad, sticks swapped"
+        );
+    }
+
+    #[test]
+    fn without_slow_toggle_builds_no_slow_mode() -> Result<(), BindingsError> {
+        let bindings = FreeCamKeyboardMousePreset::default()
+            .without_slow_toggle()
+            .to_bindings()?;
+        assert!(bindings.slow_mode().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn with_slow_toggle_key_rebinds_slow_mode() -> Result<(), BindingsError> {
+        let bindings = FreeCamKeyboardMousePreset::default()
+            .without_slow_toggle()
+            .with_slow_toggle_key(KeyCode::KeyT)
+            .to_bindings()?;
+        assert_eq!(
+            bindings.slow_mode().map(|mode| mode.toggle_key),
+            Some(KeyCode::KeyT)
+        );
+        Ok(())
     }
 
     #[test]
@@ -613,6 +713,42 @@ mod tests {
             preset.to_bindings().map(|bindings| bindings.look_pitch()),
             Ok(FreeCamLookPitch::Inverted)
         );
+    }
+
+    #[test]
+    fn keyboard_mouse_preset_binds_trackpad_look_by_default() -> Result<(), BindingsError> {
+        let bindings = FreeCamKeyboardMousePreset::default().to_bindings()?;
+
+        assert_eq!(bindings.trackpad_look.len(), 1);
+        assert_eq!(
+            bindings.trackpad_look[0].input_gain(),
+            FreeCamTrackpadLook::default().input_gain()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn keyboard_mouse_preset_can_remove_trackpad_look() -> Result<(), BindingsError> {
+        let bindings = FreeCamKeyboardMousePreset::default()
+            .without_trackpad_look()
+            .to_bindings()?;
+
+        assert_eq!(bindings.trackpad_look.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn keyboard_mouse_preset_sets_trackpad_look_input_gain() -> Result<(), BindingsError> {
+        let bindings = FreeCamKeyboardMousePreset::default()
+            .trackpad_input_gain(TRACKPAD_LOOK_INPUT_GAIN)
+            .to_bindings()?;
+
+        assert_eq!(bindings.trackpad_look.len(), 1);
+        assert_eq!(
+            bindings.trackpad_look[0].input_gain(),
+            InputGain(TRACKPAD_LOOK_INPUT_GAIN)
+        );
+        Ok(())
     }
 
     #[test]
@@ -741,7 +877,7 @@ mod tests {
         let preset = FreeCamPreset::gamepad_southpaw();
 
         assert_eq!(preset.kind(), FreeCamPresetKind::Gamepad);
-        assert_eq!(preset.name(), "Gamepad Southpaw");
+        assert_eq!(preset.name(), "Gamepad, sticks swapped");
     }
 
     #[test]

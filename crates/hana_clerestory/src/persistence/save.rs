@@ -9,11 +9,16 @@ use std::fs::write;
 use std::path::Path;
 
 use bevy::prelude::DetectChanges;
+use bevy::prelude::Has;
 use bevy::prelude::Query;
 use bevy::prelude::Reflect;
 use bevy::prelude::Res;
 use bevy::prelude::ResMut;
+use bevy::prelude::Window;
+use bevy::prelude::With;
 use bevy::prelude::warn;
+use bevy::window::PrimaryWindow;
+use bevy::window::WindowMode;
 use hana_rigging::LastKnownGoodConfigurationAccessError;
 use hana_rigging::prelude::Binding;
 use hana_rigging::prelude::Bindings;
@@ -33,6 +38,8 @@ use super::WindowPlacementConfiguration;
 use super::constants::STATE_TEMPORARY_EXTENSION;
 use super::format;
 use super::window_state::LoadedBindingPolicy;
+use super::windowed_placement::WindowedPlacement;
+use super::windowed_placement::WindowedPlacementRestore;
 use crate::ManagedWindowPersistence;
 use crate::managed::ManagedWindowRegistry;
 use crate::restore_window_config::RestoreWindowConfig;
@@ -47,13 +54,15 @@ pub(super) enum StateFileWrite {
 ///
 /// Each refusal names why this role cannot write now. Only `AbsentBinding` means the role itself is
 /// gone, so the batch writer drops its record under `ActiveOnly` and keeps it under `RememberAll`.
-/// Every other refusal is a condition of this frame — an offline display, a capture that has not
-/// happened yet, a driver that owns another erased configuration type — and never costs a role the
-/// record it already has.
+/// Every other refusal is a condition of this frame — an open window with no display to bind to,
+/// an offline display, a capture that has not happened yet, a driver that owns another erased
+/// configuration type — and never costs a role the record it already has.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum EstablishedWindowPersistenceProjection {
-    /// No kernel binding is registered for this persistence role.
+    /// The role's window is gone and no kernel binding is registered for it.
     AbsentBinding,
+    /// The role's window is open but has no kernel binding yet, as when no display is known.
+    AwaitingBinding,
     /// The kernel has not made this role ready for authoritative persistence.
     NonReadyRole,
     /// The endpoint's configured display is currently marked offline.
@@ -64,6 +73,13 @@ pub(super) enum EstablishedWindowPersistenceProjection {
     WrongErasedConfiguration,
     /// The ready binding supplied a serializable v6 record.
     WritableSerializedValue(Box<PersistedWindowPlacement>),
+}
+
+/// Whether a role's window exists, which decides what a missing binding means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RoleWindowPresence {
+    Live,
+    Gone,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,13 +188,17 @@ fn project_established_values(
 
 fn project_established(
     role: &RoleKey,
+    window_presence: RoleWindowPresence,
     bindings: &Bindings,
     role_statuses: &Query<(&RoleKey, &RoleStatus)>,
     inventory: &HardwareInventory,
     app_name: &str,
 ) -> EstablishedWindowPersistenceProjection {
     let Ok(binding) = bindings.binding(role) else {
-        return EstablishedWindowPersistenceProjection::AbsentBinding;
+        return match window_presence {
+            RoleWindowPresence::Live => EstablishedWindowPersistenceProjection::AwaitingBinding,
+            RoleWindowPresence::Gone => EstablishedWindowPersistenceProjection::AbsentBinding,
+        };
     };
     let Some(role_status) = role_statuses
         .iter()
@@ -194,6 +214,15 @@ pub(super) fn write_established_window_configurations(
     bindings: Res<Bindings>,
     inventory: Res<HardwareInventory>,
     role_statuses: Query<(&RoleKey, &RoleStatus)>,
+    primary_windows: Query<(), With<PrimaryWindow>>,
+    windowed_placements: Query<
+        (
+            &Window,
+            Option<&WindowedPlacement>,
+            Has<WindowedPlacementRestore>,
+        ),
+        With<PrimaryWindow>,
+    >,
     managed_windows: Res<ManagedWindowRegistry>,
     retention: Res<ManagedWindowPersistence>,
     mut persisted: ResMut<PersistedWindowPlacements>,
@@ -211,24 +240,57 @@ pub(super) fn write_established_window_configurations(
     let app_name = application_name();
     let primary_role = super::primary_window_role();
     if let Ok(primary_role) = primary_role {
+        let primary_window_presence = if primary_windows.is_empty() {
+            RoleWindowPresence::Gone
+        } else {
+            RoleWindowPresence::Live
+        };
+        let mut projection = project_established(
+            &primary_role,
+            primary_window_presence,
+            &bindings,
+            &role_statuses,
+            &inventory,
+            &app_name,
+        );
+        if let EstablishedWindowPersistenceProjection::WritableSerializedValue(saved) =
+            &mut projection
+        {
+            let (windowed, restoring) = match windowed_placements.single() {
+                Ok((window, windowed, restoring)) => {
+                    if window.mode != WindowMode::Windowed {
+                        saved.window_state.saved_window_mode = (&window.mode).into();
+                    }
+                    (windowed, restoring)
+                },
+                Err(_) => (None, false),
+            };
+            if restoring || saved.saved_window_mode != super::SavedWindowMode::Windowed {
+                if let Some(windowed) = windowed {
+                    windowed.retain_in(&mut saved.window_state);
+                } else if let Some(previous) = persisted.states.get(&primary_role) {
+                    saved.window_state.position = previous.window_state.position;
+                    saved.window_state.logical_width = previous.logical_width;
+                    saved.window_state.logical_height = previous.logical_height;
+                }
+            }
+        }
+        apply_projection(&mut projected, primary_role, projection, &retention);
+    }
+    // The registry releases a named window's role when the window goes, so every role left in it
+    // is live.
+    for role in managed_windows.roles() {
         apply_projection(
             &mut projected,
-            primary_role.clone(),
+            role.clone(),
             project_established(
-                &primary_role,
+                &role,
+                RoleWindowPresence::Live,
                 &bindings,
                 &role_statuses,
                 &inventory,
                 &app_name,
             ),
-            &retention,
-        );
-    }
-    for role in managed_windows.roles() {
-        apply_projection(
-            &mut projected,
-            role.clone(),
-            project_established(&role, &bindings, &role_statuses, &inventory, &app_name),
             &retention,
         );
     }
@@ -246,7 +308,7 @@ pub(super) fn write_established_window_configurations(
 ///
 /// `PersistedWindowPlacements` records a required write when live reporter evidence upgrades a
 /// retained v4 target. That upgrade already changes the authoritative cache, so comparing the
-/// projection with the cache alone would incorrectly suppress the v5 rewrite.
+/// projection with the cache alone would incorrectly suppress the rewrite.
 fn write_is_required_after_projection(
     persisted: &PersistedWindowPlacements,
     projected: &HashMap<RoleKey, PersistedWindowPlacement>,
@@ -302,7 +364,8 @@ fn managed_roles(managed_windows: &ManagedWindowRegistry) -> HashSet<RoleKey> {
 /// A writable value always replaces whatever record was retained. `AbsentBinding` is the only
 /// refusal meaning the role itself is gone, so `ActiveOnly` drops its record and `RememberAll`
 /// keeps it. Every other refusal means the role cannot project during this frame, and its retained
-/// record survives under both modes rather than being erased by a passing condition.
+/// record survives under both modes rather than being erased by a passing condition. A live window
+/// with no binding is one of those: a startup with no display leaves it unbound, not closed.
 fn apply_projection(
     projected: &mut HashMap<RoleKey, PersistedWindowPlacement>,
     role: RoleKey,
@@ -318,7 +381,8 @@ fn apply_projection(
                 projected.remove(&role);
             }
         },
-        EstablishedWindowPersistenceProjection::NonReadyRole
+        EstablishedWindowPersistenceProjection::AwaitingBinding
+        | EstablishedWindowPersistenceProjection::NonReadyRole
         | EstablishedWindowPersistenceProjection::OfflineInventory
         | EstablishedWindowPersistenceProjection::MissingLastKnownGoodConfiguration
         | EstablishedWindowPersistenceProjection::WrongErasedConfiguration => {},
@@ -345,11 +409,16 @@ mod tests {
 
     use bevy::MinimalPlugins;
     use bevy::prelude::App;
+    use bevy::prelude::Entity;
     use bevy::prelude::IVec2;
     use bevy::prelude::IntoScheduleConfigs;
     use bevy::prelude::UVec2;
     use bevy::prelude::Update;
+    use bevy::prelude::WindowPosition;
     use bevy::prelude::World;
+    use bevy::window::PrimaryWindow;
+    use bevy::window::WindowMode;
+    use hana_rigging::AvailableConfiguration;
     use hana_rigging::LastKnownGoodConfigurationAccessError;
     use hana_rigging::prelude::Applied;
     use hana_rigging::prelude::ApplyContext;
@@ -413,6 +482,7 @@ mod tests {
 
     use super::*;
     use crate::ManagedWindowName;
+    use crate::driver::WindowDriverId;
     use crate::managed;
     use crate::persistence::EstablishedWindowPosition;
     use crate::persistence::PersistedDisplayIdentityV4;
@@ -495,6 +565,7 @@ mod tests {
         primary_role:   RoleKey,
         managed_role:   RoleKey,
         primary_device: DeviceKey,
+        driver:         EndpointDriverRegistration<WindowPlacementConfiguration>,
     }
 
     impl PersistenceHarness {
@@ -568,6 +639,7 @@ mod tests {
                 primary_role,
                 managed_role,
                 primary_device,
+                driver,
             })
         }
 
@@ -583,6 +655,178 @@ mod tests {
                 },
             }
         }
+    }
+
+    fn full_screen_persistence_fixture()
+    -> Result<(PersistenceHarness, Entity, BindingPolicy), String> {
+        let mut harness = PersistenceHarness::new(ManagedMembership::Absent)?;
+        harness.app.insert_resource(crate::Platform::X11);
+        let monitor = crate::CurrentMonitor {
+            descriptor:            crate::MonitorDescriptor::for_current_enumeration(
+                0,
+                1.0,
+                IVec2::ZERO,
+                UVec2::new(1920, 1080),
+            ),
+            effective_window_mode: WindowMode::Windowed,
+        };
+        let window = harness
+            .app
+            .world_mut()
+            .spawn((
+                Window {
+                    resolution: (900, 700).into(),
+                    position: WindowPosition::At(IVec2::new(100, 80)),
+                    ..Default::default()
+                },
+                PrimaryWindow,
+                monitor,
+            ))
+            .id();
+        WindowPlacementConfiguration::toggle_full_screen(harness.app.world_mut(), window);
+        let policy = harness
+            .app
+            .world()
+            .resource::<Bindings>()
+            .binding(&harness.primary_role)
+            .map_err(|error| error.to_string())?
+            .policy();
+        let full_screen_readback = EstablishedWindowPlacement {
+            position:          EstablishedWindowPosition::Restorable {
+                logical_offset: IVec2::ZERO,
+            },
+            logical_size:      UVec2::new(1920, 1080),
+            saved_window_mode: SavedWindowMode::Windowed,
+        };
+        harness
+            .app
+            .world_mut()
+            .resource_mut::<Bindings>()
+            .replace_authoring(BindingAuthoring::new(
+                harness.primary_role.clone(),
+                DeviceEndpoint {
+                    device: harness.primary_device.clone(),
+                    id:     EndpointId::Whole,
+                },
+                harness.driver,
+                full_screen_readback.into(),
+                policy,
+            ))
+            .map_err(|error| error.to_string())?;
+        Ok((harness, window, policy))
+    }
+
+    #[test]
+    fn full_screen_editor_retains_windowed_geometry_through_driver_return() -> Result<(), String> {
+        let (mut harness, window, policy) = full_screen_persistence_fixture()?;
+        for _ in 0..8 {
+            harness.app.update();
+        }
+        let states = harness.persisted_roles()?;
+        let editor = states
+            .get(&harness.primary_role)
+            .ok_or("editor was not saved")?;
+        assert_eq!(
+            editor.saved_window_mode,
+            SavedWindowMode::BorderlessFullscreen
+        );
+        assert_eq!((editor.logical_width, editor.logical_height), (900, 700));
+        assert_eq!(
+            editor.position,
+            PersistedPosition::MonitorOffset(IVec2::new(100, 80))
+        );
+
+        // A full-screen launch has only the persisted windowed placement to retain.
+        harness
+            .app
+            .world_mut()
+            .entity_mut(window)
+            .remove::<WindowedPlacement>();
+        for _ in 0..8 {
+            harness.app.update();
+        }
+        let states = harness.persisted_roles()?;
+        let editor = states
+            .get(&harness.primary_role)
+            .ok_or("full-screen launch was not saved")?;
+        assert_eq!(
+            editor.saved_window_mode,
+            SavedWindowMode::BorderlessFullscreen
+        );
+        assert_eq!((editor.logical_width, editor.logical_height), (900, 700));
+        assert_eq!(
+            editor.position,
+            PersistedPosition::MonitorOffset(IVec2::new(100, 80))
+        );
+
+        harness.app.insert_resource(WindowDriverId(harness.driver));
+        WindowPlacementConfiguration::toggle_full_screen(harness.app.world_mut(), window);
+        assert_windowed_return_request(&harness, window, policy)?;
+        // The native mode can change before its windowed size and position arrive.
+        harness
+            .app
+            .world_mut()
+            .get_mut::<Window>(window)
+            .ok_or("editor window missing")?
+            .mode = WindowMode::Windowed;
+        for _ in 0..8 {
+            harness.app.update();
+        }
+        let states = harness.persisted_roles()?;
+        let editor = states
+            .get(&harness.primary_role)
+            .ok_or("return was not saved")?;
+        assert_eq!(editor.saved_window_mode, SavedWindowMode::Windowed);
+        assert_eq!((editor.logical_width, editor.logical_height), (900, 700));
+        assert_eq!(
+            editor.position,
+            PersistedPosition::MonitorOffset(IVec2::new(100, 80))
+        );
+        Ok(())
+    }
+
+    fn assert_windowed_return_request(
+        harness: &PersistenceHarness,
+        window: Entity,
+        policy: BindingPolicy,
+    ) -> Result<(), String> {
+        assert_eq!(
+            harness
+                .app
+                .world()
+                .get::<Window>(window)
+                .ok_or("editor window missing")?
+                .mode,
+            WindowMode::Windowed
+        );
+        let bindings = harness.app.world().resource::<Bindings>();
+        let binding = bindings
+            .binding(&harness.primary_role)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(binding.endpoint.device, harness.primary_device);
+        assert_eq!(binding.policy(), policy);
+        let AvailableConfiguration::Requested(configuration) = bindings
+            .configuration_for(&harness.primary_role)
+            .map_err(|error| error.to_string())?
+        else {
+            return Err("windowed placement was not dispatched to the window driver".into());
+        };
+        let Some(WindowPlacementConfiguration::Established(requested)) =
+            configuration
+                .as_any()
+                .downcast_ref::<WindowPlacementConfiguration>()
+        else {
+            return Err("window driver received another configuration type".into());
+        };
+        assert_eq!(requested.saved_window_mode, SavedWindowMode::Windowed);
+        assert_eq!(requested.logical_size, UVec2::new(900, 700));
+        assert_eq!(
+            requested.position,
+            EstablishedWindowPosition::Restorable {
+                logical_offset: IVec2::new(100, 80),
+            }
+        );
+        Ok(())
     }
 
     fn role_status_view<'app>(app: &'app App, role: &RoleKey) -> Option<&'app RoleStatusView> {
@@ -871,6 +1115,7 @@ mod tests {
             .map_err(|error| format!("failed to create primary role: {error}"))?;
         let refusals = [
             EstablishedWindowPersistenceProjection::AbsentBinding,
+            EstablishedWindowPersistenceProjection::AwaitingBinding,
             EstablishedWindowPersistenceProjection::NonReadyRole,
             EstablishedWindowPersistenceProjection::OfflineInventory,
             EstablishedWindowPersistenceProjection::MissingLastKnownGoodConfiguration,

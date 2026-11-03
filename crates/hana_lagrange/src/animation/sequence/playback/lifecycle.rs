@@ -926,12 +926,7 @@ mod tests {
             app.world().resource::<LifecycleEventOrder>().0,
             Vec::<&str>::new()
         );
-        assert!(
-            app.world()
-                .resource::<CameraBoundaryEventOrder>()
-                .0
-                .is_empty()
-        );
+        assert_eq!(app.world().resource::<CameraBoundaryEventOrder>().0, []);
         Ok(())
     }
 }

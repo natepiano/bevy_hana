@@ -462,7 +462,7 @@ mod tests {
     }
 
     fn test_app() -> App {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.add_plugins((MinimalPlugins, LagrangePlugin))
             .init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<ButtonInput<MouseButton>>()

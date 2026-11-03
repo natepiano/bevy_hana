@@ -1,4 +1,4 @@
-use bevy_render::batching::gpu_preprocessing::IndirectParametersCpuMetadata;
+use bevy_render::batching::gpu_preprocessing::IndirectParametersMetadata;
 use bevy_render::batching::gpu_preprocessing::UntypedPhaseIndirectParametersBuffers;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -12,7 +12,7 @@ impl IndexingMode {
         self,
         buffers: &mut UntypedPhaseIndirectParametersBuffers,
         offset: u32,
-        metadata: IndirectParametersCpuMetadata,
+        metadata: IndirectParametersMetadata,
     ) {
         match self {
             Self::Indexed => buffers.indexed.set(offset, metadata),

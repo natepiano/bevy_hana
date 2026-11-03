@@ -6,19 +6,30 @@ use bevy::prelude::Component;
 use bevy::prelude::Entity;
 use bevy::prelude::KeyCode;
 use bevy::prelude::default;
+use bevy::prelude::related;
 use bevy_enhanced_input::prelude::Action;
 use bevy_enhanced_input::prelude::ActionSettings;
 use bevy_enhanced_input::prelude::ActionSpawner;
 use bevy_enhanced_input::prelude::Binding;
+use bevy_enhanced_input::prelude::Bindings;
 use bevy_enhanced_input::prelude::BlockBy;
 use bevy_enhanced_input::prelude::Chord;
 use bevy_enhanced_input::prelude::InputAction;
 use bevy_enhanced_input::prelude::InputModKeys;
 use bevy_enhanced_input::prelude::ModKeys;
 use bevy_enhanced_input::prelude::Press;
-use bevy_enhanced_input::prelude::bindings;
 
+use super::hold_latch::HoldLatch;
 use crate::platform_shortcut_mode::PlatformShortcutMode;
+
+/// The two actions that make up a shortcut held from press through release.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeldShortcut {
+    /// One-shot action for the exact-modifier press edge.
+    pub press: Entity,
+    /// Semantic action that fires until the primary input is released.
+    pub hold:  Entity,
+}
 
 struct ModifierActions {
     families: [(ModKeys, ModifierFamilyActions); 4],
@@ -68,7 +79,7 @@ impl ModifierFamilyActions {
             .spawn((
                 Action::<A>::new(),
                 action_settings,
-                bindings![left_key, right_key],
+                related!(Bindings[Binding::from(left_key), Binding::from(right_key)]),
             ))
             .id();
         Self {
@@ -102,7 +113,7 @@ impl ModifierSideAction {
             .spawn((
                 Action::<ModifierSide>::new(),
                 action_settings,
-                bindings![key_code],
+                related!(Bindings[Binding::from(key_code)]),
             ))
             .id();
         Self { key_code, entity }
@@ -116,7 +127,8 @@ impl ModifierSideAction {
 /// [`Self::spawn_platform_key`], and [`Self::spawn_binding`] install ordinary
 /// Enhanced Input actions that can fire continuously while held.
 /// [`Self::spawn_shortcut`] is the explicit one-shot path for authored runtime
-/// bindings that need exact modifier matching.
+/// bindings that need exact modifier matching. [`Self::spawn_held_shortcut`]
+/// keeps the semantic action firing until the primary input is released.
 ///
 /// # Type parameters
 ///
@@ -208,6 +220,46 @@ impl<C: Component> Keybindings<C> {
         action_spawner: &mut ActionSpawner<C>,
         binding: Binding,
     ) -> Entity {
+        self.spawn_shortcut_with_settings::<A>(action_spawner, binding, self.action_settings)
+    }
+
+    /// Spawns a shortcut that starts on an exact-modifier press and completes
+    /// when the primary input is released. Modifier changes do not end the hold.
+    ///
+    /// Install [`HeldShortcutPlugin`](super::hold_latch::HeldShortcutPlugin)
+    /// before using this method. Attach activation gates to [`HeldShortcut::press`]
+    /// and conditions for the held action to [`HeldShortcut::hold`].
+    pub fn spawn_held_shortcut<A: InputAction>(
+        &self,
+        action_spawner: &mut ActionSpawner<C>,
+        binding: Binding,
+    ) -> HeldShortcut {
+        let press_settings = ActionSettings {
+            consume_input: false,
+            ..self.action_settings
+        };
+        let press = self.spawn_shortcut_with_settings::<HeldShortcutPress>(
+            action_spawner,
+            binding,
+            press_settings,
+        );
+        let mut hold_action = action_spawner.spawn((
+            Action::<A>::new(),
+            self.action_settings,
+            related!(Bindings[modifier_free_binding(binding)]),
+        ));
+        let hold = hold_action.id();
+        hold_action.insert(HoldLatch::new(press, hold));
+
+        HeldShortcut { press, hold }
+    }
+
+    fn spawn_shortcut_with_settings<A: InputAction>(
+        &self,
+        action_spawner: &mut ActionSpawner<C>,
+        binding: Binding,
+        action_settings: ActionSettings,
+    ) -> Entity {
         let physical_binding = modifier_free_binding(binding);
         let physical_edge = self.physical_edge(action_spawner, physical_binding);
         let mut chord_actions = vec![physical_edge];
@@ -220,9 +272,9 @@ impl<C: Component> Keybindings<C> {
 
         let mut semantic_action = action_spawner.spawn((
             Action::<A>::new(),
-            self.action_settings,
+            action_settings,
             Chord::new(chord_actions).with_ongoing(false),
-            bindings![physical_binding],
+            related!(Bindings[physical_binding]),
         ));
         if !blockers.is_empty() {
             semantic_action.insert(BlockBy::new(blockers));
@@ -244,7 +296,7 @@ impl<C: Component> Keybindings<C> {
             Action::<A>::new(),
             self.action_settings,
             BlockBy::new(self.modifier_actions.matching(held_modifier_keys())),
-            bindings![key_code],
+            related!(Bindings[Binding::from(key_code)]),
         ));
     }
 
@@ -265,7 +317,7 @@ impl<C: Component> Keybindings<C> {
                 self.modifier_actions
                     .matching(held_modifier_keys() - ModKeys::SHIFT),
             ),
-            bindings![key_code.with_mod_keys(ModKeys::SHIFT)],
+            related!(Bindings[key_code.with_mod_keys(ModKeys::SHIFT)]),
         ));
     }
 
@@ -305,7 +357,7 @@ impl<C: Component> Keybindings<C> {
         action_spawner.spawn((
             Action::<A>::new(),
             self.action_settings,
-            bindings![key_code.with_mod_keys(mod_keys)],
+            related!(Bindings[key_code.with_mod_keys(mod_keys)]),
         ));
     }
 
@@ -328,7 +380,7 @@ impl<C: Component> Keybindings<C> {
                 Action::<PhysicalShortcutEdge>::new(),
                 physical_edge_action_settings(),
                 Press::default(),
-                bindings![physical_binding],
+                related!(Bindings[physical_binding]),
             ))
             .id();
         self.physical_edges
@@ -392,6 +444,10 @@ struct PhysicalShortcutEdge;
 
 #[derive(InputAction)]
 #[action_output(bool)]
+struct HeldShortcutPress;
+
+#[derive(InputAction)]
+#[action_output(bool)]
 struct ModifierSide;
 
 #[derive(InputAction)]
@@ -428,10 +484,13 @@ mod tests {
     use bevy::prelude::SpawnWith;
     use bevy::prelude::With;
     use bevy::prelude::default;
+    use bevy::prelude::related;
     use bevy_enhanced_input::prelude::Action;
     use bevy_enhanced_input::prelude::ActionSettings;
     use bevy_enhanced_input::prelude::ActionSpawner;
     use bevy_enhanced_input::prelude::Actions;
+    use bevy_enhanced_input::prelude::Binding;
+    use bevy_enhanced_input::prelude::Bindings;
     use bevy_enhanced_input::prelude::ContextPriority;
     use bevy_enhanced_input::prelude::EnhancedInputPlugin;
     use bevy_enhanced_input::prelude::Fire;
@@ -439,7 +498,6 @@ mod tests {
     use bevy_enhanced_input::prelude::InputModKeys;
     use bevy_enhanced_input::prelude::ModKeys;
     use bevy_enhanced_input::prelude::Start;
-    use bevy_enhanced_input::prelude::bindings;
 
     use super::*;
 
@@ -623,7 +681,7 @@ mod tests {
         clear_recorded(&mut app);
         release_key(&mut app, window, KeyCode::ShiftLeft);
         app.update();
-        assert!(app.world().resource::<RecordedStarts>().0.is_empty());
+        assert_eq!(app.world().resource::<RecordedStarts>().0, []);
 
         release_key(&mut app, window, KeyCode::Enter);
         press_key(&mut app, window, KeyCode::ControlLeft);
@@ -638,7 +696,7 @@ mod tests {
         clear_recorded(&mut app);
         release_key(&mut app, window, KeyCode::ShiftRight);
         app.update();
-        assert!(app.world().resource::<RecordedStarts>().0.is_empty());
+        assert_eq!(app.world().resource::<RecordedStarts>().0, []);
     }
 
     #[test]
@@ -673,7 +731,7 @@ mod tests {
         clear_recorded(&mut app);
         release_key(&mut app, window, KeyCode::ShiftLeft);
         app.update();
-        assert!(app.world().resource::<RecordedStarts>().0.is_empty());
+        assert_eq!(app.world().resource::<RecordedStarts>().0, []);
     }
 
     #[test]
@@ -785,7 +843,7 @@ mod tests {
 
             press_key(&mut app, window, primary);
             app.update();
-            assert!(app.world().resource::<RecordedStarts>().0.is_empty());
+            assert_eq!(app.world().resource::<RecordedStarts>().0, []);
 
             release_key(&mut app, window, primary);
             release_key(&mut app, window, opposite);
@@ -822,15 +880,15 @@ mod tests {
         clear_recorded(&mut app);
         release_key(&mut app, window, KeyCode::ShiftLeft);
         app.update();
-        assert!(app.world().resource::<RecordedStarts>().0.is_empty());
+        assert_eq!(app.world().resource::<RecordedStarts>().0, []);
 
         press_key(&mut app, window, KeyCode::ShiftRight);
         app.update();
-        assert!(app.world().resource::<RecordedStarts>().0.is_empty());
+        assert_eq!(app.world().resource::<RecordedStarts>().0, []);
 
         press_key(&mut app, window, KeyCode::ShiftLeft);
         app.update();
-        assert!(app.world().resource::<RecordedStarts>().0.is_empty());
+        assert_eq!(app.world().resource::<RecordedStarts>().0, []);
 
         release_key(&mut app, window, KeyCode::ShiftLeft);
         release_key(&mut app, window, KeyCode::ControlRight);
@@ -838,7 +896,7 @@ mod tests {
         clear_recorded(&mut app);
         press_key(&mut app, window, KeyCode::AltLeft);
         app.update();
-        assert!(app.world().resource::<RecordedStarts>().0.is_empty());
+        assert_eq!(app.world().resource::<RecordedStarts>().0, []);
     }
 
     #[test]
@@ -892,7 +950,10 @@ mod tests {
         app.world_mut().spawn((
             LowerContext,
             Actions::<LowerContext>::spawn(SpawnWith(|spawner: &mut ActionSpawner<_>| {
-                spawner.spawn((Action::<LowerAction>::new(), bindings![KeyCode::Enter]));
+                spawner.spawn((
+                    Action::<LowerAction>::new(),
+                    related!(Bindings[Binding::from(KeyCode::Enter)]),
+                ));
             })),
         ));
         let window = app.world_mut().spawn_empty().id();

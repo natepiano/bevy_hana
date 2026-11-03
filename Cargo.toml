@@ -1,5 +1,11 @@
 [workspace]
-exclude  = ["crates/.claude", "vendor/clay-layout"]
+exclude = [
+  "crates/.claude",
+  "vendor/bevy_render",
+  "vendor/bevy_winit",
+  "vendor/clay-layout",
+  "vendor/wesl",
+]
 members  = [
   "crates/fairy_dust",
   "crates/hana_clerestory",
@@ -8,6 +14,7 @@ members  = [
   "crates/hana_lading",
   "crates/hana_lagrange",
   "crates/hana_liminal",
+  "crates/hana_metrics",
   "crates/hana_rigging",
   "crates/hana_rigging_scripted",
   "crates/hana_rubric",
@@ -36,6 +43,7 @@ hana_kana             = { path = "crates/hana_kana" }
 hana_lading           = { path = "crates/hana_lading" }
 hana_lagrange         = { path = "crates/hana_lagrange", features = ["fit_overlay"] }
 hana_liminal          = { path = "crates/hana_liminal" }
+hana_metrics          = { path = "crates/hana_metrics" }
 hana_rigging          = { path = "crates/hana_rigging" }
 hana_rigging_scripted = { path = "crates/hana_rigging_scripted" }
 hana_rubric           = { path = "crates/hana_rubric" }
@@ -45,11 +53,12 @@ hana_valence          = { path = "crates/hana_valence", default-features = false
 # External dependencies
 #
 anyhow = "1.0.104"
-bevy = { version = "0.19.1", default-features = false, features = [
+bevy = { version = "0.20.0", default-features = false, features = [
   "3d",
   "bevy_dev_tools",
   "bevy_remote",
   "bevy_ui_render",
+  "bevy_ui_widgets",
   "default_font",
   "gif",
   "jpeg",
@@ -64,47 +73,53 @@ bevy = { version = "0.19.1", default-features = false, features = [
   "track_location",
   "webp",
 ] }
-bevy-inspector-egui = "0.37.0"
-bevy_app = { version = "0.19.1", features = ["reflect_auto_register", "std"] }
-bevy_asset = "0.19.1"
-bevy_camera = "0.19.1"
-bevy_color = { version = "0.19.1", features = ["bevy_reflect"] }
-bevy_diagnostic = "0.19.1"
-bevy_ecs = { version = "0.19.1", features = [
+bevy-inspector-egui = "0.38.0"
+bevy_app = { version = "0.20.0", features = ["reflect_auto_register", "std"] }
+bevy_asset = "0.20.0"
+bevy_camera = "0.20.0"
+bevy_color = { version = "0.20.0", features = ["bevy_reflect"] }
+bevy_curve = "0.20.0"
+bevy_diagnostic = "0.20.0"
+bevy_ecs = { version = "0.20.0", features = [
   "bevy_reflect",
   "reflect_auto_register",
   "std",
 ] }
-bevy_enhanced_input = { version = "0.26.0", features = ["reflect"] }
-bevy_log = "0.19.1"
-bevy_lookup_curve = { version = "0.12.0", default-features = false, features = [
+bevy_enhanced_input = { version = "0.27.2", features = ["reflect"] }
+bevy_log = "0.20.0"
+bevy_lookup_curve = { version = "0.13.0", default-features = false, features = [
   "bevy_asset",
   "bevy_reflect",
 ] }
-bevy_math = { version = "0.19.1", features = ["bevy_reflect", "std"] }
-bevy_platform = { version = "0.19.1", default-features = false, features = [
+bevy_math = { version = "0.20.0", features = ["bevy_reflect", "std"] }
+bevy_platform = { version = "0.20.0", default-features = false, features = [
   "std",
 ] }
-bevy_reflect = { version = "0.19.1", features = ["glam"] }
-bevy_remote = "0.19.1"
-bevy_render = "0.19.1"
-bevy_scene = "0.19.1"
-bevy_time = { version = "0.19.1", default-features = false, features = ["std"] }
-bevy_transform = { version = "0.19.1", features = ["std"] }
-bevy_tween = { version = "0.13.0", default-features = false }
+bevy_reflect = { version = "0.20.0", features = ["glam"] }
+bevy_remote = "0.20.0"
+bevy_render = "0.20.0"
+bevy_scene = "0.20.0"
+bevy_state = "0.20.0"
+bevy_time = { version = "0.20.0", default-features = false, features = ["std"] }
+bevy_transform = { version = "0.20.0", features = ["std"] }
+bevy_tween = { version = "0.14.1", default-features = false }
 bitflags = "2"
 blake3 = "1.8.7"
+block2 = "0.6.2"
 bytemuck = "1"
 clap = { version = "4.6.7", features = ["derive"] }
+cpal = "0.18.1"
 crossbeam-channel = "0.5.17"
 dirs = "7.0.0"
 # nokhwa-bindings-macos takes a flume 0.11 `Sender` in its public API; keep this in step with it.
 flume = "0.11"
 getrandom = { version = "0.4.3", features = ["wasm_js"] }
 glam = { version = "0.33.9", features = ["serde"] }
+hound = "3.5.1"
 image = { version = "0.25", default-features = false }
-moonshine-save = "0.7.0"
-moonshine-util = "0.5"
+indexmap = "=2.14.0"
+moonshine-save = "0.8.0"
+moonshine-util = "0.6.0"
 nokhwa = { version = "0.10.11", default-features = false, features = [
   "input-native",
   "output-threaded",
@@ -112,8 +127,12 @@ nokhwa = { version = "0.10.11", default-features = false, features = [
 nokhwa-bindings-macos = "0.2.4"
 nonmax = "0.5"
 notify = "8"
+objc2 = "0.6.4"
+objc2-app-kit = "0.3.2"
 objc2-av-foundation = { version = "0.3.2", default-features = false, features = [
   "AVCaptureDevice",
+  "AVMediaFormat",
+  "block2",
   "objc2-core-media",
 ] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
@@ -125,18 +144,22 @@ objc2-core-media = { version = "0.3.2", default-features = false, features = [
   "CMTime",
   "objc2",
 ] }
+objc2-foundation = "0.3.2"
 opener = { version = "0.8.5", features = ["reveal"] }
+owned_ttf_parser = "0.25.1"
 parley = { version = "0.9.0", default-features = false, features = ["std"] }
 pipewire = "0.10.1"
 proc-macro2 = "1.0.107"
 quote = "1.0.47"
 rand = "0.10.3"
+raw-window-handle = "0.6"
 ron = "0.12.2"
 schemars = "1.2.2"
 screencapturekit = "10.0.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json_lenient = "0.2"
 smallvec = "1"
+speech = "0.8.7"
 strum = { version = "0.28.0", features = ["derive"] }
 syn = { version = "3.0.6", features = ["full"] }
 thiserror = "2.0.21"
@@ -145,24 +168,29 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 ttf-parser = "0.25"
 ureq = "3.4"
 v4l = "0.14.0"
-# Pinned to the exact winit that bevy 0.19 resolves so `MonitorHandle` unifies to
+windows = "0.62.2"
+windows-core = "0.62.2"
+# Pinned to the exact winit that bevy 0.20 resolves so `MonitorHandle` unifies to
 # one crate instance; used only for per-platform native monitor ids.
 winit = { version = "0.30.13", default-features = false, features = [
   "wayland",
   "x11",
 ] }
+x11rb = { version = "0.13", default-features = false }
 xcap = "0.9.8"
 zbus = "5.19.0"
 
 # dev-dependencies
-bevy_brp_extras   = "0.22.7"
+bevy_brp_extras   = "0.23.0"
 clay-layout       = { path = "vendor/clay-layout" }
 criterion         = { version = "0.8.2", features = ["html_reports"] }
 float-cmp         = "0.10.0"
 jsonschema        = { version = "0.57.0", default-features = false }
+naga              = { version = "30.0.1", features = ["wgsl-in", "wgsl-out"] }
 serde_json        = "1.0.151"
 static_assertions = "1.1.0"
 tempfile          = "3.27.0"
+wgpu              = "30"
 
 [workspace.lints.clippy]
 # Our strict lints
@@ -194,8 +222,18 @@ wildcard_imports       = "allow" # Bevy prelude convention
 [workspace.lints.rust]
 missing_docs = "deny"
 
+# Features verify.sh adds to its dev and test cargo calls (check, test, final, doc, and build
+# without --release). Bevy as one shared library, measured 2026-10-28 through plain verify.sh
+# under a build hold: a main.rs edit rebuilds 17% faster, a library edit 27% faster, and the
+# full test step 107 s (9%) faster. The first build after the switch takes about 4.6 min, once
+# per worktree.
+[workspace.metadata.dev]
+features = ["hana/dynamic_linking"]
+
+# Symbols, file:line and inline frames for perf, addr2line and panic backtraces;
+# the type and variable records full debug info adds are not used.
 [profile.release]
-debug = true
+debug = "line-tables-only"
 
 # Link time, not binary size, is what iteration pays here: ~18 integration-test
 # binaries each statically link the whole engine. `line-tables-only` keeps panic
@@ -209,3 +247,91 @@ split-debuginfo = "unpacked"
 # Optimize dependencies even in dev builds; keeps own-crate incremental compiles fast.
 [profile.dev.package."*"]
 opt-level = 3
+# Incremental ThinLTO reused stale objects in the vendored path crates and left undefined symbols.
+incremental = false
+
+# Cable routing searches thousands of grid cells per cable; unoptimised it runs about 20x slower,
+# so cables take seconds to settle after Open in a dev build.
+[profile.dev.package.hana_conduit]
+opt-level = 3
+
+# Every other workspace crate except `hana` builds at opt-level 1. Measured 2026-10-28 through
+# plain verify.sh under a build hold: the test step ran about 33% faster (530 / 480 s against
+# 333 / 341 s), the hana rebuild after an edit was a tie (32.8 / 32.2 s), and a cold build of
+# these crates cost 32 s more (116.9 / 149.0 s). `hana` stays at 0 because its rebuild is the
+# edit loop. One block per crate, not `[profile.dev]`: only a package block overrides
+# `build-override` for the proc-macro `hana_tool_macros`.
+[profile.dev.package.fairy_dust]
+opt-level = 1
+
+[profile.dev.package.hana_animation]
+opt-level = 1
+
+[profile.dev.package.hana_catalyst]
+opt-level = 1
+
+[profile.dev.package.hana_clerestory]
+opt-level = 1
+
+[profile.dev.package.hana_diegetic]
+opt-level = 1
+
+[profile.dev.package.hana_effects]
+opt-level = 1
+
+[profile.dev.package.hana_kana]
+opt-level = 1
+
+[profile.dev.package.hana_lading]
+opt-level = 1
+
+[profile.dev.package.hana_lagrange]
+opt-level = 1
+
+[profile.dev.package.hana_liminal]
+opt-level = 1
+
+[profile.dev.package.hana_metrics]
+opt-level = 1
+
+[profile.dev.package.hana_mimesis_tools]
+opt-level = 1
+
+[profile.dev.package.hana_organon]
+opt-level = 1
+
+[profile.dev.package.hana_origami]
+opt-level = 1
+
+[profile.dev.package.hana_prosody]
+opt-level = 1
+
+[profile.dev.package.hana_rigging]
+opt-level = 1
+
+[profile.dev.package.hana_rigging_scripted]
+opt-level = 1
+
+[profile.dev.package.hana_rubric]
+opt-level = 1
+
+[profile.dev.package.hana_sdf]
+opt-level = 1
+
+[profile.dev.package.hana_tool_macros]
+opt-level = 1
+
+[profile.dev.package.hana_tool_schema]
+opt-level = 1
+
+[profile.dev.package.hana_tools]
+opt-level = 1
+
+[profile.dev.package.hana_valence]
+opt-level = 1
+
+[profile.dev.package.hana_video]
+opt-level = 1
+
+[profile.dev.package.hana_works]
+opt-level = 1

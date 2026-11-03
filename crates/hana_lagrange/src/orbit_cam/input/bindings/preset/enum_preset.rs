@@ -36,11 +36,11 @@ impl OrbitCamPresetKind {
     #[must_use]
     pub const fn name(&self) -> &'static str {
         match self {
-            Self::SimpleMouse => "SimpleMouse",
-            Self::BlenderLike => "BlenderLike",
+            Self::SimpleMouse => "Mouse",
+            Self::BlenderLike => "Blender",
             Self::Keyboard => "Keyboard",
-            Self::SimpleMouseKeyboard => "SimpleMouseKeyboard",
-            Self::BlenderLikeKeyboard => "BlenderLikeKeyboard",
+            Self::SimpleMouseKeyboard => "Mouse and keyboard",
+            Self::BlenderLikeKeyboard => "Blender and keyboard",
             Self::Gamepad => "Gamepad",
         }
     }
@@ -223,8 +223,28 @@ mod tests {
         let preset = OrbitCamPreset::blender_like();
 
         assert_eq!(preset.kind(), OrbitCamPresetKind::BlenderLike);
-        assert_eq!(preset.kind().name(), "BlenderLike");
-        assert_eq!(preset.name(), "BlenderLike");
+        assert_eq!(preset.kind().name(), "Blender");
+        assert_eq!(preset.name(), "Blender");
+    }
+
+    #[test]
+    fn every_preset_kind_has_a_plain_display_name() {
+        for (kind, name) in [
+            (OrbitCamPresetKind::SimpleMouse, "Mouse"),
+            (OrbitCamPresetKind::BlenderLike, "Blender"),
+            (OrbitCamPresetKind::Keyboard, "Keyboard"),
+            (
+                OrbitCamPresetKind::SimpleMouseKeyboard,
+                "Mouse and keyboard",
+            ),
+            (
+                OrbitCamPresetKind::BlenderLikeKeyboard,
+                "Blender and keyboard",
+            ),
+            (OrbitCamPresetKind::Gamepad, "Gamepad"),
+        ] {
+            assert_eq!(kind.name(), name);
+        }
     }
 
     fn assert_preset_home_round_trip(preset: OrbitCamPreset) -> Result<(), BindingsError> {

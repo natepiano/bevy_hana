@@ -41,6 +41,7 @@ pub(in crate::animation::sequence) use request::RetainedCameraJourney;
 #[cfg(test)]
 pub(in crate::animation::sequence) use request::RetainedCameraJourneyOrigin;
 pub(super) use request::admit_pending_camera_requests;
+pub(super) use request::capture_fit_animation;
 pub(super) use request::capture_play_animation;
 pub(super) use request::close_discarded_camera_sequence;
 pub(super) use request::prepare_direct_camera_sequences;
@@ -152,9 +153,16 @@ mod tests {
     use std::any::TypeId;
     use std::time::Duration;
 
+    use bevy::curve::easing::EaseFunction;
     use bevy::ecs::reflect::AppTypeRegistry;
+    use bevy::prelude::Entity;
     use bevy::reflect::ReflectRef;
     use bevy::reflect::TypeInfo;
+    use bevy::reflect::serde::ReflectSerializer;
+    use hana_kana::SequenceDirection;
+    use hana_kana::SequenceEasingError;
+    use hana_kana::SequenceOwner;
+    use hana_kana::SequencePosition;
 
     use super::support::*;
     use super::*;
@@ -267,6 +275,137 @@ mod tests {
             sequence.type_info().type_path(),
             "hana_lagrange::animation::sequence::CameraSequence"
         );
+        drop(registry);
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one regression covers every camera event and its nested opaque payloads"
+    )]
+    fn camera_events_serialize_through_the_type_registry() -> TestResult {
+        let app = camera_sequence_test_app();
+        let registry = app.world().resource::<AppTypeRegistry>().read();
+        let camera = Entity::from_bits(1);
+        let target = Entity::from_bits(2);
+        let sequence = three_move_sequence();
+        let camera_move = sequence.moves()[0].clone();
+        let stage_id = sequence
+            .stage_ids_with_spans()
+            .next()
+            .ok_or("missing stage")?
+            .0;
+        let total = sequence.total();
+        let timing = CameraEventTiming::new(SequencePosition::END, total);
+        let owner = SequenceOwner::NativePlayback;
+        let direction = SequenceDirection::Forward;
+        let source = AnimationSource::PlayAnimation;
+        let events: [&dyn Reflect; 10] = [
+            &AnimationEnd {
+                camera,
+                source,
+                target: Some(target),
+                owner,
+                direction,
+                timing,
+                reason: AnimationReason::Completed,
+            },
+            &AnimationEnd {
+                camera,
+                source,
+                target: Some(target),
+                owner,
+                direction,
+                timing,
+                reason: AnimationReason::Cancelled {
+                    interrupted_stage_id: stage_id,
+                    interrupted_move:     camera_move.clone(),
+                },
+            },
+            &PlayAnimation::new(camera, [camera_move.clone()]),
+            &AnimationBegin {
+                camera,
+                source,
+                target: Some(target),
+                owner,
+                direction,
+                timing,
+            },
+            &AnimationRejected {
+                camera,
+                source,
+                target: Some(target),
+                reason: AnimationRejectionReason::InvalidMove(CameraMoveError::NegativeRadius {
+                    radius: crate::Radius(-1.0),
+                }),
+            },
+            &AnimationRejected {
+                camera,
+                source,
+                target: Some(target),
+                reason: AnimationRejectionReason::PreparationFailed(
+                    CameraEvaluationError::ExternalCurveRejected(
+                        SequenceEasingError::MappingNotBoundedMonotonic,
+                    ),
+                ),
+            },
+            &CameraMoveBegin {
+                camera,
+                stage_id,
+                owner,
+                direction,
+                camera_move: camera_move.clone(),
+                boundary_elapsed: total,
+                timing,
+            },
+            &CameraMoveEnd {
+                camera,
+                stage_id,
+                owner,
+                direction,
+                camera_move,
+                boundary_elapsed: total,
+                timing,
+            },
+            &ZoomBegin {
+                camera,
+                target,
+                margin: 0.1,
+                duration: Duration::from_secs(1),
+                easing: EaseFunction::Linear,
+            },
+            &ZoomEnd {
+                camera,
+                target,
+                margin: 0.1,
+                duration: Duration::from_secs(1),
+                easing: EaseFunction::Linear,
+                reason: ZoomReason::Completed,
+            },
+        ];
+
+        for event in events {
+            let path = event.reflect_type_path();
+            let result = serde_json::to_value(ReflectSerializer::new(event, &registry));
+            assert!(result.is_ok(), "{path} failed to serialize: {result:?}");
+            let value = result.map_err(|_| "camera event serialization failed")?;
+            assert!(
+                value.get(path).is_some(),
+                "{path} was not keyed by its type path: {value}"
+            );
+            if path == "hana_lagrange::animation::events::AnimationEnd" {
+                assert_eq!(value[path]["timing"]["normalized_position"], 1.0);
+                assert_eq!(
+                    value[path]["timing"]["total"]["whole_seconds"],
+                    total.whole_seconds().to_string(),
+                );
+                assert_eq!(
+                    value[path]["timing"]["total"]["subsec_nanoseconds"],
+                    total.subsec_nanoseconds(),
+                );
+            }
+        }
         drop(registry);
         Ok(())
     }

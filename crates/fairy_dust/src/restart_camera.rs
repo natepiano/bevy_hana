@@ -7,7 +7,7 @@
 use std::process::Command;
 use std::str::FromStr;
 
-use bevy::math::curve::easing::EaseFunction;
+use bevy::curve::easing::EaseFunction;
 use bevy::prelude::App;
 use bevy::prelude::Commands;
 use bevy::prelude::Entity;

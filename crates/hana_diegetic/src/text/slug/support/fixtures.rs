@@ -88,6 +88,7 @@ pub(in crate::text::slug) fn fixture_run_with_cache(
                 0,
                 FIXTURE_DIAGNOSTIC_CHAR,
                 DEFAULT_BAND_COUNT,
+                f32::from(face.units_per_em()),
             )
             .expect("fixture glyph should pack");
         if let CachedGlyphOutline::Visible(outline) = outline {

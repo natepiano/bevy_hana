@@ -85,9 +85,9 @@ mod tests {
     use std::time::Duration;
 
     use bevy::camera::RenderTarget;
+    use bevy::curve::easing::EaseFunction;
     use bevy::input::mouse::AccumulatedMouseMotion;
     use bevy::input::mouse::AccumulatedMouseScroll;
-    use bevy::math::curve::easing::EaseFunction;
     use bevy::prelude::App;
     use bevy::prelude::ButtonInput;
     use bevy::prelude::Camera;
@@ -149,7 +149,7 @@ mod tests {
     }
 
     fn test_app() -> App {
-        let mut app = App::new();
+        let mut app = crate::test_app();
         app.add_plugins((MinimalPlugins, LagrangePlugin))
             .init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<ButtonInput<MouseButton>>()

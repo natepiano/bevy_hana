@@ -28,7 +28,6 @@ use bevy::picking::mesh_picking::MeshPickingPlugin;
 use bevy::prelude::AlphaMode;
 use bevy::prelude::AssetServer;
 use bevy::prelude::Assets;
-use bevy::prelude::Click;
 use bevy::prelude::Color;
 use bevy::prelude::Commands;
 use bevy::prelude::Component;
@@ -44,8 +43,8 @@ use bevy::prelude::MeshMaterial3d;
 use bevy::prelude::Meshable;
 use bevy::prelude::Name;
 use bevy::prelude::On;
-use bevy::prelude::Pointer;
 use bevy::prelude::PointerButton;
+use bevy::prelude::PointerClick;
 use bevy::prelude::Quat;
 use bevy::prelude::Query;
 use bevy::prelude::Rectangle;
@@ -608,7 +607,7 @@ fn select_per_mesh(mut selection: ResMut<OutlineSelection>) {
     selection.overlap_mode = OverlapMode::PerMesh;
 }
 
-fn on_mesh_clicked(click: On<Pointer<Click>>, mut commands: Commands) {
+fn on_mesh_clicked(click: On<PointerClick>, mut commands: Commands) {
     if click.button != PointerButton::Primary {
         return;
     }

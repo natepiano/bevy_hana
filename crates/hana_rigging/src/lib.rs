@@ -199,6 +199,7 @@ pub use events::DeviceChange;
 pub use events::DiscoveryFinished;
 pub use events::DiscoveryProgressChanged;
 pub use events::EndedRegistrationLifetime;
+pub use events::HardwareInventoryChanged;
 pub use events::IdentityChanged;
 pub use events::IdentityQuestionRaised;
 pub use events::LiveRoleChange;
@@ -509,6 +510,7 @@ pub mod prelude {
     pub use crate::FlowExpectation;
     pub use crate::FlowIntervalError;
     pub use crate::HardwareInventory;
+    pub use crate::HardwareInventoryChanged;
     pub use crate::HardwareInventoryError;
     pub use crate::HardwareWait;
     pub use crate::HeldSession;

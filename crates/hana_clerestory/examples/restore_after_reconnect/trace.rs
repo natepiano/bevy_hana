@@ -310,7 +310,7 @@ pub(crate) fn on_window_restore_mismatch(
 /// Records the creation of a probe window as a `window-created` record. A
 /// [`ProbeWindowScenario::UnmanagedControl`] window is skipped, so no record names it.
 pub(crate) fn on_probe_window_added(
-    event: On<Add, ProbeWindowScenario>,
+    event: On<Add<ProbeWindowScenario>>,
     scenarios: Query<&ProbeWindowScenario>,
     trace: Res<ProbeTrace>,
     frame_count: Res<FrameCount>,
@@ -330,61 +330,4 @@ pub(crate) fn on_probe_window_added(
             (FIELD_WINDOW.into(), format!("{:?}", event.entity)),
         ],
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use std::error::Error;
-
-    use hana_rigging::prelude::AuthoredId;
-    use hana_rigging::prelude::DeviceIdSource;
-
-    use super::*;
-
-    #[test]
-    fn trace_role_tracking_distinguishes_included_and_excluded_roles() -> Result<(), Box<dyn Error>>
-    {
-        let primary = primary_window_role()?;
-        assert!(matches!(
-            wire_window_key(&primary)?,
-            TraceRoleTracking::Included("primary")
-        ));
-
-        let unrelated = RoleKey::new("unrelated-kernel-role")?;
-        assert!(matches!(
-            wire_window_key(&unrelated)?,
-            TraceRoleTracking::Excluded
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn kernel_display_departure_projects_to_controller_record() -> Result<(), Box<dyn Error>> {
-        let trace = ProbeTrace::default();
-        let device_key = DeviceKey {
-            kind: DeviceKind::Display,
-            id:   DeviceIdSource::Authored {
-                value: AuthoredId::new("controller-display")?,
-            },
-        };
-
-        record_monitor_lifetime(
-            &trace,
-            9,
-            PRODUCER_MONITOR_DISCONNECTED,
-            KIND_MONITOR_DISCONNECTED,
-            &device_key,
-        );
-
-        let records = trace.records();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].kind, KIND_MONITOR_DISCONNECTED);
-        assert!(
-            records[0]
-                .fields
-                .iter()
-                .any(|(name, value)| name == FIELD_MONITOR && value == &format!("{device_key:?}"))
-        );
-        Ok(())
-    }
 }

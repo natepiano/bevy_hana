@@ -25,6 +25,7 @@ use bevy::prelude::Commands;
 use bevy::prelude::Cuboid;
 use bevy::prelude::Entity;
 use bevy::prelude::GamepadButton;
+use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::KeyCode;
 use bevy::prelude::Mesh;
 use bevy::prelude::Mesh3d;
@@ -52,6 +53,7 @@ use fairy_dust::TitleBar;
 use fairy_dust::TitleBarControl;
 use fairy_dust::TitleBarOrientation;
 use fairy_dust::TitleBarSegment;
+use fairy_dust::TitleBarStateWriters;
 use hana_lagrange::AnglePairLimit;
 use hana_lagrange::FreeCam;
 use hana_lagrange::FreeCamGamepadLayout;
@@ -72,7 +74,7 @@ use hana_lagrange::ScalarLimit;
 const EXAMPLE_TITLE: &str = "FreeCam";
 
 // camera
-const CAMERA_NAME: &str = "FreeCam";
+const CAMERA_NAME: &str = "Free camera";
 const CAMERA_POSITION: Vec3 = Vec3::ZERO;
 const CAMERA_LOOK: LookAngles = LookAngles {
     yaw:   0.7,
@@ -150,9 +152,9 @@ fn main() {
         .add_systems(
             Update,
             (
-                update_pitch_limit,
+                update_pitch_limit.in_set(TitleBarStateWriters),
                 revert_free_cam_to_keyboard_mouse,
-                track_gamepad_availability,
+                track_gamepad_availability.in_set(TitleBarStateWriters),
             ),
         )
         .with_shortcut(KeyCode::Digit1, select_free_flight)

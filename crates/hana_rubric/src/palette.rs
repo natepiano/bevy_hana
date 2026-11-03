@@ -1,6 +1,9 @@
 //! Borrowed, renderer-independent command-palette queries.
 
 use std::marker::PhantomData;
+use std::ops::Range;
+
+use smallvec::SmallVec;
 
 use crate::ActiveKeymapContext;
 use crate::ActiveKeymapContextState;
@@ -37,8 +40,10 @@ pub fn query_command_palette<'registry, 'keymap, 'context, 'status>(
     let mut query_match = PaletteQueryMatch::None;
 
     for matching_command in command_registry.palette_search(&normalized_query) {
-        let command = match matching_command {
-            PaletteSearchMatchInvocability::Invocable(command) => command,
+        let (command, title_match) = match matching_command {
+            PaletteSearchMatchInvocability::Invocable(command, title_match) => {
+                (command, title_match)
+            },
             PaletteSearchMatchInvocability::Held => {
                 if matches!(query_match, PaletteQueryMatch::None) {
                     query_match = PaletteQueryMatch::Held;
@@ -52,6 +57,7 @@ pub fn query_command_palette<'registry, 'keymap, 'context, 'status>(
         }
         rows.push(CommandPaletteRow {
             command,
+            title_match,
             binding: palette_binding(
                 keymap_bindings,
                 active_context,
@@ -112,11 +118,72 @@ impl<'registry, 'keymap, 'context> CommandPaletteQueryResult<'registry, 'keymap,
     }
 }
 
+/// The authored title characters one query matched.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum PaletteTitleMatch {
+    /// The query is empty, or it matched the command id and not the title.
+    #[default]
+    None,
+    /// Sorted, disjoint title runs, in half-open authored character positions, not bytes.
+    ///
+    /// Two runs fit inline. More disjoint runs use heap storage.
+    Runs {
+        /// The matched runs. Overlapping or touching runs merge.
+        runs: SmallVec<[Range<usize>; 2]>,
+    },
+}
+
+impl PaletteTitleMatch {
+    /// Merges authored character runs. Empty runs do not highlight any text.
+    #[must_use]
+    pub fn from_runs(runs: impl IntoIterator<Item = Range<usize>>) -> Self {
+        let mut matched = Self::None;
+        for run in runs {
+            matched.include(run);
+        }
+        matched
+    }
+
+    /// Returns each matched run in authored title order.
+    #[must_use]
+    pub fn runs(&self) -> &[Range<usize>] {
+        match self {
+            Self::None => &[],
+            Self::Runs { runs } => runs,
+        }
+    }
+
+    pub(crate) fn include(&mut self, mut run: Range<usize>) {
+        if run.is_empty() {
+            return;
+        }
+        let Self::Runs { runs } = self else {
+            *self = Self::Runs {
+                runs: smallvec::smallvec![run],
+            };
+            return;
+        };
+        let first = runs.partition_point(|current| current.end < run.start);
+        let mut last = first;
+        while let Some(current) = runs.get(last) {
+            if current.start > run.end {
+                break;
+            }
+            run.start = run.start.min(current.start);
+            run.end = run.end.max(current.end);
+            last += 1;
+        }
+        runs.drain(first..last);
+        runs.insert(first, run);
+    }
+}
+
 /// One renderer-ready palette row with borrowed command metadata and effective binding state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandPaletteRow<'registry, 'keymap, 'context> {
-    command: PaletteInvocableCommand<'registry>,
-    binding: PaletteBinding<'keymap, 'context>,
+    command:     PaletteInvocableCommand<'registry>,
+    binding:     PaletteBinding<'keymap, 'context>,
+    title_match: PaletteTitleMatch,
 }
 
 impl<'registry, 'keymap, 'context> CommandPaletteRow<'registry, 'keymap, 'context> {
@@ -127,6 +194,10 @@ impl<'registry, 'keymap, 'context> CommandPaletteRow<'registry, 'keymap, 'contex
     /// Returns this command's exhaustive binding outcome in the queried context.
     #[must_use]
     pub const fn binding(&self) -> PaletteBinding<'keymap, 'context> { self.binding }
+
+    /// Returns the authored title characters matched by this query.
+    #[must_use]
+    pub const fn title_match(&self) -> &PaletteTitleMatch { &self.title_match }
 }
 
 /// One command's palette-visible keyboard binding state.

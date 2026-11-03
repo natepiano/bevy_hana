@@ -1,6 +1,7 @@
 use bevy::core_pipeline::core_3d::CORE_3D_DEPTH_FORMAT;
 use bevy::ecs::system::SystemParamItem;
 use bevy::ecs::system::lifetimeless::SRes;
+use bevy::extract::sync_world::MainEntity;
 use bevy::mesh::MeshVertexBufferLayoutRef;
 use bevy::pbr::MeshInputUniform;
 use bevy::pbr::MeshPipeline;
@@ -19,7 +20,7 @@ use bevy::prelude::error;
 use bevy::shader::ShaderDefVal;
 use bevy_render::batching::GetBatchData;
 use bevy_render::batching::GetFullBatchData;
-use bevy_render::batching::gpu_preprocessing::IndirectParametersCpuMetadata;
+use bevy_render::batching::gpu_preprocessing::IndirectParametersMetadata;
 use bevy_render::batching::gpu_preprocessing::UntypedPhaseIndirectParametersBuffers;
 use bevy_render::mesh::RenderMesh;
 use bevy_render::mesh::allocator::MeshAllocator;
@@ -30,7 +31,6 @@ use bevy_render::render_resource::ColorTargetState;
 use bevy_render::render_resource::ColorWrites;
 use bevy_render::render_resource::CompareFunction;
 use bevy_render::render_resource::DepthStencilState;
-use bevy_render::render_resource::Face;
 use bevy_render::render_resource::FragmentState;
 use bevy_render::render_resource::GpuArrayBuffer;
 use bevy_render::render_resource::MultisampleState;
@@ -40,7 +40,6 @@ use bevy_render::render_resource::SpecializedMeshPipeline;
 use bevy_render::render_resource::SpecializedMeshPipelineError;
 use bevy_render::render_resource::TextureFormat;
 use bevy_render::renderer::RenderDevice;
-use bevy_render::sync_world::MainEntity;
 use nonmax::NonMaxU32;
 
 use super::constants::FRAGMENT_SHADER_ENTRY_POINT;
@@ -50,9 +49,9 @@ use super::constants::GET_BINNED_INDEX_CPU_MODE_ERROR;
 use super::constants::GET_INDEX_AND_COMPARE_DATA_CPU_MODE_ERROR;
 use super::constants::MASK_SHADER_HANDLE;
 use super::constants::MISSING_BATCH_SET_INDEX;
+use super::constants::OUTLINE_INSTANCE_BATCH_SIZE_SHADER_DEF;
 use super::constants::OUTLINE_INSTANCE_BIND_GROUP_LAYOUT_LABEL;
 use super::constants::OUTLINE_PIPELINE_LABEL;
-use super::constants::PER_OBJECT_BUFFER_BATCH_SIZE_SHADER_DEF;
 use super::indexing_mode::IndexingMode;
 use super::uniforms::OutlineUniform;
 
@@ -62,7 +61,7 @@ pub(crate) struct MeshMaskPipeline {
     pub(crate) outline_bind_group_layout: BindGroupLayoutDescriptor,
     /// `Some(N)` on WebGL2 where only fixed-size uniform arrays are available,
     /// `None` on native GPU where unbounded storage buffer arrays are supported.
-    /// When `Some`, injects the `PER_OBJECT_BUFFER_BATCH_SIZE` shader def so the
+    /// When `Some`, injects the `OUTLINE_INSTANCE_BATCH_SIZE` shader def so the
     /// WGSL shader declares a fixed-size array instead of an unbounded one.
     per_object_buffer_batch_size:         Option<u32>,
 }
@@ -114,7 +113,7 @@ impl SpecializedMeshPipeline for MeshMaskPipeline {
         let mut shader_defs = vec![];
         if let Some(per_object_buffer_batch_size) = self.per_object_buffer_batch_size {
             shader_defs.push(ShaderDefVal::UInt(
-                PER_OBJECT_BUFFER_BATCH_SIZE_SHADER_DEF.into(),
+                OUTLINE_INSTANCE_BATCH_SIZE_SHADER_DEF.into(),
                 per_object_buffer_batch_size,
             ));
         }
@@ -138,6 +137,7 @@ impl SpecializedMeshPipeline for MeshMaskPipeline {
             // RT2 maps to `FloodTextures::owner` and mask `owner_data`: owner ID
             // in x and overlap factor in y, read by both the hull and jump-flood
             // compose shaders for group-aware overlap resolution.
+            // z carries view distance; w carries orthographic depth per metre.
             Some(ColorTargetState {
                 format:     TextureFormat::Rgba32Float,
                 blend:      None,
@@ -146,6 +146,7 @@ impl SpecializedMeshPipeline for MeshMaskPipeline {
         ];
 
         descriptor.fragment = Some(FragmentState {
+            constants: Vec::default(),
             shader: MASK_SHADER_HANDLE,
             shader_defs,
             entry_point: Some(FRAGMENT_SHADER_ENTRY_POINT.into()),
@@ -163,7 +164,9 @@ impl SpecializedMeshPipeline for MeshMaskPipeline {
         descriptor
             .layout
             .push(self.outline_bind_group_layout.clone());
-        descriptor.primitive.cull_mode = Some(Face::Back);
+        // Flat picture planes are visible from either side; their outline mask must be too.
+        // The depth test still picks the nearest face on closed solids.
+        descriptor.primitive.cull_mode = None;
 
         Ok(descriptor)
     }
@@ -209,6 +212,7 @@ impl GetBatchData for MeshMaskPipeline {
                 current_skin_index,
                 None,
                 Some(mesh_instance.tag()),
+                None,
             ),
             Some(((), mesh_instance.mesh_asset_id())),
         ))
@@ -263,6 +267,7 @@ impl GetFullBatchData for MeshMaskPipeline {
             current_skin_index,
             None,
             Some(mesh_instance.tag()),
+            None,
         ))
     }
 
@@ -288,9 +293,13 @@ impl GetFullBatchData for MeshMaskPipeline {
         phase_indirect_parameters_buffers: &mut UntypedPhaseIndirectParametersBuffers,
         indirect_parameters_offset: u32,
     ) {
-        let indirect_parameters = IndirectParametersCpuMetadata {
+        let indirect_parameters = IndirectParametersMetadata {
             base_output_index,
             batch_set_index: batch_set_index.map_or(MISSING_BATCH_SET_INDEX, u32::from),
+            // Filled by GPU preprocessing, as in Bevy's mesh pipeline.
+            mesh_index: 0,
+            early_instance_count: 0,
+            late_instance_count: 0,
         };
 
         IndexingMode::from(indexed).write_metadata(

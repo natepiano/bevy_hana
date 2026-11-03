@@ -481,7 +481,7 @@ pub(crate) fn check_restore_settling(
                     &settle_target,
                     &build_settle_actual(window, current_observation, actual_scale),
                     placement_evidence,
-                    total_elapsed_ms,
+                    SettleMismatchTiming::from_stability(total_elapsed_ms, stable),
                     &mut driver_state,
                     &mut fallback,
                 );
@@ -561,8 +561,33 @@ fn emit_settle_success(
         .remove::<X11FrameCompensated>();
 }
 
-/// Emit `WindowRestoreMismatch` and clean up `TargetPosition` when the window settled away from
-/// the requested placement.
+#[derive(Clone, Copy)]
+enum SettleMismatchResolution {
+    SettledAwayFromTarget,
+    TimedOutBeforeSettling,
+}
+
+#[derive(Clone, Copy)]
+struct SettleMismatchTiming {
+    resolution: SettleMismatchResolution,
+    elapsed_ms: f32,
+}
+
+impl SettleMismatchTiming {
+    const fn from_stability(elapsed_ms: f32, stable: bool) -> Self {
+        let resolution = if stable {
+            SettleMismatchResolution::SettledAwayFromTarget
+        } else {
+            SettleMismatchResolution::TimedOutBeforeSettling
+        };
+        Self {
+            resolution,
+            elapsed_ms,
+        }
+    }
+}
+
+/// Emit `WindowRestoreMismatch` and clean up `TargetPosition` when settling cannot succeed.
 fn emit_settle_mismatch(
     commands: &mut Commands,
     entity: Entity,
@@ -570,13 +595,18 @@ fn emit_settle_mismatch(
     settle_target: &SettleTarget,
     settle_actual: &SettleActual,
     placement_evidence: SettlePlacementEvidence,
-    total_elapsed_ms: f32,
+    timing: SettleMismatchTiming,
     driver_state: &mut WindowRoleDriverState,
     fallback: &mut WindowFallbackRecoveryState,
 ) {
     let role = restore_attempt.role().clone();
+    let outcome = match timing.resolution {
+        SettleMismatchResolution::SettledAwayFromTarget => "settled away from target",
+        SettleMismatchResolution::TimedOutBeforeSettling => "timed out before settling",
+    };
+    let total_elapsed_ms = timing.elapsed_ms;
     warn!(
-        "[check_restore_settling] [{role}] Settle timeout after {total_elapsed_ms:.0}ms — \
+        "[check_restore_settling] [{role}] {outcome} after {total_elapsed_ms:.0}ms — \
         mismatch remains: \
          position: {:?} vs {:?}, \
          size: {} vs {}, \

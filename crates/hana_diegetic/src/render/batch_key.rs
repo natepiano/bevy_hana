@@ -95,6 +95,63 @@ impl From<BatchUvChannel> for UvChannel {
     }
 }
 
+/// Face culling selected by a material batch.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum BatchCulling {
+    Disabled,
+    Front,
+    Back,
+}
+
+impl From<Option<Face>> for BatchCulling {
+    fn from(face: Option<Face>) -> Self {
+        match face {
+            None => Self::Disabled,
+            Some(Face::Front) => Self::Front,
+            Some(Face::Back) => Self::Back,
+        }
+    }
+}
+
+impl From<BatchCulling> for Option<Face> {
+    fn from(culling: BatchCulling) -> Self {
+        match culling {
+            BatchCulling::Disabled => None,
+            BatchCulling::Front => Some(Face::Front),
+            BatchCulling::Back => Some(Face::Back),
+        }
+    }
+}
+
+/// Whether a material batch binds a texture at one PBR slot.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum BatchTextureBinding {
+    Unbound,
+    Bound(Handle<Image>),
+}
+
+impl BatchTextureBinding {
+    pub(super) const fn is_bound(&self) -> bool { matches!(self, Self::Bound(_)) }
+}
+
+impl From<Option<Handle<Image>>> for BatchTextureBinding {
+    fn from(handle: Option<Handle<Image>>) -> Self {
+        match handle {
+            Some(handle) => Self::Bound(handle),
+            None => Self::Unbound,
+        }
+    }
+}
+
+impl From<BatchTextureBinding> for Option<Handle<Image>> {
+    fn from(binding: BatchTextureBinding) -> Self {
+        match binding {
+            BatchTextureBinding::Unbound => None,
+            BatchTextureBinding::Bound(handle) => Some(handle),
+        }
+    }
+}
+
 impl From<AlphaMode> for BatchAlphaMode {
     fn from(mode: AlphaMode) -> Self {
         match mode {
@@ -190,7 +247,7 @@ pub(crate) struct PipelineCompatibility {
     /// `StandardMaterial::double_sided` controls the PBR normal-flip shader flag.
     pub double_sided:              bool,
     /// `StandardMaterial::cull_mode` selects front, back, or no face culling.
-    pub cull_mode:                 Option<Face>,
+    pub cull_mode:                 BatchCulling,
     /// `StandardMaterial::unlit` selects the lit or unlit PBR shader path.
     pub unlit:                     bool,
     /// `StandardMaterial::fog_enabled` selects the fog-aware shader path.
@@ -203,10 +260,10 @@ pub(crate) struct PipelineCompatibility {
 
 impl From<&StandardMaterial> for PipelineCompatibility {
     fn from(material: &StandardMaterial) -> Self {
-        // Field-approval gate: every StandardMaterial field must be classified
-        // here when Bevy changes. Decide one of: table, pipeline, resource,
-        // draw-order, unsupported, deferred. Do not add `..`; E0027 is the
-        // intended reminder that a new field needs an explicit decision.
+        // Keep always-present fields explicit. `..` covers the feature-gated
+        // transmission, specular, clearcoat, and anisotropy texture/channel
+        // fields; none of them feeds this key. `..` also hides any field a Bevy
+        // upgrade adds, so an upgrade classifies each new field here.
         let StandardMaterial {
             base_color: _base_color_table,
             base_color_channel: _base_color_channel_resource,
@@ -250,11 +307,12 @@ impl From<&StandardMaterial> for PipelineCompatibility {
             opaque_render_method,
             deferred_lighting_pass_id,
             uv_transform: _uv_transform_table,
+            ..
         } = material;
         Self {
             alpha:                     (*alpha_mode).into(),
             double_sided:              *double_sided,
-            cull_mode:                 *cull_mode,
+            cull_mode:                 (*cull_mode).into(),
             unlit:                     *unlit,
             fog_enabled:               *fog_enabled,
             opaque_render_method:      (*opaque_render_method).into(),
@@ -272,38 +330,38 @@ impl From<&StandardMaterial> for PipelineCompatibility {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ResourceCompatibility {
     /// `StandardMaterial::base_color_texture` bound for base-color sampling.
-    pub base_color_texture:         Option<Handle<Image>>,
+    pub base_color_texture:         BatchTextureBinding,
     /// `StandardMaterial::base_color_channel` selects the mesh UV channel for base color.
     pub base_color_channel:         BatchUvChannel,
     /// `StandardMaterial::emissive_texture` bound for emissive sampling.
-    pub emissive_texture:           Option<Handle<Image>>,
+    pub emissive_texture:           BatchTextureBinding,
     /// `StandardMaterial::emissive_channel` selects the mesh UV channel for emissive.
     pub emissive_channel:           BatchUvChannel,
     /// `StandardMaterial::metallic_roughness_texture` bound for metallic/roughness sampling.
-    pub metallic_roughness_texture: Option<Handle<Image>>,
+    pub metallic_roughness_texture: BatchTextureBinding,
     /// `StandardMaterial::metallic_roughness_channel` selects the mesh UV channel for
     /// metallic/roughness.
     pub metallic_roughness_channel: BatchUvChannel,
     /// `StandardMaterial::normal_map_texture` requires normals, tangents, and normal sampling.
-    pub normal_map_texture:         Option<Handle<Image>>,
+    pub normal_map_texture:         BatchTextureBinding,
     /// `StandardMaterial::normal_map_channel` selects the mesh UV channel for normals.
     pub normal_map_channel:         BatchUvChannel,
     /// `StandardMaterial::flip_normal_map_y` changes normal-map decoding.
     pub flip_normal_map_y:          bool,
     /// `StandardMaterial::occlusion_texture` bound for ambient-occlusion sampling.
-    pub occlusion_texture:          Option<Handle<Image>>,
+    pub occlusion_texture:          BatchTextureBinding,
     /// `StandardMaterial::occlusion_channel` selects the mesh UV channel for occlusion.
     pub occlusion_channel:          BatchUvChannel,
     /// `StandardMaterial::depth_map` enables parallax/depth-map shader requirements.
-    pub depth_map:                  Option<Handle<Image>>,
+    pub depth_map:                  BatchTextureBinding,
 }
 
 impl From<&StandardMaterial> for ResourceCompatibility {
     fn from(material: &StandardMaterial) -> Self {
-        // Field-approval gate: every StandardMaterial field must be classified
-        // here when Bevy changes. Decide one of: table, pipeline, resource,
-        // draw-order, unsupported, deferred. Do not add `..`; E0027 is the
-        // intended reminder that a new field needs an explicit decision.
+        // Keep always-present fields explicit. `..` covers the feature-gated
+        // transmission, specular, clearcoat, and anisotropy texture/channel
+        // fields; none of them feeds this key. `..` also hides any field a Bevy
+        // upgrade adds, so an upgrade classifies each new field here.
         let StandardMaterial {
             base_color: _base_color_table,
             base_color_channel,
@@ -347,20 +405,21 @@ impl From<&StandardMaterial> for ResourceCompatibility {
             opaque_render_method: _opaque_render_method_pipeline,
             deferred_lighting_pass_id: _deferred_pass_pipeline,
             uv_transform: _uv_transform_table,
+            ..
         } = material;
         Self {
-            base_color_texture:         base_color_texture.clone(),
+            base_color_texture:         base_color_texture.clone().into(),
             base_color_channel:         BatchUvChannel::from(base_color_channel),
-            emissive_texture:           emissive_texture.clone(),
+            emissive_texture:           emissive_texture.clone().into(),
             emissive_channel:           BatchUvChannel::from(emissive_channel),
-            metallic_roughness_texture: metallic_roughness_texture.clone(),
+            metallic_roughness_texture: metallic_roughness_texture.clone().into(),
             metallic_roughness_channel: BatchUvChannel::from(metallic_roughness_channel),
-            normal_map_texture:         normal_map_texture.clone(),
+            normal_map_texture:         normal_map_texture.clone().into(),
             normal_map_channel:         BatchUvChannel::from(normal_map_channel),
             flip_normal_map_y:          *flip_normal_map_y,
-            occlusion_texture:          occlusion_texture.clone(),
+            occlusion_texture:          occlusion_texture.clone().into(),
             occlusion_channel:          BatchUvChannel::from(occlusion_channel),
-            depth_map:                  depth_map.clone(),
+            depth_map:                  depth_map.clone().into(),
         }
     }
 }
@@ -394,7 +453,7 @@ pub(crate) fn batch_summary(
         casts_shadow: matches!(shadow, VisualShadow::Cast),
         unlit: pipeline.unlit,
         alpha_mode: format!("{:?}", pipeline.alpha),
-        textured: resource.base_color_texture.is_some(),
+        textured: resource.base_color_texture.is_bound(),
         record_count: record_count.to_usize().into(),
     }
 }
@@ -410,38 +469,28 @@ pub(super) fn apply_resource_compatibility_to_standard_material(
     compatibility: &ResourceCompatibility,
 ) -> StandardMaterial {
     let mut material = base.clone();
-    material
-        .base_color_texture
-        .clone_from(&compatibility.base_color_texture);
+    material.base_color_texture = compatibility.base_color_texture.clone().into();
     material.base_color_channel = UvChannel::Uv0;
-    if compatibility.base_color_texture.is_some() {
+    if compatibility.base_color_texture.is_bound() {
         material.base_color = Color::WHITE;
     }
-    material
-        .emissive_texture
-        .clone_from(&compatibility.emissive_texture);
+    material.emissive_texture = compatibility.emissive_texture.clone().into();
     material.emissive_channel = UvChannel::Uv0;
-    if compatibility.emissive_texture.is_some() {
+    if compatibility.emissive_texture.is_bound() {
         material.emissive = Color::WHITE.into();
     }
-    material
-        .metallic_roughness_texture
-        .clone_from(&compatibility.metallic_roughness_texture);
+    material.metallic_roughness_texture = compatibility.metallic_roughness_texture.clone().into();
     material.metallic_roughness_channel = UvChannel::Uv0;
-    if compatibility.metallic_roughness_texture.is_some() {
+    if compatibility.metallic_roughness_texture.is_bound() {
         material.metallic = 1.0;
         material.perceptual_roughness = 1.0;
     }
-    material
-        .normal_map_texture
-        .clone_from(&compatibility.normal_map_texture);
+    material.normal_map_texture = compatibility.normal_map_texture.clone().into();
     material.normal_map_channel = UvChannel::Uv0;
     material.flip_normal_map_y = compatibility.flip_normal_map_y;
-    material
-        .occlusion_texture
-        .clone_from(&compatibility.occlusion_texture);
+    material.occlusion_texture = compatibility.occlusion_texture.clone().into();
     material.occlusion_channel = UvChannel::Uv0;
-    material.depth_map.clone_from(&compatibility.depth_map);
+    material.depth_map = compatibility.depth_map.clone().into();
     material
 }
 
@@ -456,7 +505,7 @@ pub(super) fn apply_pipeline_compatibility_to_standard_material(
 ) {
     material.alpha_mode = compatibility.alpha.into();
     material.double_sided = compatibility.double_sided;
-    material.cull_mode = compatibility.cull_mode;
+    material.cull_mode = compatibility.cull_mode.into();
     material.unlit = compatibility.unlit;
     material.fog_enabled = compatibility.fog_enabled;
     material.opaque_render_method = compatibility.opaque_render_method.into();
@@ -469,6 +518,28 @@ mod tests {
     use bevy::prelude::Color;
 
     use super::*;
+
+    #[test]
+    fn bevy_material_options_become_named_batch_states() {
+        assert_eq!(BatchCulling::from(None), BatchCulling::Disabled);
+        assert_eq!(BatchCulling::from(Some(Face::Front)), BatchCulling::Front);
+        assert_eq!(BatchCulling::from(Some(Face::Back)), BatchCulling::Back);
+        assert_eq!(Option::<Face>::from(BatchCulling::Disabled), None);
+
+        let handle = Handle::<Image>::default();
+        assert_eq!(
+            BatchTextureBinding::from(None),
+            BatchTextureBinding::Unbound
+        );
+        assert_eq!(
+            BatchTextureBinding::from(Some(handle.clone())),
+            BatchTextureBinding::Bound(handle.clone())
+        );
+        assert_eq!(
+            Option::<Handle<Image>>::from(BatchTextureBinding::Bound(handle.clone())),
+            Some(handle)
+        );
+    }
 
     #[test]
     fn scalar_material_changes_do_not_change_resource_compatibility() {
@@ -519,15 +590,27 @@ mod tests {
 
         let patched = apply_resource_compatibility_to_standard_material(&base, &compatibility);
 
-        assert_eq!(patched.base_color_texture, compatibility.base_color_texture);
-        assert_eq!(patched.emissive_texture, compatibility.emissive_texture);
+        assert_eq!(
+            patched.base_color_texture,
+            compatibility.base_color_texture.into()
+        );
+        assert_eq!(
+            patched.emissive_texture,
+            compatibility.emissive_texture.into()
+        );
         assert_eq!(
             patched.metallic_roughness_texture,
-            compatibility.metallic_roughness_texture
+            compatibility.metallic_roughness_texture.into()
         );
-        assert_eq!(patched.normal_map_texture, compatibility.normal_map_texture);
-        assert_eq!(patched.occlusion_texture, compatibility.occlusion_texture);
-        assert_eq!(patched.depth_map, compatibility.depth_map);
+        assert_eq!(
+            patched.normal_map_texture,
+            compatibility.normal_map_texture.into()
+        );
+        assert_eq!(
+            patched.occlusion_texture,
+            compatibility.occlusion_texture.into()
+        );
+        assert_eq!(patched.depth_map, compatibility.depth_map.into());
 
         assert_eq!(patched.base_color_channel, UvChannel::Uv0);
         assert_eq!(patched.emissive_channel, UvChannel::Uv0);

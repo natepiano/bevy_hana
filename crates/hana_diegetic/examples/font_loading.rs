@@ -16,7 +16,6 @@ use bevy::prelude::App;
 use bevy::prelude::AssetServer;
 use bevy::prelude::Assets;
 use bevy::prelude::Children;
-use bevy::prelude::Click;
 use bevy::prelude::Color;
 use bevy::prelude::Commands;
 use bevy::prelude::Component;
@@ -30,8 +29,8 @@ use bevy::prelude::MeshMaterial3d;
 use bevy::prelude::Meshable;
 use bevy::prelude::On;
 use bevy::prelude::Plane3d;
-use bevy::prelude::Pointer;
 use bevy::prelude::PointerButton;
+use bevy::prelude::PointerClick;
 use bevy::prelude::Query;
 use bevy::prelude::RelationshipTarget;
 use bevy::prelude::Res;
@@ -290,9 +289,9 @@ fn on_font_load_failed(
     panels: Query<Entity, With<StatusPanel>>,
     mut commands: Commands,
 ) {
-    warn!("FontLoadFailed: {} — {}", trigger.path, trigger.error);
+    warn!("FontLoadFailed: {} — {}", trigger.source, trigger.error);
 
-    let status = format!("FAILED: {}", trigger.path);
+    let status = format!("FAILED: {}", trigger.source);
     for entity in &panels {
         if let Err(error) = commands.set_tree(entity, build_status_panel(&status)) {
             error!("failed to replace font failure panel tree: {error}");
@@ -301,7 +300,7 @@ fn on_font_load_failed(
 }
 
 fn on_text_clicked(
-    mut click: On<Pointer<Click>>,
+    mut click: On<PointerClick>,
     children: Query<&Children>,
     meshes_q: Query<(), With<Mesh3d>>,
     mut commands: Commands,
@@ -323,7 +322,7 @@ fn on_text_clicked(
     );
 }
 
-fn on_ground_clicked(click: On<Pointer<Click>>, mut commands: Commands, scene: Res<SceneBounds>) {
+fn on_ground_clicked(click: On<PointerClick>, mut commands: Commands, scene: Res<SceneBounds>) {
     if click.button != PointerButton::Primary {
         return;
     }

@@ -187,43 +187,7 @@ impl QuadSheet {
     /// Returns [`GeometryError`] when the constructed frames or edges are
     /// rejected, which a finite [`Self::CELL_SIZE`] cannot cause.
     pub fn cell_geometry(&self) -> Result<ResolvedAnchorGeometry, GeometryError> {
-        let half = Self::CELL_SIZE / 2.0;
-        let top_left = Vec3::new(-half, half, 0.0);
-        let top_right = Vec3::new(half, half, 0.0);
-        let bottom_right = Vec3::new(half, -half, 0.0);
-        let bottom_left = Vec3::new(-half, -half, 0.0);
-
-        ResolvedAnchorGeometry::try_new(
-            [
-                (AnchorSite::Center, sheet::anchor_frame(Vec3::ZERO)?),
-                (Self::TOP_EDGE.start, sheet::anchor_frame(top_left)?),
-                (Self::TOP_EDGE.end, sheet::anchor_frame(top_right)?),
-                (Self::BOTTOM_EDGE.start, sheet::anchor_frame(bottom_right)?),
-                (Self::BOTTOM_EDGE.end, sheet::anchor_frame(bottom_left)?),
-                (
-                    Self::TOP_MIDPOINT,
-                    sheet::anchor_frame((top_left + top_right) / 2.0)?,
-                ),
-                (
-                    Self::RIGHT_MIDPOINT,
-                    sheet::anchor_frame((top_right + bottom_right) / 2.0)?,
-                ),
-                (
-                    Self::BOTTOM_MIDPOINT,
-                    sheet::anchor_frame((bottom_right + bottom_left) / 2.0)?,
-                ),
-                (
-                    Self::LEFT_MIDPOINT,
-                    sheet::anchor_frame((bottom_left + top_left) / 2.0)?,
-                ),
-            ],
-            [
-                Self::TOP_EDGE,
-                Self::RIGHT_EDGE,
-                Self::BOTTOM_EDGE,
-                Self::LEFT_EDGE,
-            ],
-        )
+        sized_cell_geometry(Self::CELL_SIZE)
     }
 
     /// Authors this sheet's connection forest in row-major cell order.
@@ -287,6 +251,53 @@ impl QuadSheet {
 
         Ok(fold_lines)
     }
+}
+
+/// Builds the common square-cell anchor geometry at `cell_size`.
+pub(super) fn sized_cell_geometry(cell_size: f32) -> Result<ResolvedAnchorGeometry, GeometryError> {
+    let half = cell_size / 2.0;
+    let top_left = Vec3::new(-half, half, 0.0);
+    let top_right = Vec3::new(half, half, 0.0);
+    let bottom_right = Vec3::new(half, -half, 0.0);
+    let bottom_left = Vec3::new(-half, -half, 0.0);
+
+    ResolvedAnchorGeometry::try_new(
+        [
+            (AnchorSite::Center, sheet::anchor_frame(Vec3::ZERO)?),
+            (QuadSheet::TOP_EDGE.start, sheet::anchor_frame(top_left)?),
+            (QuadSheet::TOP_EDGE.end, sheet::anchor_frame(top_right)?),
+            (
+                QuadSheet::BOTTOM_EDGE.start,
+                sheet::anchor_frame(bottom_right)?,
+            ),
+            (
+                QuadSheet::BOTTOM_EDGE.end,
+                sheet::anchor_frame(bottom_left)?,
+            ),
+            (
+                QuadSheet::TOP_MIDPOINT,
+                sheet::anchor_frame((top_left + top_right) / 2.0)?,
+            ),
+            (
+                QuadSheet::RIGHT_MIDPOINT,
+                sheet::anchor_frame((top_right + bottom_right) / 2.0)?,
+            ),
+            (
+                QuadSheet::BOTTOM_MIDPOINT,
+                sheet::anchor_frame((bottom_right + bottom_left) / 2.0)?,
+            ),
+            (
+                QuadSheet::LEFT_MIDPOINT,
+                sheet::anchor_frame((bottom_left + top_left) / 2.0)?,
+            ),
+        ],
+        [
+            QuadSheet::TOP_EDGE,
+            QuadSheet::RIGHT_EDGE,
+            QuadSheet::BOTTOM_EDGE,
+            QuadSheet::LEFT_EDGE,
+        ],
+    )
 }
 
 impl ArrangementProvider for QuadSheet {

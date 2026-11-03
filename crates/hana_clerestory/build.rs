@@ -1,4 +1,6 @@
-//! Enlarge the example executables' stack reserve on Windows (MSVC).
+//! Linker flags for this package's own example and test executables.
+//!
+//! # Windows (MSVC): a larger stack reserve for the examples
 //!
 //! On a host without a GPU (for example the `VMware` test guest), `wgpu`'s `dx12`
 //! backend falls back to the WARP software rasterizer. WARP recurses deeply
@@ -11,6 +13,9 @@
 //! renderers. `/STACK` is MSVC-specific, so it is gated to that target.
 
 fn main() {
+    // Cargo tracks this script and the target configuration.
+    println!("cargo::rerun-if-changed=build.rs");
+
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     if target_os == "windows" && target_env == "msvc" {

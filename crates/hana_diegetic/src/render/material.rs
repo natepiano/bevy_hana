@@ -6,13 +6,41 @@ use bevy::asset::Handle;
 use bevy::asset::LoadState;
 use bevy::pbr::StandardMaterial;
 use bevy::prelude::AlphaMode;
+use bevy::prelude::Image;
 use bevy::prelude::default;
 use bevy::render::render_resource::Face;
 
 use super::constants::DEFAULT_METALLIC;
 use super::constants::DEFAULT_REFLECTANCE;
 use super::constants::DEFAULT_ROUGHNESS;
+use super::display_compensation::DisplayCompensationTextures;
 use crate::layout::Sidedness;
+use crate::panel::CoordinateSpace;
+
+/// The camera transform applied after a panel's fragments reach the view.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum PanelDisplayTarget {
+    World,
+    Screen,
+}
+
+impl From<&CoordinateSpace> for PanelDisplayTarget {
+    fn from(space: &CoordinateSpace) -> Self {
+        match space {
+            CoordinateSpace::World { .. } => Self::World,
+            CoordinateSpace::Screen { .. } => Self::Screen,
+        }
+    }
+}
+
+impl PanelDisplayTarget {
+    pub(super) fn table(self, textures: &DisplayCompensationTextures) -> Handle<Image> {
+        match self {
+            Self::World => textures.world.clone(),
+            Self::Screen => textures.identity.clone(),
+        }
+    }
+}
 
 /// Configures a `StandardMaterial`'s `double_sided` and `cull_mode` fields from
 /// a [`Sidedness`] choice. Shared by shape and text material builders.

@@ -62,6 +62,7 @@ use crate::layout::TextStyle;
 use crate::layout::TextWrap;
 use crate::layout::Unit;
 use crate::layout::element::ElementContent;
+use crate::text;
 
 const UNIT_GAP_CHILD_SIDE: f32 = 10.0;
 const UNIT_GAP_LAYOUT_SCALE: f32 = 2.0;
@@ -383,7 +384,7 @@ fn line_commands_regenerate_from_cached_geometry() {
     let result = engine.compute(&tree, VIEWPORT, VIEWPORT, 1.0);
     let mut regenerated = result.clone();
 
-    regenerated.regenerate_commands(&tree);
+    regenerated.regenerate_commands(&tree, &monospace_measure());
 
     assert_eq!(regenerated.commands, result.commands);
     assert_eq!(line_commands(&regenerated.commands).len(), 1);
@@ -585,7 +586,7 @@ fn line_draw_regeneration_updates_visual_only_line_records() {
     let mut result = engine.compute(&original_tree, VIEWPORT, VIEWPORT, 1.0);
     let original_key = line_commands(&result.commands)[0][0].source_key;
 
-    result.regenerate_commands(&updated_tree);
+    result.regenerate_commands(&updated_tree, &monospace_measure());
     let updated_lines = line_commands(&result.commands);
 
     assert_eq!(updated_lines[0].len(), 1);
@@ -623,7 +624,7 @@ fn inserted_element_line_churns_later_ordinal_keys_without_stale_lines() {
     let mut result = engine.compute(&original_tree, VIEWPORT, VIEWPORT, 1.0);
     let old_second_key = line_commands(&result.commands)[0][1].source_key;
 
-    result.regenerate_commands(&inserted_tree);
+    result.regenerate_commands(&inserted_tree, &monospace_measure());
     let updated_lines = line_commands(&result.commands);
 
     assert_eq!(updated_lines[0].len(), 3);
@@ -2241,8 +2242,8 @@ fn empty_tree_produces_no_commands() {
     let engine = LayoutEngine::new(monospace_measure());
     let result = engine.compute(&tree, VIEWPORT, VIEWPORT, 1.0);
 
-    assert!(result.commands.is_empty());
-    assert!(result.computed.is_empty());
+    assert_eq!(result.commands, []);
+    assert_eq!(result.computed.len(), 0);
 }
 
 // ── Child dividers ───────────────────────────────────────────────────────────
@@ -2285,6 +2286,87 @@ fn child_dividers_emitted() {
 }
 
 #[test]
+fn child_dividers_center_in_the_gap() {
+    fn children(builder: &mut LayoutBuilder) {
+        for _ in 0..3 {
+            builder.with(
+                El::new()
+                    .width(Sizing::fixed(20.0))
+                    .height(Sizing::fixed(20.0)),
+                |_| {},
+            );
+        }
+    }
+
+    const GAP: f32 = 10.0;
+    let color = Color::srgb(0.2, 0.4, 0.6);
+
+    for column in [true, false] {
+        let mut builder = LayoutBuilder::new(100.0, 100.0);
+        if column {
+            builder.with(
+                El::column()
+                    .width(Sizing::fixed(100.0))
+                    .height(Sizing::fixed(100.0))
+                    .gap(GAP)
+                    .child_divider(ChildDivider::new(1.0, color)),
+                children,
+            );
+        } else {
+            builder.with(
+                El::row()
+                    .width(Sizing::fixed(100.0))
+                    .height(Sizing::fixed(100.0))
+                    .gap(GAP)
+                    .child_divider(ChildDivider::new(1.0, color)),
+                children,
+            );
+        }
+
+        let result = LayoutEngine::new(monospace_measure()).compute(
+            &builder.build(),
+            VIEWPORT,
+            VIEWPORT,
+            1.0,
+        );
+        let dividers: Vec<_> = result
+            .commands
+            .iter()
+            .filter(|command| {
+                matches!(
+                    command.kind,
+                    RenderCommandKind::Rectangle {
+                        source: RectangleSource::ChildDivider { .. },
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(dividers.len(), 2);
+
+        for (index, divider) in dividers.iter().enumerate() {
+            let first = result.computed[index + 2].bounds;
+            let second = result.computed[index + 3].bounds;
+            let (gap_start, gap_end, center) = if column {
+                (
+                    first.y + first.height,
+                    second.y,
+                    divider.bounds.y + divider.bounds.height / 2.0,
+                )
+            } else {
+                (
+                    first.x + first.width,
+                    second.x,
+                    divider.bounds.x + divider.bounds.width / 2.0,
+                )
+            };
+            assert!(approx_eq(gap_end - gap_start, GAP));
+            assert!(approx_eq(center, f32::midpoint(gap_start, gap_end)));
+        }
+    }
+}
+
+#[test]
 fn cached_geometry_regeneration_preserves_up_traversal_commands() {
     let mut builder = LayoutBuilder::new(120.0, 80.0);
     builder.with(
@@ -2316,7 +2398,7 @@ fn cached_geometry_regeneration_preserves_up_traversal_commands() {
     let result = engine.compute(&tree, VIEWPORT, VIEWPORT, 1.0);
     let mut regenerated = result.clone();
 
-    regenerated.regenerate_commands(&tree);
+    regenerated.regenerate_commands(&tree, &monospace_measure());
 
     assert_eq!(regenerated.commands, result.commands);
     let border_count = regenerated
@@ -2359,6 +2441,67 @@ fn cached_geometry_regeneration_preserves_up_traversal_commands() {
 }
 
 // ── Text wrapping ─────────────────────────────────────────────────────────────
+
+#[test]
+fn fit_text_with_padding_does_not_split_at_rounding_boundary() {
+    let mut builder = LayoutBuilder::new(100.0, 40.0);
+    builder.text(
+        Text::new("Pin", TextStyle::new(13.0))
+            .wrap(TextWrap::Words)
+            .layout(El::new().padding(Padding::xy(10.0, 0.0))),
+    );
+    let measure: MeasureTextFn = Arc::new(|text, _| TextDimensions {
+        width:       if text == "Pin" {
+            20.03
+        } else {
+            20.03 / 3.0 * text.chars().count().to_f32()
+        },
+        height:      13.0,
+        line_height: 13.0,
+    });
+    let result = LayoutEngine::new(measure).compute(&builder.build(), 100.0, 40.0, 1.0);
+    let lines: Vec<_> = result
+        .commands
+        .iter()
+        .filter_map(|command| match &command.kind {
+            RenderCommandKind::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(lines, ["Pin"]);
+    assert!(approx_eq(result.computed[1].height, 13.0));
+}
+
+#[test]
+fn real_font_fit_box_preserves_the_whole_unbroken_word() {
+    let registry = crate::text::FontRegistry::new().expect("embedded font should load");
+    let measure = text::create_parley_measurer(registry.font_context(), registry.family_names());
+    let word = "NotRequestedWithoutBreak";
+    let mut builder = LayoutBuilder::new(20.0, 200.0);
+    builder.with(
+        El::column().width(Sizing::FIT).height(Sizing::FIT),
+        |builder| {
+            builder.text(Text::new(word, TextStyle::new(4.0)).wrap(TextWrap::Words));
+        },
+    );
+    let scale = Unit::Millimeters.to_points();
+    let tree = builder.build().scaled(scale, scale);
+    let result =
+        LayoutEngine::new(measure.clone()).compute(&tree, 20.0 * scale, 200.0 * scale, 1.0);
+    let lines: Vec<_> = result
+        .commands
+        .iter()
+        .filter_map(|command| match &command.kind {
+            RenderCommandKind::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(lines, [word]);
+    let text_width = measure(word, &TextStyle::new(4.0 * scale).as_measure()).width;
+    assert!(result.computed[1].width + 0.001 >= text_width);
+}
 
 #[test]
 fn text_wraps_at_word_boundaries() {
@@ -2608,30 +2751,39 @@ fn text_wraps_at_newlines_only() {
 }
 
 #[test]
-fn word_wrap_long_word_does_not_break() {
+fn word_wrap_unbroken_word_truncates_on_one_line_within_width() {
     let font_size = 16.0;
     let word = "Supercalifragilistic";
     let word_width = text_width(word, font_size);
-    // Container is only 80 wide. The word should NOT be broken — stays on one line.
     assert!(word_width > 80.0);
     let mut b = LayoutBuilder::new(80.0, 200.0);
-    b.with(El::column().width(Sizing::GROW).height(Sizing::GROW), |b| {
-        b.text(Text::new(word, TextStyle::new(font_size)).wrap(TextWrap::Words));
-    });
+    b.with(
+        El::column().width(Sizing::fixed(80.0)).height(Sizing::GROW),
+        |b| {
+            b.text(Text::new(word, TextStyle::new(font_size)).wrap(TextWrap::Words));
+        },
+    );
     let tree = b.build();
 
     let engine = LayoutEngine::new(monospace_measure());
     let result = engine.compute(&tree, 80.0, 200.0, 1.0);
 
-    // Should be a single line (word never broken mid-word).
-    assert!(approx_eq(result.computed[2].height, line_height(font_size)));
-
-    let text_commands: Vec<_> = result
+    let container_bounds = result.computed[1].bounds;
+    let lines: Vec<_> = result
         .commands
         .iter()
-        .filter(|cmd| matches!(cmd.kind, RenderCommandKind::Text { .. }))
+        .filter_map(|cmd| match &cmd.kind {
+            RenderCommandKind::Text { text, .. } => Some((text.as_str(), &cmd.bounds)),
+            _ => None,
+        })
         .collect();
-    assert_eq!(text_commands.len(), 1);
+    assert_eq!(lines.len(), 1);
+    assert!(approx_eq(result.computed[2].height, line_height(font_size)));
+    assert!(lines[0].0.ends_with('…'));
+    for (_, bounds) in lines {
+        assert!(bounds.x >= container_bounds.x - 0.01);
+        assert!(bounds.x + bounds.width <= container_bounds.x + container_bounds.width + 0.01);
+    }
 }
 
 #[test]
@@ -2702,6 +2854,39 @@ fn word_wrap_updates_parent_fit_height() {
         result.computed[1].height,
         text_height(3, font_size)
     ));
+}
+
+#[test]
+fn grow_height_wrapped_text_keeps_following_sibling_below_last_line() {
+    let font_size = 10.0;
+    let mut builder = LayoutBuilder::new(80.0, 40.0);
+    builder.with(
+        El::column().width(Sizing::GROW).height(Sizing::GROW),
+        |builder| {
+            builder.text(
+                Text::new("one\ntwo\nthree", TextStyle::new(font_size))
+                    .wrap(TextWrap::Newlines)
+                    .layout(El::new().width(Sizing::GROW).height(Sizing::GROW)),
+            );
+            builder.with(El::new().size(80.0, 20.0), |_| {});
+        },
+    );
+
+    let result = LayoutEngine::new(monospace_measure()).compute(&builder.build(), 80.0, 40.0, 1.0);
+    let wrapped_leaf = result.computed[2].bounds;
+    let following_sibling = result.computed[3].bounds;
+    let lines: Vec<_> = result
+        .commands
+        .iter()
+        .filter(|command| {
+            command.element_idx == 2 && matches!(command.kind, RenderCommandKind::Text { .. })
+        })
+        .collect();
+
+    assert_eq!(lines.len(), 3);
+    assert!(wrapped_leaf.height >= text_height(3, font_size));
+    let last_line = lines[2].bounds;
+    assert!(following_sibling.y >= last_line.y + last_line.height);
 }
 
 #[test]

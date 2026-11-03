@@ -13,6 +13,8 @@ use std::time::Duration;
 /// stays hidden. On expiry the restore applies the fullscreen mode anyway — winit resolves the
 /// monitor index itself at that point — so the window becomes visible instead of waiting forever.
 pub(crate) const FULLSCREEN_MONITOR_MOVE_TIMEOUT_SECS: f32 = SETTLE_TIMEOUT_SECS;
+/// Maximum duration of each macOS native-state or borderless-target wait.
+pub(crate) const FULLSCREEN_NATIVE_STATE_TIMEOUT_SECS: f32 = SETTLE_TIMEOUT_SECS;
 
 // macos core graphics
 #[cfg(target_os = "macos")]
@@ -113,8 +115,6 @@ pub(crate) const RESTORE_STRATEGY_APPLY_UNCHANGED: &str = "ApplyUnchanged";
 pub(crate) const RESTORE_STRATEGY_LOWER_TO_HIGHER: &str = "LowerToHigher";
 
 // scale factors
-/// Fallback scale factor when the monitor cannot be determined.
-pub(crate) const DEFAULT_SCALE_FACTOR: f64 = 1.0;
 /// Threshold for considering two scale factors equal.
 ///
 /// Accounts for floating-point imprecision when comparing scale factors.
@@ -164,6 +164,10 @@ pub(crate) const SUBCLASS_ID: usize = 1;
 pub(crate) const SUBCLASS_REFERENCE_DATA: usize = 0;
 
 // x11 frame extents
+/// Maximum frames spent waiting for an exact direct windowed return before applying the
+/// uncompensated placement and releasing the window for further user commands and movement.
+pub(crate) const X11_WINDOWED_RETURN_MAX_FRAMES: u8 = 60;
+
 /// Number of values in `_NET_FRAME_EXTENTS` (left, right, top, bottom).
 #[cfg(all(target_os = "linux", feature = "workaround-winit-4445"))]
 pub(crate) const FRAME_EXTENT_COUNT: u32 = 4;

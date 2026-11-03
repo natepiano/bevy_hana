@@ -1,5 +1,7 @@
 //! Render commands produced by the layout engine.
 
+use std::sync::Arc;
+
 use bevy::asset::Handle;
 use bevy::color::Color;
 use bevy::image::Image;
@@ -9,6 +11,7 @@ use super::BoundingBox;
 use super::DrawZIndex;
 use super::ResolvedPanelShape;
 use super::TextStyle;
+use crate::Icon;
 
 /// A single render command produced by the layout pass.
 ///
@@ -35,6 +38,8 @@ pub struct RenderCommand {
 pub enum RectangleSource {
     /// `Element` background fill.
     Background,
+    /// Library-owned overlay thumb, with rounded ends and its own paint.
+    ScrollIndicator,
     /// Separator from a row or column [`ChildDivider`](super::ChildDivider).
     ChildDivider {
         /// Zero-based adjacent-child pair ordinal inside the parent element.
@@ -97,6 +102,8 @@ pub enum RenderCommandKind {
         /// Text configuration (font, size, etc.).
         config: TextStyle,
     },
+    /// A Lucide glyph that resolves to a text run once its bundled font is ready.
+    Icon(Icon),
     /// A border outline.
     Border {
         /// Border specification.
@@ -121,6 +128,13 @@ pub enum RenderCommandKind {
     ScissorStart,
     /// End the most recent clipping region.
     ScissorEnd,
+    /// A complete shaped paragraph line, reified as paint runs.
+    RichText {
+        /// The resolved paragraph, shared by layout and rendering.
+        paragraph:  Arc<super::RichParagraph>,
+        /// The paragraph-local line ordinal.
+        line_index: usize,
+    },
 }
 
 impl RenderCommandKind {
@@ -133,7 +147,7 @@ impl RenderCommandKind {
             | Self::Image { .. }
             | Self::PrecomposeLdr => Some(DrawSortTier::Surface),
             Self::PanelShapes { .. } => Some(DrawSortTier::PanelShape),
-            Self::Text { .. } => Some(DrawSortTier::Text),
+            Self::Text { .. } | Self::RichText { .. } | Self::Icon(_) => Some(DrawSortTier::Text),
             Self::ScissorStart | Self::ScissorEnd => None,
         }
     }
@@ -144,7 +158,9 @@ impl RenderCommandKind {
         match self {
             Self::Rectangle { .. } | Self::Border { .. } => Some(DrawBatchFamily::SdfSurface),
             Self::PanelShapes { .. } => Some(DrawBatchFamily::PanelShape),
-            Self::Text { .. } => Some(DrawBatchFamily::Text),
+            Self::Text { .. } | Self::RichText { .. } | Self::Icon(_) => {
+                Some(DrawBatchFamily::Text)
+            },
             Self::Image { .. } | Self::PrecomposeLdr => Some(DrawBatchFamily::Image),
             Self::ScissorStart | Self::ScissorEnd => None,
         }
@@ -154,10 +170,87 @@ impl RenderCommandKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::LucideIcon;
 
     const FILL_ORDINAL: u8 = 0;
     const SHAPES_ORDINAL: u8 = 1;
     const TEXT_ORDINAL: u8 = 2;
+
+    #[test]
+    fn rich_text_keeps_the_plain_command_storage_budget() {
+        enum PlainRenderCommandKind {
+            Rectangle {
+                color:  Color,
+                source: RectangleSource,
+            },
+            Text {
+                text:   String,
+                config: TextStyle,
+            },
+            Icon(Icon),
+            Border {
+                border: Border,
+            },
+            Image {
+                handle: Handle<Image>,
+                tint:   Color,
+            },
+            PrecomposeLdr,
+            PanelShapes {
+                shapes: Vec<ResolvedPanelShape>,
+            },
+            ScissorStart,
+            ScissorEnd,
+        }
+
+        let samples = [
+            PlainRenderCommandKind::Rectangle {
+                color:  Color::WHITE,
+                source: RectangleSource::Background,
+            },
+            PlainRenderCommandKind::Text {
+                text:   String::new(),
+                config: TextStyle::default(),
+            },
+            PlainRenderCommandKind::Icon(Icon::new(LucideIcon::Camera)),
+            PlainRenderCommandKind::Border {
+                border: Border::default(),
+            },
+            PlainRenderCommandKind::Image {
+                handle: Handle::default(),
+                tint:   Color::WHITE,
+            },
+            PlainRenderCommandKind::PrecomposeLdr,
+            PlainRenderCommandKind::PanelShapes { shapes: Vec::new() },
+            PlainRenderCommandKind::ScissorStart,
+            PlainRenderCommandKind::ScissorEnd,
+        ];
+        for sample in samples {
+            let kind = match sample {
+                PlainRenderCommandKind::Rectangle { color, source } => {
+                    RenderCommandKind::Rectangle { color, source }
+                },
+                PlainRenderCommandKind::Text { text, config } => {
+                    RenderCommandKind::Text { text, config }
+                },
+                PlainRenderCommandKind::Icon(icon) => RenderCommandKind::Icon(icon),
+                PlainRenderCommandKind::Border { border } => RenderCommandKind::Border { border },
+                PlainRenderCommandKind::Image { handle, tint } => {
+                    RenderCommandKind::Image { handle, tint }
+                },
+                PlainRenderCommandKind::PrecomposeLdr => RenderCommandKind::PrecomposeLdr,
+                PlainRenderCommandKind::PanelShapes { shapes } => {
+                    RenderCommandKind::PanelShapes { shapes }
+                },
+                PlainRenderCommandKind::ScissorStart => RenderCommandKind::ScissorStart,
+                PlainRenderCommandKind::ScissorEnd => RenderCommandKind::ScissorEnd,
+            };
+            assert_eq!(
+                std::mem::size_of_val(&kind),
+                std::mem::size_of::<PlainRenderCommandKind>()
+            );
+        }
+    }
 
     #[test]
     fn draw_step_ordinals_are_fixed() {

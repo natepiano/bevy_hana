@@ -9,7 +9,7 @@ use bevy::color::palettes::css::MEDIUM_PURPLE;
 use bevy::color::palettes::css::SEA_GREEN;
 use bevy::color::palettes::css::SKY_BLUE;
 use bevy::color::palettes::css::TURQUOISE;
-use bevy::math::curve::easing::EaseFunction;
+use bevy::curve::easing::EaseFunction;
 use bevy::prelude::App;
 use bevy::prelude::Assets;
 use bevy::prelude::Bundle;
@@ -27,7 +27,6 @@ use bevy::prelude::Mesh3d;
 use bevy::prelude::MeshMaterial3d;
 use bevy::prelude::On;
 use bevy::prelude::Plugin;
-use bevy::prelude::PostUpdate;
 use bevy::prelude::Quat;
 use bevy::prelude::Query;
 use bevy::prelude::Reflect;
@@ -41,6 +40,7 @@ use bevy::prelude::StandardMaterial;
 use bevy::prelude::Startup;
 use bevy::prelude::Transform;
 use bevy::prelude::Triangle2d;
+use bevy::prelude::Update;
 use bevy::prelude::Vec2;
 use bevy::prelude::Vec3;
 use bevy::prelude::Visibility;
@@ -57,8 +57,8 @@ use fairy_dust::DescriptionPanel;
 use fairy_dust::TitleBar;
 use fairy_dust::TitleBarControl;
 use fairy_dust::TitleBarSegment;
+use fairy_dust::TitleBarStateWriters;
 use hana_diegetic::DiegeticText;
-use hana_diegetic::Sidedness;
 use hana_kana::ToF32;
 use hana_lagrange::OrbitCamPreset;
 use hana_rubric::Keybindings;
@@ -66,7 +66,6 @@ use hana_rubric::action;
 use hana_rubric::bind_action_system;
 use hana_rubric::event;
 use hana_valence::AnchorPose;
-use hana_valence::AnchorSystems;
 use hana_valence::AnchoredTo;
 use hana_valence::Angle;
 use hana_valence::Displacement;
@@ -145,7 +144,14 @@ impl Plugin for TriangleAlgorithmInputPlugin {
     fn build(&self, app: &mut App) {
         app.add_input_context::<TriangleAlgorithmInput>()
             .add_systems(Startup, spawn_algorithm_input);
-        bind_action_system!(app, ToggleAlgorithm, ToggleAlgorithmEvent, toggle_algorithm);
+        app.init_resource::<PendingAlgorithmToggles>()
+            .add_systems(Update, toggle_algorithm.in_set(TitleBarStateWriters));
+        bind_action_system!(
+            app,
+            ToggleAlgorithm,
+            ToggleAlgorithmEvent,
+            queue_algorithm_toggle
+        );
     }
 }
 
@@ -182,6 +188,9 @@ struct AlgorithmSelection {
     selected_algorithm: FoldAlgorithm,
     active_algorithm:   FoldAlgorithm,
 }
+
+#[derive(Resource, Default)]
+struct PendingAlgorithmToggles(usize);
 
 impl Default for AlgorithmSelection {
     fn default() -> Self {
@@ -238,10 +247,11 @@ fn main() {
         .add_plugins(TriangleAlgorithmInputPlugin);
     app.init_resource::<AlgorithmSelection>()
         .add_systems(
-            PostUpdate,
+            Update,
             activate_selected_algorithm
-                .in_set(AnchorSystems::AnimatePose)
-                .before(AnchorSystems::HingeToPose),
+                .in_set(TitleBarStateWriters)
+                .after(toggle_algorithm)
+                .after(hana_valence::FoldSystems::Advance),
         )
         .add_systems(Startup, setup)
         .run();
@@ -319,7 +329,16 @@ fn setup(
     Ok(())
 }
 
-fn toggle_algorithm(mut selection: ResMut<AlgorithmSelection>) {
+fn queue_algorithm_toggle(mut pending: ResMut<PendingAlgorithmToggles>) { pending.0 += 1; }
+
+fn toggle_algorithm(
+    mut pending: ResMut<PendingAlgorithmToggles>,
+    mut selection: ResMut<AlgorithmSelection>,
+) {
+    let toggles = std::mem::take(&mut pending.0);
+    if toggles.is_multiple_of(2) {
+        return;
+    }
     selection.selected_algorithm = match selection.selected_algorithm {
         FoldAlgorithm::Accordion => FoldAlgorithm::Wrap,
         FoldAlgorithm::Wrap => FoldAlgorithm::Accordion,
@@ -456,7 +475,6 @@ fn face_label(text: String, on_plus_z: bool) -> impl Bundle {
     DiegeticText::world(text)
         .size(LABEL_SIZE)
         .color(LABEL_COLOR)
-        .sidedness(Sidedness::FrontOnly)
         .transform(Transform::from_xyz(0.0, 0.0, offset).with_rotation(facing))
         .build()
 }

@@ -12,3 +12,5 @@ pub(super) use run::GlyphInstance;
 pub(super) use run::GlyphKey;
 pub(super) use run::GlyphOutlineCache;
 pub(super) use run::TextRun;
+#[cfg(test)]
+pub(super) use run::font_figure_crossbar_mid;

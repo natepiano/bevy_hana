@@ -1449,7 +1449,7 @@ fn a_live_attempt_ending_follows_its_status_edge() -> Result<(), Box<dyn Error>>
             _
         ))]
     ));
-    assert!(observed.registration_attempt_endings.is_empty());
+    assert_eq!(observed.registration_attempt_endings, []);
     Ok(())
 }
 
@@ -1477,17 +1477,12 @@ fn a_matching_registration_receives_its_queued_ending_after_entity_recovery()
     control.finish_attempt(attempt, DriverCompletion::Succeeded(Applied::AsDispatched))?;
     app.update();
     assert!(app.world().get_entity(removed_binding).is_err());
-    assert!(
+    assert_eq!(app.world().resource::<ObservedEvents>().attempt_endings, []);
+    assert_eq!(
         app.world()
             .resource::<ObservedEvents>()
-            .attempt_endings
-            .is_empty()
-    );
-    assert!(
-        app.world()
-            .resource::<ObservedEvents>()
-            .registration_attempt_endings
-            .is_empty()
+            .registration_attempt_endings,
+        []
     );
 
     app.update();
@@ -1501,7 +1496,7 @@ fn a_matching_registration_receives_its_queued_ending_after_entity_recovery()
             _
         ))]
     ));
-    assert!(observed.registration_attempt_endings.is_empty());
+    assert_eq!(observed.registration_attempt_endings, []);
     assert!(observed.publication_order.iter().any(|publication| {
         matches!(
             publication,
@@ -1542,17 +1537,12 @@ fn an_ending_retires_when_role_entity_recovery_cannot_keep_an_entity_alive()
 
     control.finish_attempt(attempt, DriverCompletion::Succeeded(Applied::AsDispatched))?;
     app.update();
-    assert!(
+    assert_eq!(app.world().resource::<ObservedEvents>().attempt_endings, []);
+    assert_eq!(
         app.world()
             .resource::<ObservedEvents>()
-            .attempt_endings
-            .is_empty()
-    );
-    assert!(
-        app.world()
-            .resource::<ObservedEvents>()
-            .registration_attempt_endings
-            .is_empty()
+            .registration_attempt_endings,
+        []
     );
 
     app.update();
@@ -1562,16 +1552,16 @@ fn an_ending_retires_when_role_entity_recovery_cannot_keep_an_entity_alive()
             .role_entity(&role)
             .is_err()
     );
-    assert!(
+    assert_eq!(
         app.world()
             .resource::<ObservedEvents>()
-            .registration_attempt_endings
-            .is_empty()
+            .registration_attempt_endings,
+        []
     );
 
     app.update();
     let observed = app.world().resource::<ObservedEvents>();
-    assert!(observed.attempt_endings.is_empty());
+    assert_eq!(observed.attempt_endings, []);
     assert_eq!(
         observed.retired_roles,
         vec![ObservedRetiredRole {
@@ -1633,7 +1623,7 @@ fn a_different_endpoint_displaces_a_queued_ending_from_a_missing_entity()
         successor_endpoint
     );
     let observed = app.world().resource::<ObservedEvents>();
-    assert!(observed.attempt_endings.is_empty());
+    assert_eq!(observed.attempt_endings, []);
     assert!(matches!(
         observed.registration_attempt_endings.as_slice(),
         [ObservedRegistrationAttemptEnding {
@@ -1686,7 +1676,7 @@ fn a_same_endpoint_successor_displaces_a_queued_ending_from_a_missing_entity()
         shared_endpoint
     );
     let observed = app.world().resource::<ObservedEvents>();
-    assert!(observed.attempt_endings.is_empty());
+    assert_eq!(observed.attempt_endings, []);
     assert!(matches!(
         observed.registration_attempt_endings.as_slice(),
         [ObservedRegistrationAttemptEnding {
@@ -1735,7 +1725,7 @@ fn retirement_before_entity_recovery_retires_the_queued_ending() -> Result<(), B
             .is_err()
     );
     let observed = app.world().resource::<ObservedEvents>();
-    assert!(observed.attempt_endings.is_empty());
+    assert_eq!(observed.attempt_endings, []);
     assert!(matches!(
         observed.registration_attempt_endings.as_slice(),
         [ObservedRegistrationAttemptEnding {
@@ -1792,7 +1782,7 @@ fn a_live_attempt_ending_survives_displacement_before_publication() -> Result<()
         successor_endpoint
     );
     let observed = app.world().resource::<ObservedEvents>();
-    assert!(observed.attempt_endings.is_empty());
+    assert_eq!(observed.attempt_endings, []);
     assert!(matches!(
         observed.registration_attempt_endings.as_slice(),
         [ObservedRegistrationAttemptEnding {
@@ -1844,7 +1834,7 @@ fn a_live_attempt_ending_survives_retirement_before_publication() -> Result<(), 
             .is_err()
     );
     let observed = app.world().resource::<ObservedEvents>();
-    assert!(observed.attempt_endings.is_empty());
+    assert_eq!(observed.attempt_endings, []);
     assert!(matches!(
         observed.registration_attempt_endings.as_slice(),
         [ObservedRegistrationAttemptEnding {
@@ -1898,7 +1888,7 @@ fn a_replaced_attempt_ending_names_the_displaced_registration() -> Result<(), Bo
         successor_endpoint
     );
     let observed = app.world().resource::<ObservedEvents>();
-    assert!(observed.attempt_endings.is_empty());
+    assert_eq!(observed.attempt_endings, []);
     assert!(matches!(
         observed.registration_attempt_endings.as_slice(),
         [ObservedRegistrationAttemptEnding {
@@ -1983,7 +1973,7 @@ fn a_displaced_attempt_with_no_cleanup_entity_still_publishes_its_ending()
          key its own record by once the entity is gone"
     );
     let observed = app.world().resource::<ObservedEvents>();
-    assert!(observed.attempt_endings.is_empty());
+    assert_eq!(observed.attempt_endings, []);
     assert!(matches!(
         observed.registration_attempt_endings.as_slice(),
         [ObservedRegistrationAttemptEnding {
@@ -2034,7 +2024,7 @@ fn a_retired_attempt_ending_follows_despawn_and_retirement() -> Result<(), Box<d
             .is_err()
     );
     let observed = app.world().resource::<ObservedEvents>();
-    assert!(observed.attempt_endings.is_empty());
+    assert_eq!(observed.attempt_endings, []);
     assert!(matches!(
         observed.registration_attempt_endings.as_slice(),
         [ObservedRegistrationAttemptEnding {
@@ -2111,7 +2101,7 @@ fn a_retired_attempt_with_no_cleanup_entity_still_publishes_its_ending()
          key its own record by once the entity is gone"
     );
     let observed = app.world().resource::<ObservedEvents>();
-    assert!(observed.attempt_endings.is_empty());
+    assert_eq!(observed.attempt_endings, []);
     assert!(matches!(
         observed.registration_attempt_endings.as_slice(),
         [ObservedRegistrationAttemptEnding {
@@ -2166,7 +2156,7 @@ fn a_retired_attempt_ending_never_reaches_a_same_key_successor() -> Result<(), B
         successor_endpoint
     );
     let observed = app.world().resource::<ObservedEvents>();
-    assert!(observed.attempt_endings.is_empty());
+    assert_eq!(observed.attempt_endings, []);
     assert!(matches!(
         observed.registration_attempt_endings.as_slice(),
         [ObservedRegistrationAttemptEnding {
@@ -2290,7 +2280,7 @@ fn a_contended_device_does_not_reacquire() -> Result<(), Box<dyn Error>> {
     }
 
     assert_eq!(role_lifecycle(&app, &role)?, ObservedRoleLifecycle::Waiting);
-    assert!(app.world().resource::<DriverCalls>().started.is_empty());
+    assert_eq!(app.world().resource::<DriverCalls>().started, []);
 
     Ok(())
 }
@@ -2750,12 +2740,7 @@ fn a_status_change_queued_before_entity_projection_publishes_its_complete_edge()
         .clear();
 
     app.world_mut().trigger(ReapplyConfiguration { binding });
-    assert!(
-        app.world()
-            .resource::<ObservedEvents>()
-            .role_status
-            .is_empty()
-    );
+    assert_eq!(app.world().resource::<ObservedEvents>().role_status, []);
     app.update();
 
     let status_after = app
@@ -2800,12 +2785,7 @@ fn retiring_a_role_publishes_its_durable_endpoint() -> Result<(), Box<dyn Error>
         .clone();
 
     app.world_mut().trigger(RetireRole { role: role.clone() });
-    assert!(
-        app.world()
-            .resource::<ObservedEvents>()
-            .retired_roles
-            .is_empty()
-    );
+    assert_eq!(app.world().resource::<ObservedEvents>().retired_roles, []);
     app.update();
 
     assert_eq!(
@@ -2897,7 +2877,7 @@ fn completions_before_and_at_the_hard_end_win_when_drained_later() -> Result<(),
                 ..
             } if *published == session
         ));
-        assert!(control.cancellations().is_empty());
+        assert_eq!(control.cancellations(), []);
         let established = app
             .world()
             .resource::<Bindings>()
@@ -2996,7 +2976,7 @@ fn an_unfinished_attempt_expires_only_after_the_hard_end_and_cancels_once()
     } = completion_fixture()?;
 
     advance_frame_to(&mut app, hard_end);
-    assert!(control.cancellations().is_empty());
+    assert_eq!(control.cancellations(), []);
     assert_eq!(control.pending_attempts(), vec![attempt]);
 
     advance_frame_to(&mut app, hard_end + Duration::from_nanos(1));
@@ -3148,7 +3128,7 @@ fn role_entity_recovery_preserves_applying_queued_and_established_authorities()
     control.finish_attempt(attempt, DriverCompletion::Succeeded(Applied::AsDispatched))?;
     app.update();
     app.update();
-    assert!(control.pending_attempts().is_empty());
+    assert_eq!(control.pending_attempts(), []);
     assert_one_attempt_ending(&app);
     assert!(matches!(
         role_component(&app, &role)?.view(),
@@ -3172,7 +3152,7 @@ fn role_entity_recovery_preserves_applying_queued_and_established_authorities()
     let repaired_queued_entity = app.world().resource::<Bindings>().role_entity(&role)?;
     assert_ne!(repaired_queued_entity, queued_entity);
     assert_recovery_clients_retargeted(&app, queued_clients, repaired_queued_entity)?;
-    assert!(control.pending_attempts().is_empty());
+    assert_eq!(control.pending_attempts(), []);
     assert_one_attempt_ending(&app);
     assert!(matches!(
         role_component(&app, &role)?.view(),
@@ -3732,8 +3712,8 @@ fn replace_then_retire_batch_resolves_displaced_driver_authorities_once()
         control.cancellations(),
         vec![(attempt, AttemptInvalidation::BindingReplaced)]
     );
-    assert!(control.pending_attempts().is_empty());
-    assert!(control.releases().is_empty());
+    assert_eq!(control.pending_attempts(), []);
+    assert_eq!(control.releases(), []);
 
     let CompletionFixture {
         mut app,
@@ -3773,7 +3753,7 @@ fn replace_then_retire_batch_resolves_displaced_driver_authorities_once()
     app.world_mut().trigger(RetireRole { role: role.clone() });
     app.update();
 
-    assert!(control.cancellations().is_empty());
+    assert_eq!(control.cancellations(), []);
     assert_eq!(
         control.releases(),
         vec![(session, SessionReleaseCause::BindingReplaced)]
@@ -3925,7 +3905,7 @@ fn discovery_progress_waits_for_its_delay_then_agrees_across_both_views()
 
     {
         let observed = app.world().resource::<ObservedEvents>();
-        assert!(observed.discovery_progress.is_empty());
+        assert_eq!(observed.discovery_progress, []);
     }
 
     app.world_mut()
@@ -3935,7 +3915,7 @@ fn discovery_progress_waits_for_its_delay_then_agrees_across_both_views()
 
     {
         let observed = app.world().resource::<ObservedEvents>();
-        assert!(!observed.discovery_progress.is_empty());
+        assert_ne!(observed.discovery_progress, []);
         for observed_progress in &observed.discovery_progress {
             assert_eq!(observed_progress.reporter, reporter);
             assert_eq!(observed_progress.progress, scripted_progress);
@@ -3977,7 +3957,7 @@ fn repeated_failures_publish_serializable_reporter_health() -> Result<(), Box<dy
     }
 
     let health = reporter_health(&app)?;
-    assert!(!health.identity().name.is_empty());
+    assert_ne!(health.identity().name, "");
     assert_eq!(*health.retained_records(), 0);
     assert!(matches!(
         health.first_complete_set(),
@@ -3995,7 +3975,7 @@ fn repeated_failures_publish_serializable_reporter_health() -> Result<(), Box<dy
     assert_eq!(run.consecutive.get(), 3);
 
     let json = reporter_health_json(&app)?;
-    assert!(!json.is_empty());
+    assert_ne!(json, "");
     assert!(json.contains("ScriptedReporter"));
     assert!(json.contains("Failing"));
 
@@ -4126,8 +4106,8 @@ fn minute_one_role_status_names_the_overdue_reporter_and_saved_endpoint()
 
     let endpoint_json = reflected_component_json::<RoleEndpoint>(&app, binding_entity)?;
     let status_json = reflected_component_json::<RoleStatus>(&app, binding_entity)?;
-    assert!(!endpoint_json.is_empty());
-    assert!(!status_json.is_empty());
+    assert_ne!(endpoint_json, "");
+    assert_ne!(status_json, "");
 
     Ok(())
 }
@@ -5485,8 +5465,8 @@ fn an_offline_authored_device_reports_connection_without_touching_its_driver()
         ConfiguredDeviceConnection::Present
     );
     let observed = app.world().resource::<ObservedEvents>();
-    assert!(observed.attempt_endings.is_empty());
-    assert!(app.world().resource::<DriverCalls>().started.is_empty());
+    assert_eq!(observed.attempt_endings, []);
+    assert_eq!(app.world().resource::<DriverCalls>().started, []);
 
     Ok(())
 }
@@ -5554,7 +5534,7 @@ fn a_failure_before_first_success_keeps_the_role_awaiting_its_first_report()
         role_hardware_wait(&app, &role)?,
         HardwareWait::AwaitingFirstReport { .. }
     ));
-    assert!(app.world().resource::<DriverCalls>().started.is_empty());
+    assert_eq!(app.world().resource::<DriverCalls>().started, []);
     Ok(())
 }
 
@@ -5740,12 +5720,7 @@ fn an_uncovering_empty_complete_does_not_hide_a_covered_present_key() -> Result<
             .availability(),
         KeyAvailability::Present(_)
     ));
-    assert!(
-        app.world()
-            .resource::<ObservedEvents>()
-            .device_changes
-            .is_empty()
-    );
+    assert_eq!(app.world().resource::<ObservedEvents>().device_changes, []);
     Ok(())
 }
 
@@ -5780,7 +5755,7 @@ fn a_keyed_unreachable_record_never_authorizes_service() -> Result<(), Box<dyn E
         role_hardware_wait(&app, &role)?,
         HardwareWait::Unreachable { .. }
     ));
-    assert!(app.world().resource::<DriverCalls>().started.is_empty());
+    assert_eq!(app.world().resource::<DriverCalls>().started, []);
     Ok(())
 }
 
@@ -5846,7 +5821,7 @@ fn a_mixed_contributor_set_uses_its_combined_presence_and_names_its_reporter()
     };
     assert_eq!(established_by.reporter, absence_reporter_ref);
     assert_eq!(established_by.batch.get(), absence_batch.get());
-    assert!(app.world().resource::<DriverCalls>().started.is_empty());
+    assert_eq!(app.world().resource::<DriverCalls>().started, []);
     Ok(())
 }
 
@@ -6487,7 +6462,7 @@ fn unsupported_apply_requires_explicit_restart_and_leaves_the_fault_run_clear()
         }) if detail == UNSUPPORTED_DRIVER_DETAIL
     ));
     let binding = app.world().resource::<Bindings>().role_entity(&role)?;
-    assert!(!reflected_component_json::<RoleStatus>(&app, binding)?.is_empty());
+    assert_ne!(reflected_component_json::<RoleStatus>(&app, binding)?, "");
     let starts_before_reacquisition = app.world().resource::<DriverCalls>().started.len();
 
     for _ in 0..2 {
@@ -6564,7 +6539,7 @@ fn repeated_apply_failures_publish_their_typed_stopped_status() -> Result<(), Bo
         }) if failures.get() == 3 && detail == DRIVER_FAILURE_DETAIL
     ));
     let binding = app.world().resource::<Bindings>().role_entity(&role)?;
-    assert!(!reflected_component_json::<RoleStatus>(&app, binding)?.is_empty());
+    assert_ne!(reflected_component_json::<RoleStatus>(&app, binding)?, "");
 
     Ok(())
 }
@@ -7064,7 +7039,7 @@ fn a_displaced_unit_no_role_addresses_is_authorizable_without_an_answer()
     advance_reporter(&mut app, reporter)?;
 
     assert!(questions(&app).is_empty());
-    assert!(observed_questions(&app).raised.is_empty());
+    assert_eq!(observed_questions(&app).raised, []);
     let devices = app.world().resource::<Devices>();
     let DeviceResolution::Resolved(device_id) = devices.resolve(&candidate) else {
         return Err("the arriving unit must resolve".into());
@@ -7350,7 +7325,7 @@ fn a_synthesized_saved_key_raises_no_question() -> Result<(), Box<dyn Error>> {
     app.update();
 
     assert!(questions(&app).is_empty());
-    assert!(observed_questions(&app).raised.is_empty());
+    assert_eq!(observed_questions(&app).raised, []);
 
     Ok(())
 }

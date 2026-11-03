@@ -10,7 +10,6 @@ use std::fmt::Write as _;
 
 use bevy::camera::Hdr;
 use bevy::camera::primitives::Aabb;
-use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::diagnostic::Diagnostic;
 use bevy::diagnostic::DiagnosticsStore;
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
@@ -53,6 +52,7 @@ use bevy::prelude::Vec3;
 use bevy::prelude::With;
 use bevy::prelude::default;
 use bevy::prelude::error;
+use bevy::render::view::Tonemapping;
 use fairy_dust::CameraHomeTarget;
 use fairy_dust::ControlActivation;
 use fairy_dust::DEFAULT_PANEL_BACKGROUND;
@@ -64,6 +64,7 @@ use fairy_dust::StatsPanelSection;
 use fairy_dust::TitleBar;
 use fairy_dust::TitleBarControl;
 use fairy_dust::TitleBarSegment;
+use fairy_dust::TitleBarStateWriters;
 use fairy_dust::diegetic_stats_sections_panel_with_integral_advance;
 use fairy_dust::diegetic_stats_sections_tree_with_integral_advance;
 use fairy_dust::screen_panel_frame;
@@ -98,7 +99,6 @@ use hana_diegetic::PanelLine;
 use hana_diegetic::PanelPoint;
 use hana_diegetic::Px;
 use hana_diegetic::ShadowCasting;
-use hana_diegetic::Sidedness;
 use hana_diegetic::Sizing;
 use hana_diegetic::Text;
 use hana_diegetic::TextStyle;
@@ -738,8 +738,8 @@ fn main() {
         .add_systems(
             Update,
             (
-                adjust_text_coverage_bias,
-                apply_text_coverage_bias_default,
+                adjust_text_coverage_bias.in_set(TitleBarStateWriters),
+                apply_text_coverage_bias_default.in_set(TitleBarStateWriters),
                 update_text_coverage_title_bar,
             )
                 .chain(),
@@ -968,7 +968,7 @@ fn adjust_text_coverage_bias(
 ) {
     let left = keyboard.pressed(KeyCode::BracketLeft);
     let right = keyboard.pressed(KeyCode::BracketRight);
-    let direction = match (left, right) {
+    let direction: f32 = match (left, right) {
         (true, false) => -1.0,
         (false, true) => 1.0,
         (true, true) | (false, false) => return,
@@ -983,7 +983,8 @@ fn adjust_text_coverage_bias(
     } else {
         TEXT_COVERAGE_BIAS_RATE * time.delta_secs()
     };
-    let next = (selection.selected + direction * amount)
+    let next = direction
+        .mul_add(amount, selection.selected)
         .clamp(TEXT_COVERAGE_BIAS_MIN, TEXT_COVERAGE_BIAS_MAX);
     if (selection.selected - next).abs() > f32::EPSILON {
         selection.selected = next;
@@ -1002,7 +1003,7 @@ fn apply_text_coverage_bias_default(
 }
 
 fn apply_render_features_to_added_camera(
-    trigger: On<Add, Camera>,
+    trigger: On<Add<Camera>>,
     features: Res<RenderFeatures>,
     cameras: Query<Option<&Hdr>, With<Camera>>,
     mut commands: Commands,
@@ -1014,7 +1015,7 @@ fn apply_render_features_to_added_camera(
 }
 
 fn apply_tonemapping_to_added_camera(
-    trigger: On<Add, Camera>,
+    trigger: On<Add<Camera>>,
     selection: Res<TonemappingSelection>,
     cameras: Query<Option<&Tonemapping>, With<Camera>>,
     mut commands: Commands,
@@ -1026,7 +1027,7 @@ fn apply_tonemapping_to_added_camera(
 }
 
 fn apply_render_features_to_added_orbit_camera(
-    trigger: On<Add, FairyDustOrbitCam>,
+    trigger: On<Add<FairyDustOrbitCam>>,
     features: Res<RenderFeatures>,
     cameras: Query<(Option<&Hdr>, Option<&Bloom>), With<FairyDustOrbitCam>>,
     mut commands: Commands,
@@ -1292,7 +1293,7 @@ fn alpha_selector_stats_attachment() -> PanelAttachment {
 }
 
 fn anchor_alpha_selector_when_added(
-    trigger: On<Add, AlphaSelectorPanel>,
+    trigger: On<Add<AlphaSelectorPanel>>,
     stats_panels: Query<Entity, With<BatchValidationStatsPanel>>,
     panel_entities: PanelEntityReader,
     mut attachments: Commands,
@@ -1310,7 +1311,7 @@ fn anchor_alpha_selector_when_added(
 }
 
 fn anchor_alpha_selector_when_stats_added(
-    trigger: On<Add, BatchValidationStatsPanel>,
+    trigger: On<Add<BatchValidationStatsPanel>>,
     selectors: Query<Entity, With<AlphaSelectorPanel>>,
     panel_entities: PanelEntityReader,
     mut attachments: Commands,
@@ -1334,7 +1335,7 @@ fn tonemapping_selector_alpha_attachment() -> PanelAttachment {
 }
 
 fn anchor_tonemapping_selector_when_added(
-    trigger: On<Add, TonemappingSelectorPanel>,
+    trigger: On<Add<TonemappingSelectorPanel>>,
     alpha_selectors: Query<Entity, With<AlphaSelectorPanel>>,
     panel_entities: PanelEntityReader,
     mut attachments: Commands,
@@ -1352,7 +1353,7 @@ fn anchor_tonemapping_selector_when_added(
 }
 
 fn anchor_tonemapping_selector_when_alpha_added(
-    trigger: On<Add, AlphaSelectorPanel>,
+    trigger: On<Add<AlphaSelectorPanel>>,
     tonemapping_selectors: Query<Entity, With<TonemappingSelectorPanel>>,
     panel_entities: PanelEntityReader,
     mut attachments: Commands,
@@ -2622,7 +2623,7 @@ fn material_case_block_with_style(
 // The Divergent group authors text runs that actually carry the batch splitters,
 // so each one forms its own text batch (observable in `batch.batches` / the
 // ledger's `actual` text count). The texture row splits by resource; the
-// cull-mode rows split by sidedness; the live alpha row splits only when the
+// front-only row shares the ordinary text batch; the live alpha row splits only when the
 // selector leaves the panel-default Blend mode.
 fn divergent_group(
     builder: &mut LayoutBuilder,
@@ -2646,7 +2647,7 @@ fn divergent_group(
             material_group_spacer(builder);
             divergent_texture_case(builder, materials);
             material_group_spacer(builder);
-            divergent_cull_case(builder);
+            front_only_text_case(builder);
         },
     );
 }
@@ -2695,29 +2696,15 @@ fn divergent_texture_case(builder: &mut LayoutBuilder, materials: &TextPanelMate
     );
 }
 
-// Cull-mode split: three runs, one per `Sidedness`. `FrontOnly` and `BackOnly`
-// each form their own text batch; `BothSides` matches the panel default and
-// joins the shared batch. `BackOnly` culls front faces, so it is invisible from
-// the front camera and only legible when the orbit camera swings behind.
-fn divergent_cull_case(builder: &mut LayoutBuilder) {
+// Text always shares the front-only coverage path, even on two-sided cards.
+fn front_only_text_case(builder: &mut LayoutBuilder) {
     divergent_case_shell(
         builder,
-        "cull mode",
+        "text faces",
         MATERIAL_CASE_BG,
         material_caption_style(TEXT_MUTED),
         |builder| {
-            builder.text((
-                "FrontOnly",
-                material_value_style(ACCENT_RED).with_sidedness(Sidedness::FrontOnly),
-            ));
-            builder.text((
-                "BackOnly",
-                material_value_style(ACCENT_RED).with_sidedness(Sidedness::BackOnly),
-            ));
-            builder.text((
-                "BothSides",
-                material_value_style(ACCENT_RED).with_sidedness(Sidedness::BothSides),
-            ));
+            builder.text(("FrontOnly", material_value_style(ACCENT_RED)));
         },
     );
 }

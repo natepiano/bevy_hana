@@ -20,7 +20,6 @@ use bevy::window::WindowRef;
 use super::DiegeticPanel;
 use crate::layout;
 use crate::layout::Dimension;
-use crate::layout::LayoutTree;
 use crate::layout::ShadowCasting;
 use crate::layout::Sizing;
 
@@ -171,11 +170,9 @@ impl From<&CoordinateSpace> for PanelSpace {
     }
 }
 
-pub(crate) fn constrain_fit_width(
-    panel: &mut DiegeticPanel,
-    blueprint: &LayoutTree,
-    max_width: f32,
-) {
+/// Refits `panel` and its tree's root to at most `max_width` layout units.
+/// Only the width changes: the tree keeps everything else it was built with.
+pub(crate) fn constrain_fit_width(panel: &mut DiegeticPanel, max_width: f32) {
     let unit = panel.layout_unit();
     let min = Dimension {
         value: 0.0,
@@ -190,7 +187,7 @@ pub(crate) fn constrain_fit_width(
             *width = Sizing::Fit { min, max };
         },
     }
-    let mut tree = blueprint.clone();
+    let mut tree = panel.tree().clone();
     layout::set_root_fit_width(&mut tree, min, max);
     panel.replace_tree_full_rebuild(tree);
 }
@@ -200,7 +197,7 @@ pub(crate) fn constrain_fit_width(
 /// In-place conversions re-insert `PanelSpace` at their apply points; this
 /// observer covers initial insertion and whole-component replacement.
 pub(super) fn sync_panel_space_on_insert(
-    inserted: On<Insert, DiegeticPanel>,
+    inserted: On<Insert<DiegeticPanel>>,
     panels: Query<&DiegeticPanel>,
     mut commands: Commands,
 ) {

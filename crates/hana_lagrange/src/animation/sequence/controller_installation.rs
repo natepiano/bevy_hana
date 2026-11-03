@@ -189,7 +189,7 @@ pub(in crate::animation) fn initialize_camera_controllers(
 /// Assigns a fresh identity whenever an `OrbitCam` value is inserted or
 /// replaced. In-place controller evaluation does not trigger this observer.
 pub(in crate::animation) fn identify_orbit_controller_installation(
-    inserted: On<Insert, OrbitCam>,
+    inserted: On<Insert<OrbitCam>>,
     mut commands: Commands,
     mut identities: ResMut<CameraControllerInstallationIdentityAllocator>,
 ) {
@@ -203,7 +203,7 @@ pub(in crate::animation) fn identify_orbit_controller_installation(
 /// Assigns a fresh identity whenever a `FreeCam` value is inserted or
 /// replaced. In-place controller evaluation does not trigger this observer.
 pub(in crate::animation) fn identify_free_flight_controller_installation(
-    inserted: On<Insert, FreeCam>,
+    inserted: On<Insert<FreeCam>>,
     mut commands: Commands,
     mut identities: ResMut<CameraControllerInstallationIdentityAllocator>,
 ) {

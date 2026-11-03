@@ -10,15 +10,12 @@
   window-system geometry, talk to winit — and hands the rest to the kernel:
   telling one physical display from another, tying a window to one, and deciding
   what happens when that display comes back.
-- `MonitorDescriptor` carries the geometry and window-system data for one live
-  monitor. `MonitorDeviceAssociation` is the Clerestory-owned table that ties
-  live monitors to the identifiers the kernel issued for them, so Clerestory and
-  the kernel always agree on which display is which.
-- `MonitorDeviceKeyLookup` finds the kernel's identifier for a live monitor. When
-  it has no answer it returns nothing: it never infers a display's identity from
-  its geometry, its position in the list, or whether it is the primary, because
-  tying a window to a position in a list would hand that window to whichever
-  display later occupies it.
+- `MonitorDescriptor` carries one live monitor's geometry and window-system
+  data. `LiveDisplayEndpoint`, `LiveDisplayMonitor` and `LiveDisplayDevices`
+  relate that monitor to the kernel device entity.
+- `LiveDisplayEndpointLookup` resolves a live kernel device key from an exact
+  descriptor or non-anonymous legacy identity, and reports no match or several
+  matches instead of selecting a fallback.
 - `DisplayProductName` reports the name the operating system shows the user for
   a display. It is for showing the user, and must never be used to tell one
   display from another.
@@ -77,8 +74,8 @@
 
   `ManagedWindowName` requires `ManagedWindow`, so spawning the name alone is
   enough to put a window under Clerestory. Save-file role keys are unchanged: `window:primary` for
-  the primary window and `window:managed:<name>` for a secondary. Existing
-  state files keep loading.
+  the primary window and `window:managed:<name>` for a secondary. Existing v5
+  and v6 state files keep loading.
 
 - **Breaking:** `WindowRestored` and `WindowRestoreMismatch` keep their names
   but not their fields. Their position fields are the four types above instead of
@@ -104,12 +101,11 @@
   `ConfiguredWindowManagerPlugin` instead of `impl Plugin`. Existing callers can
   still box the result as `Box<dyn Plugin>` or return it from
   `fn make() -> impl Plugin`.
-- The saved window-state file moves to v5, which records the display a window
-  was on using the kernel's identifier for it. A window saved by v4 that the
-  kernel has not yet matched to a live display keeps its old evidence until it
-  can be matched. Files written by the old single-window format and by v1
-  through v4 still load and are converted forward, so existing saved state
-  survives the upgrade; a file written by this version cannot be read by 0.3.0.
+- The saved window-state file moves to v6, which records the display a window
+  was on using the kernel's identifier for it, and each window's binding policy.
+  A v5 file still loads. A window whose saved record holds display evidence the
+  kernel has not yet matched to a live display keeps that evidence until it can
+  be matched. A file written by this version cannot be read by 0.3.0 or 0.3.1.
 - The sequence dependency is now
   [`hana_kana`](https://crates.io/crates/hana_kana) rather than `bevy_kana`,
   whose final release under the old name was 0.3.1.
@@ -126,12 +122,17 @@
   `ReapplyConfiguration` aimed at the window, and `CancelWindowRecovery` to
   `RetireRole`. These replacements belong to `hana_rigging`; a consumer that
   uses them directly must depend on `hana_rigging` too.
-- **Breaking:** `MonitorId`, `MonitorIdentity`, and `MonitorInfo`, replaced by
-  `MonitorDescriptor` plus the two lookups above. `MonitorConnected` and
-  `MonitorDisconnected` are gone with them — displays appearing and
-  disappearing now reach applications through the kernel rather than through
-  Clerestory events.
+- **Breaking:** `MonitorId`, `MonitorIdentity`, and `MonitorInfo` are replaced
+  by `MonitorDescriptor` and live display endpoint relationships and lookups.
+  `MonitorConnected` and `MonitorDisconnected` are no longer public;
+  applications observe display discovery through the kernel.
 - **Breaking:** `WindowKey`. Windows are identified by the kernel's `RoleKey`.
+- **Breaking:** saved window-state files older than v5 are no longer read: v1
+  through v4, and the unversioned single-window format. Every released version
+  wrote one of these; 0.3.0 and 0.3.1 wrote v3. Such a file is copied to
+  `windows.ron.bak.v<N>` (an unversioned file to `windows.ron.bak.corrupt`), a
+  warning is logged, and the application starts with no saved window placement.
+  The next save replaces the file with a v6 file.
 
 ### Fixed
 
@@ -142,13 +143,13 @@
   unplugged while the application runs: a window with no marker settles on the
   display it landed on, while `RecoverOnReturn` and `RecoverOnRequest` keep the
   one that left.
-- Moving a window onto a surviving display no longer cancels its pending
-  return. The window still goes back when its display returns, or when the
-  application asks for it with `ReapplyConfiguration`.
-- Destroying a window, or removing its `PrimaryWindow` or `ManagedWindow`
-  component, no longer gives up on it. Its saved placement and its pending
-  return survive, and attach to a window spawned in its place. Only `RetireRole`
-  ends a window's recovery for good.
+- Automatic fallback placement preserves a window's pending display return. A
+  subsequent user move adopts the surviving display as its new binding target,
+  so that window no longer returns to the departed display.
+- A window opted into return recovery keeps its role and pending return when its
+  entity or management marker is removed, and a replacement window can reattach.
+  A window with Forget policy is retired automatically; saved-file retention
+  follows ManagedWindowPersistence.
 - A rejected entry in the saved file whose key still decodes now names the
   window in the warning and says that window will open at its default position.
 - A restore that landed somewhere other than where it was aimed — macOS pulling
@@ -178,21 +179,13 @@
   its saved display again. winit reports a window's display before the window
   manager has placed it, and the corrected report that follows was taken as the
   user moving the window, which replaced the saved placement with the launch
-  position. A window from an older file that names no display now takes the
+  position. A saved window that names no display now takes the
   display the window manager places it on and keeps its saved size and
-  position there, unless it is a v1 or v2 window whose saved position lies on a
-  display, which keeps that display.
-- A v5 or older saved file that lists a window the application has not opened
+  position there.
+- A v5 saved file that lists a window the application has not opened
   yet is saved again. Until that window opens, its entry is written without a
   `policy`, which is read from the window's recovery markers when it does.
   Before, every save failed and logged a warning each frame.
-- A window from a v1 or v2 file is restored to its saved position again. Those
-  files store a desktop position and no display, and that position was never
-  converted onto a display, so the window opened wherever the operating system
-  put it. The display that contains the window's saved center now becomes the
-  window's display, and the window is restored to its saved position there. A
-  saved position that lies on no display is dropped, and the window stays on the
-  display the operating system opened it on.
 
 ## [0.3.0] - 2026-07-30
 

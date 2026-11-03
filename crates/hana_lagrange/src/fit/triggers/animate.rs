@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use bevy::math::curve::easing::EaseFunction;
+use bevy::curve::easing::EaseFunction;
 use bevy::prelude::Assets;
 use bevy::prelude::Camera;
 use bevy::prelude::Children;
@@ -10,7 +10,6 @@ use bevy::prelude::Entity;
 use bevy::prelude::EntityEvent;
 use bevy::prelude::GlobalTransform;
 use bevy::prelude::Mesh;
-use bevy::prelude::Mesh3d;
 use bevy::prelude::On;
 use bevy::prelude::Projection;
 use bevy::prelude::Query;
@@ -33,11 +32,14 @@ use crate::animation::AnimationSource;
 use crate::animation::CameraMove;
 use crate::animation::FreeCamRollTarget;
 use crate::animation::PlayAnimation;
+use crate::fit::FitBoundsSource;
 use crate::fit::constants::ANIMATE_TO_FIT_CONTEXT;
 use crate::fit::constants::DEFAULT_ANIMATE_TO_FIT_PITCH;
 use crate::fit::constants::DEFAULT_ANIMATE_TO_FIT_YAW;
 use crate::fit::constants::DEFAULT_FIT_MARGIN;
 use crate::fit::geometry::FitAnchor;
+use crate::fit::geometry::FitMeshQuery;
+use crate::fit::geometry::FitViewportInsets;
 use crate::free_cam::FreeCam;
 use crate::operation::Focus;
 use crate::operation::OrbitAngles;
@@ -64,6 +66,9 @@ pub struct AnimateToFit {
     pub(crate) anchor:    FitAnchor,
     /// Pixel offset from the selected anchor, using positive x right and positive y down.
     pub(crate) offset_px: Vec2,
+    /// Window space the fit keeps the target out of.
+    #[reflect(default)]
+    viewport_insets:      FitViewportInsets,
     /// Animation duration (`ZERO` for instant).
     pub(crate) duration:  Duration,
     /// Easing curve for the animation.
@@ -82,6 +87,7 @@ impl AnimateToFit {
             margin: DEFAULT_FIT_MARGIN,
             anchor: FitAnchor::Center,
             offset_px: Vec2::ZERO,
+            viewport_insets: FitViewportInsets::NONE,
             duration: Duration::ZERO,
             easing: EaseFunction::CubicOut,
         }
@@ -125,6 +131,15 @@ impl AnimateToFit {
         self
     }
 
+    /// Reserves window space the fit keeps the target out of, such as the
+    /// area overlay panels cover. The margin and pixel offset then apply to
+    /// the region that remains.
+    #[must_use]
+    pub const fn viewport_insets(mut self, viewport_insets: FitViewportInsets) -> Self {
+        self.viewport_insets = viewport_insets;
+        self
+    }
+
     /// Sets the animation duration.
     #[must_use]
     pub const fn duration(mut self, duration: Duration) -> Self {
@@ -149,7 +164,7 @@ pub(crate) fn on_animate_to_fit(
     orbit_cameras: Query<(), With<OrbitCam>>,
     free_cameras: Query<(), With<FreeCam>>,
     camera_bases: Query<(), With<CameraBasis>>,
-    mesh_query: Query<&Mesh3d>,
+    mesh_query: FitMeshQuery,
     children_query: Query<&Children>,
     global_transform_query: Query<&GlobalTransform>,
     meshes: Res<Assets<Mesh>>,
@@ -184,7 +199,7 @@ fn prepare_animate_to_fit(
     orbit_cameras: &Query<(), With<OrbitCam>>,
     free_cameras: &Query<(), With<FreeCam>>,
     camera_bases: &Query<(), With<CameraBasis>>,
-    mesh_query: &Query<&Mesh3d>,
+    mesh_query: &FitMeshQuery,
     children_query: &Query<&Children>,
     global_transform_query: &Query<&GlobalTransform>,
     meshes: &Assets<Mesh>,
@@ -198,6 +213,7 @@ fn prepare_animate_to_fit(
     let easing = event.easing;
     let anchor = event.anchor;
     let offset_px = event.offset_px;
+    let viewport_insets = event.viewport_insets;
     let camera_component = cameras.get(camera).map_err(|_| {
         request::request_preparation_rejection(CameraRequestPreparationError::MissingCamera)
     })?;
@@ -216,12 +232,14 @@ fn prepare_animate_to_fit(
     let fit = request::prepare_fit_for_target(
         &FitRequest {
             context: ANIMATE_TO_FIT_CONTEXT,
+            bounds: &FitBoundsSource::MeasureTarget,
             target,
             yaw,
             pitch,
             margin,
             anchor,
             offset_px,
+            viewport_insets,
             projection,
             camera: camera_component,
         },
@@ -250,6 +268,7 @@ mod tests {
 
     use bevy::prelude::App;
     use bevy::prelude::Cuboid;
+    use bevy::prelude::Mesh3d;
     use bevy::prelude::MinimalPlugins;
     use bevy::prelude::OrthographicProjection;
     use bevy::prelude::PerspectiveProjection;

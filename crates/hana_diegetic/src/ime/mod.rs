@@ -12,20 +12,26 @@ mod field;
 mod ids;
 mod input;
 mod lease;
+mod pointer;
 mod session;
 mod target;
+mod value_drag;
 
+pub use activation::ImeFieldAuthoringLock;
 use bevy::input::keyboard::KeyboardInput;
+use bevy::picking::PickingSystems;
 use bevy::prelude::App;
 use bevy::prelude::ButtonInput;
 use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::KeyCode;
 use bevy::prelude::Plugin;
+use bevy::prelude::PreUpdate;
 use bevy::prelude::SystemSet;
 use bevy::prelude::Update;
 use bevy::window::Ime;
 use bevy::window::WindowClosed;
 use bevy::window::WindowFocused;
+use bevy_enhanced_input::EnhancedInputSystems;
 pub use buffer::ImeBufferBoundary;
 pub use buffer::ImeBufferRange;
 pub use buffer::ImeBufferSnapshot;
@@ -55,6 +61,7 @@ pub use events::ImeValidationRejected;
 pub use events::ImeVerticalArrow;
 pub use events::ImeVerticalArrowPressed;
 pub use field::ImeAppOwnedFieldSpec;
+pub use field::ImeAuthoredFieldText;
 pub use field::ImeBuiltInApplied;
 pub use field::ImeBuiltInFieldKind;
 pub use field::ImeBuiltInFieldSpec;
@@ -72,14 +79,18 @@ use input::ImeInputFrame;
 use input::ImeWindowState;
 use input::PendingImeTraversal;
 pub use lease::ImeInputBlocker;
+use pointer::FieldSelectionDrag;
 use session::ActiveImeSession;
 pub use session::ImeCommitAuthority;
 pub use session::ImeCommitAuthorityToken;
+pub use session::ImeInsertText;
 pub use session::ImeOpenSession;
 pub use session::ImeRequestCancel;
 pub use session::ImeRequestCommit;
 pub use target::ImeSessionAnchor;
 pub use target::ImeTarget;
+pub use value_drag::ImeNumberFieldDrag;
+pub(crate) use value_drag::ImeValueDragging;
 
 use crate::PanelSystems;
 
@@ -90,6 +101,8 @@ pub(crate) struct ImePlugin;
 #[derive(SystemSet, Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ImeSystemSet {
     /// Point where input blockers are ready for same-frame input consumers.
+    /// In `PreUpdate`, pointer blur completes after picking and before keyboard routing.
+    /// In `Update`, semantic input starts from the published session state.
     PublishInputBlockers,
     /// Point where `Window::ime_enabled` is updated.
     UpdateWindowIme,
@@ -105,6 +118,7 @@ pub enum ImeSystemSet {
 
 impl Plugin for ImePlugin {
     fn build(&self, app: &mut App) {
+        value_drag::install(app);
         app.add_message::<Ime>()
             .add_message::<KeyboardInput>()
             .add_message::<WindowClosed>()
@@ -132,11 +146,18 @@ impl Plugin for ImePlugin {
                 )
                     .chain(),
             )
-            .add_observer(activation::observe_panel_clicks)
+            .init_resource::<FieldSelectionDrag>()
+            .add_observer(pointer::click)
+            .add_observer(pointer::press)
+            .add_observer(pointer::start_drag)
+            .add_observer(pointer::drag)
+            .add_observer(pointer::end_drag)
+            .add_observer(pointer::cancel_drag)
             .add_observer(activation::open_from_semantic_activation)
-            .add_observer(editor::observe_panel_clicks)
             .add_observer(editor::classify_non_panel_click)
             .add_observer(session::open_session)
+            .add_observer(activation::cancel_locked_session)
+            .add_observer(session::insert_text)
             .add_observer(session::request_commit)
             .add_observer(session::request_cancel)
             .add_observer(session::accept_commit)
@@ -150,6 +171,13 @@ impl Plugin for ImePlugin {
             .add_observer(editor::update_editor_validation)
             .add_observer(editor::close_editor_on_cancel)
             .add_observer(editor::close_editor_on_apply)
+            .add_systems(
+                PreUpdate,
+                editor::handle_blur_intent
+                    .in_set(ImeSystemSet::PublishInputBlockers)
+                    .after(PickingSystems::Last)
+                    .before(EnhancedInputSystems::Prepare),
+            )
             .add_systems(
                 Update,
                 input::clear_frame_input.in_set(ImeSystemSet::PublishInputBlockers),

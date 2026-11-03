@@ -1,0 +1,23 @@
+[package]
+authors.workspace    = true
+categories.workspace = true
+description          = "Low cost per-frame main and render timing for Hana"
+edition.workspace    = true
+keywords.workspace   = true
+license.workspace    = true
+name                 = "hana_metrics"
+publish              = false
+readme.workspace     = true
+repository.workspace = true
+version.workspace    = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bevy_app.workspace        = true
+bevy_diagnostic.workspace = true
+bevy_ecs.workspace        = true
+bevy_reflect.workspace    = true
+bevy_render.workspace     = true
+bevy_state.workspace      = true

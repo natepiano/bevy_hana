@@ -1,4 +1,4 @@
-//! Anchor-point relationships for animatable Bevy assemblies.
+//! Anchor-point relationships for animatable groups of entities.
 //!
 //! `hana_valence` lets authored geometry expose validated local anchor frames and edges,
 //! then connects entities by component data. The contract is
@@ -40,8 +40,8 @@
 //! The hinge driver derives the current [`AnchorPose`] from the
 //! [`EasedFoldFraction`] that [`FoldSequencePlayback`] resolved for that member
 //! in `Update`, or from the base endpoint when no sequence stages it. A fold
-//! recipe such as [`Accordion`], [`Coil`], or [`Wrap`] replaces the folded
-//! endpoint of every selected member at once through
+//! recipe such as [`Accordion`], [`Coil`], [`Wrap`], or [`StripFold`] replaces
+//! the folded endpoint of every selected member at once through
 //! [`ArrangementCommandsExt::apply_fold_recipe`].
 //!
 //! Because the angle is derived in `PostUpdate` from the live [`Hinge`],
@@ -173,6 +173,7 @@ pub use fold::FoldSegmentProgress;
 pub use fold::FoldSequence;
 pub use fold::FoldSequenceBuilder;
 pub use fold::FoldSequencePlayback;
+pub use fold::FoldStackPivotClearance;
 pub use fold::FoldStage;
 pub use fold::FoldStageBegin;
 pub use fold::FoldStageEnd;
@@ -181,6 +182,8 @@ pub use fold::FoldTarget;
 pub use fold::FoldTiming;
 pub use fold::NoCapability;
 pub use fold::ProviderCapability;
+pub use fold::StripFold;
+pub use fold::StripFoldError;
 pub use fold::WindingClearance;
 pub use fold::Wrap;
 pub use fold::evaluate_fold_angle;
@@ -235,6 +238,9 @@ pub use hinge::HingePoseReported;
 pub use pose::AnchorPose;
 pub use pose::AnchorSystems;
 pub use pose::ResolvedAnchorWorld;
+pub use providers::CellFoldGroupSelection;
+pub use providers::CellSheet;
+pub use providers::CellSheetError;
 pub use providers::QuadCell;
 pub use providers::QuadFoldGroupSelection;
 pub use providers::QuadSheet;
@@ -248,4 +254,5 @@ pub use relation::ResolvedAnchorOffset;
 pub use resolve::AnchorResolveDiagnostics;
 pub use resolve::AnchorResolveSkip;
 pub use resolve::AnchorResolverScratch;
+pub use resolve::local_transform_for_parent;
 pub use resolve::resolve_anchors;

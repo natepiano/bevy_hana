@@ -13,6 +13,7 @@ use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
+use std::sync::Arc;
 
 use bevy::asset::Handle;
 use bevy::color::Color;
@@ -28,6 +29,7 @@ use super::CornerRadius;
 use super::Dimension;
 use super::DrawZIndex;
 use super::LayoutResult;
+use super::MeasureTextFn;
 use super::Padding;
 use super::PanelDraw;
 use super::ShadowCasting;
@@ -35,11 +37,14 @@ use super::Sizing;
 use super::TextMeasure;
 use super::TextSizing;
 use super::TextStyle;
+use super::TextWrap;
 use super::Unit;
 use super::builder::EditorPart;
+use super::builder::TooltipBodyStyleOrigins;
 use super::child_layout::ChildLayout;
 use super::constants::INLINE_CHILDREN;
 use super::engine;
+use crate::Icon;
 use crate::ImePanelField;
 use crate::PanelBuildError;
 use crate::PanelElementId;
@@ -52,8 +57,10 @@ use crate::widgets::ComputedVisualSlot;
 use crate::widgets::ComputedWidgetRecord;
 use crate::widgets::StateAppearance;
 use crate::widgets::Tooltip;
+use crate::widgets::TooltipBoundary;
 use crate::widgets::VisualElementCapabilities;
 use crate::widgets::VisualSlotId;
+use crate::widgets::WidgetHitArea;
 use crate::widgets::WidgetInteractivity;
 use crate::widgets::WidgetKind;
 use crate::widgets::WidgetSpec;
@@ -84,9 +91,52 @@ pub(super) enum ChildOverflow {
     Scrolled,
 }
 
+/// Who supplies a scrolling element's offset.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ScrollDrive {
+    #[default]
+    Author,
+    Library(ScrollRestEdge),
+}
+
+/// Edge shown before a scroll view is used, and whenever its content fits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScrollRestEdge {
+    /// Open at the first row.
+    #[default]
+    Start,
+    /// Open at the last row and follow arriving content.
+    End,
+}
+
 impl ChildOverflow {
     /// Whether children are clipped to the element's content box.
     pub(super) const fn clips(self) -> bool { matches!(self, Self::Clipped | Self::Scrolled) }
+}
+
+/// Whether an element bounds where its descendants' tooltips slide.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum TooltipBoundaryRole {
+    /// Set by [`El::tooltip_boundary`](crate::El::tooltip_boundary): tooltips of
+    /// widgets inside slide to stay within this element first.
+    Boundary,
+    /// The element passes its nearest marked ancestor through to its descendants.
+    #[default]
+    PassThrough,
+}
+
+impl TooltipBoundaryRole {
+    /// The boundary an element with this role and `bounds` passes to its children.
+    const fn for_children(
+        self,
+        bounds: BoundingBox,
+        inherited: TooltipBoundary,
+    ) -> TooltipBoundary {
+        match self {
+            Self::Boundary => TooltipBoundary::Element(bounds),
+            Self::PassThrough => inherited,
+        }
+    }
 }
 
 /// Which edge [`Element::scroll_offset`] measures from. `Start` is an absolute
@@ -168,78 +218,89 @@ pub(crate) enum PrecomposeMode {
 #[derive(Clone, Debug)]
 pub(super) struct Element {
     /// Optional panel-local identity for this layout element.
-    pub(super) id:                Option<PanelElementId>,
+    pub(super) id:                      Option<PanelElementId>,
     /// Width sizing rule.
-    pub(super) width:             Sizing,
+    pub(super) width:                   Sizing,
     /// Height sizing rule.
-    pub(super) height:            Sizing,
+    pub(super) height:                  Sizing,
     /// Interior padding.
-    pub(super) padding:           Padding,
+    pub(super) padding:                 Padding,
     /// Child layout mode, spacing, and alignment.
-    pub(super) child_layout:      ChildLayout,
+    pub(super) child_layout:            ChildLayout,
     /// Optional background color.
-    pub(super) background:        Option<Color>,
+    pub(super) background:              Option<Color>,
     /// Optional border.
-    pub(super) border:            Option<Border>,
+    pub(super) border:                  Option<Border>,
     /// Corner radius for rounded backgrounds and borders.
-    pub(super) corner_radius:     CornerRadius,
+    pub(super) corner_radius:           CornerRadius,
     /// Whether overflowing children are clipped to this element's content box.
-    pub(super) overflow:          ChildOverflow,
+    pub(super) overflow:                ChildOverflow,
+    /// Who supplies this element's scrolling offset.
+    pub(super) scroll_drive:            ScrollDrive,
+    /// Total leading content the author removed, in layout units; library views only.
+    pub(super) scroll_content_origin_y: f32,
     /// Scroll offset (logical px) subtracted from child positions when this
     /// element clips. Clamped during positioning to `[0, content - viewport]`
     /// per axis. Interpreted relative to each axis' scroll anchor.
-    pub(super) scroll_offset:     Vec2,
+    pub(super) scroll_offset:           Vec2,
     /// Which horizontal edge `scroll_offset.x` measures from.
-    pub(super) scroll_anchor_x:   ScrollAnchor,
+    pub(super) scroll_anchor_x:         ScrollAnchor,
     /// Which vertical edge `scroll_offset.y` measures from.
-    pub(super) scroll_anchor_y:   ScrollAnchor,
+    pub(super) scroll_anchor_y:         ScrollAnchor,
     /// Text line this element moves by when it scrolls.
-    pub(super) scroll_line:       ScrollLine,
+    pub(super) scroll_line:             ScrollLine,
+    /// Follow the marked editor caret using the previous solved horizontal offset.
+    pub(super) caret_follow:            bool,
+    /// This editor element locates the caret for its enclosing field.
+    pub(super) caret_marker:            bool,
     /// Authored PBR source-material handle for this element's surfaces.
     ///
     /// When overridden, render systems use this over the panel material handle
     /// and global material cascade defaults.
     /// `base_color` is overridden by layout or primitive color when both are set.
-    pub(super) material:          Cascade<Handle<StandardMaterial>>,
+    pub(super) material:                Cascade<Handle<StandardMaterial>>,
     /// Authored widget interactivity for this layout scope.
-    pub(super) interactivity:     Cascade<WidgetInteractivity>,
+    pub(super) interactivity:           Cascade<WidgetInteractivity>,
     /// Optional editable field contract.
-    pub(super) editable:          Option<ImePanelField>,
+    pub(super) editable:                Option<ImePanelField>,
     /// Optional authored widget contract.
-    pub(super) widget:            Option<WidgetSpec>,
+    pub(super) widget:                  Option<WidgetSpec>,
     /// Optional per-state appearance for this widget element's root visual
     /// slot. Boxed so an ordinary element pays one pointer rather than four
     /// appearance layers.
-    pub(super) appearance:        Option<Box<StateAppearance>>,
+    pub(super) appearance:              Option<Box<StateAppearance>>,
     /// Whether the editor created this element at runtime rather than from the
     /// panel's authored tree.
-    pub(super) editor_origin:     EditorElementOrigin,
+    pub(super) editor_origin:           EditorElementOrigin,
     /// Authored declaration for generated committed and preedit text runs.
-    pub(super) editor_text:       Option<Box<EditorPart>>,
+    pub(super) editor_text:             Option<Box<EditorPart>>,
     /// Authored declaration for the generated selection highlight box.
-    pub(super) editor_selection:  Option<Box<EditorPart>>,
+    pub(super) editor_selection:        Option<Box<EditorPart>>,
     /// Authored declaration for the generated caret box.
-    pub(super) editor_caret:      Option<Box<EditorPart>>,
+    pub(super) editor_caret:            Option<Box<EditorPart>>,
     /// Authored declaration for the generated validation message run.
-    pub(super) editor_validation: Option<Box<EditorPart>>,
+    pub(super) editor_validation:       Option<Box<EditorPart>>,
     /// Optional tooltip declaration associated with this widget.
-    pub(super) tooltip:           Option<Tooltip>,
+    pub(super) tooltip:                 Option<Tooltip>,
     /// Optional stable visual-slot id for widget-owned retained records.
-    pub(super) visual_slot:       Option<VisualSlotId>,
+    pub(super) visual_slot:             Option<VisualSlotId>,
+    pub(super) dim_with_widget:         Option<PanelElementId>,
+    /// Whether this element bounds its descendants' tooltips.
+    pub(super) tooltip_boundary:        TooltipBoundaryRole,
     /// Optional paint-only draw data.
-    pub(super) draw:              Option<PanelDraw>,
+    pub(super) draw:                    Option<PanelDraw>,
     /// `DrawZIndex` stamped onto this element's render commands.
-    pub(super) z_index:           DrawZIndex,
+    pub(super) z_index:                 DrawZIndex,
     /// Authored anti-alias mode for this element's analytic line marks.
-    pub(super) anti_alias:        Cascade<AntiAlias>,
+    pub(super) anti_alias:              Cascade<AntiAlias>,
     /// Authored hairline fade policy for this element's analytic line marks.
-    pub(super) hairline_fade:     Cascade<HairlineFade>,
+    pub(super) hairline_fade:           Cascade<HairlineFade>,
     /// Authored shadow-casting policy for this element and its render commands.
-    pub(super) shadow_casting:    Cascade<ShadowCasting>,
+    pub(super) shadow_casting:          Cascade<ShadowCasting>,
     /// Optional subtree precomposition mode.
-    pub(super) precompose:        PrecomposeMode,
+    pub(super) precompose:              PrecomposeMode,
     /// Content of this element.
-    pub(super) content:           ElementContent,
+    pub(super) content:                 ElementContent,
 }
 
 /// Distinguishes authored layout elements from editor-generated elements.
@@ -266,6 +327,8 @@ pub(super) enum ElementContent {
         /// Sizing and wrapping policy.
         sizing: TextSizing,
     },
+    /// A fixed-square Lucide glyph drawn through the text renderer.
+    Icon(Icon),
     /// Image leaf — rendered as a textured quad.
     Image {
         /// Handle to the image asset.
@@ -275,6 +338,8 @@ pub(super) enum ElementContent {
     },
     /// Empty (no children, no text).
     Empty,
+    /// One resolved read-only rich paragraph.
+    RichText(Arc<super::RichParagraph>),
 }
 
 /// Classifies the difference between two layout trees.
@@ -289,6 +354,15 @@ pub enum LayoutTreeChange {
     LayoutAffecting = 2,
 }
 
+/// Result of overriding one widget's authored interactivity in a layout tree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WidgetInteractivityOverrideOutcome {
+    /// The widget's authored interactivity was overridden.
+    Applied,
+    /// The tree declares no widget with the requested id.
+    NoWidgetWithId,
+}
+
 impl LayoutTreeChange {
     pub(crate) fn combine(self, other: Self) -> Self { self.max(other) }
 }
@@ -296,43 +370,60 @@ impl LayoutTreeChange {
 impl Default for Element {
     fn default() -> Self {
         Self {
-            id:                None,
-            width:             Sizing::FIT,
-            height:            Sizing::FIT,
-            padding:           Padding::default(),
-            child_layout:      ChildLayout::default(),
-            background:        None,
-            border:            None,
-            corner_radius:     CornerRadius::ZERO,
-            overflow:          ChildOverflow::Visible,
-            scroll_offset:     Vec2::ZERO,
-            scroll_anchor_x:   ScrollAnchor::Start,
-            scroll_anchor_y:   ScrollAnchor::Start,
-            scroll_line:       ScrollLine::PanelDefaultFont,
-            material:          Cascade::Inherit,
-            interactivity:     Cascade::Inherit,
-            editable:          None,
-            widget:            None,
-            appearance:        None,
-            editor_origin:     EditorElementOrigin::Authored,
-            editor_text:       None,
-            editor_selection:  None,
-            editor_caret:      None,
-            editor_validation: None,
-            tooltip:           None,
-            visual_slot:       None,
-            draw:              None,
-            z_index:           DrawZIndex::default(),
-            anti_alias:        Cascade::Inherit,
-            hairline_fade:     Cascade::Inherit,
-            shadow_casting:    Cascade::Inherit,
-            precompose:        PrecomposeMode::Direct,
-            content:           ElementContent::Empty,
+            id:                      None,
+            width:                   Sizing::FIT,
+            height:                  Sizing::FIT,
+            padding:                 Padding::default(),
+            child_layout:            ChildLayout::default(),
+            background:              None,
+            border:                  None,
+            corner_radius:           CornerRadius::ZERO,
+            overflow:                ChildOverflow::Visible,
+            scroll_drive:            ScrollDrive::Author,
+            scroll_content_origin_y: 0.0,
+            scroll_offset:           Vec2::ZERO,
+            scroll_anchor_x:         ScrollAnchor::Start,
+            scroll_anchor_y:         ScrollAnchor::Start,
+            scroll_line:             ScrollLine::PanelDefaultFont,
+            caret_follow:            false,
+            caret_marker:            false,
+            material:                Cascade::Inherit,
+            interactivity:           Cascade::Inherit,
+            editable:                None,
+            widget:                  None,
+            appearance:              None,
+            editor_origin:           EditorElementOrigin::Authored,
+            editor_text:             None,
+            editor_selection:        None,
+            editor_caret:            None,
+            editor_validation:       None,
+            tooltip:                 None,
+            visual_slot:             None,
+            dim_with_widget:         None,
+            tooltip_boundary:        TooltipBoundaryRole::PassThrough,
+            draw:                    None,
+            z_index:                 DrawZIndex::default(),
+            anti_alias:              Cascade::Inherit,
+            hairline_fade:           Cascade::Inherit,
+            shadow_casting:          Cascade::Inherit,
+            precompose:              PrecomposeMode::Direct,
+            content:                 ElementContent::Empty,
         }
     }
 }
 
 impl Element {
+    /// The clip this element, laid out at `bounds`, passes to its children.
+    fn child_widget_clip(&self, bounds: BoundingBox, inherited_clip: BoundingBox) -> BoundingBox {
+        if self.overflow.clips() {
+            inherited_clip
+                .intersect(&self.child_clip_bounds(bounds))
+                .unwrap_or_default()
+        } else {
+            inherited_clip
+        }
+    }
+
     pub(super) fn child_clip_bounds(&self, bounds: BoundingBox) -> BoundingBox {
         let top = self.border.as_ref().map_or(0.0, |border| border.top.value);
         let right = self
@@ -344,11 +435,23 @@ impl Element {
             .as_ref()
             .map_or(0.0, |border| border.bottom.value);
         let left = self.border.as_ref().map_or(0.0, |border| border.left.value);
-        BoundingBox {
+        let clip = BoundingBox {
             x:      bounds.x + left,
             y:      bounds.y + top,
             width:  (bounds.width - left - right).max(0.0),
             height: (bounds.height - top - bottom).max(0.0),
+        };
+        // Scrolling editors use the padded content box as their viewport.
+        // Keep their glyphs and caret inside it, including at fractional pixels.
+        if self.editable.is_some() && self.caret_follow {
+            BoundingBox {
+                x:      clip.x + self.padding.left.value,
+                y:      clip.y + self.padding.top.value,
+                width:  (clip.width - self.padding.horizontal()).max(0.0),
+                height: (clip.height - self.padding.vertical()).max(0.0),
+            }
+        } else {
+            clip
         }
     }
 }
@@ -360,12 +463,52 @@ impl Element {
 #[derive(Clone, Debug, Default)]
 pub struct LayoutTree {
     /// All elements in insertion order.
-    pub(super) elements: Vec<Element>,
+    pub(super) elements:                   Vec<Element>,
     /// Index of the root element.
-    pub(super) root:     Option<usize>,
+    pub(super) root:                       Option<usize>,
+    pub(super) tooltip_body_style_origins: TooltipBodyStyleOrigins,
+    /// Set only by rich authorship; fits the tree's existing alignment padding.
+    has_rich_text:                         bool,
+    /// Cached on insertion; shares the tree's existing alignment padding.
+    has_scroll_views:                      bool,
 }
 
 impl LayoutTree {
+    /// The root's authored sizing, before a panel builder applies its own sizing.
+    pub(crate) fn root_sizing(&self) -> (Sizing, Sizing) {
+        self.root
+            .and_then(|root| self.elements.get(root))
+            .map_or((Sizing::FIT, Sizing::FIT), |root| (root.width, root.height))
+    }
+
+    /// Measures the natural root height at a fixed width.
+    /// The caller supplies the same text measurer and font scale used by its panel.
+    #[must_use]
+    pub fn measured_height_at_width(
+        &self,
+        width: f32,
+        font_scale: f32,
+        measure_text: MeasureTextFn,
+    ) -> f32 {
+        let mut tree = self.clone();
+        tree.set_root_fit_height(
+            Dimension {
+                value: 0.0,
+                unit:  None,
+            },
+            Dimension {
+                value: f32::MAX,
+                unit:  None,
+            },
+        );
+        let result =
+            engine::LayoutEngine::new(measure_text).compute(&tree, width, f32::MAX, font_scale);
+        let Some(root) = result.computed.first() else {
+            return 0.0;
+        };
+        root.bounds.height
+    }
+
     /// Creates a new empty layout tree.
     #[must_use]
     pub fn new() -> Self { Self::default() }
@@ -377,17 +520,27 @@ impl LayoutTree {
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            elements: Vec::with_capacity(capacity),
-            root:     None,
+            elements:                   Vec::with_capacity(capacity),
+            root:                       None,
+            tooltip_body_style_origins: TooltipBodyStyleOrigins::default(),
+            has_rich_text:              false,
+            has_scroll_views:           false,
         }
     }
 
     /// Adds an element and returns its index.
     pub(super) fn add(&mut self, element: Element) -> usize {
         let index = self.elements.len();
+        self.has_scroll_views |= matches!(element.scroll_drive, ScrollDrive::Library(_));
         self.elements.push(element);
         index
     }
+
+    pub(super) const fn note_rich_text(&mut self) { self.has_rich_text = true; }
+
+    pub(crate) const fn contains_rich_text(&self) -> bool { self.has_rich_text }
+
+    pub(super) const fn contains_scroll_views(&self) -> bool { self.has_scroll_views }
 
     /// Adds an element as a child of the given parent.
     ///
@@ -403,7 +556,10 @@ impl LayoutTree {
                     parent_element.content =
                         ElementContent::Children(SmallVec::from_elem(child_index, 1));
                 },
-                ElementContent::Text { .. } | ElementContent::Image { .. } => {
+                ElementContent::Text { .. }
+                | ElementContent::RichText(_)
+                | ElementContent::Icon(_)
+                | ElementContent::Image { .. } => {
                     // Leaf elements cannot have children — this is a programming error.
                     // Release builds ignore it; debug builds catch it via the
                     // orphan check in layout computation.
@@ -494,7 +650,7 @@ impl LayoutTree {
 
     /// Child element indices of the element at `index`, in layout order; empty
     /// for a leaf or an index outside the tree. The indices address
-    /// [`LayoutResult::computed`].
+    /// `LayoutResult::computed`.
     #[must_use]
     pub fn children_of(&self, index: usize) -> &[usize] {
         self.elements
@@ -602,6 +758,12 @@ impl LayoutTree {
                 ElementContent::Text { .. } => {
                     1_u8.hash(&mut hasher);
                 },
+                ElementContent::RichText(_) => {
+                    5_u8.hash(&mut hasher);
+                },
+                ElementContent::Icon(_) => {
+                    4_u8.hash(&mut hasher);
+                },
                 ElementContent::Image { .. } => {
                     2_u8.hash(&mut hasher);
                 },
@@ -635,29 +797,43 @@ impl LayoutTree {
         index: usize,
     ) -> Option<PanelFieldPresentation> {
         let element = self.elements.get(index)?;
-        element.editable.as_ref()?;
-        let text_style = self
-            .first_text_descendant(index)
-            .and_then(|text_index| self.elements.get(text_index))
-            .and_then(|text_element| match &text_element.content {
-                ElementContent::Text { config, .. } => Some(config.clone()),
-                ElementContent::Children(_)
-                | ElementContent::Empty
-                | ElementContent::Image { .. } => None,
-            });
+        let field = element.editable.as_ref()?;
         Some(PanelFieldPresentation {
-            background: element.background,
-            border: element.border,
-            corner_radius: element.corner_radius,
-            padding: element.padding,
-            align_x: element.child_layout.align_x(),
-            align_y: element.child_layout.align_y(),
-            text_style,
-            editor_text: element.editor_text.as_deref().cloned(),
-            editor_selection: element.editor_selection.as_deref().cloned(),
-            editor_caret: element.editor_caret.as_deref().cloned(),
+            background:        element.background,
+            border:            element.border,
+            corner_radius:     element.corner_radius,
+            padding:           element.padding,
+            align_x:           element.child_layout.align_x(),
+            align_y:           element.child_layout.align_y(),
+            text_style:        field.text_style.clone(),
+            editor_text:       element.editor_text.as_deref().cloned(),
+            editor_selection:  element.editor_selection.as_deref().cloned(),
+            editor_caret:      element.editor_caret.as_deref().cloned(),
             editor_validation: element.editor_validation.as_deref().cloned(),
         })
+    }
+
+    /// Reads a field's authored presentation before panel-unit scaling.
+    pub(crate) fn editable_field_presentation_for(
+        &self,
+        field_id: &PanelElementId,
+    ) -> Option<PanelFieldPresentation> {
+        let mut matches = self
+            .elements
+            .iter()
+            .enumerate()
+            .filter_map(|(index, element)| {
+                element
+                    .editable
+                    .as_ref()
+                    .is_some_and(|field| field.field_id == *field_id)
+                    .then_some(index)
+            });
+        let index = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        self.editable_field_presentation(index)
     }
 
     /// Returns editable field metadata for the element at `index`, if any.
@@ -772,12 +948,35 @@ impl LayoutTree {
         true
     }
 
-    /// Returns the panel-local id of the element at `index`.
+    /// Returns the panel-local id of the element at `index`, using an editable
+    /// field's id when its layout element has no separate id.
     #[must_use]
-    pub(crate) fn element_id(&self, index: usize) -> Option<&PanelElementId> {
+    pub(crate) fn element_scroll_drive(&self, index: usize) -> ScrollDrive {
         self.elements
             .get(index)
-            .and_then(|element| element.id.as_ref())
+            .map_or(ScrollDrive::Author, |element| element.scroll_drive)
+    }
+
+    pub(crate) fn element_scroll_content_origin_y(&self, index: usize) -> f32 {
+        self.elements
+            .get(index)
+            .map_or(0.0, |element| element.scroll_content_origin_y)
+    }
+
+    pub(crate) fn scroll_content_origin_y(&self, id: &PanelElementId) -> f32 {
+        self.elements
+            .iter()
+            .find(|element| element.id.as_ref() == Some(id))
+            .map_or(0.0, |element| element.scroll_content_origin_y)
+    }
+
+    pub(crate) fn element_id(&self, index: usize) -> Option<&PanelElementId> {
+        self.elements.get(index).and_then(|element| {
+            element
+                .id
+                .as_ref()
+                .or_else(|| element.editable.as_ref().map(|field| &field.field_id))
+        })
     }
 
     pub(crate) fn widget_interactivity(
@@ -786,6 +985,19 @@ impl LayoutTree {
     ) -> Option<Cascade<WidgetInteractivity>> {
         self.widget_element_index(id)
             .map(|index| self.elements[index].interactivity)
+    }
+
+    /// Overrides the authored interactivity of the widget named by `id`.
+    pub fn override_widget_interactivity(
+        &mut self,
+        id: &PanelElementId,
+        value: WidgetInteractivity,
+    ) -> WidgetInteractivityOverrideOutcome {
+        if self.set_widget_interactivity(id, Cascade::Override(value)) {
+            WidgetInteractivityOverrideOutcome::Applied
+        } else {
+            WidgetInteractivityOverrideOutcome::NoWidgetWithId
+        }
     }
 
     pub(crate) fn set_widget_interactivity(
@@ -817,7 +1029,12 @@ impl LayoutTree {
     pub(crate) fn text_element_id(&self, index: usize) -> Option<&PanelElementId> {
         self.elements
             .get(index)
-            .filter(|element| matches!(element.content, ElementContent::Text { .. }))
+            .filter(|element| {
+                matches!(
+                    element.content,
+                    ElementContent::Text { .. } | ElementContent::RichText(_)
+                )
+            })
             .and_then(|element| element.id.as_ref())
     }
 
@@ -846,7 +1063,9 @@ impl LayoutTree {
     pub(crate) fn duplicate_named_element_id(&self) -> Option<&PanelElementId> {
         let mut seen: Vec<&PanelElementId> = Vec::new();
         for index in 0..self.elements.len() {
-            let element_id = self.element_id(index);
+            // Inspect the authored ids separately: element_id() also exposes a
+            // field id for layout records, which is not a second declaration.
+            let element_id = self.elements[index].id.as_ref();
             let field_id = self.editable_field(index).map(|field| &field.field_id);
             for id in [element_id, field_id].into_iter().flatten() {
                 if id.is_named() {
@@ -865,6 +1084,7 @@ impl LayoutTree {
             return Ok(());
         };
         let mut sliders_with_thumb = HashSet::new();
+        let mut sliders_with_fill = HashSet::new();
         let mut stack = vec![(
             root,
             Option::<(PanelElementId, WidgetKind)>::None,
@@ -893,6 +1113,20 @@ impl LayoutTree {
                 }
             }
 
+            if element.visual_slot == Some(VisualSlotId::SLIDER_FILL) {
+                if let Some((slider_id, WidgetKind::Slider)) = owning_widget.as_ref() {
+                    if !sliders_with_fill.insert(slider_id.clone()) {
+                        return Err(PanelBuildError::SliderHasMultipleFills(slider_id.clone()));
+                    }
+                } else {
+                    let fill_id = element
+                        .id
+                        .clone()
+                        .unwrap_or_else(|| PanelElementId::auto(u32::try_from(index).unwrap_or(0)));
+                    return Err(PanelBuildError::SliderFillOutsideSlider(fill_id));
+                }
+            }
+
             validate_part_state_colors(element, index, owning_widget.as_ref())?;
 
             let next_owning_widget =
@@ -916,10 +1150,24 @@ impl LayoutTree {
             return Vec::new();
         };
         let mut ranked_records = Vec::new();
-        let mut stack = vec![(root, Cascade::Inherit, root_layout.bounds, None::<usize>)];
+        let mut stack = vec![(
+            root,
+            Cascade::Inherit,
+            root_layout.bounds,
+            None::<usize>,
+            None::<PanelElementId>,
+            TooltipBoundary::PlacementAreaOnly,
+        )];
+        let mut linked_caption_elements = Vec::new();
         let mut preorder = 0;
-        while let Some((index, inherited_interactivity, inherited_clip, inherited_owner)) =
-            stack.pop()
+        while let Some((
+            index,
+            inherited_interactivity,
+            inherited_clip,
+            inherited_owner,
+            inherited_caption,
+            inherited_boundary,
+        )) = stack.pop()
         {
             let (Some(element), Some(computed)) =
                 (self.elements.get(index), result.computed.get(index))
@@ -930,20 +1178,9 @@ impl LayoutTree {
                 Cascade::Inherit => inherited_interactivity,
                 Cascade::Override(value) => Cascade::Override(value),
             };
-            let widget_declaration = element
-                .id
-                .as_ref()
-                .zip(element.widget.as_ref())
-                .map(|(id, widget)| (id.clone(), widget.clone()))
-                .or_else(|| {
-                    element.editable.as_ref().map(|field| {
-                        (
-                            field.field_id.clone(),
-                            WidgetSpec::EditableField(field.clone()),
-                        )
-                    })
-                });
+            let widget_declaration = widget_declaration(element);
             let is_widget_root = widget_declaration.is_some();
+            let dim_with_widget = element.dim_with_widget.clone().or(inherited_caption);
             let owning_record = if let Some((id, widget)) = widget_declaration {
                 ranked_records.push((
                     element.z_index,
@@ -954,7 +1191,8 @@ impl LayoutTree {
                         element.appearance.as_deref().cloned().unwrap_or_default(),
                         interactivity,
                         computed.bounds,
-                        computed.bounds.intersect(&inherited_clip),
+                        WidgetHitArea::within(computed.bounds, inherited_clip),
+                        inherited_boundary,
                     ),
                 ));
                 Some(ranked_records.len() - 1)
@@ -969,45 +1207,36 @@ impl LayoutTree {
                     is_widget_root,
                 );
             }
+            if owning_record.is_none()
+                && let Some(target) = &dim_with_widget
+                && !element_visual_capabilities(element).is_empty()
+            {
+                linked_caption_elements.push((index, target.clone()));
+            }
             if let (Some(slot), Some(record_index)) = (element.visual_slot, owning_record) {
-                let border_box = computed.bounds;
-                let content_box = engine::content_box_bounds(element, border_box);
-                ranked_records[record_index]
-                    .1
-                    .push_visual_slot(ComputedVisualSlot {
-                        slot,
-                        element_index: index,
-                        border_box,
-                        content_box,
-                    });
+                let slot = computed_visual_slot(element, index, slot, computed.bounds);
+                ranked_records[record_index].1.push_visual_slot(slot);
             }
             preorder += 1;
-            let child_clip = if element.overflow.clips() {
-                inherited_clip
-                    .intersect(&element.child_clip_bounds(computed.bounds))
-                    .unwrap_or_default()
-            } else {
-                inherited_clip
-            };
+            let child_clip = element.child_widget_clip(computed.bounds, inherited_clip);
+            let child_boundary = element
+                .tooltip_boundary
+                .for_children(computed.bounds, inherited_boundary);
             for &child in self.children_of(index).iter().rev() {
-                stack.push((child, interactivity, child_clip, owning_record));
+                stack.push((
+                    child,
+                    interactivity,
+                    child_clip,
+                    owning_record,
+                    dim_with_widget.clone(),
+                    child_boundary,
+                ));
             }
         }
 
-        let mut rank_order: Vec<usize> = (0..ranked_records.len()).collect();
-        rank_order.sort_by_key(|&index| {
-            let (z_index, record) = &ranked_records[index];
-            (*z_index, record.preorder())
-        });
-        for (interaction_rank, record_index) in rank_order.into_iter().enumerate() {
-            ranked_records[record_index]
-                .1
-                .set_interaction_rank(interaction_rank);
-        }
-        ranked_records
-            .into_iter()
-            .map(|(_, record)| record)
-            .collect()
+        link_dimmed_captions(self, result, &mut ranked_records, linked_caption_elements);
+
+        rank_widget_records(ranked_records)
     }
 
     pub(crate) fn computed_tooltip_records(&self) -> Vec<ComputedTooltipRecord> {
@@ -1043,6 +1272,82 @@ impl LayoutTree {
         None
     }
 
+    /// The authored behavior of a field identified by its panel-local id.
+    pub(crate) fn field_spec_for(
+        &self,
+        field_id: &PanelElementId,
+    ) -> Option<&crate::ImeEditableFieldSpec> {
+        self.elements
+            .iter()
+            .filter_map(|element| element.editable.as_ref())
+            .find(|field| field.field_id == *field_id)
+            .map(|field| &field.field_spec)
+    }
+
+    /// Wraps an existing element and feedback in one fitted column without
+    /// changing the element's frame, descendants, or ids.
+    pub(crate) fn wrap_element_with_feedback(
+        &mut self,
+        element_id: &PanelElementId,
+        feedback: &Self,
+    ) -> bool {
+        let matches = (0..self.len())
+            .filter(|&index| self.element_id(index) == Some(element_id))
+            .collect::<Vec<_>>();
+        let ([element], Some(feedback_root)) = (matches.as_slice(), feedback.root) else {
+            return false;
+        };
+        let element = *element;
+        let parent = (0..self.len()).find_map(|index| {
+            self.children_of(index)
+                .iter()
+                .position(|&child| child == element)
+                .map(|position| (index, position))
+        });
+        if parent.is_none() && self.root != Some(element) {
+            return false;
+        }
+        let first_added = self.len();
+        let mut next_auto_id = self.next_auto_element_id();
+        let Some(wrapper) =
+            feedback.clone_subtree_into(feedback_root, self, 0.0.into(), 0.0.into(), false)
+        else {
+            return false;
+        };
+        for added in &mut self.elements[first_added..] {
+            if matches!(added.id, Some(PanelElementId::Auto(_))) {
+                added.id = Some(PanelElementId::auto(next_auto_id));
+                next_auto_id = next_auto_id.saturating_add(1);
+            }
+        }
+        self.elements[wrapper].width = self.elements[element].width;
+        let ElementContent::Children(children) = &mut self.elements[wrapper].content else {
+            return false;
+        };
+        children.insert(0, element);
+        if let Some((parent, position)) = parent {
+            let ElementContent::Children(children) = &mut self.elements[parent].content else {
+                return false;
+            };
+            children[position] = wrapper;
+        } else {
+            self.set_root(wrapper);
+        }
+        self.has_rich_text |= feedback.has_rich_text;
+        true
+    }
+
+    /// Whether the author allows this field to grow to contain validation feedback.
+    pub(crate) fn field_can_grow_for_validation(&self, field_id: &PanelElementId) -> bool {
+        self.elements.iter().any(|element| {
+            element.height.is_fit()
+                && element
+                    .editable
+                    .as_ref()
+                    .is_some_and(|field| field.field_id == *field_id)
+        })
+    }
+
     pub(crate) fn set_field_display_text(
         &mut self,
         field_id: &PanelElementId,
@@ -1074,10 +1379,14 @@ impl LayoutTree {
         };
         if let ElementContent::Text {
             text: existing_text,
+            sizing,
             ..
         } = &mut self.elements[text_index].content
         {
             *existing_text = text.into();
+            if !matches!(sizing, TextSizing::MeasureAs { .. }) {
+                *sizing = TextSizing::wrap(TextWrap::None);
+            }
         }
         FieldDisplayTextUpdate::Updated
     }
@@ -1118,6 +1427,7 @@ impl LayoutTree {
         };
 
         let mut next = Self::with_capacity(self.len() + replacement.len());
+        next.has_rich_text = self.has_rich_text || replacement.has_rich_text;
         let mut next_auto_id = self.next_auto_element_id();
         let Some(root) = self.clone_with_field_editing_content(
             source_root,
@@ -1134,6 +1444,11 @@ impl LayoutTree {
         FieldDisplayTextUpdate::Updated
     }
 
+    /// Whether the tree currently contains an inline editor that follows its caret.
+    pub(crate) fn has_caret_follow_field(&self) -> bool {
+        self.elements.iter().any(|element| element.caret_follow)
+    }
+
     fn clone_with_field_editing_content(
         &self,
         source_index: usize,
@@ -1146,13 +1461,29 @@ impl LayoutTree {
         let source = self.elements.get(source_index)?;
         let children = match &source.content {
             ElementContent::Children(children) => children.clone(),
-            ElementContent::Empty | ElementContent::Text { .. } | ElementContent::Image { .. } => {
-                SmallVec::new()
-            },
+            ElementContent::Empty
+            | ElementContent::Text { .. }
+            | ElementContent::RichText(_)
+            | ElementContent::Icon(_)
+            | ElementContent::Image { .. } => SmallVec::new(),
         };
         let mut clone = source.clone();
         if source_index == field_index || !children.is_empty() {
             clone.content = ElementContent::Children(SmallVec::new());
+        }
+        if source_index == field_index {
+            clone.overflow = ChildOverflow::Scrolled;
+            clone.scroll_offset.x = 0.0;
+            clone.caret_follow = true;
+            // The editor's column adds a second child only for a rejected
+            // value. Grow the field vertically so that line remains visible.
+            if matches!(
+                replacement.elements[replacement_root].child_layout,
+                ChildLayout::Column { .. }
+            ) && replacement.children_of(replacement_root).len() > 1
+            {
+                clone.height = Sizing::FIT;
+            }
         }
         let target_index = target.add(clone);
 
@@ -1197,11 +1528,26 @@ impl LayoutTree {
         let source = self.elements.get(source_index)?;
         let children = match &source.content {
             ElementContent::Children(children) => children.clone(),
-            ElementContent::Empty | ElementContent::Text { .. } | ElementContent::Image { .. } => {
-                SmallVec::new()
-            },
+            ElementContent::Empty
+            | ElementContent::Text { .. }
+            | ElementContent::RichText(_)
+            | ElementContent::Icon(_)
+            | ElementContent::Image { .. } => SmallVec::new(),
         };
         let mut clone = source.clone();
+        if let ElementContent::Text { sizing, .. } = &mut clone.content
+            && !matches!(sizing, TextSizing::MeasureAs { .. })
+        {
+            *sizing = TextSizing::wrap(TextWrap::None);
+        }
+        // The field scrolls this immediate child. Its width must reflect the
+        // unwrapped editor row rather than grow to the field's viewport width.
+        if matches!(clone.content, ElementContent::Children(_)) && clone.width == Sizing::GROW {
+            clone.width = Sizing::FIT;
+        }
+        if matches!(clone.content, ElementContent::Children(_)) && clone.height == Sizing::GROW {
+            clone.height = Sizing::FIT;
+        }
         if matches!(clone.id, Some(PanelElementId::Auto(_))) {
             clone.id = Some(PanelElementId::auto(*next_auto_id));
             *next_auto_id = next_auto_id.saturating_add(1);
@@ -1257,6 +1603,14 @@ impl LayoutTree {
     /// always operate in points, avoiding parley's integer quantization at small sizes.
     #[must_use]
     pub fn scaled(&self, layout_scale: f32, font_scale: f32) -> Self {
+        if self.has_rich_text {
+            self.scaled_tree::<true>(layout_scale, font_scale)
+        } else {
+            self.scaled_tree::<false>(layout_scale, font_scale)
+        }
+    }
+
+    fn scaled_tree<const RICH: bool>(&self, layout_scale: f32, font_scale: f32) -> Self {
         let mut tree = self.clone();
         for element in &mut tree.elements {
             element.width = element.width.resolved(layout_scale);
@@ -1271,6 +1625,7 @@ impl LayoutTree {
                 *panel_draw = panel_draw.scaled(layout_scale);
             }
             element.scroll_offset *= layout_scale;
+            element.scroll_content_origin_y *= layout_scale;
             if matches!(element.overflow, ChildOverflow::Scrolled) {
                 element.scroll_line = element.scroll_line.to_points(font_scale);
             }
@@ -1278,12 +1633,23 @@ impl LayoutTree {
             scale_editor_part(&mut element.editor_selection, layout_scale);
             scale_editor_part(&mut element.editor_caret, layout_scale);
             scale_editor_part(&mut element.editor_validation, layout_scale);
-            if let ElementContent::Text { ref mut config, .. } = element.content {
-                // If this text element carries an explicit unit (e.g., from
-                // `TextStyle::new(Mm(6.0))`), convert from that unit to
-                // points directly. Otherwise use the panel-wide font_scale.
-                let scale = config.unit().map_or(font_scale, Unit::to_points);
-                *config = config.scaled(scale);
+            if let Some(field) = &mut element.editable {
+                let scale = field.text_style.unit().map_or(font_scale, Unit::to_points);
+                field.text_style = field.text_style.scaled(scale);
+            }
+            match &mut element.content {
+                ElementContent::Text { config, .. } => {
+                    // If this text element carries an explicit unit (e.g., from
+                    // `TextStyle::new(Mm(6.0))`), convert from that unit to
+                    // points directly. Otherwise use the panel-wide font_scale.
+                    let scale = config.unit().map_or(font_scale, Unit::to_points);
+                    *config = config.scaled(scale);
+                },
+                ElementContent::RichText(paragraph) if RICH => {
+                    let scale = paragraph.base.unit().map_or(font_scale, Unit::to_points);
+                    *paragraph = std::sync::Arc::new(paragraph.scaled(scale));
+                },
+                _ => {},
             }
         }
         tree
@@ -1302,7 +1668,20 @@ impl LayoutTree {
         font_to_points: f32,
         points_to_pixels: f32,
     ) -> Self {
-        let mut tree = self.scaled(layout_to_points, font_to_points);
+        if self.has_rich_text {
+            self.screen_scaled_tree::<true>(layout_to_points, font_to_points, points_to_pixels)
+        } else {
+            self.screen_scaled_tree::<false>(layout_to_points, font_to_points, points_to_pixels)
+        }
+    }
+
+    fn screen_scaled_tree<const RICH: bool>(
+        &self,
+        layout_to_points: f32,
+        font_to_points: f32,
+        points_to_pixels: f32,
+    ) -> Self {
+        let mut tree = self.scaled_tree::<RICH>(layout_to_points, font_to_points);
         for element in &mut tree.elements {
             element.width = element.width.resolved(points_to_pixels);
             element.height = element.height.resolved(points_to_pixels);
@@ -1316,13 +1695,29 @@ impl LayoutTree {
                 *panel_draw = panel_draw.scaled(points_to_pixels);
             }
             element.scroll_offset *= points_to_pixels;
+            element.scroll_content_origin_y *= points_to_pixels;
             element.scroll_line = element.scroll_line.to_pixels(points_to_pixels);
             scale_editor_part(&mut element.editor_text, points_to_pixels);
             scale_editor_part(&mut element.editor_selection, points_to_pixels);
             scale_editor_part(&mut element.editor_caret, points_to_pixels);
             scale_editor_part(&mut element.editor_validation, points_to_pixels);
-            if let ElementContent::Text { ref mut config, .. } = element.content {
-                *config = config.scaled_as_unit(points_to_pixels, Unit::Pixels);
+            if let Some(field) = &mut element.editable {
+                field.text_style = field
+                    .text_style
+                    .scaled_as_unit(points_to_pixels, Unit::Pixels);
+            }
+            match &mut element.content {
+                ElementContent::Text { config, .. } => {
+                    *config = config.scaled_as_unit(points_to_pixels, Unit::Pixels);
+                },
+                ElementContent::RichText(paragraph) if RICH => {
+                    let mut scaled = paragraph.scaled(points_to_pixels);
+                    scaled.base = paragraph
+                        .base
+                        .scaled_as_unit(points_to_pixels, Unit::Pixels);
+                    *paragraph = std::sync::Arc::new(scaled);
+                },
+                _ => {},
             }
         }
         tree
@@ -1383,7 +1778,10 @@ fn element_visual_capabilities(element: &Element) -> VisualElementCapabilities {
     if element.border.is_some() {
         capabilities |= VisualElementCapabilities::SDF_BORDER;
     }
-    let has_text = matches!(element.content, ElementContent::Text { .. });
+    let has_text = matches!(
+        element.content,
+        ElementContent::Text { .. } | ElementContent::RichText(_)
+    );
     let has_image = matches!(element.content, ElementContent::Image { .. });
     let has_draw = element
         .draw
@@ -1441,6 +1839,85 @@ fn validate_part_state_colors(
     Ok(())
 }
 
+fn widget_declaration(element: &Element) -> Option<(PanelElementId, WidgetSpec)> {
+    element
+        .id
+        .as_ref()
+        .zip(element.widget.as_ref())
+        .map(|(id, widget)| (id.clone(), widget.clone()))
+        .or_else(|| {
+            element.editable.as_ref().map(|field| {
+                (
+                    field.field_id.clone(),
+                    WidgetSpec::EditableField(field.clone()),
+                )
+            })
+        })
+}
+
+fn link_dimmed_captions(
+    tree: &LayoutTree,
+    result: &LayoutResult,
+    ranked_records: &mut [(DrawZIndex, ComputedWidgetRecord)],
+    linked_caption_elements: Vec<(usize, PanelElementId)>,
+) {
+    for (element_index, target) in linked_caption_elements {
+        let Some((_, record)) = ranked_records
+            .iter_mut()
+            .find(|(_, record)| record.id() == &target)
+        else {
+            continue;
+        };
+        let (Some(element), Some(computed)) = (
+            tree.elements.get(element_index),
+            result.computed.get(element_index),
+        ) else {
+            continue;
+        };
+        record_owned_widget_element(record, element, element_index, false);
+        record.push_visual_slot(ComputedVisualSlot {
+            slot: VisualSlotId::DIMMED_CAPTION,
+            element_index,
+            border_box: computed.bounds,
+            content_box: engine::content_box_bounds(element, computed.bounds),
+        });
+    }
+}
+
+fn rank_widget_records(
+    mut ranked_records: Vec<(DrawZIndex, ComputedWidgetRecord)>,
+) -> Vec<ComputedWidgetRecord> {
+    let mut rank_order: Vec<usize> = (0..ranked_records.len()).collect();
+    rank_order.sort_by_key(|&index| {
+        let (z_index, record) = &ranked_records[index];
+        (*z_index, record.preorder())
+    });
+    for (interaction_rank, record_index) in rank_order.into_iter().enumerate() {
+        ranked_records[record_index]
+            .1
+            .set_interaction_rank(interaction_rank);
+    }
+    ranked_records
+        .into_iter()
+        .map(|(_, record)| record)
+        .collect()
+}
+
+/// The visual slot `element` fills, with its border and content boxes.
+fn computed_visual_slot(
+    element: &Element,
+    element_index: usize,
+    slot: VisualSlotId,
+    border_box: BoundingBox,
+) -> ComputedVisualSlot {
+    ComputedVisualSlot {
+        slot,
+        element_index,
+        border_box,
+        content_box: engine::content_box_bounds(element, border_box),
+    }
+}
+
 fn record_owned_widget_element(
     record: &mut ComputedWidgetRecord,
     element: &Element,
@@ -1463,94 +1940,28 @@ fn record_owned_widget_element(
 }
 
 fn classify_element_change(element: &Element, next: &Element) -> LayoutTreeChange {
-    let Element {
-        id: _,
-        width,
-        height,
-        padding,
-        child_layout,
-        background: _,
-        border,
-        corner_radius: _,
-        overflow,
-        scroll_offset,
-        scroll_anchor_x,
-        scroll_anchor_y,
-        scroll_line,
-        material: _,
-        interactivity: _,
-        editable,
-        widget: _,
-        appearance: _,
-        editor_origin: _,
-        editor_text: _,
-        editor_selection: _,
-        editor_caret: _,
-        editor_validation: _,
-        tooltip: _,
-        visual_slot: _,
-        draw: _,
-        z_index: _,
-        anti_alias: _,
-        hairline_fade: _,
-        shadow_casting: _,
-        precompose: _,
-        content,
-    } = element;
-    let Element {
-        id: _,
-        width: n_width,
-        height: n_height,
-        padding: n_padding,
-        child_layout: n_child_layout,
-        background: _,
-        border: n_border,
-        corner_radius: _,
-        overflow: n_overflow,
-        scroll_offset: n_scroll_offset,
-        scroll_anchor_x: n_scroll_anchor_x,
-        scroll_anchor_y: n_scroll_anchor_y,
-        scroll_line: n_scroll_line,
-        material: _,
-        interactivity: _,
-        editable: n_editable,
-        widget: _,
-        appearance: _,
-        editor_origin: _,
-        editor_text: _,
-        editor_selection: _,
-        editor_caret: _,
-        editor_validation: _,
-        tooltip: _,
-        visual_slot: _,
-        draw: _,
-        z_index: _,
-        anti_alias: _,
-        hairline_fade: _,
-        shadow_casting: _,
-        precompose: _,
-        content: n_content,
-    } = next;
-
-    let child_layout_change = classify_child_layout_change(child_layout, n_child_layout);
-    if width != n_width
-        || height != n_height
-        || padding != n_padding
+    let child_layout_change =
+        classify_child_layout_change(&element.child_layout, &next.child_layout);
+    if element.width != next.width
+        || element.height != next.height
+        || element.padding != next.padding
         || child_layout_change == LayoutTreeChange::LayoutAffecting
-        || overflow != n_overflow
-        || scroll_offset != n_scroll_offset
-        || scroll_anchor_x != n_scroll_anchor_x
-        || scroll_anchor_y != n_scroll_anchor_y
-        || scroll_line != n_scroll_line
+        || element.overflow != next.overflow
+        || element.scroll_drive != next.scroll_drive
+        || element.scroll_content_origin_y.to_bits() != next.scroll_content_origin_y.to_bits()
+        || (matches!(element.scroll_drive, ScrollDrive::Library(_)) && element.id != next.id)
+        || element.scroll_offset != next.scroll_offset
+        || element.scroll_anchor_x != next.scroll_anchor_x
+        || element.scroll_anchor_y != next.scroll_anchor_y
+        || element.scroll_line != next.scroll_line
+        || element.caret_follow != next.caret_follow
+        || element.caret_marker != next.caret_marker
+        || element.editable != next.editable
     {
         return LayoutTreeChange::LayoutAffecting;
     }
 
-    if editable != n_editable {
-        return LayoutTreeChange::LayoutAffecting;
-    }
-
-    let border_change = classify_border_change(*border, *n_border);
+    let border_change = classify_border_change(element.border, next.border);
     if border_change == LayoutTreeChange::LayoutAffecting {
         return LayoutTreeChange::LayoutAffecting;
     }
@@ -1560,7 +1971,7 @@ fn classify_element_change(element: &Element, next: &Element) -> LayoutTreeChang
         change = change.combine(LayoutTreeChange::VisualOnly);
     }
 
-    change.combine(classify_content_change(content, n_content))
+    change.combine(classify_content_change(&element.content, &next.content))
 }
 
 fn visual_only_properties_changed(element: &Element, next: &Element) -> bool {
@@ -1583,6 +1994,8 @@ fn visual_only_properties_changed(element: &Element, next: &Element) -> bool {
         )
         || element.tooltip != next.tooltip
         || element.visual_slot != next.visual_slot
+        || element.dim_with_widget != next.dim_with_widget
+        || element.tooltip_boundary != next.tooltip_boundary
         || element.interactivity != next.interactivity
         || element.background != next.background
         || element.corner_radius != next.corner_radius
@@ -1761,6 +2174,18 @@ fn classify_content_change(content: &ElementContent, next: &ElementContent) -> L
                 LayoutTreeChange::VisualOnly
             }
         },
+        (ElementContent::Icon(icon), ElementContent::Icon(next_icon)) => {
+            if icon == next_icon {
+                LayoutTreeChange::Identical
+            } else if icon.size_value().to_bits() == next_icon.size_value().to_bits() {
+                LayoutTreeChange::VisualOnly
+            } else {
+                LayoutTreeChange::LayoutAffecting
+            }
+        },
+        (ElementContent::RichText(paragraph), ElementContent::RichText(next)) => {
+            paragraph.classify_change(next)
+        },
         (ElementContent::Empty, ElementContent::Empty) => LayoutTreeChange::Identical,
         _ => LayoutTreeChange::LayoutAffecting,
     }
@@ -1781,6 +2206,7 @@ mod tests {
     use bevy::image::Image;
     use bevy::pbr::StandardMaterial;
     use bevy::prelude::default;
+    use smallvec::SmallVec;
 
     use super::ElementContent;
     use super::FieldDisplayTextUpdate;
@@ -1793,9 +2219,11 @@ mod tests {
     use crate::CalloutCap;
     use crate::DiegeticPanel;
     use crate::EditorStateColors;
+    use crate::Icon;
     use crate::ImeBuiltInFieldKind;
     use crate::ImeBuiltInFieldSpec;
     use crate::ImeEditableFieldSpec;
+    use crate::LucideIcon;
     use crate::Mm;
     use crate::PanelBuildError;
     use crate::PanelElementId;
@@ -1822,7 +2250,9 @@ mod tests {
     use crate::layout::Sizing;
     use crate::layout::Text;
     use crate::layout::TextDimensions;
+    use crate::layout::TextSizing;
     use crate::layout::TextStyle;
+    use crate::layout::TextWrap;
     use crate::layout::Unit;
     use crate::layout::WidgetElement;
     use crate::layout::child_layout::ChildLayout;
@@ -1830,11 +2260,82 @@ mod tests {
     use crate::widgets::VisualElementCapabilities;
     use crate::widgets::VisualSlotId;
     use crate::widgets::VisualSlotOverride;
+    use crate::widgets::WidgetHitArea;
     use crate::widgets::WidgetState;
 
     const LARGE_CHILD_GAP: f32 = 2.0;
     const SMALL_CHILD_GAP: f32 = 1.0;
     const FLOAT_TOLERANCE: f32 = 0.001;
+
+    #[test]
+    fn rich_text_keeps_the_plain_content_storage_budget() {
+        // The content kinds before paragraphs: use the same compiler and payloads.
+        enum PlainElementContent {
+            Children(SmallVec<[usize; super::INLINE_CHILDREN]>),
+            Text {
+                text:   String,
+                config: TextStyle,
+                sizing: TextSizing,
+            },
+            Icon(Icon),
+            Image {
+                handle: Handle<Image>,
+                tint:   Color,
+            },
+            Empty,
+        }
+
+        let samples = [
+            PlainElementContent::Children(smallvec::SmallVec::new()),
+            PlainElementContent::Text {
+                text:   String::new(),
+                config: TextStyle::default(),
+                sizing: TextSizing::wrap(TextWrap::None),
+            },
+            PlainElementContent::Icon(Icon::new(LucideIcon::Camera)),
+            PlainElementContent::Image {
+                handle: Handle::default(),
+                tint:   Color::WHITE,
+            },
+            PlainElementContent::Empty,
+        ];
+        assert_eq!(
+            std::mem::align_of::<ElementContent>(),
+            std::mem::align_of::<PlainElementContent>()
+        );
+        // Rich presence occupies existing tree padding, rather than each element.
+        assert_eq!(
+            std::mem::size_of::<super::LayoutTree>(),
+            std::mem::size_of::<(
+                Vec<super::Element>,
+                Option<usize>,
+                super::TooltipBodyStyleOrigins
+            )>()
+        );
+        for sample in samples {
+            let content = match sample {
+                PlainElementContent::Children(children) => ElementContent::Children(children),
+                PlainElementContent::Text {
+                    text,
+                    config,
+                    sizing,
+                } => ElementContent::Text {
+                    text,
+                    config,
+                    sizing,
+                },
+                PlainElementContent::Icon(icon) => ElementContent::Icon(icon),
+                PlainElementContent::Image { handle, tint } => {
+                    ElementContent::Image { handle, tint }
+                },
+                PlainElementContent::Empty => ElementContent::Empty,
+            };
+            assert_eq!(
+                std::mem::size_of_val(&content),
+                std::mem::size_of::<PlainElementContent>()
+            );
+        }
+    }
 
     fn text_tree(text: &str, style: TextStyle) -> LayoutTree {
         let mut builder = LayoutBuilder::new(100.0, 50.0);
@@ -1894,6 +2395,22 @@ mod tests {
         let tree = builder.build();
 
         assert_eq!(tree.text_element_id(1), Some(&id));
+    }
+
+    #[test]
+    fn field_id_identifies_its_layout_element_for_scroll_records() {
+        let id = PanelElementId::named("field");
+        let mut builder = LayoutBuilder::new(100.0, 50.0);
+        builder.with(
+            El::new().editable_field(id.clone(), field_spec(), TextStyle::new(10.0)),
+            |builder| {
+                builder.text(("value", TextStyle::new(10.0)));
+            },
+        );
+        let tree = builder.build();
+
+        assert_eq!(tree.element_id(1), Some(&id));
+        assert_eq!(tree.duplicate_named_element_id(), None);
     }
 
     fn root_tree<L: ChildLayoutState>(root: El<L, LayoutOnly>) -> LayoutTree {
@@ -1993,17 +2510,25 @@ mod tests {
 
     #[test]
     fn screen_source_scaled_resolves_world_units_to_pixel_source_values() {
-        let mut builder = LayoutBuilder::with_root(
+        let field_spec =
+            ImeEditableFieldSpec::BuiltIn(ImeBuiltInFieldSpec::new(ImeBuiltInFieldKind::Text));
+        let mut builder = LayoutBuilder::with_widget_root(
             El::column()
                 .width(Sizing::fixed(Mm(20.0)))
                 .height(Sizing::fixed(Mm(10.0)))
-                .padding(Padding::all(Mm(2.0))),
+                .padding(Padding::all(Mm(2.0)))
+                .editable_field("value", field_spec, TextStyle::new(3.0)),
         );
         builder.text(("child", TextStyle::new(3.0)));
         let tree = builder.build();
 
         let millimeters_to_points = Unit::Millimeters.to_points();
         let points_to_pixels = 2.0;
+        let points = tree.scaled(millimeters_to_points, millimeters_to_points);
+        assert!(matches!(
+            points.editable_field(0),
+            Some(field) if 3.0f32.mul_add(-millimeters_to_points, field.text_style.size()).abs() < FLOAT_TOLERANCE
+        ));
         let scaled = tree.screen_source_scaled(
             millimeters_to_points,
             millimeters_to_points,
@@ -2033,6 +2558,54 @@ mod tests {
         let expected_text_size = 3.0 * millimeters_to_points * points_to_pixels;
         assert!((config.size() - expected_text_size).abs() < FLOAT_TOLERANCE);
         assert_eq!(config.unit(), Cascade::Override(Unit::Pixels));
+        assert!(matches!(
+            scaled.editable_field(0),
+            Some(field) if (field.text_style.size() - expected_text_size).abs() < FLOAT_TOLERANCE
+                && field.text_style.unit() == Cascade::Override(Unit::Pixels)
+        ));
+    }
+
+    #[test]
+    fn icon_square_stays_in_points_in_panel_and_projected_screen_layouts() -> Result<(), String> {
+        let mut builder = LayoutBuilder::new(100.0, 100.0);
+        builder.icon(Icon::new(LucideIcon::CircleCheck).size(64.0));
+        let tree = builder.build();
+
+        let scaled = tree.scaled(Unit::Pixels.to_points(), Unit::Points.to_points());
+        let ElementContent::Icon(icon) = &scaled.elements[1].content else {
+            return Err("scaled panel leaf must remain an icon".to_owned());
+        };
+        let expected_size = 64.0;
+
+        assert!((icon.size_value() - expected_size).abs() < FLOAT_TOLERANCE);
+        assert!(matches!(
+            scaled.elements[1].width,
+            Sizing::Fixed(width) if (width.value - expected_size).abs() < FLOAT_TOLERANCE
+        ));
+        assert!(matches!(
+            scaled.elements[1].height,
+            Sizing::Fixed(height) if (height.value - expected_size).abs() < FLOAT_TOLERANCE
+        ));
+
+        let projected = tree
+            .screen_source_scaled(Unit::Millimeters.to_points(), Unit::Pixels.to_points(), 2.0)
+            .scaled(Unit::Pixels.to_points(), Unit::Pixels.to_points());
+        let ElementContent::Icon(icon) = &projected.elements[1].content else {
+            return Err("projected screen leaf must remain an icon".to_owned());
+        };
+        let expected_projected_size = expected_size * 2.0 * Unit::Pixels.to_points();
+        assert_eq!(icon.size_value(), expected_size);
+        assert!(matches!(
+            projected.elements[1].width,
+            Sizing::Fixed(width)
+                if (width.value - expected_projected_size).abs() < FLOAT_TOLERANCE
+        ));
+        assert!(matches!(
+            projected.elements[1].height,
+            Sizing::Fixed(height)
+                if (height.value - expected_projected_size).abs() < FLOAT_TOLERANCE
+        ));
+        Ok(())
     }
 
     #[test]
@@ -2040,7 +2613,7 @@ mod tests {
         let mut builder = LayoutBuilder::new(100.0, 40.0);
         builder.with(
             El::new()
-                .editable_field("field", field_spec())
+                .editable_field("field", field_spec(), crate::TextStyle::new(10.0))
                 .editor_caret(EditorStateColors::new().hovered(Color::srgb(0.2, 0.4, 0.6))),
             |_| {},
         );
@@ -2095,7 +2668,7 @@ mod tests {
     }
 
     #[test]
-    fn text_leaf_normalizes_authored_child_layout() {
+    fn text_leaf_normalizes_child_flow_but_keeps_alignment() {
         let mut builder = LayoutBuilder::new(100.0, 50.0);
         builder.text(
             Text::new("child", TextStyle::new(10.0)).layout(
@@ -2107,7 +2680,15 @@ mod tests {
         );
         let tree = builder.build();
 
-        assert_default_leaf_child_layout(tree.elements[1].child_layout);
+        assert_eq!(
+            tree.elements[1].child_layout,
+            ChildLayout::Row {
+                gap:     Dimension::default(),
+                align_x: AlignX::Right,
+                align_y: AlignY::Bottom,
+                divider: None,
+            }
+        );
     }
 
     #[test]
@@ -2127,7 +2708,7 @@ mod tests {
     }
 
     #[test]
-    fn text_leaf_normalizes_authored_overlay_child_layout() {
+    fn text_leaf_normalizes_overlay_flow_but_keeps_alignment() {
         let mut builder = LayoutBuilder::new(100.0, 50.0);
         builder.text(
             Text::new("child", TextStyle::new(10.0))
@@ -2135,7 +2716,15 @@ mod tests {
         );
         let tree = builder.build();
 
-        assert_default_leaf_child_layout(tree.elements[1].child_layout);
+        assert_eq!(
+            tree.elements[1].child_layout,
+            ChildLayout::Row {
+                gap:     Dimension::default(),
+                align_x: AlignX::Right,
+                align_y: AlignY::Bottom,
+                divider: None,
+            }
+        );
     }
 
     #[test]
@@ -2190,11 +2779,30 @@ mod tests {
 
     #[test]
     fn button_record_add_remove_classifies_as_visual_only() {
-        let tree = root_tree(El::new());
-        let next = widget_root_tree(El::new().button("action"));
+        let mut builder = LayoutBuilder::with_root(El::new());
+        builder.text(Text::new("child", TextStyle::new(10.0)).measure_as("child"));
+        let tree = builder.build();
+        let mut builder = LayoutBuilder::with_widget_root(El::new().button("action"));
+        builder.text(Text::new("child", TextStyle::new(10.0)).measure_as("child"));
+        let next = builder.build();
 
         assert_eq!(tree.classify_change(&next), LayoutTreeChange::VisualOnly);
         assert_eq!(next.classify_change(&tree), LayoutTreeChange::VisualOnly);
+    }
+
+    #[test]
+    fn button_record_over_natural_text_classifies_as_layout_affecting() {
+        let tree = root_tree(El::new());
+        let next = widget_root_tree(El::new().button("action"));
+
+        assert_eq!(
+            tree.classify_change(&next),
+            LayoutTreeChange::LayoutAffecting
+        );
+        assert_eq!(
+            next.classify_change(&tree),
+            LayoutTreeChange::LayoutAffecting
+        );
     }
 
     #[test]
@@ -2604,9 +3212,12 @@ mod tests {
     #[test]
     fn editable_tree_replacement_rekeys_part_appearance_entries() {
         let mut display_builder = LayoutBuilder::new(100.0, 50.0);
-        display_builder.with(El::new().editable_field("gain", field_spec()), |builder| {
-            builder.with(El::new(), |_| {});
-        });
+        display_builder.with(
+            El::new().editable_field("gain", field_spec(), crate::TextStyle::new(10.0)),
+            |builder| {
+                builder.with(El::new(), |_| {});
+            },
+        );
         let mut display = display_builder.build();
         let Some(display_index) = display
             .elements
@@ -2728,17 +3339,16 @@ mod tests {
             .find(|record| record.id() == &PanelElementId::named("partial"))
             .expect("partially clipped widget should have a record");
         assert!((partial.rect().width - 30.0).abs() < FLOAT_TOLERANCE);
-        assert!(
-            partial
-                .clipped_rect()
-                .is_some_and(|rect| (rect.width - 20.0).abs() < FLOAT_TOLERANCE)
-        );
+        assert!(matches!(
+            partial.hit_area(),
+            WidgetHitArea::Visible(rect) if (rect.width - 20.0).abs() < FLOAT_TOLERANCE
+        ));
         assert_eq!(
             records
                 .iter()
                 .find(|record| record.id() == &PanelElementId::named("clipped"))
-                .and_then(super::ComputedWidgetRecord::clipped_rect),
-            None
+                .map(super::ComputedWidgetRecord::hit_area),
+            Some(WidgetHitArea::FullyClipped)
         );
 
         let rank = |id| {
@@ -3047,15 +3657,90 @@ mod tests {
     #[test]
     fn updates_field_display_text_descendant() {
         let mut builder = LayoutBuilder::new(100.0, 40.0);
-        builder.with(El::new().editable_field("gain", field_spec()), |builder| {
-            builder.text(("10", TextStyle::new(10.0)));
-        });
+        builder.with(
+            El::new().editable_field("gain", field_spec(), crate::TextStyle::new(10.0)),
+            |builder| {
+                builder.text(("10", TextStyle::new(10.0)));
+            },
+        );
         let mut tree = builder.build();
 
         let update = tree.set_field_display_text(&"gain".into(), "11");
 
         assert_eq!(update, FieldDisplayTextUpdate::Updated);
         assert_eq!(tree.field_display_text(1), Some("11"));
+        assert!(matches!(
+            tree.elements[1].overflow,
+            super::ChildOverflow::Clipped
+        ));
+        assert!(matches!(
+            tree.elements[2].content,
+            ElementContent::Text {
+                sizing: TextSizing::Natural {
+                    wrap: TextWrap::None,
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn replacing_field_display_text_keeps_it_on_one_line() {
+        let mut builder = LayoutBuilder::new(80.0, 30.0);
+        builder.with(
+            El::new().width(Sizing::fixed(80.0)).editable_field(
+                "gain",
+                field_spec(),
+                crate::TextStyle::new(10.0),
+            ),
+            |builder| {
+                builder.text(("short", crate::TextStyle::new(10.0)));
+            },
+        );
+        let mut tree = builder.build();
+        assert_eq!(
+            tree.set_field_display_text(&"gain".into(), "a long field value"),
+            FieldDisplayTextUpdate::Updated
+        );
+        assert!(matches!(
+            tree.elements[2].content,
+            ElementContent::Text {
+                sizing: TextSizing::Natural {
+                    wrap: TextWrap::None,
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn field_measure_as_keeps_surrogate_width_after_display_replacement() {
+        let mut builder = LayoutBuilder::new(200.0, 40.0);
+        builder.with(
+            El::new().editable_field("field", field_spec(), TextStyle::new(10.0)),
+            |builder| {
+                builder.text(Text::new("1", TextStyle::new(10.0)).measure_as("000000"));
+            },
+        );
+        let mut tree = builder.build();
+        let text_index = tree
+            .elements
+            .iter()
+            .position(|element| matches!(element.content, ElementContent::Text { .. }))
+            .expect("field text exists");
+        let surrogate = TextSizing::measure_as("000000");
+        assert!(matches!(
+            &tree.elements[text_index].content,
+            ElementContent::Text { sizing, .. } if sizing == &surrogate
+        ));
+        assert_eq!(
+            tree.set_field_display_text(&PanelElementId::named("field"), "2"),
+            FieldDisplayTextUpdate::Updated,
+        );
+        assert!(matches!(
+            &tree.elements[text_index].content,
+            ElementContent::Text { sizing, .. } if sizing == &surrogate
+        ));
     }
 
     #[test]
@@ -3066,7 +3751,7 @@ mod tests {
             El::new()
                 .padding(Padding::all(3.0))
                 .background(Color::BLACK)
-                .editable_field("gain", field_spec()),
+                .editable_field("gain", field_spec(), crate::TextStyle::new(10.0)),
             |builder| {
                 builder.text(("10", TextStyle::new(10.0)));
             },
@@ -3088,6 +3773,26 @@ mod tests {
         assert_eq!(tree.field_display_text(field_index), Some("left"));
         assert_eq!(tree.elements[field_index].padding, Padding::all(3.0));
         assert_eq!(tree.elements[field_index].background, Some(Color::BLACK));
+        assert!(tree.elements[field_index].caret_follow);
+        assert!(matches!(
+            tree.elements[field_index].overflow,
+            super::ChildOverflow::Scrolled
+        ));
+        assert!(
+            tree.elements
+                .iter()
+                .filter(|element| matches!(
+                    element.content,
+                    ElementContent::Text {
+                        sizing: TextSizing::Natural {
+                            wrap: TextWrap::None,
+                        },
+                        ..
+                    }
+                ))
+                .count()
+                >= 2
+        );
         assert!(
             tree.elements.iter().all(|element| {
                 !matches!(&element.content, ElementContent::Text { text, .. } if text == "10")
@@ -3112,12 +3817,18 @@ mod tests {
     #[test]
     fn rejects_duplicate_field_display_update() {
         let mut builder = LayoutBuilder::new(100.0, 40.0);
-        builder.with(El::new().editable_field("gain", field_spec()), |builder| {
-            builder.text(("10", TextStyle::new(10.0)));
-        });
-        builder.with(El::new().editable_field("gain", field_spec()), |builder| {
-            builder.text(("12", TextStyle::new(10.0)));
-        });
+        builder.with(
+            El::new().editable_field("gain", field_spec(), crate::TextStyle::new(10.0)),
+            |builder| {
+                builder.text(("10", TextStyle::new(10.0)));
+            },
+        );
+        builder.with(
+            El::new().editable_field("gain", field_spec(), crate::TextStyle::new(10.0)),
+            |builder| {
+                builder.text(("12", TextStyle::new(10.0)));
+            },
+        );
         let mut tree = builder.build();
 
         let update = tree.set_field_display_text(&"gain".into(), "11");

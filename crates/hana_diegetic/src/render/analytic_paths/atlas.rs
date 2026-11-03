@@ -1,6 +1,9 @@
 //! Generic atlas for non-text analytic paths.
 
 use std::collections::HashMap;
+use std::error::Error;
+use std::fmt::Display;
+use std::fmt::Formatter;
 use std::hash::Hash;
 
 use bevy::prelude::Assets;
@@ -18,25 +21,23 @@ use super::packing::BandLayout;
 /// Compact atlas keyed by caller-owned stable path identities.
 #[derive(Debug)]
 pub(crate) struct PathAtlas<K> {
-    indices:           HashMap<K, u32>,
-    curves:            Vec<CurveRecord>,
-    bands:             Vec<BandRecord>,
-    path_records:      Vec<PackedPathRecord>,
-    revision:          u32,
-    uploaded_revision: u32,
-    handles:           Option<PathAtlasHandles>,
+    indices:      HashMap<K, u32>,
+    curves:       Vec<CurveRecord>,
+    bands:        Vec<BandRecord>,
+    path_records: Vec<PackedPathRecord>,
+    revision:     u32,
+    publication:  AtlasState,
 }
 
 impl<K> Default for PathAtlas<K> {
     fn default() -> Self {
         Self {
-            indices:           HashMap::new(),
-            curves:            Vec::new(),
-            bands:             Vec::new(),
-            path_records:      Vec::new(),
-            revision:          0,
-            uploaded_revision: u32::MAX,
-            handles:           None,
+            indices:      HashMap::new(),
+            curves:       Vec::new(),
+            bands:        Vec::new(),
+            path_records: Vec::new(),
+            revision:     0,
+            publication:  AtlasState::Unpublished,
         }
     }
 }
@@ -108,8 +109,7 @@ where
 
         self.revision = self.revision.wrapping_add(1);
         if self.path_records.is_empty() {
-            self.handles = None;
-            self.uploaded_revision = u32::MAX;
+            self.publication = AtlasState::Unpublished;
         }
     }
 
@@ -117,18 +117,24 @@ where
     #[must_use]
     pub(crate) fn index(&self, key: &K) -> Option<u32> { self.indices.get(key).copied() }
 
+    /// Whether the current path indices have matching GPU buffers.
+    #[must_use]
+    pub(crate) const fn upload_is_current(&self) -> bool {
+        matches!(&self.publication, AtlasState::Published { revision, .. } if *revision == self.revision)
+    }
+
     /// Uploads atlas storage buffers when the compact atlas changed.
     pub(crate) fn upload(
         &mut self,
         storage_buffers: &mut Assets<ShaderBuffer>,
-    ) -> Option<(PathAtlasHandles, bool)> {
+    ) -> AtlasPublication {
         if self.path_records.is_empty() {
-            return None;
+            return AtlasPublication::Empty;
         }
-        if let Some(handles) = self.handles.clone()
-            && self.uploaded_revision == self.revision
+        if let AtlasState::Published { handles, revision } = &self.publication
+            && *revision == self.revision
         {
-            return Some((handles, false));
+            return AtlasPublication::Unchanged(handles.clone());
         }
 
         let handles = PathAtlasHandles {
@@ -136,8 +142,130 @@ where
             bands:        storage_buffers.add(ShaderBuffer::from(self.bands.clone())),
             path_records: storage_buffers.add(ShaderBuffer::from(self.path_records.clone())),
         };
-        self.uploaded_revision = self.revision;
-        self.handles = Some(handles.clone());
-        Some((handles, true))
+        self.publication = AtlasState::Published {
+            revision: self.revision,
+            handles:  handles.clone(),
+        };
+        AtlasPublication::Replaced(handles)
+    }
+}
+
+/// Result of publishing all three atlas tables as one drawing revision.
+#[derive(Clone, Debug)]
+pub(crate) enum AtlasPublication {
+    /// No visible paths have been packed.
+    Empty,
+    /// The previously published buffers already cover this revision.
+    Unchanged(PathAtlasHandles),
+    /// A complete new set of buffers replaces the previous drawing revision.
+    Replaced(PathAtlasHandles),
+}
+
+/// Authoritative readiness of the handles bound by live path materials.
+#[derive(Debug, Default)]
+pub(crate) enum AtlasState {
+    #[default]
+    Unpublished,
+    Published {
+        handles:  PathAtlasHandles,
+        revision: u32,
+    },
+}
+
+/// Published table failures that prevent an atomic glyph-atlas replacement.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AtlasPublicationError {
+    MissingBuffer { table: &'static str },
+    InvalidTable { table: &'static str },
+}
+
+impl Display for AtlasPublicationError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingBuffer { table } => write!(f, "published {table} buffer is missing"),
+            Self::InvalidTable { table } => {
+                write!(f, "published {table} buffer has invalid layout or length")
+            },
+        }
+    }
+}
+
+impl Error for AtlasPublicationError {}
+
+#[cfg(test)]
+mod tests {
+    use bevy::math::Vec2;
+
+    use super::*;
+    use crate::render::analytic_paths::Bounds;
+
+    #[test]
+    fn path_atlas_publication_tracks_empty_current_and_rebuilt_tables() -> Result<(), String> {
+        let mut atlas = PathAtlas::<u32>::default();
+        let mut buffers = Assets::<ShaderBuffer>::default();
+        assert!(!atlas.upload_is_current());
+        assert!(matches!(
+            atlas.upload(&mut buffers),
+            AtlasPublication::Empty
+        ));
+        let path = PathOutline {
+            bounds:   Bounds {
+                min: Vec2::ZERO,
+                max: Vec2::new(20.0, 12.0),
+            },
+            contours: vec![super::super::PathContour {
+                segments:             vec![super::super::QuadraticSegment {
+                    start:   Vec2::ZERO,
+                    control: Vec2::new(10.0, 4.0),
+                    end:     Vec2::new(20.0, 12.0),
+                }],
+                minimum_feature_size: 0.0,
+                fade_exponent:        0.0,
+                role:                 super::super::ContourRole::Ink,
+            }],
+        };
+        atlas.rebuild([(7, path.clone())], 8.0);
+        assert!(!atlas.upload_is_current());
+        let AtlasPublication::Replaced(first) = atlas.upload(&mut buffers) else {
+            return Err("first publication replaces all tables".to_owned());
+        };
+        assert!(atlas.upload_is_current());
+        assert_eq!(atlas.index(&7), Some(0));
+        assert_eq!(buffers.len(), 3);
+        assert_eq!(
+            buffers
+                .get(&first.curves)
+                .and_then(ShaderBuffer::cast_slice::<CurveRecord>),
+            Some(atlas.curves.as_slice())
+        );
+        assert_eq!(
+            buffers
+                .get(&first.bands)
+                .and_then(ShaderBuffer::cast_slice::<BandRecord>),
+            Some(atlas.bands.as_slice())
+        );
+        assert_eq!(
+            buffers
+                .get(&first.path_records)
+                .and_then(ShaderBuffer::cast_slice::<PackedPathRecord>),
+            Some(atlas.path_records.as_slice())
+        );
+        assert!(
+            matches!(atlas.upload(&mut buffers), AtlasPublication::Unchanged(handles) if handles.curves == first.curves && handles.bands == first.bands && handles.path_records == first.path_records)
+        );
+        assert_eq!(buffers.len(), 3);
+        atlas.rebuild([(8, path)], 8.0);
+        assert!(!atlas.upload_is_current());
+        assert!(
+            matches!(atlas.upload(&mut buffers), AtlasPublication::Replaced(handles) if handles.curves != first.curves)
+        );
+        assert!(atlas.upload_is_current());
+        atlas.rebuild([], 8.0);
+        assert!(!atlas.upload_is_current());
+        assert!(matches!(
+            atlas.upload(&mut buffers),
+            AtlasPublication::Empty
+        ));
+        Ok(())
     }
 }

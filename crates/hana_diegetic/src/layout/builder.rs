@@ -30,6 +30,7 @@ use std::marker::PhantomData;
 use std::ops::RangeInclusive;
 
 use bevy::asset::Handle;
+use bevy::color::Alpha;
 use bevy::color::Color;
 use bevy::ecs::system::In;
 use bevy::ecs::system::IntoSystem;
@@ -49,6 +50,7 @@ use super::PanelDraw;
 use super::Px;
 use super::ShadowCasting;
 use super::Sizing;
+use super::TextAlign;
 use super::TextStyle;
 use super::TextWrap;
 use super::child_layout::ChildLayout;
@@ -59,8 +61,12 @@ use super::element::ElementContent;
 use super::element::LayoutTree;
 use super::element::PrecomposeMode;
 use super::element::ScrollAnchor;
+use super::element::ScrollDrive;
 use super::element::ScrollLine;
+use super::element::ScrollRestEdge;
+use super::element::TooltipBoundaryRole;
 use crate::DimensionMatch;
+use crate::Icon;
 use crate::ImeEditableFieldSpec;
 use crate::ImePanelField;
 use crate::PanelElementId;
@@ -70,11 +76,14 @@ use crate::render::HairlineFade;
 use crate::widgets::Appearance;
 use crate::widgets::Button;
 use crate::widgets::ButtonClicked;
+use crate::widgets::ControlLength;
+use crate::widgets::ControlMetrics;
+use crate::widgets::ControlPalette;
 use crate::widgets::IntoAppearance;
 use crate::widgets::Slider;
 use crate::widgets::SliderDirection;
-use crate::widgets::SliderResetBehavior;
 use crate::widgets::StateAppearance;
+use crate::widgets::Switch;
 use crate::widgets::Tooltip;
 use crate::widgets::VisualSlotId;
 use crate::widgets::WidgetDisabledAppearance;
@@ -94,6 +103,22 @@ pub struct El<L = Row, Role = LayoutOnly> {
     common:       CommonEl,
     child_layout: L,
     role:         PhantomData<fn() -> Role>,
+}
+
+/// Whether a tooltip body property was supplied through its root builder.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum TooltipBodyPropertyOrigin {
+    #[default]
+    Unset,
+    Authored,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct TooltipBodyStyleOrigins {
+    padding:       TooltipBodyPropertyOrigin,
+    border:        TooltipBodyPropertyOrigin,
+    background:    TooltipBodyPropertyOrigin,
+    corner_radius: TooltipBodyPropertyOrigin,
 }
 
 /// Marker for an ordinary visual layout element.
@@ -265,6 +290,8 @@ impl WidgetOwner for Button {}
 
 impl WidgetOwner for Slider {}
 
+impl WidgetOwner for Switch {}
+
 impl WidgetOwner for EditableField {}
 
 /// A pre-built widget declaration an element can adopt through [`El::widget`].
@@ -304,6 +331,14 @@ impl Widget for Slider {
     fn into_declaration(self) -> WidgetDeclaration { WidgetDeclaration(WidgetSpec::Slider(self)) }
 
     fn root_visual_slot() -> WidgetRootSlot { WidgetRootSlot(VisualSlotId::SLIDER_ROOT) }
+}
+
+impl Widget for Switch {
+    fn into_declaration(self) -> WidgetDeclaration {
+        WidgetDeclaration(WidgetSpec::Button(Button::new()))
+    }
+
+    fn root_visual_slot() -> WidgetRootSlot { WidgetRootSlot(VisualSlotId::SWITCH_ROOT) }
 }
 
 /// A widget kind that can be held — a button press or a slider drag.
@@ -385,11 +420,19 @@ impl TextSizing {
 #[must_use]
 #[derive(Clone, Debug)]
 pub struct Text<Role = LayoutOnly> {
-    layout:  CommonEl,
-    content: String,
-    style:   TextStyle,
-    sizing:  TextSizing,
-    role:    PhantomData<fn() -> Role>,
+    layout:       CommonEl,
+    content:      String,
+    style:        TextStyle,
+    style_origin: TextStyleOrigin,
+    sizing:       TextSizing,
+    role:         PhantomData<fn() -> Role>,
+}
+
+/// Whether a text leaf's style was supplied by its author.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TextStyleOrigin {
+    Unstyled,
+    Authored,
 }
 
 impl Text<LayoutOnly> {
@@ -399,6 +442,7 @@ impl Text<LayoutOnly> {
             layout: CommonEl::default(),
             content: text.into(),
             style,
+            style_origin: TextStyleOrigin::Authored,
             sizing: TextSizing::default(),
             role: PhantomData,
         }
@@ -406,6 +450,30 @@ impl Text<LayoutOnly> {
 }
 
 impl<Role> Text<Role> {
+    /// Trims the line box above the cap line and below the alphabetic baseline.
+    /// The caller supplies those distances from the font's metrics at the drawn size.
+    pub fn trim_text_box(
+        mut self,
+        top: impl Into<Dimension>,
+        bottom: impl Into<Dimension>,
+    ) -> Self {
+        let top = top.into();
+        let bottom = bottom.into();
+        self.layout.padding.top = Dimension {
+            value: -top.value,
+            unit:  top.unit,
+        };
+        self.layout.padding.bottom = Dimension {
+            value: -bottom.value,
+            unit:  bottom.unit,
+        };
+        self
+    }
+
+    pub(crate) const fn is_unstyled(&self) -> bool {
+        matches!(self.style_origin, TextStyleOrigin::Unstyled)
+    }
+
     /// Marks this text leaf as an inline-editor generated part.
     pub(crate) const fn generated_editor_part(mut self) -> Self {
         self.layout.editor_origin = EditorElementOrigin::Generated;
@@ -442,11 +510,12 @@ impl<Role> Text<Role> {
             self.layout.id = current_id;
         }
         Text {
-            layout:  self.layout,
-            content: self.content,
-            style:   self.style,
-            sizing:  self.sizing,
-            role:    PhantomData,
+            layout:       self.layout,
+            content:      self.content,
+            style:        self.style,
+            style_origin: self.style_origin,
+            sizing:       self.sizing,
+            role:         PhantomData,
         }
     }
 
@@ -479,6 +548,7 @@ impl<Role> Text<Role> {
             layout,
             content,
             style,
+            style_origin: _,
             sizing,
             role: _,
         } = self;
@@ -494,15 +564,25 @@ impl<Role> Text<Role> {
 }
 
 impl From<&str> for Text {
-    fn from(text: &str) -> Self { Self::new(text, TextStyle::default()) }
+    fn from(text: &str) -> Self {
+        Self {
+            style_origin: TextStyleOrigin::Unstyled,
+            ..Self::new(text, TextStyle::default())
+        }
+    }
 }
 
 impl From<&String> for Text {
-    fn from(text: &String) -> Self { Self::new(text, TextStyle::default()) }
+    fn from(text: &String) -> Self { Self::from(text.as_str()) }
 }
 
 impl From<String> for Text {
-    fn from(text: String) -> Self { Self::new(text, TextStyle::default()) }
+    fn from(text: String) -> Self {
+        Self {
+            style_origin: TextStyleOrigin::Unstyled,
+            ..Self::new(text, TextStyle::default())
+        }
+    }
 }
 
 impl<T> From<(T, TextStyle)> for Text
@@ -510,6 +590,44 @@ where
     T: Into<String>,
 {
     fn from((text, style): (T, TextStyle)) -> Self { Self::new(text, style) }
+}
+
+impl LayoutTree {
+    /// Resolves the tooltip's default body and plain-string text into the stored blueprint.
+    pub(crate) fn apply_tooltip_look(&mut self, unstyled_text: &[usize], text_style: TextStyle) {
+        for &index in unstyled_text {
+            if let Some(Element {
+                content: ElementContent::Text { config, .. },
+                ..
+            }) = self.elements.get_mut(index)
+            {
+                *config = text_style.clone();
+            }
+        }
+    }
+
+    /// Replaces the tooltip root's default padding, border and corner radius
+    /// with frame values resolved for its presentation. Authored values stay.
+    pub(crate) fn apply_tooltip_frame(
+        &mut self,
+        padding: Padding,
+        border: Border,
+        corner_radius: CornerRadius,
+    ) {
+        let Some(root) = self.elements.get_mut(0) else {
+            return;
+        };
+        let origins = self.tooltip_body_style_origins;
+        if origins.padding == TooltipBodyPropertyOrigin::Unset {
+            root.padding = padding;
+        }
+        if origins.border == TooltipBodyPropertyOrigin::Unset {
+            root.border = Some(border);
+        }
+        if origins.corner_radius == TooltipBodyPropertyOrigin::Unset {
+            root.corner_radius = corner_radius;
+        }
+    }
 }
 
 /// Public row child-layout state for [`El`].
@@ -540,41 +658,48 @@ impl ChildLayoutState for Column {}
 impl ChildLayoutState for Overlay {}
 
 #[derive(Clone, Debug, PartialEq)]
-struct CommonEl {
-    id:                Option<PanelElementId>,
-    width:             Sizing,
-    height:            Sizing,
-    padding:           Padding,
-    align_x:           AlignX,
-    align_y:           AlignY,
-    background:        Option<Color>,
-    border:            Option<Border>,
-    corner_radius:     CornerRadius,
-    overflow:          ChildOverflow,
-    scroll_offset:     Vec2,
-    scroll_anchor_x:   ScrollAnchor,
-    scroll_anchor_y:   ScrollAnchor,
-    scroll_line:       ScrollLine,
-    material:          Cascade<Handle<StandardMaterial>>,
-    interactivity:     Cascade<WidgetInteractivity>,
-    editable:          Option<ImePanelField>,
-    widget:            Option<WidgetSpec>,
+pub(super) struct CommonEl {
+    pub(super) id:              Option<PanelElementId>,
+    width:                      Sizing,
+    height:                     Sizing,
+    pub(super) padding:         Padding,
+    align_x:                    AlignX,
+    align_y:                    AlignY,
+    background:                 Option<Color>,
+    border:                     Option<Border>,
+    corner_radius:              CornerRadius,
+    tooltip_body_style_origins: TooltipBodyStyleOrigins,
+    overflow:                   ChildOverflow,
+    scroll_drive:               ScrollDrive,
+    scroll_content_origin_y:    f32,
+    scroll_offset:              Vec2,
+    scroll_anchor_x:            ScrollAnchor,
+    scroll_anchor_y:            ScrollAnchor,
+    scroll_line:                ScrollLine,
+    caret_follow:               bool,
+    caret_marker:               bool,
+    material:                   Cascade<Handle<StandardMaterial>>,
+    interactivity:              Cascade<WidgetInteractivity>,
+    editable:                   Option<ImePanelField>,
+    widget:                     Option<WidgetSpec>,
     /// Boxed so the per-state appearance a widget element authors does not
     /// widen every ordinary element declaration.
-    appearance:        Option<Box<StateAppearance>>,
-    editor_origin:     EditorElementOrigin,
-    editor_text:       Option<Box<EditorPart>>,
-    editor_selection:  Option<Box<EditorPart>>,
-    editor_caret:      Option<Box<EditorPart>>,
-    editor_validation: Option<Box<EditorPart>>,
-    tooltip:           Option<Tooltip>,
-    visual_slot:       Option<VisualSlotId>,
-    draw:              Option<PanelDraw>,
-    z_index:           DrawZIndex,
-    anti_alias:        Cascade<AntiAlias>,
-    hairline_fade:     Cascade<HairlineFade>,
-    shadow_casting:    Cascade<ShadowCasting>,
-    precompose:        PrecomposeMode,
+    appearance:                 Option<Box<StateAppearance>>,
+    editor_origin:              EditorElementOrigin,
+    editor_text:                Option<Box<EditorPart>>,
+    editor_selection:           Option<Box<EditorPart>>,
+    editor_caret:               Option<Box<EditorPart>>,
+    editor_validation:          Option<Box<EditorPart>>,
+    tooltip:                    Option<Tooltip>,
+    visual_slot:                Option<VisualSlotId>,
+    dim_with_widget:            Option<PanelElementId>,
+    tooltip_boundary:           TooltipBoundaryRole,
+    draw:                       Option<PanelDraw>,
+    z_index:                    DrawZIndex,
+    anti_alias:                 Cascade<AntiAlias>,
+    hairline_fade:              Cascade<HairlineFade>,
+    shadow_casting:             Cascade<ShadowCasting>,
+    precompose:                 PrecomposeMode,
 }
 
 /// An erased generated-editor part declaration retained by an editable field.
@@ -754,38 +879,45 @@ impl CommonEl {
 impl Default for CommonEl {
     fn default() -> Self {
         Self {
-            id:                None,
-            width:             Sizing::FIT,
-            height:            Sizing::FIT,
-            padding:           Padding::default(),
-            align_x:           AlignX::default(),
-            align_y:           AlignY::default(),
-            background:        None,
-            border:            None,
-            corner_radius:     CornerRadius::ZERO,
-            overflow:          ChildOverflow::Visible,
-            scroll_offset:     Vec2::ZERO,
-            scroll_anchor_x:   ScrollAnchor::Start,
-            scroll_anchor_y:   ScrollAnchor::Start,
-            scroll_line:       ScrollLine::PanelDefaultFont,
-            material:          Cascade::Inherit,
-            interactivity:     Cascade::Inherit,
-            editable:          None,
-            widget:            None,
-            appearance:        None,
-            editor_origin:     EditorElementOrigin::Authored,
-            editor_text:       None,
-            editor_selection:  None,
-            editor_caret:      None,
-            editor_validation: None,
-            tooltip:           None,
-            visual_slot:       None,
-            draw:              None,
-            z_index:           DrawZIndex::default(),
-            anti_alias:        Cascade::Inherit,
-            hairline_fade:     Cascade::Inherit,
-            shadow_casting:    Cascade::Inherit,
-            precompose:        PrecomposeMode::Direct,
+            id:                         None,
+            width:                      Sizing::FIT,
+            height:                     Sizing::FIT,
+            padding:                    Padding::default(),
+            align_x:                    AlignX::default(),
+            align_y:                    AlignY::default(),
+            background:                 None,
+            border:                     None,
+            corner_radius:              CornerRadius::ZERO,
+            tooltip_body_style_origins: TooltipBodyStyleOrigins::default(),
+            overflow:                   ChildOverflow::Visible,
+            scroll_drive:               ScrollDrive::Author,
+            scroll_content_origin_y:    0.0,
+            scroll_offset:              Vec2::ZERO,
+            scroll_anchor_x:            ScrollAnchor::Start,
+            scroll_anchor_y:            ScrollAnchor::Start,
+            scroll_line:                ScrollLine::PanelDefaultFont,
+            caret_follow:               false,
+            caret_marker:               false,
+            material:                   Cascade::Inherit,
+            interactivity:              Cascade::Inherit,
+            editable:                   None,
+            widget:                     None,
+            appearance:                 None,
+            editor_origin:              EditorElementOrigin::Authored,
+            editor_text:                None,
+            editor_selection:           None,
+            editor_caret:               None,
+            editor_validation:          None,
+            tooltip:                    None,
+            visual_slot:                None,
+            dim_with_widget:            None,
+            tooltip_boundary:           TooltipBoundaryRole::PassThrough,
+            draw:                       None,
+            z_index:                    DrawZIndex::default(),
+            anti_alias:                 Cascade::Inherit,
+            hairline_fade:              Cascade::Inherit,
+            shadow_casting:             Cascade::Inherit,
+            precompose:                 PrecomposeMode::Direct,
         }
     }
 }
@@ -797,15 +929,24 @@ fn text_leaf_element(mut common: CommonEl, content: ElementContent) -> Element {
         width: common.width,
         height: common.height,
         padding: common.padding,
-        child_layout: ChildLayout::default(),
+        child_layout: ChildLayout::Row {
+            gap:     Dimension::default(),
+            align_x: common.align_x,
+            align_y: common.align_y,
+            divider: None,
+        },
         background: common.background,
         border: common.border,
         corner_radius: common.corner_radius,
         overflow: common.overflow,
+        scroll_drive: common.scroll_drive,
+        scroll_content_origin_y: common.scroll_content_origin_y,
         scroll_offset: common.scroll_offset,
         scroll_anchor_x: common.scroll_anchor_x,
         scroll_anchor_y: common.scroll_anchor_y,
         scroll_line: common.scroll_line,
+        caret_follow: common.caret_follow,
+        caret_marker: common.caret_marker,
         material: common.material,
         interactivity: common.interactivity,
         editable: common.editable,
@@ -818,6 +959,8 @@ fn text_leaf_element(mut common: CommonEl, content: ElementContent) -> Element {
         editor_validation: common.editor_validation,
         tooltip: common.tooltip,
         visual_slot: common.visual_slot,
+        dim_with_widget: common.dim_with_widget,
+        tooltip_boundary: common.tooltip_boundary,
         draw: common.draw,
         z_index: common.z_index,
         anti_alias: common.anti_alias,
@@ -863,6 +1006,39 @@ where
 }
 
 impl<L, Role> El<L, Role> {
+    pub(crate) fn with_tooltip_body_defaults(
+        mut self,
+        padding: Padding,
+        border: Border,
+        background: Color,
+        corner_radius: CornerRadius,
+    ) -> Self {
+        let origins = self.common.tooltip_body_style_origins;
+        if origins.padding == TooltipBodyPropertyOrigin::Unset {
+            self.common.padding = padding;
+        }
+        if origins.border == TooltipBodyPropertyOrigin::Unset {
+            self.common.border = Some(border);
+        }
+        if origins.background == TooltipBodyPropertyOrigin::Unset {
+            self.common.background = Some(background);
+        }
+        if origins.corner_radius == TooltipBodyPropertyOrigin::Unset {
+            self.common.corner_radius = corner_radius;
+        }
+        self
+    }
+
+    pub(crate) fn opaque_tooltip_surface(mut self) -> Self {
+        self.common.background = Some(
+            self.common
+                .background
+                .unwrap_or(Color::BLACK)
+                .with_alpha(1.0),
+        );
+        self
+    }
+
     /// Marks this element as an inline-editor generated part.
     pub(crate) const fn generated_editor_part(mut self) -> Self {
         self.common.editor_origin = EditorElementOrigin::Generated;
@@ -876,6 +1052,74 @@ impl El<Row, LayoutOnly> {
 
     /// Creates a left-to-right row element declaration.
     pub fn row() -> Self { Self::default() }
+
+    /// Frames an editable slider value in the System Settings field look.
+    ///
+    /// Add the displayed digits as a text child using `metrics.label_size`.
+    pub fn slider_value_field<L: ControlLength>(
+        self,
+        id: impl Into<PanelElementId>,
+        spec: ImeEditableFieldSpec,
+        metrics: &ControlMetrics<L>,
+    ) -> El<Row, WidgetElement<EditableField>> {
+        self.value_field(id, spec, metrics, TextAlign::Right)
+            .width(Sizing::fixed(metrics.slider.value_width))
+    }
+
+    /// Frames a left-aligned editable text value with the shared field metrics.
+    ///
+    /// Add a text child using `metrics.label_size`; override the width to fit
+    /// the containing form's control column.
+    pub fn text_value_field<L: ControlLength>(
+        self,
+        id: impl Into<PanelElementId>,
+        spec: ImeEditableFieldSpec,
+        metrics: &ControlMetrics<L>,
+    ) -> El<Row, WidgetElement<EditableField>> {
+        self.value_field(id, spec, metrics, TextAlign::Left)
+    }
+
+    fn value_field<L: ControlLength>(
+        self,
+        id: impl Into<PanelElementId>,
+        spec: ImeEditableFieldSpec,
+        metrics: &ControlMetrics<L>,
+        alignment: TextAlign,
+    ) -> El<Row, WidgetElement<EditableField>> {
+        let palette = ControlPalette::system_dark();
+        let horizontal = match alignment {
+            TextAlign::Left => AlignX::Left,
+            TextAlign::Center => AlignX::Center,
+            TextAlign::Right => AlignX::Right,
+        };
+        let mut field = self
+            .width(Sizing::fixed(metrics.field.width))
+            .height(Sizing::fixed(metrics.field.height))
+            .alignment(horizontal, AlignY::Center)
+            .padding(Padding::new(
+                metrics.field.side_padding,
+                metrics.field.side_padding,
+                metrics.field.border_width,
+                metrics.field.border_width,
+            ))
+            .background(palette.field_fill)
+            .border(Border::all(
+                metrics.field.border_width,
+                palette.field_border,
+            ))
+            .corner_radius(CornerRadius::all(metrics.field.corner_radius))
+            .editable_field(
+                id,
+                spec,
+                TextStyle::new(metrics.label_size)
+                    .with_color(palette.knob)
+                    .with_align(alignment),
+            );
+        field.appearance_mut().pressed = Cascade::Override(WidgetPressedAppearance::new(
+            Appearance::new().background(palette.control_fill),
+        ));
+        field
+    }
 }
 
 impl<Role: ElementRole> El<Row, Role> {
@@ -1024,6 +1268,7 @@ impl<L, Role> El<L, Role> {
     /// Sets padding on all sides.
     pub const fn padding(mut self, padding: Padding) -> Self {
         self.common.padding = padding;
+        self.common.tooltip_body_style_origins.padding = TooltipBodyPropertyOrigin::Authored;
         self
     }
 
@@ -1049,12 +1294,14 @@ impl<L, Role> El<L, Role> {
     /// Sets a background color.
     pub const fn background(mut self, color: Color) -> Self {
         self.common.background = Some(color);
+        self.common.tooltip_body_style_origins.background = TooltipBodyPropertyOrigin::Authored;
         self
     }
 
     /// Sets a border.
     pub const fn border(mut self, border: Border) -> Self {
         self.common.border = Some(border);
+        self.common.tooltip_body_style_origins.border = TooltipBodyPropertyOrigin::Authored;
         self
     }
 
@@ -1064,6 +1311,7 @@ impl<L, Role> El<L, Role> {
     /// or a bare `f32` for uniform radius on all corners.
     pub fn corner_radius(mut self, radius: impl Into<CornerRadius>) -> Self {
         self.common.corner_radius = radius.into();
+        self.common.tooltip_body_style_origins.corner_radius = TooltipBodyPropertyOrigin::Authored;
         self
     }
 
@@ -1080,12 +1328,25 @@ impl<L, Role> El<L, Role> {
         self
     }
 
+    /// Keeps the tooltips of widgets inside this element within its bounds.
+    ///
+    /// A tooltip first slides along its side to stay inside the nearest marked
+    /// ancestor, less the tooltip viewport margin. One wider than that space may
+    /// cross the element's edge, but only into the free placement area, never
+    /// over a screen panel. Without a marked ancestor a tooltip keeps to the
+    /// placement area alone.
+    pub const fn tooltip_boundary(mut self) -> Self {
+        self.common.tooltip_boundary = TooltipBoundaryRole::Boundary;
+        self
+    }
+
     /// Scrolls children vertically by `offset` logical px from the top and clips
     /// overflow.
     ///
     /// The offset is clamped during positioning to `[0, content - viewport]`;
     /// pass `f32::MAX` to pin to the bottom.
     pub const fn scroll_y(mut self, offset: f32) -> Self {
+        self.common.scroll_drive = ScrollDrive::Author;
         self.common.scroll_offset.y = offset;
         self.common.scroll_anchor_y = ScrollAnchor::Start;
         self.common.overflow = ChildOverflow::Scrolled;
@@ -1099,9 +1360,37 @@ impl<L, Role> El<L, Role> {
     /// supply its content height; increasing `scrollback` walks upward.
     /// Clamped during positioning to `[0, content - viewport]`.
     pub const fn scroll_y_from_end(mut self, scrollback: f32) -> Self {
+        self.common.scroll_drive = ScrollDrive::Author;
         self.common.scroll_offset.y = scrollback;
         self.common.scroll_anchor_y = ScrollAnchor::End;
         self.common.overflow = ChildOverflow::Scrolled;
+        self
+    }
+
+    /// Vertical scroll view the library drives; opens at the first row.
+    pub fn scroll_view(mut self, id: impl Into<PanelElementId>) -> Self {
+        self.common.id = Some(id.into());
+        self.common.overflow = ChildOverflow::Scrolled;
+        self.common.scroll_drive = ScrollDrive::Library(ScrollRestEdge::Start);
+        self
+    }
+
+    /// Vertical scroll view that opens at the last row and follows arriving content.
+    pub fn scroll_view_from_end(mut self, id: impl Into<PanelElementId>) -> Self {
+        self.common.id = Some(id.into());
+        self.common.overflow = ChildOverflow::Scrolled;
+        self.common.scroll_drive = ScrollDrive::Library(ScrollRestEdge::End);
+        self
+    }
+
+    /// Total height of leading content removed by the author, in panel layout units.
+    ///
+    /// Only library-driven scroll views read this value. Increasing it preserves
+    /// a pinned reader's position among retained rows; an end-following view
+    /// keeps following. Leave it unchanged while no leading content is removed.
+    /// The origin only grows; a smaller value moves nothing.
+    pub const fn scroll_content_origin_y(mut self, origin: f32) -> Self {
+        self.common.scroll_content_origin_y = origin;
         self
     }
 
@@ -1122,9 +1411,16 @@ impl<L, Role> El<L, Role> {
     /// The offset is clamped during positioning to `[0, content - viewport]`;
     /// pass `f32::MAX` to pin to the right edge.
     pub const fn scroll_x(mut self, offset: f32) -> Self {
+        self.common.scroll_drive = ScrollDrive::Author;
         self.common.scroll_offset.x = offset;
         self.common.scroll_anchor_x = ScrollAnchor::Start;
         self.common.overflow = ChildOverflow::Scrolled;
+        self
+    }
+
+    /// Marks the editor's zero-width caret wrapper for horizontal field scrolling.
+    pub(crate) const fn caret_marker(mut self) -> Self {
+        self.common.caret_marker = true;
         self
     }
 
@@ -1154,6 +1450,29 @@ impl<L, Role> El<L, Role> {
     /// panel build error. Zero marked thumbs leaves the slider valid with no
     /// automatic value visualization.
     pub const fn slider_thumb(self) -> Self { self.visual_slot(VisualSlotId::SLIDER_THUMB) }
+
+    /// Marks one ordinary, noninteractive slider descendant as its value fill.
+    ///
+    /// Author its border box from the track's leading edge. Value presentation
+    /// shortens the rendered fill to the thumb center without changing layout.
+    /// A fill outside a slider or a second fill in one slider is a build error.
+    pub const fn slider_fill(self) -> Self { self.visual_slot(VisualSlotId::SLIDER_FILL) }
+
+    /// Marks this ordinary, noninteractive descendant as its slider's signal marker.
+    pub const fn slider_marker(self) -> Self { self.visual_slot(VisualSlotId::SLIDER_MARKER) }
+
+    /// Marks the round knob inside a switch track for state-driven motion.
+    pub const fn switch_knob(self) -> Self { self.visual_slot(VisualSlotId::SWITCH_KNOB) }
+
+    /// Dims this ordinary element and its descendants with a sibling widget.
+    ///
+    /// The named widget stays the sole interaction target; this only links
+    /// retained visual records such as a nearby caption to its disabled or
+    /// [`WidgetDimmed`](crate::WidgetDimmed) appearance.
+    pub fn dim_with_widget(mut self, id: impl Into<PanelElementId>) -> Self {
+        self.common.dim_with_widget = Some(id.into());
+        self
+    }
 
     /// Authors widget interactivity for this element and its widget descendants.
     ///
@@ -1197,7 +1516,7 @@ impl<L> El<L, LayoutOnly> {
     /// fn field() -> El<Row, WidgetElement<EditableField>> {
     ///     let spec = ImeEditableFieldSpec::AppOwned(ImeAppOwnedFieldSpec::new("gain"));
     ///     El::new()
-    ///         .editable_field("editable", spec)
+    ///         .editable_field("editable", spec, hana_diegetic::TextStyle::new(10.0))
     ///         .hovered(Appearance::new().background(Color::BLACK))
     ///         .focused(Appearance::new().background(Color::BLACK))
     ///         .disabled(Appearance::new().background(Color::BLACK))
@@ -1215,7 +1534,7 @@ impl<L> El<L, LayoutOnly> {
     ///
     /// let spec = ImeEditableFieldSpec::AppOwned(ImeAppOwnedFieldSpec::new("test"));
     /// let _ = El::new()
-    ///     .editable_field("editable", spec)
+    ///     .editable_field("editable", spec, hana_diegetic::TextStyle::new(10.0))
     ///     .button("button");
     /// ```
     ///
@@ -1227,7 +1546,7 @@ impl<L> El<L, LayoutOnly> {
     ///
     /// let spec = ImeEditableFieldSpec::AppOwned(ImeAppOwnedFieldSpec::new("test"));
     /// let _ = El::new()
-    ///     .editable_field("editable", spec)
+    ///     .editable_field("editable", spec, hana_diegetic::TextStyle::new(10.0))
     ///     .pressed(Appearance::new().background(Color::BLACK));
     /// ```
     ///
@@ -1242,7 +1561,7 @@ impl<L> El<L, LayoutOnly> {
     ///
     /// let spec = ImeEditableFieldSpec::AppOwned(ImeAppOwnedFieldSpec::new("test"));
     /// let mut builder = LayoutBuilder::new(100.0, 50.0);
-    /// builder.with(El::new().editable_field("editable", spec), |builder| {
+    /// builder.with(El::new().editable_field("editable", spec, hana_diegetic::TextStyle::new(10.0)), |builder| {
     ///     builder.with(
     ///         builder
     ///             .child(El::new().background(Color::WHITE))
@@ -1255,9 +1574,12 @@ impl<L> El<L, LayoutOnly> {
         mut self,
         field_id: impl Into<PanelElementId>,
         field_spec: ImeEditableFieldSpec,
+        text_style: TextStyle,
     ) -> El<L, WidgetElement<EditableField>> {
-        self.common.editable = Some(ImePanelField::new(field_id, field_spec));
+        self.common.editable = Some(ImePanelField::new(field_id, field_spec, text_style));
         self.common.visual_slot = Some(VisualSlotId::EDITABLE_ROOT);
+        self.common.overflow = ChildOverflow::Clipped;
+        self.common.scroll_offset.x = 0.0;
         self.into_widget_element()
     }
 
@@ -1284,6 +1606,11 @@ impl<L> El<L, LayoutOnly> {
         range: RangeInclusive<f32>,
     ) -> El<L, WidgetElement<Slider>> {
         self.widget(id, Slider::new(range))
+    }
+
+    /// Marks this element as a two-sided switch with panel-local identity `id`.
+    pub fn switch(self, id: impl Into<PanelElementId>) -> El<L, WidgetElement<Switch>> {
+        self.widget(id, Switch::new())
     }
 
     /// Marks this element as the pre-built widget `widget` with panel-local
@@ -1620,12 +1947,14 @@ impl<L> El<L, WidgetElement<EditableField>> {
     ///
     /// fn caret() {
     ///     let spec = ImeEditableFieldSpec::AppOwned(ImeAppOwnedFieldSpec::new("gain"));
-    ///     let _ = El::new().editable_field("editable", spec).editor_caret(
-    ///         EditorStateColors::new()
-    ///             .focused(Color::WHITE)
-    ///             .hovered(Color::BLACK)
-    ///             .disabled(Color::NONE),
-    ///     );
+    ///     let _ = El::new()
+    ///         .editable_field("editable", spec, hana_diegetic::TextStyle::new(10.0))
+    ///         .editor_caret(
+    ///             EditorStateColors::new()
+    ///                 .focused(Color::WHITE)
+    ///                 .hovered(Color::BLACK)
+    ///                 .disabled(Color::NONE),
+    ///         );
     /// }
     /// ```
     ///
@@ -1640,7 +1969,7 @@ impl<L> El<L, WidgetElement<EditableField>> {
     /// use hana_diegetic::{EditorStateColors, El, ImeAppOwnedFieldSpec, ImeEditableFieldSpec};
     ///
     /// let spec = ImeEditableFieldSpec::AppOwned(ImeAppOwnedFieldSpec::new("test"));
-    /// let _ = El::new().editable_field("editable", spec).editor_caret(
+    /// let _ = El::new().editable_field("editable", spec, hana_diegetic::TextStyle::new(10.0)).editor_caret(
     ///     EditorStateColors::new()
     ///         .focused(Color::BLACK)
     ///         .text_color(Color::WHITE),
@@ -1656,7 +1985,7 @@ impl<L> El<L, WidgetElement<EditableField>> {
     ///
     /// let spec = ImeEditableFieldSpec::AppOwned(ImeAppOwnedFieldSpec::new("test"));
     /// let _ = El::new()
-    ///     .editable_field("editable", spec)
+    ///     .editable_field("editable", spec, hana_diegetic::TextStyle::new(10.0))
     ///     .editor_caret(EditorStateColors::new().focused(Color::WHITE).pressed(Color::BLACK));
     /// ```
     pub fn editor_caret(mut self, colors: EditorStateColors) -> Self {
@@ -1773,7 +2102,14 @@ impl<L> El<L, WidgetElement<Button>> {
 }
 
 impl<L> El<L, WidgetElement<Slider>> {
-    /// Sets the slider's authored default value.
+    /// Sets the slider's stable reset target.
+    ///
+    /// See [`Slider::default_value`].
+    pub fn default_value(self, value: f32) -> Self {
+        self.configure_slider(|slider| slider.default_value(value))
+    }
+
+    /// Sets the slider's initial live value without changing its reset target.
     ///
     /// See [`Slider::value`].
     pub fn value(self, value: f32) -> Self { self.configure_slider(|slider| slider.value(value)) }
@@ -1788,13 +2124,6 @@ impl<L> El<L, WidgetElement<Slider>> {
     /// See [`Slider::direction`].
     pub fn direction(self, direction: SliderDirection) -> Self {
         self.configure_slider(|slider| slider.direction(direction))
-    }
-
-    /// Sets the optional thumb gesture that proposes the authored default.
-    ///
-    /// See [`Slider::reset_behavior`].
-    pub fn reset_behavior(self, reset_behavior: SliderResetBehavior) -> Self {
-        self.configure_slider(|slider| slider.reset_behavior(reset_behavior))
     }
 
     fn configure_slider(mut self, configure: impl FnOnce(Slider) -> Slider) -> Self {
@@ -1903,10 +2232,14 @@ impl<L, Role> El<L, Role> {
             border: common.border,
             corner_radius: common.corner_radius,
             overflow: common.overflow,
+            scroll_drive: common.scroll_drive,
+            scroll_content_origin_y: common.scroll_content_origin_y,
             scroll_offset: common.scroll_offset,
             scroll_anchor_x: common.scroll_anchor_x,
             scroll_anchor_y: common.scroll_anchor_y,
             scroll_line: common.scroll_line,
+            caret_follow: common.caret_follow,
+            caret_marker: common.caret_marker,
             material: common.material,
             interactivity: common.interactivity,
             editable: common.editable,
@@ -1919,6 +2252,8 @@ impl<L, Role> El<L, Role> {
             editor_validation: common.editor_validation,
             tooltip: common.tooltip,
             visual_slot: common.visual_slot,
+            dim_with_widget: common.dim_with_widget,
+            tooltip_boundary: common.tooltip_boundary,
             draw: common.draw,
             z_index: common.z_index,
             anti_alias: common.anti_alias,
@@ -1942,6 +2277,7 @@ mod private {
     use super::PressedPart;
     use super::Row;
     use super::Slider;
+    use super::Switch;
     use super::WidgetBuilder;
     use super::WidgetChild;
     use super::WidgetElement;
@@ -1988,9 +2324,13 @@ mod private {
 
     impl WidgetSealed for Slider {}
 
+    impl WidgetSealed for Switch {}
+
     impl WidgetOwnerSealed for Button {}
 
     impl WidgetOwnerSealed for Slider {}
+
+    impl WidgetOwnerSealed for Switch {}
 
     impl WidgetOwnerSealed for EditableField {}
 
@@ -2186,6 +2526,9 @@ pub trait LayoutContentBuilder: private::BuilderSealed + AcceptsElement<LayoutOn
     /// Adds a text leaf as a child of the current parent.
     fn text(&mut self, text: impl Into<Text<LayoutOnly>>) -> &mut Self;
 
+    /// Adds a fixed-square Lucide icon leaf as a child of the current parent.
+    fn icon(&mut self, icon: Icon) -> &mut Self;
+
     /// Adds an image leaf as a child of the current parent.
     fn image<L>(&mut self, el: El<L, LayoutOnly>, handle: Handle<Image>, tint: Color) -> &mut Self
     where
@@ -2296,6 +2639,7 @@ impl LayoutBuilder {
         Role: ElementRole,
     {
         let mut tree = LayoutTree::new();
+        tree.tooltip_body_style_origins = el.common.tooltip_body_style_origins;
         let root = tree.add(el.into_element(ElementContent::Empty));
         tree.set_root(root);
 
@@ -2365,6 +2709,22 @@ impl LayoutBuilder {
         self
     }
 
+    /// Adds one read-only paragraph with typed colour and word-spacing spans.
+    pub fn rich_text(
+        &mut self,
+        text: super::RichText,
+        spans: impl FnOnce(&mut super::RichTextBuilder),
+    ) -> &mut Self {
+        self.add_rich_text(text, spans);
+        self
+    }
+
+    /// Adds a fixed-square Lucide icon leaf as a child of the current parent.
+    pub fn icon(&mut self, icon: Icon) -> &mut Self {
+        self.add_icon(icon);
+        self
+    }
+
     /// Takes the next build-order [`PanelElementId::Auto`] id for an unnamed run.
     const fn take_auto_id(&mut self) -> PanelElementId {
         let id = PanelElementId::auto(self.next_auto_id);
@@ -2416,6 +2776,29 @@ impl LayoutBuilder {
     {
         let parent = self.current_parent();
         let mut text = text.into();
+        if self
+            .parent_stack
+            .iter()
+            .any(|&index| self.tree.elements[index].editable.is_some())
+            && matches!(
+                text.sizing,
+                TextSizing::Natural { .. } | TextSizing::WrapAtMeasure { .. }
+            )
+        {
+            text.sizing = TextSizing::wrap(TextWrap::None);
+        } else if matches!(
+            text.sizing,
+            TextSizing::Natural { .. } | TextSizing::WrapAtMeasure { .. }
+        ) && (matches!(text.layout.widget, Some(WidgetSpec::Button(_)))
+            || self.parent_stack.iter().any(|&index| {
+                matches!(
+                    self.tree.elements[index].widget,
+                    Some(WidgetSpec::Button(_))
+                )
+            }))
+        {
+            text.sizing = TextSizing::wrap(TextWrap::TruncateTail);
+        }
         let id = text
             .layout
             .id
@@ -2423,6 +2806,39 @@ impl LayoutBuilder {
             .unwrap_or_else(|| self.take_auto_id());
         text.layout.id = Some(id);
         self.tree.add_child(parent, text.into_element());
+    }
+
+    fn add_rich_text(
+        &mut self,
+        mut text: super::RichText,
+        spans: impl FnOnce(&mut super::RichTextBuilder),
+    ) {
+        assert!(
+            !self
+                .parent_stack
+                .iter()
+                .any(|&index| self.tree.elements[index].editable.is_some()),
+            "rich text is read-only; editable fields use plain text"
+        );
+        if text.layout.id.is_none() {
+            text.layout.id = Some(self.take_auto_id());
+        }
+        let mut builder = super::RichTextBuilder::new(text.base, text.sizing);
+        spans(&mut builder);
+        let paragraph = std::sync::Arc::new(builder.finish());
+        let element = text_leaf_element(text.layout, ElementContent::RichText(paragraph));
+        self.tree.note_rich_text();
+        self.tree.add_child(self.current_parent(), element);
+    }
+
+    fn add_icon(&mut self, icon: Icon) {
+        let parent = self.current_parent();
+        let size = super::Pt(icon.size_value());
+        let element = El::new()
+            .width(Sizing::fixed(size))
+            .height(Sizing::fixed(size))
+            .into_element(ElementContent::Icon(icon));
+        self.tree.add_child(parent, element);
     }
 
     fn add_image<L, Role>(&mut self, el: El<L, Role>, handle: Handle<Image>, tint: Color)
@@ -2567,6 +2983,11 @@ impl LayoutContentBuilder for LayoutBuilder {
         self
     }
 
+    fn icon(&mut self, icon: Icon) -> &mut Self {
+        self.add_icon(icon);
+        self
+    }
+
     fn image<L>(&mut self, el: El<L, LayoutOnly>, handle: Handle<Image>, tint: Color) -> &mut Self
     where
         L: ChildLayoutState,
@@ -2618,6 +3039,22 @@ impl<W: WidgetOwner> WidgetBuilder<'_, W> {
         self
     }
 
+    /// Adds one read-only rich paragraph inside this widget.
+    pub fn rich_text(
+        &mut self,
+        text: super::RichText,
+        spans: impl FnOnce(&mut super::RichTextBuilder),
+    ) -> &mut Self {
+        self.layout_builder_mut().add_rich_text(text, spans);
+        self
+    }
+
+    /// Adds a fixed-square Lucide icon leaf under the current widget scope.
+    pub fn icon(&mut self, icon: Icon) -> &mut Self {
+        self.layout_builder_mut().add_icon(icon);
+        self
+    }
+
     /// Adds an image leaf under the current widget-scope parent.
     pub fn image<L, Role>(
         &mut self,
@@ -2661,6 +3098,11 @@ impl<W: WidgetOwner> LayoutContentBuilder for WidgetBuilder<'_, W> {
         self
     }
 
+    fn icon(&mut self, icon: Icon) -> &mut Self {
+        self.layout_builder_mut().add_icon(icon);
+        self
+    }
+
     fn image<L>(&mut self, el: El<L, LayoutOnly>, handle: Handle<Image>, tint: Color) -> &mut Self
     where
         L: ChildLayoutState,
@@ -2683,7 +3125,7 @@ impl LayoutTree {
         parent: usize,
         text: impl Into<Text<LayoutOnly>>,
         next_auto_id: &mut u32,
-    ) {
+    ) -> usize {
         let mut text = text.into();
         let id = text
             .layout
@@ -2694,7 +3136,7 @@ impl LayoutTree {
             *next_auto_id += 1;
         }
         text.layout.id = Some(id);
-        self.add_child(parent, text.into_element());
+        self.add_child(parent, text.into_element())
     }
 
     pub(crate) fn tooltip_add_image<L>(
@@ -2723,6 +3165,10 @@ mod tests {
     use super::ElementContent;
     use crate::Appearance;
     use crate::Border;
+    use crate::ControlMetrics;
+    use crate::ControlPalette;
+    use crate::ImeAppOwnedFieldSpec;
+    use crate::ImeEditableFieldSpec;
     use crate::Px;
     use crate::cascade::Cascade;
 
@@ -2795,5 +3241,22 @@ mod tests {
 
         assert_eq!(element.background, Some(Color::BLACK));
         assert_eq!(element.border, Some(Border::all(Px(1.0), Color::WHITE)));
+    }
+
+    #[test]
+    fn slider_value_field_uses_its_field_metrics_border() {
+        let metrics = ControlMetrics::from_label_size(13.0_f32);
+        let spec = ImeEditableFieldSpec::AppOwned(ImeAppOwnedFieldSpec::new("value"));
+        let element = El::row()
+            .slider_value_field("value", spec, &metrics)
+            .into_element(ElementContent::Empty);
+
+        assert_eq!(
+            element.border,
+            Some(Border::all(
+                metrics.field.border_width,
+                ControlPalette::system_dark().field_border,
+            ))
+        );
     }
 }

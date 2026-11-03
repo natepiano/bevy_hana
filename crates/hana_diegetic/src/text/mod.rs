@@ -18,48 +18,84 @@ use bevy::asset::AssetLoadFailedEvent;
 use bevy::prelude::App;
 use bevy::prelude::AssetApp;
 use bevy::prelude::AssetEvent;
+use bevy::prelude::AssetServer;
 use bevy::prelude::Assets;
 use bevy::prelude::Commands;
 use bevy::prelude::MessageReader;
+use bevy::prelude::Mut;
 use bevy::prelude::Plugin;
 use bevy::prelude::PostUpdate;
 use bevy::prelude::Res;
 use bevy::prelude::ResMut;
 use bevy::prelude::Startup;
 use bevy::prelude::warn;
+use bevy::render::storage::ShaderBuffer;
 pub(crate) use font::DEFAULT_FAMILY;
+pub use font::DecorationLineMetrics;
 pub use font::DiegeticTextMeasurer;
+pub use font::EmbeddedFace;
 pub use font::Font;
+pub use font::FontFailureSource;
 pub use font::FontId;
+pub use font::FontLoadError;
 pub use font::FontLoadFailed;
 use font::FontLoader;
+pub use font::FontLookupError;
 pub use font::FontMetrics;
+pub use font::FontParseError;
 pub use font::FontRegistered;
+pub use font::FontRegistrationError;
 pub use font::FontRegistry;
+pub use font::FontRegistryError;
 pub use font::FontSource;
 #[cfg(feature = "typography_overlay")]
 pub use font::GlyphBounds;
 #[cfg(feature = "typography_overlay")]
+pub use font::GlyphInkMeasurement;
+#[cfg(feature = "typography_overlay")]
+pub use font::GlyphMetricsError;
+pub use font::GlyphOutline;
+#[cfg(feature = "typography_overlay")]
 pub use font::GlyphTypographyMetrics;
 pub use font::IntegralAdvanceSizeError;
+pub(crate) use font::RichTextMeasurer;
+pub use font::TextOutline;
+pub use font::TextOutlineError;
+pub use font::TextOutlineMeasurement;
+pub(crate) use font::create_cap_height_measurer;
 pub use font::create_parley_measurer;
+pub(crate) use font::create_parley_rich_measurer;
 pub(crate) use font::glyph_ink_extents;
 pub(crate) use slug::GlyphCache;
 pub(crate) use slug::GlyphQuadExtents;
 pub(crate) use slug::PositionedGlyph;
 pub(crate) use slug::PreparedTextRun;
 pub(crate) use slug::RunStorageKey;
+pub(in crate::text) use slug::font_glyph_id_has_visible_outline;
 pub(crate) use slug::glyph_quad_extents;
+pub(in crate::text) use slug::load_glyph_by_id_from_face;
+
+/// Clears cached glyph paths and their atlas buffers between drawn test scenes.
+pub fn reset_drawn_glyph_cache(app: &mut App) {
+    app.world_mut()
+        .resource_scope(|world, mut buffers: Mut<Assets<ShaderBuffer>>| {
+            world
+                .resource_mut::<GlyphCache>()
+                .reset_to_post_startup(&mut buffers);
+        });
+}
 
 use self::slug::SlugPlugin;
+use crate::constants::DIAGNOSTIC_LOG_TARGET;
+use crate::layout::ShapedTextCache;
 #[cfg(test)]
 use crate::render::PathExtendedMaterial;
 
 pub(crate) struct TextPlugin;
 
 #[cfg(test)]
-pub(super) const fn text_material_oit_depth_offset(material: &PathExtendedMaterial) -> f32 {
-    slug::text_material_oit_depth_offset(material)
+pub(super) const fn text_material_oit_paint_order(material: &PathExtendedMaterial) -> f32 {
+    slug::text_material_oit_paint_order(material)
 }
 
 impl Plugin for TextPlugin {
@@ -69,9 +105,12 @@ impl Plugin for TextPlugin {
         // If the embedded font fails to parse, skip the rest of text setup:
         // no `FontRegistry`, no `DiegeticTextMeasurer`, no `Font` asset or
         // loader, and none of the font systems get registered.
-        let Some(font_registry) = FontRegistry::new() else {
-            warn!("hana_diegetic: embedded font failed to parse — text plugin disabled");
-            return;
+        let font_registry = match FontRegistry::new() {
+            Ok(registry) => registry,
+            Err(error) => {
+                warn!(target: DIAGNOSTIC_LOG_TARGET, "hana_diegetic: {error} — text plugin disabled");
+                return;
+            },
         };
 
         let measurer = DiegeticTextMeasurer {
@@ -81,6 +120,15 @@ impl Plugin for TextPlugin {
             ),
         };
 
+        app.init_resource::<ShapedTextCache>();
+        let rich_measurer = RichTextMeasurer {
+            measure_fn: create_parley_rich_measurer(
+                font_registry.font_context(),
+                font_registry.family_names(),
+                app.world().resource::<ShapedTextCache>().clone(),
+            ),
+        };
+        app.insert_resource(rich_measurer);
         app.insert_resource(font_registry)
             .insert_resource(measurer)
             .init_asset::<Font>()
@@ -101,38 +149,56 @@ fn register_embedded_font(mut commands: Commands) {
 
 /// Watches for newly loaded [`Font`] assets and registers them with
 /// [`FontRegistry`]. Fires [`FontRegistered`] for each successful
-/// registration.
+/// registration and [`FontLoadFailed`] for each refused one.
 fn consume_loaded_fonts(
     mut events: MessageReader<AssetEvent<Font>>,
     font_assets: Res<Assets<Font>>,
+    asset_server: Res<AssetServer>,
     mut font_registry: ResMut<FontRegistry>,
     mut commands: Commands,
+    cache: Option<Res<ShapedTextCache>>,
 ) {
     for event in events.read() {
         if let AssetEvent::Added { id } = event
             && let Some(font) = font_assets.get(*id)
         {
-            if font_registry.font_id_by_name(font.name()).is_some() {
+            if font_registry.font_id_by_name(font.name()).is_ok() {
                 continue;
             }
-            if let Some(font_id) = font_registry.register_font(font.name(), font.data()) {
-                // The parley measurer maps `font_id` → family name through the
-                // family list it was built from. A font registered after
-                // startup is absent from that list, so its measure falls back
-                // to the default family and mis-sizes the panel. Rebuild the
-                // measurer with the now-current family list so the new font
-                // measures as itself.
-                commands.insert_resource(DiegeticTextMeasurer {
-                    measure_fn: create_parley_measurer(
-                        font_registry.font_context(),
-                        font_registry.family_names(),
-                    ),
-                });
-                commands.trigger(FontRegistered {
-                    id:     font_id,
-                    name:   (*font.name()).to_string(),
-                    source: FontSource::Loaded,
-                });
+            match font_registry.register_font(font.name(), font.data()) {
+                Ok(font_id) => {
+                    // A loaded family was absent when the measurer was built.
+                    // Rebuild its family list so it measures with its own face.
+                    commands.insert_resource(DiegeticTextMeasurer {
+                        measure_fn: create_parley_measurer(
+                            font_registry.font_context(),
+                            font_registry.family_names(),
+                        ),
+                    });
+                    commands.insert_resource(RichTextMeasurer {
+                        measure_fn: create_parley_rich_measurer(
+                            font_registry.font_context(),
+                            font_registry.family_names(),
+                            cache.as_deref().cloned().unwrap_or_default(),
+                        ),
+                    });
+                    commands.trigger(FontRegistered {
+                        id:     font_id,
+                        name:   (*font.name()).to_string(),
+                        source: FontSource::Loaded,
+                    });
+                },
+                Err(error) => {
+                    let source = asset_server.get_path(*id).map_or_else(
+                        || FontFailureSource::FamilyName(font.name().to_string()),
+                        |path| FontFailureSource::AssetPath(path.into_owned()),
+                    );
+                    warn!(target: DIAGNOSTIC_LOG_TARGET, "hana_diegetic: font {source}: {error}");
+                    commands.trigger(FontLoadFailed {
+                        source,
+                        error: FontLoadError::Registration(error),
+                    });
+                },
             }
         }
     }
@@ -145,8 +211,8 @@ fn watch_font_failures(
 ) {
     for event in failures.read() {
         commands.trigger(FontLoadFailed {
-            path:  event.path.to_string(),
-            error: event.error.to_string(),
+            source: FontFailureSource::AssetPath(event.path.clone()),
+            error:  FontLoadError::Asset(event.error.clone()),
         });
     }
 }
@@ -166,10 +232,20 @@ mod tests {
     use bevy::prelude::Assets;
     use bevy::prelude::IntoScheduleConfigs;
     use bevy::prelude::MinimalPlugins;
+    use bevy::prelude::On;
     use bevy::prelude::PostUpdate;
+    use bevy::prelude::ResMut;
+    use bevy::prelude::Resource;
 
     use super::DiegeticTextMeasurer;
     use super::Font;
+    use super::FontFailureSource;
+    use super::FontLoadError;
+    use super::FontLoadFailed;
+    use super::FontLookupError;
+    use super::FontParseError;
+    use super::FontRegistered;
+    use super::FontRegistrationError;
     use super::FontRegistry;
     use super::consume_loaded_fonts;
     use super::create_parley_measurer;
@@ -179,6 +255,63 @@ mod tests {
     /// whose descenders clipped because its tall CJK line box was measured with
     /// the monospace default's metrics instead.
     const NOTO_CJK_DATA: &[u8] = include_bytes!("../../assets/fonts/NotoSansCJKsc-Regular.otf");
+
+    #[derive(Resource, Default)]
+    struct RegistrationCount(usize);
+
+    #[derive(Resource, Default)]
+    struct LoadFailures(Vec<FontLoadFailed>);
+
+    fn count_registration(_: On<FontRegistered>, mut count: ResMut<RegistrationCount>) {
+        count.0 += 1;
+    }
+
+    fn record_load_failure(failure: On<FontLoadFailed>, mut failures: ResMut<LoadFailures>) {
+        failures.0.push(failure.event().clone());
+    }
+
+    #[test]
+    fn unreadable_loaded_font_fires_load_failed_and_does_not_register() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.add_plugins(AssetPlugin::default());
+        app.init_asset::<Font>();
+        app.insert_resource(FontRegistry::new().unwrap());
+        app.init_resource::<RegistrationCount>();
+        app.init_resource::<LoadFailures>();
+        app.add_observer(count_registration);
+        app.add_observer(record_load_failure);
+        app.add_systems(PostUpdate, consume_loaded_fonts.after(AssetEventSystems));
+        app.finish();
+        app.cleanup();
+
+        let font = Font::from_bytes("Broken family", NOTO_CJK_DATA)
+            .unwrap()
+            .with_unreadable_data_for_test();
+        let _handle = app.world_mut().resource_mut::<Assets<Font>>().add(font);
+        app.update();
+
+        assert_eq!(app.world().resource::<RegistrationCount>().0, 0);
+        assert_eq!(
+            app.world()
+                .resource::<FontRegistry>()
+                .font_id_by_name("Broken family"),
+            Err(FontLookupError::UnknownFamilyName(
+                "Broken family".to_string()
+            ))
+        );
+        let failures = &app.world().resource::<LoadFailures>().0;
+        assert_eq!(failures.len(), 1);
+        assert!(matches!(
+            &failures[0],
+            FontLoadFailed {
+                source: FontFailureSource::FamilyName(name),
+                error: FontLoadError::Registration(FontRegistrationError::Unreadable(
+                    FontParseError::Unreadable { name: parsed_name }
+                )),
+            } if name == "Broken family" && parsed_name == "Broken family"
+        ));
+    }
 
     #[test]
     fn loading_a_font_rebuilds_the_measurer_to_resolve_it() {
@@ -221,7 +354,7 @@ mod tests {
             app.world()
                 .resource::<FontRegistry>()
                 .font_id_by_name("Noto Sans CJK SC")
-                .is_some(),
+                .is_ok(),
             "consume_loaded_fonts should register the loaded font",
         );
 

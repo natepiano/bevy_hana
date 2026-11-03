@@ -1,6 +1,7 @@
 use std::ops::Range;
 
 use bevy::asset::UntypedAssetId;
+use bevy::extract::sync_world::MainEntity;
 use bevy::prelude::Entity;
 use bevy_render::mesh::allocator::MeshSlabs;
 use bevy_render::render_phase::BinnedPhaseItem;
@@ -10,7 +11,6 @@ use bevy_render::render_phase::PhaseItem;
 use bevy_render::render_phase::PhaseItemBatchSetKey;
 use bevy_render::render_phase::PhaseItemExtraIndex;
 use bevy_render::render_resource::CachedRenderPipelineId;
-use bevy_render::sync_world::MainEntity;
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct OutlineBatchSetKey {

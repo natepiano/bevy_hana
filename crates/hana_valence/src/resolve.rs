@@ -2,10 +2,15 @@
 
 use std::hash::Hash;
 
+use bevy_ecs::change_detection::DetectChanges;
 use bevy_ecs::change_detection::DetectChangesMut;
 use bevy_ecs::entity::Entities;
 use bevy_ecs::entity::Entity;
 use bevy_ecs::hierarchy::ChildOf;
+use bevy_ecs::lifecycle::RemovedComponents;
+use bevy_ecs::query::Changed;
+use bevy_ecs::query::With;
+use bevy_ecs::query::Without;
 #[cfg(test)]
 use bevy_ecs::schedule::IntoScheduleConfigs;
 #[cfg(test)]
@@ -15,6 +20,7 @@ use bevy_ecs::system::Query;
 use bevy_ecs::system::ResMut;
 #[cfg(test)]
 use bevy_ecs::world::World;
+use bevy_math::Affine3A;
 use bevy_math::Vec3;
 use bevy_platform::collections::HashMap;
 use bevy_transform::prelude::GlobalTransform;
@@ -49,7 +55,6 @@ const ORTHONORMAL_EPSILON: f32 = 1e-4;
 const TEST_QUAD_HEIGHT: f32 = 1.0;
 #[cfg(test)]
 const TEST_QUAD_WIDTH: f32 = 2.0;
-const UNIFORM_SCALE_EPSILON: f32 = 1e-4;
 
 /// Reason an anchor relationship did not resolve this frame.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -67,7 +72,8 @@ pub enum AnchorResolveSkip {
     MissingAnchor(AnchorSite),
     /// The target entity no longer exists.
     DespawnedTarget,
-    /// The source has a transform parent with unsupported scale or shear.
+    /// The source's transform parent is missing or degenerate (non-finite or
+    /// non-invertible), or the wanted pose cannot be expressed under it without skew.
     UnsupportedParentTransform,
     /// The source entity's current global scale is non-finite.
     NonFiniteScale,
@@ -87,13 +93,183 @@ pub type AnchorResolveDiagnostics = AttachmentResolveDiagnostics<AnchorResolveSk
 /// Applications do not insert or inspect this type. Bevy creates one
 /// `Local<AnchorResolverScratch>` for each registered [`resolve_anchors`] system.
 /// Every invocation reads the current relationships and geometry from ECS,
-/// then empties its collections before returning; only temporary allocation
-/// capacity, never topology or diagnostics, remains between frames.
+/// then empties its traversal collections before returning. The scratch also
+/// retains only the semantic global-transform inputs of the last completed
+/// pass, so equal-value transform ticks can be ignored.
 #[derive(Default)]
 pub struct AnchorResolverScratch {
     candidates:          Vec<AttachmentResolveCandidate<AnchorResolveSkip>>,
+    resolution_order:    Vec<AttachmentResolveAction>,
+    cached_placements:   Vec<CachedAnchorPlacement>,
+    cached_indices:      HashMap<Entity, usize>,
     resolved_globals:    HashMap<Entity, GlobalTransform>,
+    dirty_placements:    Vec<bool>,
+    skipped_placements:  Vec<bool>,
     attachment_resolver: AttachmentResolverScratch,
+    input_state:         AnchorResolveInputState,
+}
+
+impl AnchorResolverScratch {
+    fn can_resolve_cached_pose(
+        &self,
+        evidence: &AnchorResolveInputEvidence,
+        diagnostics: &AnchorResolveDiagnostics,
+    ) -> bool {
+        self.input_state
+            .permits_cached_pose_resolution(evidence, diagnostics)
+            && !self.resolution_order.is_empty()
+            && self.cached_placements.len() == self.resolution_order.len()
+    }
+}
+
+/// Inputs that stay fixed while only an anchor pose is animating.
+#[derive(Clone, Copy)]
+struct CachedAnchorPlacement {
+    source:           Entity,
+    target:           Entity,
+    target_placement: Option<usize>,
+    target_frame:     AnchorFrame,
+    source_frame:     AnchorFrame,
+    offset:           Vec3,
+    source_scale:     Vec3,
+    source_parent:    AnchorPlacementParent,
+    parent_placement: Option<usize>,
+    last_global:      GlobalTransform,
+}
+
+/// Coordinate space in which an anchored source's local transform is stored.
+#[derive(Clone, Copy)]
+enum AnchorPlacementParent {
+    World,
+    Entity(Entity),
+}
+
+/// The global transforms the last completed anchor pass actually read.
+///
+/// A component change tick alone is not enough evidence: transform
+/// propagation and the word presentation can both write the same value the
+/// resolver already solved against. Missing values are retained explicitly so
+/// their later arrival opens the pass too.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ObservedAnchorGlobal {
+    Missing,
+    Present(GlobalTransform),
+}
+
+/// Semantic resolver inputs retained across invocations of one registered
+/// system.
+#[derive(Default)]
+enum AnchorResolveInputState {
+    #[default]
+    NeverResolved,
+    ResolvedAgainst(HashMap<Entity, ObservedAnchorGlobal>),
+}
+
+struct AnchorResolveInputEvidence {
+    non_pose_component_changed: bool,
+    changed_poses:              Vec<Entity>,
+    changed_globals:            Vec<(Entity, GlobalTransform)>,
+    removed_globals:            Vec<Entity>,
+}
+
+impl AnchorResolveInputState {
+    fn requires_resolution(
+        &self,
+        evidence: &AnchorResolveInputEvidence,
+        diagnostics: &AnchorResolveDiagnostics,
+    ) -> bool {
+        let Self::ResolvedAgainst(observed_globals) = self else {
+            return true;
+        };
+        let meaningful_global_change = evidence.changed_globals.iter().any(|(entity, current)| {
+            observed_globals
+                .get(entity)
+                .is_some_and(|observed| *observed != ObservedAnchorGlobal::Present(*current))
+        });
+        let meaningful_global_removal = evidence
+            .removed_globals
+            .iter()
+            .any(|entity| observed_globals.contains_key(entity));
+
+        evidence.non_pose_component_changed
+            || !evidence.changed_poses.is_empty()
+            || meaningful_global_removal
+            || meaningful_global_change
+            || diagnostics.current().next().is_some()
+    }
+
+    fn permits_cached_pose_resolution(
+        &self,
+        evidence: &AnchorResolveInputEvidence,
+        diagnostics: &AnchorResolveDiagnostics,
+    ) -> bool {
+        let Self::ResolvedAgainst(observed_globals) = self else {
+            return false;
+        };
+        let meaningful_global_change = evidence.changed_globals.iter().any(|(entity, current)| {
+            observed_globals
+                .get(entity)
+                .is_some_and(|observed| *observed != ObservedAnchorGlobal::Present(*current))
+        });
+        let meaningful_global_removal = evidence
+            .removed_globals
+            .iter()
+            .any(|entity| observed_globals.contains_key(entity));
+
+        !evidence.non_pose_component_changed
+            && !evidence.changed_poses.is_empty()
+            && !meaningful_global_change
+            && !meaningful_global_removal
+            && diagnostics.current().next().is_none()
+    }
+
+    fn record_resolution(
+        &mut self,
+        anchored_entities: &Query<Entity, With<AnchoredTo>>,
+        unanchored_geometry: &Query<Entity, (With<ResolvedAnchorGeometry>, Without<AnchoredTo>)>,
+        anchored_parents: &Query<&ChildOf, With<AnchoredTo>>,
+        globals: &Query<'_, '_, &GlobalTransform>,
+        resolved_globals: &HashMap<Entity, GlobalTransform>,
+    ) {
+        if matches!(self, Self::NeverResolved) {
+            *self = Self::ResolvedAgainst(HashMap::new());
+        }
+        let Self::ResolvedAgainst(observed_globals) = self else {
+            return;
+        };
+        observed_globals.clear();
+        for entity in anchored_entities {
+            observed_globals.insert(entity, observed_global(entity, globals, resolved_globals));
+        }
+        for entity in unanchored_geometry {
+            observed_globals.insert(entity, observed_global(entity, globals, resolved_globals));
+        }
+        for child_of in anchored_parents {
+            let parent = child_of.parent();
+            observed_globals.insert(parent, observed_global(parent, globals, resolved_globals));
+        }
+    }
+
+    fn record_resolved_globals(&mut self, resolved_globals: &HashMap<Entity, GlobalTransform>) {
+        let Self::ResolvedAgainst(observed_globals) = self else {
+            return;
+        };
+        for (&entity, &global) in resolved_globals {
+            observed_globals.insert(entity, ObservedAnchorGlobal::Present(global));
+        }
+    }
+}
+
+fn observed_global(
+    entity: Entity,
+    globals: &Query<&GlobalTransform>,
+    resolved_globals: &HashMap<Entity, GlobalTransform>,
+) -> ObservedAnchorGlobal {
+    resolved_globals
+        .get(&entity)
+        .copied()
+        .or_else(|| globals.get(entity).ok().copied())
+        .map_or(ObservedAnchorGlobal::Missing, ObservedAnchorGlobal::Present)
 }
 
 /// Resolves [`AnchoredTo`] relationships into local [`Transform`] values.
@@ -110,8 +286,13 @@ pub struct AnchorResolverScratch {
 /// of anchored entities' `GlobalTransform` components are one frame stale until
 /// the consumer runs `TransformSystems::Propagate`.
 ///
-/// [`ResolvedAnchorWorld`] is recomputed every frame for entities carrying the
-/// cache. Entities resolved in the current frame use the newly computed
+/// Sources keep their hierarchy and compensate parent stretch when an exact
+/// local translation, rotation and scale can represent the rigid world pose.
+/// Degenerate parents and poses requiring local shear skip with
+/// [`AnchorResolveSkip::UnsupportedParentTransform`].
+///
+/// [`ResolvedAnchorWorld`] is recomputed whenever a resolver input changes for
+/// entities carrying the cache. Entities resolved in the current pass use the newly computed
 /// `GlobalTransform` stored by `resolve_anchors`. Cache entries for entities
 /// not resolved in the current frame use the `GlobalTransform` from the
 /// previous propagation pass, matching every query read by the resolver because
@@ -126,7 +307,7 @@ pub fn resolve_anchors(
     poses: Query<&AnchorPose>,
     offsets: Query<&ResolvedAnchorOffset>,
     parents: Query<&ChildOf>,
-    mut transforms: Query<&mut Transform>,
+    mut transforms: Query<&mut Transform, With<AnchoredTo>>,
     mut anchor_worlds: Query<(
         Entity,
         &ResolvedAnchorGeometry,
@@ -135,11 +316,77 @@ pub fn resolve_anchors(
     )>,
     mut diagnostics: ResMut<AnchorResolveDiagnostics>,
     mut scratch: Local<AnchorResolverScratch>,
+    changed_inputs: (
+        Query<(), Changed<AnchoredTo>>,
+        Query<Entity, Changed<AnchorPose>>,
+        Query<(), Changed<ResolvedAnchorOffset>>,
+        Query<(), Changed<ResolvedAnchorGeometry>>,
+        Query<(), Changed<ChildOf>>,
+    ),
+    global_inputs: (
+        Query<(Entity, &GlobalTransform), Changed<GlobalTransform>>,
+        Query<Entity, With<AnchoredTo>>,
+        Query<Entity, (With<ResolvedAnchorGeometry>, Without<AnchoredTo>)>,
+        Query<&ChildOf, With<AnchoredTo>>,
+    ),
+    mut removed_inputs: (
+        RemovedComponents<AnchoredTo>,
+        RemovedComponents<AnchorPose>,
+        RemovedComponents<ResolvedAnchorOffset>,
+        RemovedComponents<ResolvedAnchorGeometry>,
+        RemovedComponents<ChildOf>,
+        RemovedComponents<GlobalTransform>,
+    ),
 ) {
+    let input_evidence = collect_anchor_input_evidence(
+        &mut anchor_worlds,
+        &mut transforms,
+        &changed_inputs,
+        &global_inputs,
+        &mut removed_inputs,
+    );
+    if !scratch
+        .input_state
+        .requires_resolution(&input_evidence, &diagnostics)
+    {
+        return;
+    }
+    if scratch.can_resolve_cached_pose(&input_evidence, &diagnostics) {
+        let AnchorResolverScratch {
+            cached_placements,
+            cached_indices,
+            resolved_globals,
+            dirty_placements,
+            skipped_placements,
+            input_state,
+            ..
+        } = &mut *scratch;
+        resolve_cached_pose_changes(
+            cached_placements,
+            cached_indices,
+            &input_evidence.changed_poses,
+            &globals,
+            &poses,
+            &mut transforms,
+            resolved_globals,
+            dirty_placements,
+            skipped_placements,
+            &mut diagnostics,
+        );
+        refresh_resolved_anchor_world_cache(&mut anchor_worlds, resolved_globals);
+        input_state.record_resolved_globals(resolved_globals);
+        resolved_globals.clear();
+        return;
+    }
     let AnchorResolverScratch {
         candidates,
+        resolution_order,
+        cached_placements,
+        cached_indices,
         resolved_globals,
         attachment_resolver,
+        input_state,
+        ..
     } = &mut *scratch;
     classify_candidates(
         candidates,
@@ -149,6 +396,9 @@ pub fn resolve_anchors(
         &globals,
         &transforms,
     );
+    resolution_order.clear();
+    cached_placements.clear();
+    cached_indices.clear();
     resolved_globals.clear();
     attachment::resolve_attachments_with_scratch(
         candidates,
@@ -156,7 +406,10 @@ pub fn resolve_anchors(
         &mut diagnostics,
         attachment_resolver,
         |action| {
-            handle_action(
+            if matches!(action, AttachmentResolveAction::Place { .. }) {
+                resolution_order.push(action);
+            }
+            let result = handle_action(
                 &geometry,
                 &globals,
                 &poses,
@@ -165,11 +418,181 @@ pub fn resolve_anchors(
                 &mut transforms,
                 resolved_globals,
                 action,
-            )
+            );
+            cache_resolved_placement(cached_placements, cached_indices, result)
         },
     );
     refresh_anchor_world_cache(&mut anchor_worlds, resolved_globals);
+    let (_, anchored_entities, unanchored_geometry, anchored_parents) = &global_inputs;
+    input_state.record_resolution(
+        anchored_entities,
+        unanchored_geometry,
+        anchored_parents,
+        &globals,
+        resolved_globals,
+    );
     resolved_globals.clear();
+}
+
+fn cache_resolved_placement(
+    cached_placements: &mut Vec<CachedAnchorPlacement>,
+    cached_indices: &mut HashMap<Entity, usize>,
+    result: Result<Option<CachedAnchorPlacement>, AnchorResolveSkip>,
+) -> Result<(), AnchorResolveSkip> {
+    if let Some(mut placement) = result? {
+        placement.target_placement = cached_indices.get(&placement.target).copied();
+        if let AnchorPlacementParent::Entity(parent) = placement.source_parent {
+            placement.parent_placement = cached_indices.get(&parent).copied();
+        }
+        cached_indices.insert(placement.source, cached_placements.len());
+        cached_placements.push(placement);
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Bevy groups the resolver's change-detection queries by input role"
+)]
+fn collect_anchor_input_evidence(
+    anchor_worlds: &mut Query<(
+        Entity,
+        &ResolvedAnchorGeometry,
+        Option<&GlobalTransform>,
+        &mut ResolvedAnchorWorld,
+    )>,
+    transforms: &mut Query<&mut Transform, With<AnchoredTo>>,
+    changed_inputs: &(
+        Query<(), Changed<AnchoredTo>>,
+        Query<Entity, Changed<AnchorPose>>,
+        Query<(), Changed<ResolvedAnchorOffset>>,
+        Query<(), Changed<ResolvedAnchorGeometry>>,
+        Query<(), Changed<ChildOf>>,
+    ),
+    global_inputs: &(
+        Query<(Entity, &GlobalTransform), Changed<GlobalTransform>>,
+        Query<Entity, With<AnchoredTo>>,
+        Query<Entity, (With<ResolvedAnchorGeometry>, Without<AnchoredTo>)>,
+        Query<&ChildOf, With<AnchoredTo>>,
+    ),
+    removed_inputs: &mut (
+        RemovedComponents<AnchoredTo>,
+        RemovedComponents<AnchorPose>,
+        RemovedComponents<ResolvedAnchorOffset>,
+        RemovedComponents<ResolvedAnchorGeometry>,
+        RemovedComponents<ChildOf>,
+        RemovedComponents<GlobalTransform>,
+    ),
+) -> AnchorResolveInputEvidence {
+    let (changed_attachments, changed_poses, changed_offsets, changed_geometry, changed_parents) =
+        changed_inputs;
+    let (changed_globals, _, _, _) = global_inputs;
+    let (
+        removed_attachments,
+        removed_poses,
+        removed_offsets,
+        removed_geometry,
+        removed_parents,
+        removed_globals,
+    ) = removed_inputs;
+    let new_anchor_world = anchor_worlds
+        .iter_mut()
+        .any(|(_, _, _, anchor_world)| anchor_world.is_added());
+    AnchorResolveInputEvidence {
+        non_pose_component_changed: new_anchor_world
+            || !changed_attachments.is_empty()
+            || !changed_offsets.is_empty()
+            || !changed_geometry.is_empty()
+            || !changed_parents.is_empty()
+            || transforms
+                .iter_mut()
+                .any(|transform| transform.is_changed())
+            || removed_attachments.read().next().is_some()
+            || removed_poses.read().next().is_some()
+            || removed_offsets.read().next().is_some()
+            || removed_geometry.read().next().is_some()
+            || removed_parents.read().next().is_some(),
+        changed_poses:              changed_poses.iter().collect(),
+        changed_globals:            changed_globals
+            .iter()
+            .map(|(entity, global)| (entity, *global))
+            .collect(),
+        removed_globals:            removed_globals.read().collect(),
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the cached pass receives each reusable resolver buffer separately"
+)]
+fn resolve_cached_pose_changes(
+    cached_placements: &mut [CachedAnchorPlacement],
+    cached_indices: &HashMap<Entity, usize>,
+    changed_poses: &[Entity],
+    globals: &Query<&GlobalTransform>,
+    poses: &Query<&AnchorPose>,
+    transforms: &mut Query<&mut Transform, With<AnchoredTo>>,
+    resolved_globals: &mut HashMap<Entity, GlobalTransform>,
+    dirty_placements: &mut Vec<bool>,
+    skipped_placements: &mut Vec<bool>,
+    diagnostics: &mut AnchorResolveDiagnostics,
+) {
+    diagnostics.begin_frame();
+    resolved_globals.clear();
+    dirty_placements.resize(cached_placements.len(), false);
+    dirty_placements.fill(false);
+    for entity in changed_poses {
+        if let Some(&index) = cached_indices.get(entity) {
+            dirty_placements[index] = true;
+        }
+    }
+    skipped_placements.resize(cached_placements.len(), false);
+    skipped_placements.fill(false);
+
+    for index in 0..cached_placements.len() {
+        let placement_inputs = cached_placements[index];
+        let source = placement_inputs.source;
+        let target = placement_inputs.target;
+        let target_dirty = placement_inputs
+            .target_placement
+            .is_some_and(|target_index| dirty_placements[target_index]);
+        let parent_dirty = placement_inputs
+            .parent_placement
+            .is_some_and(|parent_index| dirty_placements[parent_index]);
+        if !dirty_placements[index] && !target_dirty && !parent_dirty {
+            continue;
+        }
+        dirty_placements[index] = true;
+        if placement_inputs
+            .target_placement
+            .is_some_and(|target_index| skipped_placements[target_index])
+        {
+            skipped_placements[index] = true;
+            diagnostics.record(
+                source,
+                target,
+                AnchorResolveSkip::BlockedBySkippedDependency,
+            );
+            continue;
+        }
+        match cached_anchor_placement(cached_placements, index, globals, poses) {
+            Ok(placement) => {
+                let Ok(mut transform) = transforms.get_mut(source) else {
+                    skipped_placements[index] = true;
+                    diagnostics.record(source, target, AnchorResolveSkip::MissingSourceTransform);
+                    continue;
+                };
+                transform.set_if_neq(placement.local_transform);
+                cached_placements[index].last_global = placement.global_transform;
+                resolved_globals.insert(source, placement.global_transform);
+            },
+            Err(reason) => {
+                skipped_placements[index] = true;
+                diagnostics.record(source, target, reason);
+            },
+        }
+    }
+    diagnostics.finish_frame();
 }
 
 fn classify_candidates(
@@ -178,7 +601,7 @@ fn classify_candidates(
     attachments: &Query<(Entity, &AnchoredTo)>,
     geometry: &Query<&ResolvedAnchorGeometry>,
     globals: &Query<&GlobalTransform>,
-    transforms: &Query<&mut Transform>,
+    transforms: &Query<&mut Transform, With<AnchoredTo>>,
 ) {
     candidates.clear();
     candidates.extend(attachments.iter().map(|(source, attachment)| {
@@ -203,7 +626,7 @@ fn validate_candidate(
     entities: &Entities,
     geometry: &Query<&ResolvedAnchorGeometry>,
     globals: &Query<&GlobalTransform>,
-    transforms: &Query<&mut Transform>,
+    transforms: &Query<&mut Transform, With<AnchoredTo>>,
     source: Entity,
     attachment: AnchoredTo,
 ) -> Result<(), AnchorResolveSkip> {
@@ -240,10 +663,10 @@ fn handle_action(
     poses: &Query<&AnchorPose>,
     offsets: &Query<&ResolvedAnchorOffset>,
     parents: &Query<&ChildOf>,
-    transforms: &mut Query<&mut Transform>,
+    transforms: &mut Query<&mut Transform, With<AnchoredTo>>,
     resolved_globals: &mut HashMap<Entity, GlobalTransform>,
     action: AttachmentResolveAction,
-) -> Result<(), AnchorResolveSkip> {
+) -> Result<Option<CachedAnchorPlacement>, AnchorResolveSkip> {
     match action {
         AttachmentResolveAction::Place {
             source,
@@ -261,7 +684,7 @@ fn handle_action(
             target,
             attachment,
         ),
-        AttachmentResolveAction::Fallback { source: _ } => Ok(()),
+        AttachmentResolveAction::Fallback { source: _ } => Ok(None),
     }
 }
 
@@ -271,16 +694,15 @@ fn place_anchor(
     poses: &Query<&AnchorPose>,
     offsets: &Query<&ResolvedAnchorOffset>,
     parents: &Query<&ChildOf>,
-    transforms: &mut Query<&mut Transform>,
+    transforms: &mut Query<&mut Transform, With<AnchoredTo>>,
     resolved_globals: &mut HashMap<Entity, GlobalTransform>,
     source: Entity,
     target: Entity,
     attachment: AnchoredTo,
-) -> Result<(), AnchorResolveSkip> {
-    let placement = anchor_placement(
+) -> Result<Option<CachedAnchorPlacement>, AnchorResolveSkip> {
+    let mut placement_inputs = anchor_placement_inputs(
         geometry,
         globals,
-        poses,
         offsets,
         parents,
         resolved_globals,
@@ -288,12 +710,41 @@ fn place_anchor(
         target,
         attachment,
     )?;
+    let placement = anchor_placement(globals, poses, resolved_globals, placement_inputs)?;
     let Ok(mut transform) = transforms.get_mut(source) else {
         return Err(AnchorResolveSkip::MissingSourceTransform);
     };
     transform.set_if_neq(placement.local_transform);
     resolved_globals.insert(source, placement.global_transform);
-    Ok(())
+    placement_inputs.last_global = placement.global_transform;
+    Ok(Some(placement_inputs))
+}
+
+fn cached_anchor_placement(
+    cached_placements: &[CachedAnchorPlacement],
+    index: usize,
+    globals: &Query<&GlobalTransform>,
+    poses: &Query<&AnchorPose>,
+) -> Result<AnchorPlacement, AnchorResolveSkip> {
+    let inputs = cached_placements[index];
+    let target_global = match inputs.target_placement {
+        Some(target_index) => cached_placements[target_index].last_global,
+        None => globals
+            .get(inputs.target)
+            .copied()
+            .map_err(|_| AnchorResolveSkip::MissingTargetTransform)?,
+    };
+    let parent_global = match inputs.source_parent {
+        AnchorPlacementParent::World => None,
+        AnchorPlacementParent::Entity(parent) => Some(match inputs.parent_placement {
+            Some(parent_index) => cached_placements[parent_index].last_global,
+            None => globals
+                .get(parent)
+                .copied()
+                .map_err(|_| AnchorResolveSkip::UnsupportedParentTransform)?,
+        }),
+    };
+    anchor_placement_from_globals(poses, inputs, target_global, parent_global)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -302,47 +753,95 @@ struct AnchorPlacement {
     local_transform:  Transform,
 }
 
-fn anchor_placement(
+fn anchor_placement_inputs(
     geometry: &Query<&ResolvedAnchorGeometry>,
     globals: &Query<&GlobalTransform>,
-    poses: &Query<&AnchorPose>,
     offsets: &Query<&ResolvedAnchorOffset>,
     parents: &Query<&ChildOf>,
     resolved_globals: &HashMap<Entity, GlobalTransform>,
     source: Entity,
     target: Entity,
     attachment: AnchoredTo,
-) -> Result<AnchorPlacement, AnchorResolveSkip> {
-    let target_global = entity_global(globals, resolved_globals, target)
-        .ok_or(AnchorResolveSkip::MissingTargetTransform)?;
+) -> Result<CachedAnchorPlacement, AnchorResolveSkip> {
     let source_global = entity_global(globals, resolved_globals, source)
         .ok_or(AnchorResolveSkip::MissingSourceTransform)?;
-    let source_scale = source_global.to_scale_rotation_translation().0;
-    if !source_scale.is_finite() {
+    let parent = parents.get(source).ok().map(ChildOf::parent);
+    // The source's x axis is the size reference. Parent stretch must not turn
+    // anchored content into a stretched or sheared world frame.
+    let source_scale = Vec3::splat(source_global.affine().matrix3.x_axis.length());
+    if !source_scale.is_finite() || !source_global.affine().matrix3.is_finite() {
+        if let Some(parent) = parent {
+            let parent_global = entity_global(globals, resolved_globals, parent)
+                .ok_or(AnchorResolveSkip::UnsupportedParentTransform)?;
+            validate_supported_parent_transform(&parent_global)?;
+        }
         return Err(AnchorResolveSkip::NonFiniteScale);
     }
 
-    let target_point = anchor_frame(geometry, target, attachment.target_anchor())?;
-    let source_point = anchor_frame(geometry, source, attachment.source_anchor())?;
-    let pose = poses.get(source).copied().unwrap_or_default();
+    let target_frame = anchor_frame(geometry, target, attachment.target_anchor())?;
+    let source_frame = anchor_frame(geometry, source, attachment.source_anchor())?;
     let offset = offsets
         .get(source)
         .copied()
-        .map_or_else(|_| attachment.offset(), ResolvedAnchorOffset::offset);
+        .map_or_else(|_| attachment.offset(), ResolvedAnchorOffset::offset)
+        .into_inner();
+    let source_parent = parent.map_or(AnchorPlacementParent::World, AnchorPlacementParent::Entity);
 
-    let target_world = target_global.transform_point(target_point.position().into_inner());
-    let base = target_global.rotation() * target_point.orientation().into_inner();
-    let rotation =
-        base * pose.rotation.into_inner() * source_point.orientation().inverse().into_inner();
-    let translation = target_world + base * (offset.into_inner() + pose.translation.into_inner())
-        - rotation * (source_scale * source_point.position().into_inner());
+    Ok(CachedAnchorPlacement {
+        source,
+        target,
+        target_placement: None,
+        target_frame,
+        source_frame,
+        offset,
+        source_scale,
+        source_parent,
+        parent_placement: None,
+        last_global: source_global,
+    })
+}
+
+fn anchor_placement(
+    globals: &Query<&GlobalTransform>,
+    poses: &Query<&AnchorPose>,
+    resolved_globals: &HashMap<Entity, GlobalTransform>,
+    inputs: CachedAnchorPlacement,
+) -> Result<AnchorPlacement, AnchorResolveSkip> {
+    let target_global = entity_global(globals, resolved_globals, inputs.target)
+        .ok_or(AnchorResolveSkip::MissingTargetTransform)?;
+    let parent_global = match inputs.source_parent {
+        AnchorPlacementParent::World => None,
+        AnchorPlacementParent::Entity(parent) => Some(
+            entity_global(globals, resolved_globals, parent)
+                .ok_or(AnchorResolveSkip::UnsupportedParentTransform)?,
+        ),
+    };
+    anchor_placement_from_globals(poses, inputs, target_global, parent_global)
+}
+
+fn anchor_placement_from_globals(
+    poses: &Query<&AnchorPose>,
+    inputs: CachedAnchorPlacement,
+    target_global: GlobalTransform,
+    parent_global: Option<GlobalTransform>,
+) -> Result<AnchorPlacement, AnchorResolveSkip> {
+    let pose = poses.get(inputs.source).copied().unwrap_or_default();
+
+    let target_world = target_global.transform_point(inputs.target_frame.position().into_inner());
+    let base =
+        target_global.rotation().normalize() * inputs.target_frame.orientation().into_inner();
+    let rotation = base
+        * pose.rotation.into_inner()
+        * inputs.source_frame.orientation().inverse().into_inner();
+    let translation = target_world + base * (inputs.offset + pose.translation.into_inner())
+        - rotation * (inputs.source_scale * inputs.source_frame.position().into_inner());
     let global_transform = GlobalTransform::from(Transform {
         translation,
         rotation,
-        scale: source_scale,
+        scale: inputs.source_scale,
     });
     let local_transform =
-        local_transform_for(parents, globals, resolved_globals, source, global_transform)?;
+        local_transform_for(inputs.source_parent, parent_global, global_transform)?;
 
     Ok(AnchorPlacement {
         global_transform,
@@ -375,57 +874,67 @@ fn anchor_frame(
 }
 
 fn local_transform_for(
-    parents: &Query<&ChildOf>,
-    globals: &Query<&GlobalTransform>,
-    resolved_globals: &HashMap<Entity, GlobalTransform>,
-    source: Entity,
+    parent: AnchorPlacementParent,
+    parent_global: Option<GlobalTransform>,
     global_transform: GlobalTransform,
 ) -> Result<Transform, AnchorResolveSkip> {
-    let Ok(parent) = parents.get(source) else {
+    let AnchorPlacementParent::Entity(_) = parent else {
         return Ok(global_transform.compute_transform());
     };
-    let parent_global = entity_global(globals, resolved_globals, parent.parent())
-        .ok_or(AnchorResolveSkip::UnsupportedParentTransform)?;
-    validate_supported_parent_transform(&parent_global)?;
-    Ok(global_transform.reparented_to(&parent_global))
+    let parent_global = parent_global.ok_or(AnchorResolveSkip::UnsupportedParentTransform)?;
+    local_transform_for_parent(&parent_global, &global_transform)
 }
 
-fn validate_supported_parent_transform(parent: &GlobalTransform) -> Result<(), AnchorResolveSkip> {
-    let affine = parent.affine();
-    let x_axis = affine.transform_vector3(Vec3::X);
-    let y_axis = affine.transform_vector3(Vec3::Y);
-    let z_axis = affine.transform_vector3(Vec3::Z);
-    let x_scale = x_axis.length();
-    let y_scale = y_axis.length();
-    let z_scale = z_axis.length();
-    if !x_scale.is_finite()
-        || !y_scale.is_finite()
-        || !z_scale.is_finite()
-        || x_scale <= ORTHONORMAL_EPSILON
-        || y_scale <= ORTHONORMAL_EPSILON
-        || z_scale <= ORTHONORMAL_EPSILON
+/// Expresses a world pose below a parent without losing shear during decomposition.
+///
+/// Rigid sources can remain children of stretched parents when an exact local
+/// TRS exists. Degenerate parents and poses requiring local shear are refused.
+///
+/// # Errors
+/// Returns [`AnchorResolveSkip::UnsupportedParentTransform`] when the local
+/// transform cannot reproduce the requested world pose without shear.
+pub fn local_transform_for_parent(
+    parent_global: &GlobalTransform,
+    global_transform: &GlobalTransform,
+) -> Result<Transform, AnchorResolveSkip> {
+    let parent_inverse = validate_supported_parent_transform(parent_global)?;
+    let relative = parent_inverse * global_transform.affine();
+    let (scale, rotation, translation) = relative.to_scale_rotation_translation();
+    let local = Transform {
+        translation,
+        rotation,
+        scale,
+    };
+    let reconstructed = parent_global.mul_transform(local);
+    let wanted = global_transform.affine();
+    let actual = reconstructed.affine();
+    // Decomposition alone silently loses shear. Only write a local transform
+    // when recomposition recovers every world axis and the world translation.
+    let tolerance = ORTHONORMAL_EPSILON * wanted.matrix3.x_axis.length();
+    if [
+        (actual.matrix3.x_axis - wanted.matrix3.x_axis).length(),
+        (actual.matrix3.y_axis - wanted.matrix3.y_axis).length(),
+        (actual.matrix3.z_axis - wanted.matrix3.z_axis).length(),
+    ]
+    .into_iter()
+    .all(|error| error <= tolerance)
+        && (actual.translation - wanted.translation).length()
+            <= ORTHONORMAL_EPSILON * wanted.translation.length().max(1.0)
     {
-        return Err(AnchorResolveSkip::UnsupportedParentTransform);
+        return Ok(local);
     }
-    let average_scale = (x_scale + y_scale + z_scale) / 3.0;
-    if (x_scale - average_scale).abs() > UNIFORM_SCALE_EPSILON
-        || (y_scale - average_scale).abs() > UNIFORM_SCALE_EPSILON
-        || (z_scale - average_scale).abs() > UNIFORM_SCALE_EPSILON
-    {
-        return Err(AnchorResolveSkip::UnsupportedParentTransform);
-    }
+    Err(AnchorResolveSkip::UnsupportedParentTransform)
+}
 
-    let x_axis = x_axis / x_scale;
-    let y_axis = y_axis / y_scale;
-    let z_axis = z_axis / z_scale;
-    if x_axis.dot(y_axis).abs() > ORTHONORMAL_EPSILON
-        || x_axis.dot(z_axis).abs() > ORTHONORMAL_EPSILON
-        || y_axis.dot(z_axis).abs() > ORTHONORMAL_EPSILON
-        || x_axis.cross(y_axis).dot(z_axis) <= 0.0
-    {
+fn validate_supported_parent_transform(
+    parent: &GlobalTransform,
+) -> Result<Affine3A, AnchorResolveSkip> {
+    let affine = parent.affine();
+    let inverse = affine.inverse();
+    if !affine.is_finite() || !inverse.is_finite() {
         return Err(AnchorResolveSkip::UnsupportedParentTransform);
     }
-    Ok(())
+    Ok(inverse)
 }
 
 fn refresh_anchor_world_cache(
@@ -444,6 +953,31 @@ fn refresh_anchor_world_cache(
             .or_else(|| global_transform.copied())
         else {
             anchor_world.points.clear();
+            continue;
+        };
+        anchor_world
+            .points
+            .retain(|anchor_id, _| geometry.frame(*anchor_id).is_ok());
+        for (anchor_id, point) in geometry.frames() {
+            anchor_world.points.insert(
+                *anchor_id,
+                global_transform.transform_point(point.position().into_inner()),
+            );
+        }
+    }
+}
+
+fn refresh_resolved_anchor_world_cache(
+    anchor_worlds: &mut Query<(
+        Entity,
+        &ResolvedAnchorGeometry,
+        Option<&GlobalTransform>,
+        &mut ResolvedAnchorWorld,
+    )>,
+    resolved_globals: &HashMap<Entity, GlobalTransform>,
+) {
+    for (&entity, &global_transform) in resolved_globals {
+        let Ok((_, geometry, _, mut anchor_world)) = anchor_worlds.get_mut(entity) else {
             continue;
         };
         anchor_world
@@ -847,10 +1381,10 @@ mod tests {
     }
 
     #[test]
-    fn non_uniform_transform_parent_records_skip() {
+    fn degenerate_transform_parent_records_skip() {
         let mut world = world_with_diagnostics();
         let parent =
-            spawn_transform_only(&mut world, Transform::from_scale(Vec3::new(2.0, 1.0, 1.0)));
+            spawn_transform_only(&mut world, Transform::from_scale(Vec3::new(2.0, 0.0, 1.0)));
         let target = spawn_quad(&mut world, Transform::default());
         let source = world
             .spawn((

@@ -52,11 +52,9 @@ pub(super) fn spawn_overlay_label(
     style: TextStyle,
     transform: Transform,
 ) {
-    let anchor = style.anchor();
     commands.entity(container).with_child(
         DiegeticText::world(text)
             .style(style)
-            .anchor(anchor)
             .transform(transform)
             .build(),
     );

@@ -125,10 +125,10 @@ struct LiveDisplayContradictionCountError {
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum LiveDisplayMatchError {
     /// No projected display capability matches the supplied evidence.
-    #[error("no live display matches")]
+    #[error("no live monitor matches")]
     NoLiveDisplayMatches,
     /// More than one projected display capability matches the supplied evidence.
-    #[error("{count} live displays match")]
+    #[error("{count} live monitors match")]
     SeveralLiveDisplaysMatch {
         /// Validated number of matching projected device entities.
         count: LiveDisplayContradictionCount,

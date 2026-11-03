@@ -61,7 +61,6 @@ pub(super) const HULL_OUTLINE_RENDER_ERROR: &str =
 pub(super) const LIMINAL_TRACING_TARGET: &str = "hana_liminal";
 pub(super) const NO_GLOBAL_DEPTH_TEXTURE_WARNING: &str = "No global depth texture found";
 pub(super) const NO_MESH_FOUND_WARNING: &str = "No mesh found for entity";
-pub(super) const NO_MESH_INSTANCE_FOUND_WARNING: &str = "No mesh instance found for entity";
 
 // outline rendering constants
 /// Custom vertex attribute storing pre-computed smoothed outline normals.
@@ -147,7 +146,7 @@ pub(super) const POST_PROCESS_PASS_LABEL: &str = "post_process_pass";
 // shader defs
 pub(super) const HAS_OUTLINE_NORMALS_SHADER_DEF: &str = "HAS_OUTLINE_NORMALS";
 pub(super) const MULTISAMPLED_SHADER_DEF: &str = "MULTISAMPLED";
-pub(super) const PER_OBJECT_BUFFER_BATCH_SIZE_SHADER_DEF: &str = "PER_OBJECT_BUFFER_BATCH_SIZE";
+pub(super) const OUTLINE_INSTANCE_BATCH_SIZE_SHADER_DEF: &str = "OUTLINE_INSTANCE_BATCH_SIZE";
 
 // shader entry points
 pub(super) const FRAGMENT_SHADER_ENTRY_POINT: &str = "fragment";
@@ -161,6 +160,8 @@ pub(super) const HULL_SHADER_HANDLE: Handle<Shader> =
     uuid_handle!("6b6c1df4-e857-4f9f-a4a3-4ca5f0bc4df4");
 pub(super) const MASK_SHADER_HANDLE: Handle<Shader> =
     uuid_handle!("4c41a7eb-b802-4e76-97f1-3327d80743dd");
+pub(super) const OUTLINE_OCCLUDED_SHADER_HANDLE: Handle<Shader> =
+    uuid_handle!("70ba4580-8c7a-449c-8fb7-b3d9f88fbe37");
 pub(super) const VIEW_HELPERS_SHADER_HANDLE: Handle<Shader> =
     uuid_handle!("a3e7c2b1-9d4f-4e8a-b5c6-1f2d3e4a5b6c");
 

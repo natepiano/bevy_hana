@@ -80,7 +80,7 @@ pub(crate) fn on_spawn_managed_window(
 }
 
 pub(crate) fn on_secondary_window_added(
-    add: On<Add, ManagedWindow>,
+    add: On<Add<ManagedWindow>>,
     mut commands: Commands,
     primary_query: Query<(), With<PrimaryWindow>>,
 ) {
@@ -111,7 +111,7 @@ pub(crate) fn on_secondary_window_added(
 }
 
 pub(crate) fn on_secondary_window_removed(
-    remove: On<Remove, ManagedWindow>,
+    remove: On<Remove<ManagedWindow>>,
     mut commands: Commands,
     displays: Query<(Entity, &SecondaryDisplay)>,
 ) {

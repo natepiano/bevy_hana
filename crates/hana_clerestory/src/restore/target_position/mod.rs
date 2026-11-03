@@ -12,6 +12,7 @@ pub(crate) use strategy::FullscreenRestoreState;
 pub(crate) use strategy::MonitorScaleStrategy;
 pub(crate) use strategy::NativeFullscreenState;
 pub(crate) use strategy::WindowRestoreState;
+pub(crate) use target::NativeWindowReadbackPosition;
 pub(crate) use target::PreparedPositionMeaning;
 pub(crate) use target::RestoreDiagnostics;
 pub(crate) use target::TargetPosition;

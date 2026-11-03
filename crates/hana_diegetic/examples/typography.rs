@@ -20,6 +20,7 @@ use bevy::prelude::Commands;
 use bevy::prelude::Component;
 use bevy::prelude::Entity;
 use bevy::prelude::Handle;
+use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::KeyCode;
 use bevy::prelude::On;
 use bevy::prelude::ParamSet;
@@ -47,6 +48,7 @@ use fairy_dust::ControlActivation;
 use fairy_dust::TitleBar;
 use fairy_dust::TitleBarControl;
 use fairy_dust::TitleBarSegment;
+use fairy_dust::TitleBarStateWriters;
 use hana_diegetic::AlignX;
 use hana_diegetic::AlignY;
 use hana_diegetic::AntiAlias;
@@ -155,7 +157,7 @@ const NOTO_SANS_CJK_SC_REGULAR_FONT_ASSET_PATH: &str = "fonts/NotoSansCJKsc-Regu
 const NOTO_SANS_REGULAR_FONT_ASSET_PATH: &str = "fonts/NotoSans-Regular.ttf";
 
 const DISPLAY_WORDS: &[(&str, &str)] = &[
-    ("Typography", "accented cap above ascent"),
+    ("Typography", "y, p and g descenders, h ascender"),
     ("V", "EB Garamond Test"),
     ("Ångström", "ring accent, umlaut"),
     ("fjord", "f-j ligature candidate, j descender"),
@@ -298,7 +300,7 @@ struct HomeOverlayTarget(Option<Entity>);
 fn main() {
     // `hana_diegetic::DiegeticUiPlugin` is registered automatically by
     // `fairy_dust::sprinkle_example`.
-    fairy_dust::sprinkle_example()
+    let example = fairy_dust::sprinkle_example()
         .with_brp_extras()
         .with_save_window_position()
         .with_studio_lighting()
@@ -323,7 +325,57 @@ fn main() {
         .pitch(HOME_PITCH)
         .margin(ZOOM_TO_FIT_MARGIN)
         .with_restore_camera_on_restart()
-        .with_title_bar(title_bar())
+        .with_title_bar(title_bar());
+    wire_title_bar_chips(example)
+        .with_camera_control_panel()
+        .insert_resource(WordCycle {
+            index: 0,
+            timer: Timer::from_seconds(0.15, TimerMode::Repeating),
+        })
+        .insert_resource(SelectedFont(0))
+        .init_resource::<FontHandles>()
+        .init_resource::<HomeOverlayTarget>()
+        .init_resource::<TypographyFeatureState>()
+        .init_resource::<CycleState>()
+        .init_resource::<RequestedFont>()
+        .add_systems(Startup, setup)
+        // `switch_font` consumes the digit request; `cycle_word` is a held
+        // arrow-key word scrubber (press-to-advance, hold-to-repeat) that the
+        // shortcut binding can't express, so it stays a raw per-frame reader.
+        .add_systems(
+            Update,
+            (
+                switch_font,
+                cycle_word.in_set(TitleBarStateWriters),
+                tick_cycle_state.in_set(TitleBarStateWriters),
+            ),
+        )
+        // T and the font digits run through Fairy Dust's shortcut binding,
+        // which fires each only when no modifier is held.
+        .with_shortcut(KeyCode::KeyT, toggle_overlay)
+        .with_shortcut(KeyCode::KeyA, cycle_anti_alias)
+        .with_shortcut(KeyCode::KeyW, toggle_word_text)
+        .with_shortcut(KeyCode::KeyG, toggle_ground_plane)
+        .with_shortcut(KeyCode::KeyB, toggle_glyph_metrics)
+        .with_shortcut(KeyCode::KeyM, toggle_font_metrics)
+        .with_shortcut(KeyCode::KeyL, toggle_labels)
+        .with_shortcut(KeyCode::KeyS, toggle_overlay_shadow)
+        .with_shortcut(KeyCode::Digit1, request_font_1)
+        .with_shortcut(KeyCode::Digit2, request_font_2)
+        .with_shortcut(KeyCode::Digit3, request_font_3)
+        .with_shortcut(KeyCode::Digit4, request_font_4)
+        .with_shortcut(KeyCode::Digit5, request_font_5)
+        .with_shortcut(KeyCode::Digit6, request_font_6)
+        .with_shortcut(KeyCode::Digit7, request_font_7)
+        .add_observer(on_font_registered)
+        .add_observer(on_overlay_bounds_added)
+        .run();
+}
+
+fn wire_title_bar_chips(
+    example: fairy_dust::TitleBarBuilder<fairy_dust::WithOrbitCam>,
+) -> fairy_dust::TitleBarBuilder<fairy_dust::WithOrbitCam> {
+    example
         .wire_chip_to_state::<TypographyFeatureState, _>("T Overlay", |state| {
             if state.overlay() {
                 ControlActivation::Active
@@ -349,7 +401,7 @@ fn main() {
         .wire_chip_to_state::<TypographyFeatureState, _>("S Shadow", |state| {
             chip_activation(state.shadow())
         })
-        .wire_chip_to_state::<CycleState, _>("←/→ Cycle Word", |state| match state {
+        .wire_chip_to_state::<CycleState, _>("←/→ Cycle word", |state| match state {
             CycleState::Cycling { .. } => ControlActivation::Active,
             CycleState::Idle => ControlActivation::Inactive,
         })
@@ -365,42 +417,6 @@ fn main() {
         .wire_chip_to_state::<AntiAlias, _>(AA_MODES[3].0, |anti_alias| {
             chip_activation(*anti_alias == AA_MODES[3].2)
         })
-        .with_camera_control_panel()
-        .insert_resource(WordCycle {
-            index: 0,
-            timer: Timer::from_seconds(0.15, TimerMode::Repeating),
-        })
-        .insert_resource(SelectedFont(0))
-        .init_resource::<FontHandles>()
-        .init_resource::<HomeOverlayTarget>()
-        .init_resource::<TypographyFeatureState>()
-        .init_resource::<CycleState>()
-        .init_resource::<RequestedFont>()
-        .add_systems(Startup, setup)
-        // `switch_font` consumes the digit request; `cycle_word` is a held
-        // arrow-key word scrubber (press-to-advance, hold-to-repeat) that the
-        // shortcut binding can't express, so it stays a raw per-frame reader.
-        .add_systems(Update, (switch_font, cycle_word, tick_cycle_state))
-        // T and the font digits run through Fairy Dust's shortcut binding,
-        // which fires each only when no modifier is held.
-        .with_shortcut(KeyCode::KeyT, toggle_overlay)
-        .with_shortcut(KeyCode::KeyA, cycle_anti_alias)
-        .with_shortcut(KeyCode::KeyW, toggle_word_text)
-        .with_shortcut(KeyCode::KeyG, toggle_ground_plane)
-        .with_shortcut(KeyCode::KeyB, toggle_glyph_metrics)
-        .with_shortcut(KeyCode::KeyM, toggle_font_metrics)
-        .with_shortcut(KeyCode::KeyL, toggle_labels)
-        .with_shortcut(KeyCode::KeyS, toggle_overlay_shadow)
-        .with_shortcut(KeyCode::Digit1, request_font_1)
-        .with_shortcut(KeyCode::Digit2, request_font_2)
-        .with_shortcut(KeyCode::Digit3, request_font_3)
-        .with_shortcut(KeyCode::Digit4, request_font_4)
-        .with_shortcut(KeyCode::Digit5, request_font_5)
-        .with_shortcut(KeyCode::Digit6, request_font_6)
-        .with_shortcut(KeyCode::Digit7, request_font_7)
-        .add_observer(on_font_registered)
-        .add_observer(on_overlay_bounds_added)
-        .run();
 }
 
 fn title_bar() -> TitleBar {
@@ -412,7 +428,7 @@ fn title_bar() -> TitleBar {
         .control("M Metrics")
         .control("L Labels")
         .control("S Shadow")
-        .control("←/→ Cycle Word")
+        .control("←/→ Cycle word")
         .control(TitleBarControl::segmented(
             "A",
             AA_MODES.map(|(id, label, _)| TitleBarSegment::new(id, label)),
@@ -504,7 +520,7 @@ fn load_fonts(asset_server: &AssetServer, font_handles: &mut FontHandles) {
 }
 
 fn on_overlay_bounds_added(
-    trigger: On<Add, OverlayBoundingBox>,
+    trigger: On<Add<OverlayBoundingBox>>,
     mut cycle_state: ResMut<CycleState>,
     mut home_target: ResMut<HomeOverlayTarget>,
     marked_home_targets: Query<(), With<CameraHomeTarget>>,

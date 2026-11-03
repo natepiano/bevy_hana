@@ -1,36 +1,22 @@
-mod appearance;
-mod button;
-mod capture;
+mod anchor;
 mod constants;
-mod editable;
-mod focus;
-mod id;
-mod input;
-mod interactivity;
-mod picking;
+mod controls;
+mod identity;
+mod interaction;
+mod presentation;
 mod reify;
-mod relationship;
-mod scroll;
-mod slider;
 mod tooltip;
-mod visual;
-
-pub use appearance::Appearance;
-pub use appearance::BackgroundColor;
-pub use appearance::BorderColor;
-pub use appearance::IntoAppearance;
-pub use appearance::PathColor;
-pub(crate) use appearance::ResolvedWidgetStateAppearances;
-pub(crate) use appearance::StateAppearance;
-pub use appearance::TextColor;
-pub use appearance::Tint;
-pub use appearance::WidgetDisabledAppearance;
-pub use appearance::WidgetFocusedAppearance;
-pub use appearance::WidgetHoveredAppearance;
-pub use appearance::WidgetPressedAppearance;
-pub(crate) use appearance::WidgetState;
+pub(crate) use anchor::ScreenWidgetAnchorProxy;
+pub(crate) use anchor::ScreenWidgetAnchoredHere;
+pub(crate) use anchor::ScreenWidgetAnchoredTo;
+pub(crate) use anchor::TooltipBoundary;
+pub(crate) use anchor::WidgetAnchorRect;
+pub(crate) use anchor::on_screen_widget_demand_added;
+pub(crate) use anchor::on_screen_widget_demand_removed;
+pub(crate) use anchor::update_screen_anchor_geometry;
 use bevy::ecs::schedule::ApplyDeferred;
 use bevy::ecs::schedule::common_conditions::resource_exists;
+use bevy::input::InputSystems;
 use bevy::picking::PickingSettings;
 use bevy::picking::PickingSystems;
 use bevy::picking::backend::ray::RayMap;
@@ -40,123 +26,179 @@ use bevy::picking::mesh_picking::MeshPickingSettings;
 use bevy::picking::pointer::PointerInput;
 use bevy::prelude::App;
 use bevy::prelude::Assets;
+use bevy::prelude::Component;
 use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::Mesh;
 use bevy::prelude::Messages;
 use bevy::prelude::Plugin;
 use bevy::prelude::PostUpdate;
 use bevy::prelude::PreUpdate;
+use bevy::prelude::Reflect;
+use bevy::prelude::ReflectComponent;
 use bevy::prelude::SystemCondition;
 use bevy::prelude::SystemSet;
 use bevy::prelude::Update;
 use bevy::window::WindowFocused;
-pub use button::Button;
-pub use button::ButtonCancelCause;
-pub use button::ButtonCanceled;
-pub(crate) use button::ButtonCaptures;
-pub use button::ButtonClicked;
-pub(crate) use button::ButtonPress;
-pub use button::ButtonPressed;
-pub use button::ButtonReleased;
-pub(crate) use button::finalize_panel_buttons;
-use capture::WidgetCaptures;
-pub use focus::ClearWidgetFocus;
-pub use focus::RequestPanelFocus;
-pub use focus::RequestWidgetFocus;
-pub(crate) use focus::WidgetFocusAuthority;
-pub use focus::WidgetFocusChangeCause;
-pub use focus::WidgetFocusChanged;
-pub(crate) use focus::WidgetFocusVisible;
-pub use focus::WidgetFocusable;
-pub use focus::WidgetFocused;
-pub(crate) use focus::finalize_panel_focus;
+pub use controls::Button;
+pub use controls::ButtonActivationSource;
+pub use controls::ButtonCancelCause;
+pub use controls::ButtonCanceled;
+pub(crate) use controls::ButtonCaptures;
+pub use controls::ButtonClicked;
+pub use controls::ButtonLatch;
+pub use controls::ButtonMetrics;
+pub use controls::ButtonMode;
+pub(crate) use controls::ButtonPress;
+pub use controls::ButtonPressSource;
+pub use controls::ButtonPressed;
+pub use controls::ButtonReleased;
+pub use controls::CapsuleThumb;
+pub use controls::ControlLength;
+pub use controls::ControlMetrics;
+pub use controls::ControlPalette;
+pub use controls::FieldMetrics;
+pub use controls::MenuMetrics;
+pub use controls::PopUpMetrics;
+pub use controls::RequestSliderAdjustment;
+pub use controls::RowMetrics;
+pub use controls::Slider;
+pub use controls::SliderAdjustment;
+pub use controls::SliderAuthoringLock;
+pub use controls::SliderCancelCause;
+pub use controls::SliderCanceled;
+pub(crate) use controls::SliderCaptures;
+pub use controls::SliderChangeRequested;
+pub use controls::SliderConfigError;
+pub use controls::SliderDirection;
+pub(crate) use controls::SliderDrag;
+pub use controls::SliderGrabbed;
+pub use controls::SliderMetrics;
+use controls::SliderPlugin;
+pub use controls::SliderProposalSource;
+pub use controls::SliderProposalValue;
+pub use controls::SliderPushedValue;
+pub use controls::SliderRange;
+pub use controls::SliderReachableBand;
+pub use controls::SliderReleased;
+pub use controls::SliderState;
+pub use controls::SliderStep;
+pub use controls::SliderStepping;
+pub use controls::SpacingMetrics;
+pub use controls::Switch;
+pub use controls::SwitchMetrics;
+use controls::SwitchPlugin;
+pub use controls::SwitchSide;
+pub use controls::SwitchState;
+pub use controls::SwitchToggleRequested;
+pub(crate) use controls::finalize_panel_buttons;
+pub(crate) use controls::finalize_panel_sliders;
+pub use controls::release_button;
+pub use controls::slider_self_update;
 use hana_valence::AnchorSystems;
-pub(crate) use id::ComputedWidgetRecord;
-pub use id::PanelWidget;
-pub(crate) use id::PanelWidgetIndex;
-pub use id::PanelWidgetReader;
-pub(crate) use id::VisualElementCapabilities;
-pub(crate) use id::WidgetKind;
-pub(crate) use id::WidgetSpec;
-pub(crate) use id::validate_tree;
-pub(crate) use input::SemanticWidgetIntent;
-pub use input::WidgetControlSummary;
-pub use input::WidgetInput;
-pub use input::WidgetInputBindings;
-pub use input::WidgetInputBindingsBuilder;
-pub use input::WidgetInputBindingsError;
-pub use input::WidgetInputDisabled;
-pub use input::WidgetInputMode;
-pub use input::WidgetInputPlugin;
-pub use interactivity::PanelWidgetWriter;
-pub use interactivity::WidgetDisabled;
-pub use interactivity::WidgetInteractivity;
-pub use picking::FacePicking;
-pub use picking::PanelPicking;
-pub(crate) use reify::WidgetAnchorRect;
-pub(crate) use reify::on_screen_widget_demand_added;
-pub(crate) use reify::on_screen_widget_demand_removed;
-pub(crate) use reify::update_screen_anchor_geometry;
-pub use relationship::PanelWidgets;
-pub(crate) use relationship::ScreenWidgetAnchorProxy;
-pub(crate) use relationship::ScreenWidgetAnchoredHere;
-pub(crate) use relationship::ScreenWidgetAnchoredTo;
-pub use relationship::TooltipFor;
-pub use relationship::Tooltips;
-pub use relationship::WidgetOf;
-pub use scroll::HoveredScrollTargets;
-pub use scroll::PanelScrolled;
-pub use scroll::PointerScrollTarget;
-pub use slider::RequestSliderAdjustment;
-pub use slider::Slider;
-pub use slider::SliderAdjustment;
-pub use slider::SliderCancelCause;
-pub use slider::SliderCanceled;
-pub(crate) use slider::SliderCaptures;
-pub use slider::SliderChangeRequested;
-pub use slider::SliderConfigError;
-pub use slider::SliderDirection;
-pub(crate) use slider::SliderDrag;
-pub use slider::SliderGrabbed;
-use slider::SliderPlugin;
-pub use slider::SliderRange;
-pub use slider::SliderReleased;
-pub use slider::SliderResetBehavior;
-pub use slider::SliderState;
-pub use slider::SliderStep;
-pub(crate) use slider::finalize_panel_sliders;
-pub use slider::slider_self_update;
+pub(crate) use identity::ComputedWidgetRecord;
+pub use identity::PanelWidget;
+pub(crate) use identity::PanelWidgetIndex;
+pub use identity::PanelWidgetReader;
+pub use identity::PanelWidgets;
+pub(crate) use identity::VisualElementCapabilities;
+pub(crate) use identity::WidgetHitArea;
+pub use identity::WidgetKind;
+pub use identity::WidgetOf;
+pub(crate) use identity::WidgetSpec;
+pub(crate) use identity::validate_tree;
+pub use interaction::ClearWidgetFocus;
+pub use interaction::FacePicking;
+pub use interaction::HoveredScrollTargets;
+pub use interaction::PanelPicking;
+pub use interaction::PanelScrolled;
+pub use interaction::PanelWidgetWriter;
+pub use interaction::PointerScrollTarget;
+pub use interaction::RequestPanelFocus;
+pub use interaction::RequestWidgetFocus;
+pub(crate) use interaction::SemanticWidgetIntent;
+pub use interaction::SizeGateExempt;
+use interaction::WidgetCaptures;
+pub use interaction::WidgetControlSummary;
+pub use interaction::WidgetDisabled;
+pub use interaction::WidgetPrimaryPressOwnership;
+pub use interaction::WidgetScreenSizeGate;
+#[cfg(test)]
+pub(crate) use tooltip::TooltipPointerCamera;
+/// Dims a control's linked caption while leaving its appearance and interaction enabled.
+///
+/// Add this marker to a widget entity. Focus, input routing, and widget events
+/// continue to use its resolved interactivity.
+#[derive(Clone, Copy, Component, Debug, Default, Eq, PartialEq, Reflect)]
+#[reflect(Component)]
+pub struct WidgetDimmed;
+
+pub(crate) use constants::TOOLTIP_SHADOW_EXTENT;
+pub(crate) use interaction::WidgetFocusAuthority;
+pub use interaction::WidgetFocusChangeCause;
+pub use interaction::WidgetFocusChanged;
+pub use interaction::WidgetFocusTarget;
+pub(crate) use interaction::WidgetFocusVisible;
+pub use interaction::WidgetFocusable;
+pub use interaction::WidgetFocused;
+pub use interaction::WidgetInput;
+pub use interaction::WidgetInputBindings;
+pub use interaction::WidgetInputBindingsBuilder;
+pub use interaction::WidgetInputBindingsError;
+pub use interaction::WidgetInputDisabled;
+pub use interaction::WidgetInputMode;
+pub use interaction::WidgetInputPlugin;
+pub use interaction::WidgetInteractivity;
+use interaction::WidgetPrimaryPresses;
+pub use interaction::WidgetStepDirection;
+pub(crate) use interaction::finalize_panel_focus;
+pub use presentation::Appearance;
+pub use presentation::BackgroundColor;
+pub use presentation::BorderColor;
+pub(crate) use presentation::ComputedVisualSlot;
+pub use presentation::IntoAppearance;
+pub use presentation::PathColor;
+pub(crate) use presentation::ResolvedWidgetStateAppearances;
+pub(crate) use presentation::StateAppearance;
+pub use presentation::TextColor;
+pub use presentation::Tint;
+pub(crate) use presentation::VisualOverrideIndex;
+pub(crate) use presentation::VisualSlotId;
+pub(crate) use presentation::VisualSlotOverride;
+pub use presentation::WidgetDisabledAppearance;
+pub use presentation::WidgetFocusedAppearance;
+pub use presentation::WidgetHoveredAppearance;
+pub use presentation::WidgetPressedAppearance;
+pub(crate) use presentation::WidgetState;
+pub(crate) use presentation::WidgetVisualOverrides;
+pub(crate) use presentation::WidgetVisualSlots;
 pub(crate) use tooltip::ComputedTooltipRecord;
 pub(crate) use tooltip::MaterializedTooltip;
 pub use tooltip::MeshAnchorCommandsExt;
-pub(crate) use tooltip::MeshAnchorTarget;
 pub(crate) use tooltip::MeshAnchorWarnings;
 pub use tooltip::MeshFace;
 pub use tooltip::ScreenAnchorCommandsExt;
 pub use tooltip::Tooltip;
+pub use tooltip::TooltipCardOccupiedRegions;
 pub use tooltip::TooltipCommandsExt;
 pub(crate) use tooltip::TooltipControllerIndex;
 pub use tooltip::TooltipDisabledPolicy;
+pub use tooltip::TooltipFor;
 pub use tooltip::TooltipHidden;
-pub use tooltip::TooltipPlacementPolicy;
+pub(crate) use tooltip::TooltipPaintInsideBorder;
 use tooltip::TooltipPlugin;
 pub use tooltip::TooltipShown;
 pub use tooltip::TooltipTarget;
 pub use tooltip::TooltipTargetEntity;
 pub use tooltip::TooltipTargetSpace;
+pub use tooltip::Tooltips;
 pub(crate) use tooltip::remove_materialized_state as remove_materialized_tooltip_state;
 pub(crate) use tooltip::select_window_presentation_camera;
-pub(crate) use visual::ComputedVisualSlot;
-pub(crate) use visual::VisualOverrideIndex;
-pub(crate) use visual::VisualSlotId;
-pub(crate) use visual::VisualSlotOverride;
-pub(crate) use visual::WidgetVisualOverrides;
-pub(crate) use visual::WidgetVisualSlots;
 
 use crate::PanelSystems;
 use crate::cascade;
 use crate::cascade::CascadeSet;
 use crate::ime::ImeSystemSet;
+use crate::panel;
 use crate::screen_space::ScreenSpaceSystems;
 
 /// Named scheduling points for semantic widget work.
@@ -164,6 +206,8 @@ use crate::screen_space::ScreenSpaceSystems;
 pub(crate) enum WidgetSystems {
     /// Reifies widget identities from the latest computed panel output.
     Reify,
+    /// Refreshes edited field parts after post-input layout.
+    ReifyEdited,
     /// Applies widget creation and synchronization commands.
     ReifyCommandsApplied,
     /// Synchronizes the final disabled marker from the resolved cascade value.
@@ -211,29 +255,34 @@ enum TooltipSystems {
 pub(crate) struct WidgetsPlugin;
 
 fn add_widget_observers(app: &mut App) {
-    app.add_observer(focus::request_panel_focus)
-        .add_observer(focus::request_widget_focus)
-        .add_observer(focus::clear_widget_focus)
-        .add_observer(focus::focus_from_pointer_press)
-        .add_observer(button::press_from_pointer)
-        .add_observer(button::click_from_pointer)
-        .add_observer(button::release_from_pointer)
-        .add_observer(button::cancel_from_pointer)
-        .add_observer(button::cancel_from_drag_end)
-        .add_observer(button::cancel_from_pointer_removal)
-        .add_observer(button::cancel_from_disabled)
-        .add_observer(button::cancel_from_widget_removal)
-        .add_observer(button::cancel_before_widget_despawn)
-        .add_observer(button::handle_semantic_intent)
-        .add_observer(button::dispatch_click_callback)
-        .add_observer(scroll::scroll_from_pointer);
+    app.add_observer(interaction::request_panel_focus)
+        .add_observer(interaction::request_widget_focus)
+        .add_observer(interaction::clear_widget_focus)
+        .add_observer(interaction::focus_from_pointer_press)
+        .add_observer(controls::press_from_pointer)
+        .add_observer(controls::pointer_over_button)
+        .add_observer(controls::pointer_out_of_button)
+        .add_observer(controls::click_from_pointer)
+        .add_observer(controls::release_from_pointer)
+        .add_observer(controls::cancel_from_pointer)
+        .add_observer(controls::cancel_from_drag_end)
+        .add_observer(controls::cancel_from_pointer_removal)
+        .add_observer(controls::cancel_from_disabled)
+        .add_observer(controls::cancel_from_focus_loss)
+        .add_observer(controls::cancel_from_widget_removal)
+        .add_observer(controls::cancel_before_widget_despawn)
+        .add_observer(controls::handle_semantic_intent)
+        .add_observer(controls::dispatch_click_callback)
+        .add_observer(interaction::scroll_from_pointer)
+        .add_observer(interaction::record_widget_primary_press);
 }
 
 fn add_mesh_anchor_systems(app: &mut App) {
     app.add_systems(
         PostUpdate,
         (
-            reify::update_world_anchor_geometry,
+            anchor::update_world_anchor_geometry,
+            tooltip::remove_mesh_anchor_geometry,
             tooltip::update_mesh_anchor_geometry,
             tooltip::warn_pending_mesh_anchor_geometry,
         )
@@ -251,6 +300,10 @@ fn configure_widget_system_sets(app: &mut App) {
                 .after(PanelSystems::ResolveWorldFit)
                 .after(ScreenSpaceSystems::ResolveDimensions),
             WidgetSystems::ReifyCommandsApplied.after(WidgetSystems::Reify),
+            WidgetSystems::ReifyEdited
+                .after(PanelSystems::ComputeEditedLayout)
+                .before(ImeSystemSet::UpdateEditorGeometry)
+                .run_if(panel::late_editor_layout_needed),
             TooltipSystems::ReifyControllers.after(WidgetSystems::ReifyCommandsApplied),
             TooltipSystems::ControllerCommandsApplied
                 .after(TooltipSystems::ReifyControllers)
@@ -280,9 +333,12 @@ fn configure_widget_system_sets(app: &mut App) {
 
 impl Plugin for WidgetsPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<MeshPickingSettings>()
+        app.init_resource::<WidgetScreenSizeGate>()
+            .init_resource::<MeshPickingSettings>()
             .init_resource::<WidgetFocusAuthority>()
             .init_resource::<WidgetCaptures>()
+            .init_resource::<WidgetPrimaryPresses>()
+            .init_resource::<WidgetPrimaryPressOwnership>()
             .init_resource::<ButtonCaptures>()
             .init_resource::<VisualOverrideIndex>()
             .init_resource::<MeshAnchorWarnings>()
@@ -295,18 +351,19 @@ impl Plugin for WidgetsPlugin {
                 cascade::cascade_plugin::<WidgetFocusedAppearance>(),
                 cascade::cascade_plugin::<WidgetDisabledAppearance>(),
                 SliderPlugin,
+                SwitchPlugin,
                 TooltipPlugin,
             ));
         configure_widget_system_sets(app);
         app.add_systems(
             PreUpdate,
-            picking::update_hits
+            interaction::update_hits
                 .run_if(resource_exists::<RayMap>.and_then(resource_exists::<Assets<Mesh>>))
                 .in_set(PickingSystems::Backend),
         )
         .add_systems(
             PreUpdate,
-            capture::reconcile_pointer_input
+            interaction::reconcile_pointer_input
                 .run_if(
                     resource_exists::<Messages<PointerInput>>
                         .and_then(resource_exists::<PointerState>)
@@ -316,34 +373,50 @@ impl Plugin for WidgetsPlugin {
                 .in_set(PickingSystems::Last),
         )
         .add_systems(
+            PreUpdate,
+            interaction::release_widget_primary_presses
+                .after(InputSystems)
+                .before(PickingSystems::Hover),
+        )
+        .add_systems(
             Update,
             (
                 reify::reify_widgets.in_set(WidgetSystems::Reify),
+                (
+                    reify::reify_widgets,
+                    ApplyDeferred,
+                    controls::present_editable_state,
+                    ApplyDeferred,
+                    presentation::dispatch_visual_overrides,
+                )
+                    .chain()
+                    .in_set(WidgetSystems::ReifyEdited),
                 ApplyDeferred.in_set(WidgetSystems::ReifyCommandsApplied),
-                reify::reify_tooltip_controllers.in_set(TooltipSystems::ReifyControllers),
+                tooltip::reify_tooltip_controllers.in_set(TooltipSystems::ReifyControllers),
                 ApplyDeferred.in_set(TooltipSystems::ControllerCommandsApplied),
-                interactivity::resolve_interactivity.in_set(WidgetSystems::ResolveInteractivity),
+                interaction::resolve_interactivity.in_set(WidgetSystems::ResolveInteractivity),
                 ApplyDeferred.in_set(WidgetSystems::InteractivityCommandsApplied),
-                focus::cleanup_removed_focus_participants.in_set(WidgetSystems::Focus),
-                input::route_semantic_input.in_set(WidgetSystems::SemanticInput),
+                interaction::cleanup_removed_focus_participants.in_set(WidgetSystems::Focus),
+                interaction::route_semantic_input.in_set(WidgetSystems::SemanticInput),
                 ApplyDeferred.in_set(WidgetSystems::FocusCommandsApplied),
-                button::present_button_state
+                controls::present_button_state
                     .after(WidgetSystems::FocusCommandsApplied)
                     .after(WidgetSystems::ReifyCommandsApplied)
                     .after(CascadeSet::Propagate)
                     .before(WidgetSystems::PresentationCommandsApplied),
-                editable::present_editable_state
+                controls::present_editable_state
                     .after(WidgetSystems::FocusCommandsApplied)
                     .after(WidgetSystems::ReifyCommandsApplied)
                     .after(CascadeSet::Propagate)
                     .before(WidgetSystems::PresentationCommandsApplied),
-                slider::present_slider_state
+                controls::present_slider_state
                     .after(WidgetSystems::FocusCommandsApplied)
                     .after(WidgetSystems::ReifyCommandsApplied)
                     .after(CascadeSet::Propagate)
                     .before(WidgetSystems::PresentationCommandsApplied),
                 ApplyDeferred.in_set(WidgetSystems::PresentationCommandsApplied),
-                visual::dispatch_visual_overrides.after(WidgetSystems::PresentationCommandsApplied),
+                presentation::dispatch_visual_overrides
+                    .after(WidgetSystems::PresentationCommandsApplied),
             ),
         );
         add_widget_observers(app);

@@ -60,6 +60,14 @@ pub(crate) type DrawOutline = (
     DrawMesh,
 );
 
+pub(crate) type DrawTranslucentDepth = (
+    SetItemPipeline,
+    SetMeshViewBindGroup<MESH_VIEW_BIND_GROUP_SLOT>,
+    SetMeshViewBindingArrayBindGroup<MESH_VIEW_BINDING_ARRAY_BIND_GROUP_SLOT>,
+    SetMeshBindGroup<MESH_BIND_GROUP_SLOT>,
+    DrawMesh,
+);
+
 pub(crate) type DrawHull = (
     SetItemPipeline,
     SetMeshViewBindGroup<HULL_MESH_VIEW_BIND_GROUP_SLOT>,

@@ -592,6 +592,7 @@ mod tests {
     use bevy::ecs::spawn::SpawnWith;
     use bevy::input::ButtonInput;
     use bevy::input::keyboard::KeyCode;
+    use bevy::input::mouse::MouseScrollPixelsPerLine;
     use bevy::prelude::App;
     use bevy::prelude::Component;
     use bevy::prelude::Entity;
@@ -602,14 +603,15 @@ mod tests {
     use bevy::prelude::ResMut;
     use bevy::prelude::Resource;
     use bevy::prelude::With;
+    use bevy::prelude::related;
     use bevy::reflect::TypeRegistry;
     use bevy::time::TimePlugin;
-    use bevy_enhanced_input::bindings;
     use bevy_enhanced_input::prelude::Action;
     use bevy_enhanced_input::prelude::ActionSpawner;
     use bevy_enhanced_input::prelude::ActionValue;
     use bevy_enhanced_input::prelude::Actions;
     use bevy_enhanced_input::prelude::Binding;
+    use bevy_enhanced_input::prelude::Bindings;
     use bevy_enhanced_input::prelude::Complete;
     use bevy_enhanced_input::prelude::CustomInput;
     use bevy_enhanced_input::prelude::CustomInputs;
@@ -1817,6 +1819,7 @@ mod tests {
     fn runtime_app() -> App {
         let mut app = App::new();
         app.init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<MouseScrollPixelsPerLine>()
             .init_resource::<CustomInputs>()
             .init_resource::<DispatchCounts>()
             .init_resource::<HeldTransitionCounts>();
@@ -2024,7 +2027,7 @@ mod tests {
                 move |action_spawner: &mut ActionSpawner<RuntimeInputContext>| {
                     action_spawner.spawn((
                         Action::<RuntimeHeldAction>::new(),
-                        bindings![Binding::Custom(custom_input)],
+                        related!(Bindings[Binding::Custom(custom_input)]),
                     ));
                 },
             )),

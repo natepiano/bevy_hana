@@ -172,9 +172,9 @@ fn finite_easing(eased: f32) -> Result<f64, FoldEvaluationError> {
 mod tests {
     use std::time::Duration;
 
+    use bevy_curve::EaseFunction;
     use bevy_ecs::entity::Entity;
     use bevy_ecs::world::World;
-    use bevy_math::curve::EaseFunction;
     use hana_kana::EasingCurve;
     use hana_kana::EasingInput;
     use hana_kana::EasingOutput;

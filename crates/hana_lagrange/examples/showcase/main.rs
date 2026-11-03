@@ -21,7 +21,7 @@ use std::time::Duration;
 use bevy::camera::ScalingMode;
 use bevy::color::palettes::css::DEEP_SKY_BLUE;
 use bevy::color::palettes::css::ORANGE;
-use bevy::math::curve::easing::EaseFunction;
+use bevy::curve::easing::EaseFunction;
 use bevy::prelude::AppExtStates;
 use bevy::prelude::AppGizmoBuilder;
 use bevy::prelude::Assets;
@@ -52,6 +52,7 @@ use fairy_dust::ControlActivation;
 use fairy_dust::FairyDustOrbitCam;
 use fairy_dust::TitleBar;
 use fairy_dust::TitleBarOrientation;
+use fairy_dust::TitleBarStateWriters;
 use hana_kana::ToUsize;
 use hana_lagrange::AnimateToFit;
 use hana_lagrange::AnimationBegin;
@@ -195,7 +196,7 @@ fn main() {
                 policy_panel::rebuild_policy_panel,
                 policy_panel::tick_key_flash,
                 animation_controls::apply_projection_refit,
-                animation_controls::tick_easing_flash,
+                animation_controls::tick_easing_flash.in_set(TitleBarStateWriters),
             ),
         )
         .add_observer(event_log::enable_log_on_initial_fit)

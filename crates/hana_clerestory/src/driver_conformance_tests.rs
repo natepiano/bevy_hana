@@ -73,16 +73,12 @@
 //! this driver.
 //!
 //! Widening `Time<Virtual>` is what reconciles the two. `TimeUpdateStrategy` — which the walk owns
-//! and this subject never touches — sets the real delta; `Time<Virtual>` clamps that raw delta to
-//! its own maximum and scales the clamped value, in that order. So the maximum is set to
-//! [`WALK_CLOCK_GRAIN`], below any real step the walk can choose, which makes the clamp always
-//! bind, and the relative speed is the exact ratio that turns that grain into
-//! [`WALK_VIRTUAL_FRAME`]. Each walk frame then carries a quarter second, whatever real step the
-//! walk chose for itself. Setting the maximum to the quarter second instead would bound the real
-//! step rather than the virtual frame, and the scale would then multiply the walk's whole
-//! millisecond — putting a thousand virtual seconds on every frame and expiring every deadline the
-//! walk means to exercise on its first frame. No clock is added and none is replaced. The
-//! kernel's own bounds are the walk's 600-second limits, which a walk of a few hundred quarter
+//! and this subject never touches — sets the real delta; `Time<Virtual>` scales that raw delta
+//! before clamping it to its own maximum. The relative speed makes every nonzero real step the
+//! walk can choose exceed [`WALK_VIRTUAL_FRAME`] after scaling, and the maximum caps the resulting
+//! virtual frame at that quarter second. A zero real step still advances no virtual time. No clock
+//! is added and none is replaced. The kernel's own bounds are the walk's 600-second limits,
+//! which a walk of a few hundred quarter
 //! seconds comes nowhere near, so the coarser step changes which frame each deadline falls on and
 //! nothing about which deadlines exist.
 
@@ -209,29 +205,13 @@ const WALK_WINDOW_LOGICAL_SIZE: UVec2 = UVec2::new(800, 600);
 /// whole reason this is not the walk's own millisecond.
 const WALK_VIRTUAL_FRAME: Duration = Duration::from_millis(250);
 
-/// Raw step every walk frame's delta is clamped to before the virtual clock scales it.
-///
-/// `Time<Virtual>::advance_with_raw_delta` clamps the raw delta to `max_delta` and multiplies by
-/// the relative speed afterwards, so `max_delta` bounds the walk's real step rather than the
-/// virtual frame that step produces. Set below any real step the walk can choose, the clamp always
-/// binds, which is what lets [`WALK_CLOCK_WIDENING`] name an exact virtual frame instead of a
-/// multiple of whatever step the walk happens to be using.
-const WALK_CLOCK_GRAIN: Duration = Duration::from_micros(1);
-
 /// Relative speed the subject sets on the virtual clock.
 ///
-/// Every frame's delta is clamped to [`WALK_CLOCK_GRAIN`] first, so this is exactly
-/// `WALK_VIRTUAL_FRAME / WALK_CLOCK_GRAIN` and each walk frame carries [`WALK_VIRTUAL_FRAME`] of
-/// virtual time whatever real step the walk chose for itself.
+/// Bevy scales the raw delta before clamping it. This speed makes even a one-microsecond real
+/// step reach [`WALK_VIRTUAL_FRAME`], so every nonzero step the walk chooses saturates the virtual
+/// frame cap. The speed ensures the cap is reached; the cap determines how much virtual time
+/// passes, without changing the kernel deadlines.
 const WALK_CLOCK_WIDENING: f32 = 250_000.0;
-
-/// The widening above is [`WALK_VIRTUAL_FRAME`] counted in [`WALK_CLOCK_GRAIN`] units, and a `f32`
-/// literal is the only way to write it. Checked here so a change to either duration fails the
-/// build rather than quietly handing every walk frame the wrong amount of virtual time.
-const _: () = assert!(
-    WALK_CLOCK_GRAIN.as_micros() == 1 && WALK_VIRTUAL_FRAME.as_micros() == 250_000,
-    "WALK_CLOCK_WIDENING no longer equals WALK_VIRTUAL_FRAME divided by WALK_CLOCK_GRAIN",
-);
 
 /// A promise the walk's fixture makes that no walk step can observe on its own.
 ///
@@ -503,7 +483,7 @@ impl ConformanceSubject for WindowPlacementSubject {
         app.world_mut().init_resource::<InjectedWinitWindows>();
 
         let mut virtual_time = app.world_mut().resource_mut::<Time<Virtual>>();
-        virtual_time.set_max_delta(WALK_CLOCK_GRAIN);
+        virtual_time.set_max_delta(WALK_VIRTUAL_FRAME);
         virtual_time.set_relative_speed(WALK_CLOCK_WIDENING);
 
         driver
@@ -529,8 +509,8 @@ impl ConformanceSubject for WindowPlacementSubject {
                 monitor:         monitor.get().copied().unwrap_or(Entity::PLACEHOLDER),
                 descriptor:      Self::monitor_descriptor(),
                 // The walk's display is named by the walk's own scheme, and the legacy identity is
-                // read only when migrating a pre-v5 saved file. Anonymous is what a display with
-                // no migration history carries.
+                // read only when resolving a saved record that still holds v4 evidence. Anonymous
+                // is what a display with no migration history carries.
                 legacy_identity: DisplayIdentity::Anonymous,
             })
         })

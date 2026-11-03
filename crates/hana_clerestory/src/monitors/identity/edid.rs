@@ -4,6 +4,7 @@ use super::DisplayFingerprint;
 use super::DisplayIdentityEvidence;
 use super::MonitorIdentificationError;
 use super::synthesized_without_serial;
+use crate::monitors::DisplayPhysicalSize;
 
 /// Durable display identity carried by one structurally valid EDID.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -57,6 +58,20 @@ impl EdidEvidence {
     pub(super) const SERIAL_END: usize = 16;
     pub(super) const SERIAL_START: usize = 12;
     const TEXT_SERIAL_START: usize = 5;
+
+    /// Reads the base block's physical image dimensions before identity drops its bytes.
+    pub(super) fn image_size(edid: &[u8]) -> DisplayPhysicalSize {
+        let Some((&width_cm, &height_cm)) = edid.get(21).zip(edid.get(22)) else {
+            return DisplayPhysicalSize::NotReported;
+        };
+        if width_cm == 0 || height_cm == 0 {
+            return DisplayPhysicalSize::NotReported;
+        }
+        DisplayPhysicalSize::Reported {
+            width_mm:  u32::from(width_cm) * 10,
+            height_mm: u32::from(height_cm) * 10,
+        }
+    }
 
     pub(super) fn qualify(
         edid: Vec<u8>,
@@ -186,6 +201,33 @@ mod tests {
 
     const CHECKSUM_INDEX: usize = EdidEvidence::BLOCK_SIZE - 1;
     const NUMERIC_SERIAL: u32 = 42;
+
+    #[test]
+    fn edid_image_size_is_reported_for_serial_and_descriptor_identities() {
+        for serial in [false, true] {
+            let mut edid = if serial {
+                numeric_serial_edid(0)
+            } else {
+                synthetic_edid(0)
+            };
+            edid[21] = 60;
+            edid[22] = 34;
+            update_checksums(&mut edid);
+            let size = EdidEvidence::image_size(&edid);
+            assert!(EdidEvidence::qualify(edid).is_ok());
+            assert_eq!(
+                size,
+                DisplayPhysicalSize::Reported {
+                    width_mm:  600,
+                    height_mm: 340,
+                }
+            );
+        }
+        assert_eq!(
+            EdidEvidence::image_size(&[]),
+            DisplayPhysicalSize::NotReported
+        );
+    }
 
     fn synthetic_edid(extension_count: u8) -> Vec<u8> {
         let block_count = usize::from(extension_count) + 1;

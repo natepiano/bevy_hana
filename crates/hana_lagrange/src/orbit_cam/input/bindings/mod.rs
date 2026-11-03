@@ -834,9 +834,9 @@ mod tests {
         assert!(bindings.pan().is_empty());
         assert!(bindings.zoom_smooth().is_empty());
         assert!(bindings.zoom_coarse().is_empty());
-        assert!(bindings.trackpad_orbit().is_empty());
-        assert!(bindings.trackpad_pan().is_empty());
-        assert!(bindings.trackpad_zoom().is_empty());
+        assert_eq!(bindings.trackpad_orbit(), []);
+        assert_eq!(bindings.trackpad_pan(), []);
+        assert_eq!(bindings.trackpad_zoom(), []);
         assert_eq!(bindings.pinch_zoom(), PinchGestureZoom::Disabled);
         assert!(bindings.mouse_wheel_zoom().is_none());
         assert!(bindings.home().is_empty());

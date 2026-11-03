@@ -9,13 +9,16 @@ use hana_lagrange::CameraControlSummary;
 use hana_lagrange::ControlSpeed;
 use hana_lagrange::FreeCam;
 use hana_lagrange::FreeCamActiveDirections;
+use hana_lagrange::FreeCamDirectionFilter;
 use hana_lagrange::FreeCamInputMode;
 use hana_lagrange::InteractionSources;
 use hana_lagrange::OrbitCamInputMode;
-use hana_lagrange::ZoomDirection;
+use hana_lagrange::SlowModeHint;
+use hana_lagrange::ZoomRowFilter;
 use hana_lagrange::describe_controls;
 use hana_lagrange::describe_controls_for;
 
+use super::display::LastZoomDirection;
 use super::guidance;
 use super::guidance::CameraGuidance;
 use super::guidance::CameraGuidanceContent;
@@ -23,12 +26,19 @@ use super::guidance::CameraGuidanceRow;
 
 #[derive(Component, Clone, Debug, PartialEq, Eq)]
 pub(super) struct CameraGuidanceSnapshot {
-    pub(super) camera_label:            String,
-    pub(super) mode_label:              String,
-    pub(super) mode_value:              String,
-    pub(super) slow_mode_binding_label: Option<String>,
-    pub(super) settings:                Vec<CameraControlBinding>,
-    pub(super) rows:                    Vec<CameraGuidanceRow>,
+    pub(super) camera_label: String,
+    pub(super) mode_label:   String,
+    pub(super) mode_value:   String,
+    pub(super) slow_mode:    SlowModeHint,
+    pub(super) settings:     Vec<CameraControlBinding>,
+    pub(super) rows:         Vec<CameraGuidanceRow>,
+}
+
+/// Where the visible Home shortcut belongs for this panel snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HomeHintLocation {
+    CameraPanel,
+    TitleBar,
 }
 
 pub(super) fn resolve_guidance_snapshot(
@@ -37,9 +47,9 @@ pub(super) fn resolve_guidance_snapshot(
     orbit_mode: Option<&OrbitCamInputMode>,
     free_cam: Option<&FreeCam>,
     free_mode: Option<&FreeCamInputMode>,
+    home_hint: HomeHintLocation,
 ) -> CameraGuidanceSnapshot {
     let name_label = name.map(|n| n.as_str().to_string());
-    let title_label = guidance.and_then(|g| g.title.clone());
     let explicit = guidance.and_then(|g| match &g.content {
         CameraGuidanceContent::Auto => None,
         CameraGuidanceContent::Rows(rows) => Some((g, rows.clone())),
@@ -55,31 +65,42 @@ pub(super) fn resolve_guidance_snapshot(
         };
         return CameraGuidanceSnapshot {
             camera_label: name_label
-                .or(title_label)
-                .unwrap_or_else(|| summary.camera_label.clone()),
-            mode_label: guidance
-                .mode_label
-                .clone()
-                .unwrap_or_else(|| summary.mode_label.clone()),
-            mode_value: guidance
-                .mode_value
-                .clone()
-                .unwrap_or_else(|| summary.mode_value.clone()),
-            slow_mode_binding_label: summary.slow_mode_binding_label,
+                .unwrap_or_else(|| guidance.title.resolve(&summary.camera_label).to_string()),
+            mode_label: guidance.mode_label.resolve(&summary.mode_label).to_string(),
+            mode_value: guidance.mode_value.resolve(&summary.mode_value).to_string(),
+            slow_mode: summary.slow_mode,
             settings,
-            rows,
+            rows: rows
+                .into_iter()
+                .filter(|row| {
+                    row.action() != guidance::CameraGuidanceAction::Home
+                        || home_hint == HomeHintLocation::CameraPanel
+                })
+                .collect(),
         };
     }
 
     let summary = resolve_camera_summary(orbit_mode, free_cam, free_mode);
     let (settings, rows) = guidance::split_summary_bindings(summary.bindings);
     CameraGuidanceSnapshot {
-        camera_label: name_label.or(title_label).unwrap_or(summary.camera_label),
+        camera_label: name_label.unwrap_or_else(|| {
+            guidance
+                .map_or(summary.camera_label.as_str(), |g| {
+                    g.title.resolve(&summary.camera_label)
+                })
+                .to_string()
+        }),
         mode_label: summary.mode_label,
         mode_value: summary.mode_value,
-        slow_mode_binding_label: summary.slow_mode_binding_label,
+        slow_mode: summary.slow_mode,
         settings,
-        rows,
+        rows: rows
+            .into_iter()
+            .filter(|row| {
+                row.action() != guidance::CameraGuidanceAction::Home
+                    || home_hint == HomeHintLocation::CameraPanel
+            })
+            .collect(),
     }
 }
 
@@ -103,7 +124,7 @@ fn resolve_camera_summary(
 pub(super) fn row_active(
     row: &CameraGuidanceRow,
     sources: InteractionSources,
-    live_zoom_direction: Option<ZoomDirection>,
+    live_zoom_direction: LastZoomDirection,
     live_free_directions: FreeCamActiveDirections,
 ) -> bool {
     if sources.is_empty() || !sources.intersects(row.camera_interaction_sources()) {
@@ -111,16 +132,19 @@ pub(super) fn row_active(
     }
     // A decomposed `FreeCam` row lights only while its own direction is engaged,
     // so pressing one affordance never lights the whole action's rows.
-    if let Some(direction) = row.direction() {
+    if let FreeCamDirectionFilter::Only(direction) = row.direction() {
         return live_free_directions.contains(direction);
     }
     match row.action().zoom_direction() {
         // Non-directional action rows match on source alone.
-        None => true,
+        ZoomRowFilter::Unrestricted => true,
         // A directional zoom row lights only when the live zoom matches it. Until
         // a direction has been reported (no zoom engaged yet) fall back to
         // source-only so the row can still light rather than going dark.
-        Some(direction) => live_zoom_direction.is_none_or(|live| live == direction),
+        ZoomRowFilter::Only(direction) => {
+            matches!(live_zoom_direction, LastZoomDirection::Unknown)
+                || live_zoom_direction == LastZoomDirection::Known(direction)
+        },
     }
 }
 
@@ -151,6 +175,7 @@ mod tests {
     use hana_lagrange::OrbitCamInputGain;
     use hana_lagrange::OrbitCamMouseDrag;
     use hana_lagrange::OrbitCamPreset;
+    use hana_lagrange::ZoomDirection;
 
     use super::*;
     use crate::camera_control_panel::guidance::CameraGuidanceAction;
@@ -169,13 +194,13 @@ mod tests {
         assert!(row_active(
             &row,
             InteractionSources::GAMEPAD,
-            Some(ZoomDirection::In),
+            LastZoomDirection::Known(ZoomDirection::In),
             FreeCamActiveDirections::NONE,
         ));
         assert!(!row_active(
             &row,
             InteractionSources::GAMEPAD,
-            Some(ZoomDirection::Out),
+            LastZoomDirection::Known(ZoomDirection::Out),
             FreeCamActiveDirections::NONE,
         ));
     }
@@ -186,7 +211,7 @@ mod tests {
         assert!(row_active(
             &row,
             InteractionSources::GAMEPAD,
-            None,
+            LastZoomDirection::Unknown,
             FreeCamActiveDirections::NONE,
         ));
     }
@@ -197,13 +222,13 @@ mod tests {
         assert!(row_active(
             &row,
             InteractionSources::GAMEPAD,
-            Some(ZoomDirection::In),
+            LastZoomDirection::Known(ZoomDirection::In),
             FreeCamActiveDirections::NONE,
         ));
         assert!(row_active(
             &row,
             InteractionSources::GAMEPAD,
-            Some(ZoomDirection::Out),
+            LastZoomDirection::Known(ZoomDirection::Out),
             FreeCamActiveDirections::NONE,
         ));
     }
@@ -214,13 +239,13 @@ mod tests {
         assert!(!row_active(
             &row,
             InteractionSources::WHEEL,
-            Some(ZoomDirection::In),
+            LastZoomDirection::Known(ZoomDirection::In),
             FreeCamActiveDirections::NONE,
         ));
         assert!(!row_active(
             &row,
             InteractionSources::NONE,
-            Some(ZoomDirection::In),
+            LastZoomDirection::Known(ZoomDirection::In),
             FreeCamActiveDirections::NONE,
         ));
     }
@@ -233,12 +258,22 @@ mod tests {
         let up = FreeCamActiveDirections::NONE.with(FreeCamControlDirection::Up);
         let down = FreeCamActiveDirections::NONE.with(FreeCamControlDirection::Down);
 
-        assert!(row_active(&row, InteractionSources::GAMEPAD, None, up));
-        assert!(!row_active(&row, InteractionSources::GAMEPAD, None, down));
+        assert!(row_active(
+            &row,
+            InteractionSources::GAMEPAD,
+            LastZoomDirection::Unknown,
+            up
+        ));
         assert!(!row_active(
             &row,
             InteractionSources::GAMEPAD,
-            None,
+            LastZoomDirection::Unknown,
+            down
+        ));
+        assert!(!row_active(
+            &row,
+            InteractionSources::GAMEPAD,
+            LastZoomDirection::Unknown,
             FreeCamActiveDirections::NONE,
         ));
     }
@@ -253,9 +288,13 @@ mod tests {
             )),
             None,
             None,
+            HomeHintLocation::CameraPanel,
         );
 
-        assert_eq!(snapshot.slow_mode_binding_label.as_deref(), Some("alt-s"));
+        assert_eq!(
+            snapshot.slow_mode,
+            SlowModeHint::ToggledBy("Alt S".to_string())
+        );
     }
 
     #[test]
@@ -270,16 +309,20 @@ mod tests {
             Some(&OrbitCamInputMode::with_preset(preset)),
             None,
             None,
+            HomeHintLocation::CameraPanel,
         );
         let labels = row_labels(&snapshot);
 
-        assert_eq!(snapshot.mode_label, "Preset");
-        assert_eq!(snapshot.mode_value, "BlenderLike");
-        assert_eq!(snapshot.slow_mode_binding_label.as_deref(), Some("alt-s"));
-        assert!(labels.contains(&"pinch out"));
-        assert!(labels.contains(&"pinch in"));
-        assert!(!labels.contains(&"mmb drag"));
-        assert!(!labels.contains(&"smooth-scroll"));
+        assert_eq!(snapshot.mode_label, "Controls");
+        assert_eq!(snapshot.mode_value, "Blender");
+        assert_eq!(
+            snapshot.slow_mode,
+            SlowModeHint::ToggledBy("Alt S".to_string())
+        );
+        assert!(labels.contains(&"Pinch out"));
+        assert!(labels.contains(&"Pinch in"));
+        assert!(!labels.contains(&"Middle drag"));
+        assert!(!labels.contains(&"Two-finger drag"));
     }
 
     #[test]
@@ -303,10 +346,11 @@ mod tests {
             Some(&OrbitCamInputMode::Bindings(bindings)),
             None,
             None,
+            HomeHintLocation::CameraPanel,
         );
 
-        assert_eq!(snapshot.slow_mode_binding_label, None);
-        assert!(snapshot.rows.is_empty());
+        assert_eq!(snapshot.slow_mode, SlowModeHint::NoDisplayableSlowToggle);
+        assert_eq!(snapshot.rows, []);
         Ok(())
     }
 
@@ -320,26 +364,68 @@ mod tests {
             )),
             None,
             None,
+            HomeHintLocation::CameraPanel,
         );
 
-        assert_eq!(snapshot.slow_mode_binding_label, None);
+        assert_eq!(snapshot.slow_mode, SlowModeHint::NoDisplayableSlowToggle);
     }
 
     #[test]
     fn free_cam_snapshot_uses_free_actions() {
         let preset = FreeCamKeyboardMousePreset::default().with_home(KeyCode::KeyH);
         let mode = FreeCamInputMode::with_preset(preset);
-        let snapshot = resolve_guidance_snapshot(None, None, None, None, Some(&mode));
+        let snapshot = resolve_guidance_snapshot(
+            None,
+            None,
+            None,
+            None,
+            Some(&mode),
+            HomeHintLocation::TitleBar,
+        );
 
         assert_eq!(
             row_actions(&snapshot),
             vec![
                 CameraGuidanceAction::Look,
+                CameraGuidanceAction::Look,
                 CameraGuidanceAction::Translate,
                 CameraGuidanceAction::Roll,
-                CameraGuidanceAction::Home,
             ]
         );
+    }
+
+    #[test]
+    fn automatic_home_hint_appears_only_without_title_bar_home_control() {
+        let mode = FreeCamInputMode::with_preset(
+            FreeCamKeyboardMousePreset::default().with_home(KeyCode::KeyH),
+        );
+        for (location, expected) in [
+            (HomeHintLocation::CameraPanel, 1),
+            (HomeHintLocation::TitleBar, 0),
+        ] {
+            let snapshot = resolve_guidance_snapshot(None, None, None, None, Some(&mode), location);
+            assert_eq!(
+                row_actions(&snapshot)
+                    .into_iter()
+                    .filter(|action| *action == CameraGuidanceAction::Home)
+                    .count(),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn authored_home_hint_appears_only_without_title_bar_home_control() {
+        let guidance =
+            CameraGuidance::custom([CameraGuidanceRow::new(CameraGuidanceAction::Home, "H Home")]);
+        for (location, expected) in [
+            (HomeHintLocation::CameraPanel, 1),
+            (HomeHintLocation::TitleBar, 0),
+        ] {
+            let snapshot =
+                resolve_guidance_snapshot(None, Some(&guidance), None, None, None, location);
+            assert_eq!(row_actions(&snapshot).len(), expected);
+        }
     }
 
     #[test]
@@ -347,14 +433,21 @@ mod tests {
         let mode = FreeCamInputMode::with_preset(
             FreeCamKeyboardMousePreset::default().with_look_pitch(FreeCamLookPitch::Inverted),
         );
-        let snapshot = resolve_guidance_snapshot(None, None, None, None, Some(&mode));
+        let snapshot = resolve_guidance_snapshot(
+            None,
+            None,
+            None,
+            None,
+            Some(&mode),
+            HomeHintLocation::CameraPanel,
+        );
         let setting = single_setting_binding(&snapshot);
 
         assert_eq!(
             CameraGuidanceAction::from(setting.action),
             CameraGuidanceAction::Look
         );
-        assert_eq!(setting.label, "alt-i");
+        assert_eq!(setting.label, "Alt I");
         assert_eq!(setting_value(setting), Some("Invert Y"));
         assert_eq!(setting.speed, ControlSpeed::Normal);
         assert_eq!(
@@ -367,7 +460,14 @@ mod tests {
     fn horizon_locked_free_cam_snapshot_reports_disabled_roll() {
         let free_cam = FreeCam::horizon_locked();
         let mode = FreeCamInputMode::with_preset(FreeCamPreset::keyboard_mouse());
-        let snapshot = resolve_guidance_snapshot(None, None, None, Some(&free_cam), Some(&mode));
+        let snapshot = resolve_guidance_snapshot(
+            None,
+            None,
+            None,
+            Some(&free_cam),
+            Some(&mode),
+            HomeHintLocation::CameraPanel,
+        );
         let labels = row_labels(&snapshot);
 
         assert!(labels.contains(&"Roll disabled"));

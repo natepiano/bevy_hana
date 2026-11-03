@@ -5,14 +5,19 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::Commands;
 use bevy::prelude::DetectChanges;
+use bevy::prelude::DetectChangesMut;
 use bevy::prelude::Entity;
 use bevy::prelude::Local;
+use bevy::prelude::Mut;
 use bevy::prelude::Query;
 use bevy::prelude::Ref;
 use bevy::prelude::Res;
 use bevy::prelude::ResMut;
+use bevy::prelude::Resource;
+use bevy::prelude::World;
 
 use super::constants::PANEL_RESIZE_EPSILON;
 use super::coordinate_space::CoordinateSpace;
@@ -26,20 +31,68 @@ use super::events::PanelChangeKind;
 use super::field;
 use super::perf::DiegeticPerfStats;
 use super::scroll;
+use super::scroll_view::PanelScrollViews;
+use crate::FontRegistry;
 use crate::cascade::FontUnit;
 use crate::cascade::PanelDefaults;
 use crate::cascade::Resolved;
+use crate::constants::DIAGNOSTIC_LOG_TARGET;
 use crate::constants::MILLISECONDS_PER_SECOND;
 use crate::layout::BoundingBox;
+use crate::layout::CapHeightMeasurer;
 use crate::layout::LayoutEngine;
 use crate::layout::LayoutResult;
 use crate::layout::LayoutTree;
 use crate::layout::LayoutTreeChange;
 use crate::layout::MeasureTextFn;
+use crate::layout::RichMeasurement;
+use crate::layout::ScrollSolveInput;
 use crate::layout::ShapedTextCache;
 use crate::layout::Sizing;
 use crate::layout::TextMeasure;
+use crate::text;
 use crate::text::DiegeticTextMeasurer;
+use crate::text::RichTextMeasurer;
+
+/// Keeps the cap measurer's shaping buffers and style cache across frames.
+#[derive(SystemParam)]
+pub(super) struct PanelTextMeasurers<'w, 's> {
+    plain: Res<'w, DiegeticTextMeasurer>,
+    rich:  Option<Res<'w, RichTextMeasurer>>,
+    fonts: Option<Res<'w, FontRegistry>>,
+    caps:  Local<'s, CapHeightMeasurer>,
+}
+
+/// Marks whether IME input queued a tree edit after the regular layout pass.
+#[derive(Resource, Default)]
+pub(crate) struct LateEditorLayoutNeeded(bool);
+
+pub(super) fn mark_late_editor_layout(
+    mut needed: ResMut<LateEditorLayoutNeeded>,
+    panels: Query<(
+        &DiegeticPanelChangeClassification,
+        &DiegeticPanel,
+        &ComputedDiegeticPanel,
+    )>,
+) {
+    needed.0 = panels.iter().any(|(change, panel, computed)| {
+        change.pending().is_some()
+            && (panel.tree().has_caret_follow_field()
+                || computed.layout().solved().is_some_and(|solved| {
+                    computed.field_records().iter().any(|field| {
+                        solved
+                            .scrolls
+                            .iter()
+                            .any(|scroll| scroll.element_index == field.element_index)
+                    })
+                }))
+    });
+}
+
+pub(crate) fn late_editor_layout_needed(needed: Res<LateEditorLayoutNeeded>) -> bool { needed.0 }
+
+/// Applies tree replacements queued by observers during the input flush.
+pub(super) fn flush_editor_tree_replacements(world: &mut World) { world.flush(); }
 
 /// Recomputes layout after a panel, its layout tree, or its resolved font unit
 /// changes.
@@ -54,11 +107,12 @@ pub(super) fn compute_panel_layouts(
         Ref<DiegeticPanel>,
         &mut DiegeticPanelChangeClassification,
         &mut ScaledLayoutTreeCache,
+        Option<&mut PanelScrollViews>,
     )>,
     mut computed_panels: Query<&mut ComputedDiegeticPanel>,
     mut commands: Commands,
     panel_font_units: Query<Ref<Resolved<FontUnit>>>,
-    measurer: Res<DiegeticTextMeasurer>,
+    mut measurers: PanelTextMeasurers,
     cache: Res<ShapedTextCache>,
     mut perf: ResMut<DiegeticPerfStats>,
     defaults: Res<PanelDefaults>,
@@ -72,115 +126,276 @@ pub(super) fn compute_panel_layouts(
         *trace_remaining = 30;
     }
 
-    let cached_measure = build_cached_measure(&cache, &measurer);
+    if let Some(fonts) = measurers.fonts.as_ref()
+        && (fonts.is_changed() || matches!(*measurers.caps, CapHeightMeasurer::LineBoxFallback))
+    {
+        *measurers.caps = CapHeightMeasurer::FontMetrics(text::create_cap_height_measurer(
+            fonts.font_context(),
+            fonts.family_names(),
+        ));
+    }
+    let cached_measure = build_cached_measure(&cache, &measurers.plain);
+    let rich_measure = PanelRichMeasurement {
+        rich: measurers
+            .rich
+            .as_deref()
+            .map_or(RichMeasurement::PlainTextFallback, |measurer| {
+                RichMeasurement::ShapedParagraph(Arc::clone(&measurer.measure_fn))
+            }),
+        caps: measurers.caps.clone(),
+    };
 
-    for (entity, panel_ref, mut tree_change, mut scaled_tree_cache) in &mut panels {
+    for (entity, panel_ref, mut tree_change, mut scaled_tree_cache, mut views) in &mut panels {
+        let views_changed = views.as_ref().is_some_and(DetectChanges::is_changed);
         let panel_changed = panel_ref.is_changed();
         let pending_some = tree_change.pending().is_some();
         let resolved_font_unit = panel_font_units.get(entity).ok();
         let font_unit_changed = resolved_font_unit
             .as_ref()
             .is_some_and(DetectChanges::is_changed);
-        if !panel_changed && !pending_some && !font_unit_changed {
+        if !panel_changed && !pending_some && !font_unit_changed && !views_changed {
             continue;
         }
-        if *trace_remaining > 0 {
-            *trace_remaining -= 1;
-            bevy::log::debug!(
-                target: "compute_panel_layouts_trace",
-                "entity={entity:?} panel_changed={panel_changed} pending={pending_some} budget_left={}",
-                *trace_remaining,
-            );
-        }
+        trace_panel_change(&mut trace_remaining, entity, panel_changed, pending_some);
         let Ok(mut computed) = computed_panels.get_mut(entity) else {
             continue;
         };
 
-        let layout_unit = panel_ref.layout_unit();
-        // Every panel carries a seeded `Cascade<FontUnit>`, so `Resolved` is
-        // always present; the fallback to the construction-time
-        // `panel_font_unit` seed only guards a missing-component edge.
         let font_unit =
             resolved_font_unit.map_or(defaults.panel_font_unit, |resolved| resolved.0.0);
-        let layout_to_points = layout_unit.to_points();
-        let font_to_points = font_unit.to_points();
-
-        let viewport_width = panel_ref.width() * layout_to_points;
-        let viewport_height = panel_ref.height() * layout_to_points;
-
-        let (pending_change, tree_visual_geometry_stable) =
-            tree_change.take_with_tree_visual_geometry_stable();
-        // An identical replacement skips the solve only while the last solve
-        // still matches the panel. A screen panel with dynamic axes solves on
-        // its spawn frame before those axes resolve against the window, so an
-        // identical tree sent on the next frame must not retain that solve.
-        let solved_for_panel = computed
-            .layout()
-            .solved()
-            .is_some_and(|result| result.solved_for_viewport(viewport_width, viewport_height));
-        if matches!(pending_change, Some(LayoutTreeChange::Identical))
-            && solved_for_panel
-            && !font_unit_changed
-        {
-            continue;
-        }
-        let had_result = computed.is_solved();
-
-        let scaled_tree = scaled_tree_cache.get_or_update(
-            panel_ref.tree_source(),
-            layout_to_points,
-            font_to_points,
-        );
-
-        // Geometry-stable skip: regenerate render commands from cached positions
-        // without re-running the layout solve. Safe only when
-        // `Resolved<FontUnit>` is unchanged and a text-only edit (`VisualOnly`)
-        // leaves every leaf's box unchanged — verified by `can_reuse_geometry`,
-        // which re-measures the leaves and rejects anything the reuse would
-        // render wrong.
-        let can_reuse_geometry = !font_unit_changed
-            && (tree_visual_geometry_stable
-                || computed.layout().solved().is_some_and(|result| {
-                    result.can_reuse_geometry(
-                        scaled_tree,
-                        &cached_measure,
-                        viewport_width,
-                        viewport_height,
-                        1.0,
-                    )
-                }));
-        if matches!(pending_change, Some(LayoutTreeChange::VisualOnly))
-            && can_reuse_geometry
-            && computed.regenerate_commands(scaled_tree, layout_to_points)
-        {
-            events::trigger_panel_changed(&mut commands, entity, PanelChangeKind::VisualOnly);
-            panel_count += 1;
-            continue;
-        }
-
-        let engine = LayoutEngine::new(Arc::clone(&cached_measure));
-        let result = engine.compute(scaled_tree, viewport_width, viewport_height, 1.0);
-
-        commit_layout_result(&mut computed, &panel_ref, scaled_tree, result, entity);
-        let layout_change = font_unit_changed
-            .then_some(LayoutTreeChange::LayoutAffecting)
-            .or(pending_change);
-        events::trigger_panel_changed(
-            &mut commands,
+        let refreshed = refresh_panel_layout(
             entity,
-            PanelChangeKind::from_layout_change(layout_change, had_result),
+            &panel_ref,
+            &mut tree_change,
+            &mut scaled_tree_cache,
+            &mut computed,
+            views.as_deref(),
+            font_unit.to_points(),
+            font_unit_changed,
+            views_changed,
+            &cached_measure,
+            &rich_measure,
+            &mut commands,
         );
-        panel_count += 1;
+        if refreshed {
+            if let Some(views) = &mut views {
+                // Reconciliation describes the result just committed, so it
+                // must not schedule another identical solve next frame.
+                views
+                    .bypass_change_detection()
+                    .reconcile(&computed, panel_ref.tree());
+            }
+            panel_count += 1;
+        }
     }
 
-    // Zeroes on an empty frame so the `layout` row reads 0 when no panel relaid
-    // out, rather than the bare loop overhead.
+    record_layout_perf(&mut perf, panel_count, start);
+}
+
+fn refresh_panel_layout(
+    entity: Entity,
+    panel: &DiegeticPanel,
+    tree_change: &mut DiegeticPanelChangeClassification,
+    scaled_tree_cache: &mut Mut<'_, ScaledLayoutTreeCache>,
+    computed: &mut Mut<'_, ComputedDiegeticPanel>,
+    views: Option<&PanelScrollViews>,
+    font_to_points: f32,
+    font_unit_changed: bool,
+    views_changed: bool,
+    cached_measure: &MeasureTextFn,
+    rich_measure: &PanelRichMeasurement,
+    commands: &mut Commands,
+) -> bool {
+    let layout_to_points = panel.layout_unit().to_points();
+    let viewport_width = panel.width() * layout_to_points;
+    let viewport_height = panel.height() * layout_to_points;
+
+    let (pending_change, tree_visual_geometry_stable) =
+        tree_change.take_with_tree_visual_geometry_stable();
+    // An identical replacement skips the solve only while the last solve
+    // still matches the panel. A screen panel with dynamic axes solves on
+    // its spawn frame before those axes resolve against the window, so an
+    // identical tree sent on the next frame must not retain that solve.
+    if !views_changed
+        && can_skip_identical_layout(
+            pending_change,
+            computed,
+            font_unit_changed,
+            viewport_width,
+            viewport_height,
+        )
+    {
+        return false;
+    }
+    let had_result = computed.is_solved();
+
+    let scaled_tree =
+        scaled_tree_cache.get_or_update(panel.tree_source(), layout_to_points, font_to_points);
+
+    // Geometry-stable skip: regenerate render commands from cached positions
+    // without re-running the layout solve. Safe only when
+    // `Resolved<FontUnit>` is unchanged and a text-only edit (`VisualOnly`)
+    // leaves every leaf's box unchanged — verified by `can_reuse_geometry`,
+    // which re-measures the leaves and rejects anything the reuse would
+    // render wrong.
+    let can_reuse_geometry = !views_changed
+        && !font_unit_changed
+        && can_reuse_visual_geometry(
+            tree_visual_geometry_stable,
+            computed,
+            scaled_tree,
+            cached_measure,
+            viewport_width,
+            viewport_height,
+        );
+    if matches!(pending_change, Some(LayoutTreeChange::VisualOnly))
+        && can_reuse_geometry
+        && computed.regenerate_commands(scaled_tree, cached_measure, layout_to_points)
+    {
+        events::trigger_panel_changed(commands, entity, PanelChangeKind::VisualOnly);
+        return true;
+    }
+
+    let result = solve_panel_with_caret_history(
+        scaled_tree,
+        computed,
+        cached_measure,
+        rich_measure,
+        viewport_width,
+        viewport_height,
+        views,
+        layout_to_points,
+    );
+
+    commit_layout_result(computed, panel, scaled_tree, result, entity);
+    let layout_change = (font_unit_changed || views_changed)
+        .then_some(LayoutTreeChange::LayoutAffecting)
+        .or(pending_change);
+    events::trigger_panel_changed(
+        commands,
+        entity,
+        PanelChangeKind::from_layout_change(layout_change, had_result),
+    );
+    true
+}
+
+fn trace_panel_change(
+    trace_remaining: &mut u32,
+    entity: Entity,
+    panel_changed: bool,
+    pending_some: bool,
+) {
+    if *trace_remaining > 0 {
+        *trace_remaining -= 1;
+        bevy::log::debug!(
+            target: "compute_panel_layouts_trace",
+            "entity={entity:?} panel_changed={panel_changed} pending={pending_some} budget_left={}",
+            *trace_remaining,
+        );
+    }
+}
+
+fn can_skip_identical_layout(
+    pending_change: Option<LayoutTreeChange>,
+    computed: &ComputedDiegeticPanel,
+    font_unit_changed: bool,
+    viewport_width: f32,
+    viewport_height: f32,
+) -> bool {
+    matches!(pending_change, Some(LayoutTreeChange::Identical))
+        && !font_unit_changed
+        && computed
+            .layout()
+            .solved()
+            .is_some_and(|result| result.solved_for_viewport(viewport_width, viewport_height))
+}
+
+fn can_reuse_visual_geometry(
+    tree_visual_geometry_stable: bool,
+    computed: &ComputedDiegeticPanel,
+    scaled_tree: &LayoutTree,
+    cached_measure: &MeasureTextFn,
+    viewport_width: f32,
+    viewport_height: f32,
+) -> bool {
+    tree_visual_geometry_stable
+        || computed.layout().solved().is_some_and(|result| {
+            result.can_reuse_geometry(
+                scaled_tree,
+                cached_measure,
+                viewport_width,
+                viewport_height,
+                1.0,
+            )
+        })
+}
+
+struct PanelRichMeasurement {
+    rich: RichMeasurement,
+    caps: CapHeightMeasurer,
+}
+
+/// Solves a panel with the applied field offsets from its previous layout.
+fn solve_panel_with_caret_history(
+    scaled_tree: &LayoutTree,
+    computed: &ComputedDiegeticPanel,
+    cached_measure: &MeasureTextFn,
+    rich_measure: &PanelRichMeasurement,
+    viewport_width: f32,
+    viewport_height: f32,
+    views: Option<&PanelScrollViews>,
+    layout_to_points: f32,
+) -> LayoutResult {
+    let mut previous_offsets = previous_caret_offsets(computed);
+    if let Some(views) = views {
+        views.solve_input(layout_to_points, scaled_tree, &mut previous_offsets);
+    }
+    let engine = match &rich_measure.rich {
+        _ if !scaled_tree.contains_rich_text() => LayoutEngine::new(Arc::clone(cached_measure)),
+        RichMeasurement::PlainTextFallback => LayoutEngine::new(Arc::clone(cached_measure)),
+        RichMeasurement::ShapedParagraph(rich) => {
+            LayoutEngine::with_rich_measure(Arc::clone(cached_measure), Arc::clone(rich))
+        },
+    }
+    .with_cap_height_measure(rich_measure.caps.clone());
+    if previous_offsets.is_empty() {
+        engine.compute(scaled_tree, viewport_width, viewport_height, 1.0)
+    } else {
+        engine.compute_with_caret_offsets(
+            scaled_tree,
+            viewport_width,
+            viewport_height,
+            1.0,
+            &previous_offsets,
+        )
+    }
+}
+
+/// Leaves the timing row at zero when no panel needed a solve.
+fn record_layout_perf(perf: &mut DiegeticPerfStats, panel_count: usize, start: Instant) {
     perf.compute_ms = if panel_count == 0 {
         0.0
     } else {
         start.elapsed().as_secs_f32() * MILLISECONDS_PER_SECOND
     };
     perf.compute_panels = panel_count.into();
+}
+
+/// Resolves field ids against the previous solve's applied point offsets.
+fn previous_caret_offsets(computed: &ComputedDiegeticPanel) -> ScrollSolveInput {
+    let mut offsets = ScrollSolveInput::default();
+    if let Some(previous) = computed.layout().solved() {
+        for record in computed.field_records() {
+            if let Some(scroll) = previous
+                .scrolls
+                .iter()
+                .find(|scroll| scroll.element_index == record.element_index)
+            {
+                offsets.insert(record.field_id.clone(), scroll.offset_points.x);
+            }
+        }
+    }
+    offsets
 }
 
 /// Builds the cache-backed text measurer for one layout pass.
@@ -224,7 +439,7 @@ fn commit_layout_result(
         field::collect_panel_field_records(scaled_tree, &result);
     if !field_id_conflicts.is_empty() {
         bevy::log::warn!(
-            target: "hana_diegetic::ime",
+            target: DIAGNOSTIC_LOG_TARGET,
             "panel {entity:?} has duplicate editable field ids: {field_id_conflicts:?}"
         );
     }
@@ -318,14 +533,25 @@ pub(super) fn resolve_world_panel_fit(
 mod tests {
     use std::sync::Arc;
 
+    use bevy::input::ButtonState;
+    use bevy::input::InputPlugin;
+    use bevy::input::keyboard::Key;
+    use bevy::input::keyboard::KeyboardInput;
+    use bevy::input::keyboard::NativeKey;
     use bevy::prelude::App;
     use bevy::prelude::Color;
+    use bevy::prelude::Entity;
+    use bevy::prelude::KeyCode;
     use bevy::prelude::MinimalPlugins;
     use bevy::prelude::On;
     use bevy::prelude::ResMut;
     use bevy::prelude::Resource;
+    use bevy::window::Ime;
     use bevy::window::PrimaryWindow;
     use bevy::window::Window;
+    use bevy::window::WindowClosed;
+    use bevy::window::WindowFocused;
+    use bevy::window::WindowRef;
     use hana_kana::ToF32;
 
     use super::panel_surface_bounds;
@@ -336,8 +562,15 @@ mod tests {
     use crate::El;
     use crate::Fit;
     use crate::FitMax;
+    use crate::HeadlessDiegeticUiPlugin;
+    use crate::ImeBuiltInFieldKind;
+    use crate::ImeBuiltInFieldSpec;
+    use crate::ImeEditableFieldSpec;
+    use crate::ImeOpenSession;
+    use crate::ImeTarget;
     use crate::Mm;
     use crate::Padding;
+    use crate::PanelElementId;
     use crate::Percent;
     use crate::Px;
     use crate::Sizing;
@@ -395,6 +628,99 @@ mod tests {
         app.insert_resource(monospace_measurer());
         app.add_plugins(HeadlessLayoutPlugin);
         app
+    }
+
+    fn assert_inline_tree_solved(app: &App, panel: Entity) {
+        let world = app.world();
+        let tree_len = world
+            .get::<DiegeticPanel>(panel)
+            .expect("panel exists")
+            .tree()
+            .len();
+        let computed = world
+            .get::<ComputedDiegeticPanel>(panel)
+            .expect("computed panel exists");
+        let solved_len = computed
+            .layout()
+            .solved()
+            .expect("panel solved")
+            .computed
+            .len();
+        assert_eq!(solved_len, tree_len, "tree and solve differ on this update");
+        let scroll = computed
+            .scroll_records()
+            .iter()
+            .find(|record| record.id == PanelElementId::named("field"))
+            .expect("named field scroll is solved on this update");
+        assert!(scroll.element_index < solved_len);
+    }
+
+    #[test]
+    fn inline_ime_tree_has_solved_geometry_on_each_update() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, InputPlugin))
+            .add_message::<Ime>()
+            .add_message::<WindowClosed>()
+            .add_message::<WindowFocused>()
+            .insert_resource(DiegeticTextMeasurer::default())
+            .add_plugins(HeadlessDiegeticUiPlugin);
+        let window = app.world_mut().spawn(Window::default()).id();
+        let mut builder = LayoutBuilder::new(140.0, 40.0);
+        builder.with(
+            El::new().size(72.0, 18.0).editable_field(
+                "field",
+                ImeEditableFieldSpec::BuiltIn(ImeBuiltInFieldSpec::new(ImeBuiltInFieldKind::Text)),
+                TextStyle::new(12.0),
+            ),
+            |builder| {
+                builder.text(("", TextStyle::new(12.0)));
+            },
+        );
+        let panel = app
+            .world_mut()
+            .spawn(
+                DiegeticPanel::screen()
+                    .size(Px(140.0), Px(40.0))
+                    .window(WindowRef::Entity(window))
+                    .font_unit(Unit::Pixels)
+                    .with_tree(builder.build())
+                    .build()
+                    .expect("field panel builds"),
+            )
+            .id();
+        app.update();
+        app.world_mut().trigger(ImeOpenSession {
+            target: ImeTarget::ScreenPanelField {
+                panel,
+                field_id: PanelElementId::named("field"),
+            },
+            window,
+            initial_text: String::new(),
+            field_spec: ImeEditableFieldSpec::BuiltIn(ImeBuiltInFieldSpec::new(
+                ImeBuiltInFieldKind::Text,
+            )),
+            anchor: None,
+        });
+        app.update();
+        assert_inline_tree_solved(&app, panel);
+        for value in "macOS field scrolling across a very long single line".chars() {
+            app.world_mut().write_message(Ime::Commit {
+                window,
+                value: value.to_string(),
+            });
+            app.update();
+            assert_inline_tree_solved(&app, panel);
+        }
+        app.world_mut().write_message(KeyboardInput {
+            key_code: KeyCode::Home,
+            logical_key: Key::Unidentified(NativeKey::Unidentified),
+            state: ButtonState::Pressed,
+            text: None,
+            repeat: false,
+            window,
+        });
+        app.update();
+        assert_inline_tree_solved(&app, panel);
     }
 
     #[track_caller]

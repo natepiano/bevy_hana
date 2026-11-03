@@ -775,7 +775,7 @@ fn first_datum_silence_expires_into_stalled() -> Result<(), Box<dyn Error>> {
             ..
         }
     ));
-    assert!(harness.control.releases().is_empty());
+    assert_eq!(harness.control.releases(), []);
     Ok(())
 }
 
@@ -832,7 +832,7 @@ fn datum_on_each_exact_expiry_frame_remains_current() -> Result<(), Box<dyn Erro
             ..
         }
     ));
-    assert!(harness.control.releases().is_empty());
+    assert_eq!(harness.control.releases(), []);
     Ok(())
 }
 
@@ -1249,7 +1249,7 @@ fn stalled_is_published_for_one_update_before_waiting_for_retry() -> Result<(), 
             ..
         } if *published_session == session
     ));
-    assert!(harness.control.releases().is_empty());
+    assert_eq!(harness.control.releases(), []);
 
     harness.update_at(crossed_at)?;
     assert_eq!(
@@ -1430,7 +1430,7 @@ fn not_monitored_never_stalls_or_releases_without_data() -> Result<(), Box<dyn E
             ..
         }
     ));
-    assert!(harness.control.releases().is_empty());
+    assert_eq!(harness.control.releases(), []);
     Ok(())
 }
 
@@ -1949,6 +1949,7 @@ fn production_prelude_compiles_without_test_support() -> Result<(), Box<dyn Erro
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
 
     let output = Command::new(cargo)
+        .current_dir(&workspace_root)
         .arg("check")
         .arg("--manifest-path")
         .arg(&fixture_manifest)

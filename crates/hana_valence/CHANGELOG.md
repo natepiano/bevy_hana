@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `CellSheet` is a sparse `ArrangementProvider` over plain `QuadCell` values
+  and one finite, positive cell pitch. It builds one row-running strip per
+  connected piece, exposes depth-first unfold order through
+  `CellFoldGroupSelection::Strips`, shares the sized quad geometry used by
+  `QuadSheet`, and rejects invalid sizes and duplicate logical cells through
+  `CellSheetError`.
+- `StripFold` folds a `CellSheet` into clearance-separated stacks. The sheet's
+  `FoldStackPivotClearance` capability retains the direction and per-member
+  pivot guarantee computed by the pure stack simulation; `StripFoldError`
+  reports incomplete, foreign, duplicate, non-finite, or unrepresentable
+  authoring input before any hinge endpoint is written.
+
 - `FoldStageBegin`, `FoldStageEnd`, `FoldMemberBegin`, `FoldMemberEnd`, and
   `FoldEndpointReached` are the entity events a retained fold sequence emits for
   every boundary it crosses, once each, in ledger order. Stage and endpoint
@@ -158,6 +170,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   errors retain their boxed downstream source.
 
 ### Changed
+
+- **Breaking:** `CellSheet::try_new` now rejects `usize::MAX` row and column
+  coordinates before neighbour arithmetic, and validates complete strip-fold
+  pivot coverage, finite clearances, and representable half-turn endpoints.
+  `CellSheetError` names row/column successor overflow and every strip-fold
+  coverage cause; `NonFiniteFoldStackPivotClearance` is replaced by the more
+  precise `NonFiniteStripFoldPivotClearance`.
 
 - **Breaking:** `hinge_to_pose` derives each `AnchorPose` in `PostUpdate` from
   the live `Hinge` and the `EasedFoldFraction` its sequence cached in `Update`,
