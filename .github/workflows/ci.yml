@@ -23,8 +23,18 @@ jobs:
   build:
     name: Build (examples included)
     runs-on: ubuntu-latest
+    # The Bevy 0.20 test build filled the runner's disk.
+    env: &ci-build-env
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - uses: actions/checkout@v4
+      - &free-runner-disk
+        name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install Bevy system dependencies
@@ -38,8 +48,10 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    env: *ci-build-env
     steps:
       - uses: actions/checkout@v4
+      - *free-runner-disk
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install Bevy system dependencies
