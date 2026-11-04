@@ -1,9 +1,9 @@
 //! Links current diegetic shaders for production scene and prepass descriptors.
 
-#[path = "../../hana_effects/tests/shader_record/mod.rs"]
+#[path = "shader_record/mod.rs"]
 mod shader_record;
 
-#[path = "../../hana_effects/tests/shader_record/calls.rs"]
+#[path = "shader_record/calls.rs"]
 mod shader_calls;
 
 use std::collections::HashMap;

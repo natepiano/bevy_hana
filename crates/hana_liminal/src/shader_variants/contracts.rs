@@ -1,6 +1,6 @@
 //! Linked contracts checked by the single liminal descriptor recorder.
 
-#[path = "../../../hana_effects/tests/shader_record/calls.rs"]
+#[path = "../../../hana_diegetic/tests/shader_record/calls.rs"]
 mod shader_calls;
 
 use std::collections::BTreeMap;

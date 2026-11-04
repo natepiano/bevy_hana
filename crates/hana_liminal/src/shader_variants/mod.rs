@@ -14,7 +14,7 @@ use bevy::window::ExitCondition;
 use bevy::winit::WinitPlugin;
 use contracts::OutlineContracts;
 
-#[path = "../../../hana_effects/tests/shader_record/mod.rs"]
+#[path = "../../../hana_diegetic/tests/shader_record/mod.rs"]
 mod shader_record;
 
 use std::collections::HashMap;
