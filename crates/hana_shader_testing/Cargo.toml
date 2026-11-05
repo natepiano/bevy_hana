@@ -1,0 +1,15 @@
+[package]
+description       = "Shader checks for workspace tests"
+edition.workspace = true
+license.workspace = true
+name              = "hana_shader_testing"
+publish           = false
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bevy.workspace       = true
+naga.workspace       = true
+serde_json.workspace = true

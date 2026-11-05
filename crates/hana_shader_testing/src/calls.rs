@@ -1,25 +1,28 @@
 //! Inspects call sites in nested Naga control flow.
 
-pub(super) fn call_sites(
-    function: &naga::Function,
-) -> Vec<(
-    naga::Handle<naga::Function>,
-    &[naga::Handle<naga::Expression>],
-)> {
+use bevy::shader::ShaderDefVal;
+use naga::Expression;
+use naga::Function;
+use naga::Handle;
+use naga::Statement;
+
+/// Returns function calls from all nested blocks.
+#[must_use]
+pub fn call_sites(function: &Function) -> Vec<(Handle<Function>, &[Handle<Expression>])> {
     let mut calls = Vec::new();
     let mut blocks = vec![&function.body];
     while let Some(block) = blocks.pop() {
         for statement in block {
             match statement {
-                naga::Statement::Block(block) => blocks.push(block),
-                naga::Statement::If { accept, reject, .. } => blocks.extend([accept, reject]),
-                naga::Statement::Loop {
+                Statement::Block(block) => blocks.push(block),
+                Statement::If { accept, reject, .. } => blocks.extend([accept, reject]),
+                Statement::Loop {
                     body, continuing, ..
                 } => blocks.extend([body, continuing]),
-                naga::Statement::Switch { cases, .. } => {
+                Statement::Switch { cases, .. } => {
                     blocks.extend(cases.iter().map(|case| &case.body));
                 },
-                naga::Statement::Call {
+                Statement::Call {
                     function,
                     arguments,
                     ..
@@ -31,7 +34,9 @@ pub(super) fn call_sites(
     calls
 }
 
-pub(super) fn definition_enabled(definitions: &[bevy::shader::ShaderDefVal], flag: &str) -> bool {
+/// Returns whether the definitions enable the Boolean flag.
+#[must_use]
+pub fn definition_enabled(definitions: &[ShaderDefVal], flag: &str) -> bool {
     definitions.iter().any(|definition| {
         matches!(definition,
         bevy::shader::ShaderDefVal::Bool(name, true) if name == flag)

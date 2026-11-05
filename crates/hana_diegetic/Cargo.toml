@@ -49,20 +49,21 @@ thiserror = { workspace = true }
 ttf-parser = { workspace = true }
 
 [dev-dependencies]
-bevy            = { workspace = true, features = ["default_font", "tonemapping_luts"] }
-bevy_brp_extras = { workspace = true }
-blake3          = { workspace = true }
-clay-layout     = { workspace = true }
-criterion       = { workspace = true }
-fairy_dust      = { workspace = true }
-hana_clerestory = { workspace = true }
-hana_lagrange   = { workspace = true, features = ["fit_overlay"] }
-hana_metrics    = { workspace = true }
-image           = { workspace = true, features = ["png"] }
-naga            = { workspace = true }
-serde           = { workspace = true }
-serde_json      = { workspace = true }
-wgpu            = { workspace = true }
+bevy                          = { workspace = true, features = ["default_font", "tonemapping_luts"] }
+bevy_brp_extras               = { workspace = true }
+blake3                        = { workspace = true }
+clay-layout                   = { workspace = true }
+criterion                     = { workspace = true }
+fairy_dust                    = { workspace = true }
+hana_clerestory               = { workspace = true }
+hana_lagrange                 = { workspace = true, features = ["fit_overlay"] }
+hana_metrics                  = { workspace = true }
+hana_shader_testing.workspace = true
+image                         = { workspace = true, features = ["png"] }
+naga                          = { workspace = true }
+serde                         = { workspace = true }
+serde_json                    = { workspace = true }
+wgpu                          = { workspace = true }
 
 [[example]]
 name = "side_by_side"

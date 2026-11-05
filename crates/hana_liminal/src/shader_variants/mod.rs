@@ -2,29 +2,25 @@
 
 mod contracts;
 
-use bevy::prelude::*;
-use bevy::render::RenderApp;
-use bevy::render::RenderPlugin;
-use bevy::render::pipelined_rendering::PipelinedRenderingPlugin;
-use bevy::render::render_resource::*;
-use bevy::render::renderer::RenderDevice;
-use bevy::shader::ShaderCache;
-use bevy::shader::ShaderDefVal;
-use bevy::window::ExitCondition;
-use bevy::winit::WinitPlugin;
-use contracts::OutlineContracts;
-
-#[path = "../../../hana_diegetic/tests/shader_record/mod.rs"]
-mod shader_record;
-
 use std::collections::HashMap;
 
 use bevy::log::LogPlugin;
 use bevy::mesh::VertexAttributeValues;
 use bevy::pbr::MeshPipelineKey;
 use bevy::pbr::MeshUniform;
+use bevy::prelude::*;
+use bevy::render::RenderApp;
+use bevy::render::RenderPlugin;
+use bevy::render::pipelined_rendering::PipelinedRenderingPlugin;
+use bevy::render::render_resource::*;
+use bevy::render::renderer::RenderDevice;
 use bevy::render::settings::WgpuSettings;
-use shader_record::ShaderRecord;
+use bevy::shader::ShaderCache;
+use bevy::shader::ShaderDefVal;
+use bevy::window::ExitCondition;
+use bevy::winit::WinitPlugin;
+use contracts::OutlineContracts;
+use hana_shader_testing::ShaderRecord;
 
 use crate::constants::ATTRIBUTE_OUTLINE_NORMAL;
 use crate::constants::HAS_OUTLINE_NORMALS_SHADER_DEF;
@@ -80,7 +76,7 @@ fn shader_variants_for_descriptors(
 ) -> Result<(), String> {
     let device = app.world().resource::<RenderDevice>();
     let mut cache = ShaderCache::new((), |(), source, validate| {
-        shader_record::load_module(source, validate)
+        hana_shader_testing::load_module(source, validate)
     });
     let shaders = app.world().resource::<Assets<Shader>>();
     for (id, shader) in shaders.iter() {
@@ -180,14 +176,14 @@ const ROOT_COUNT: usize = 4;
 
 #[test]
 fn shader_variants_link_morph_targets_and_distinct_uniform_arrays() -> Result<(), String> {
-    let mut record = shader_record::ShaderRecord::new(CRATE_NAME, SOURCES);
+    let mut record = hana_shader_testing::ShaderRecord::new(CRATE_NAME, SOURCES);
     let mut contracts = OutlineContracts::default();
     for buffers in [InstanceBuffers::Storage, InstanceBuffers::Uniform] {
         let mut app = headless_app(buffers);
         app.add_plugins(crate::LiminalPlugin);
         app.finish();
         app.cleanup();
-        shader_record::wait_for_shaders(&mut app)?;
+        hana_shader_testing::wait_for_shaders(&mut app)?;
         let mut descriptors = captured_descriptors(&app);
         descriptors.extend(outline_descriptors(
             app.sub_app(RenderApp).world(),

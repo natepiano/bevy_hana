@@ -1,11 +1,5 @@
 //! Links current diegetic shaders for production scene and prepass descriptors.
 
-#[path = "shader_record/mod.rs"]
-mod shader_record;
-
-#[path = "shader_record/calls.rs"]
-mod shader_calls;
-
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -68,10 +62,10 @@ use hana_diegetic::ScreenSpaceCamera;
 use hana_diegetic::SurfaceShadow;
 use hana_diegetic::TextStyle;
 use hana_diegetic::Tooltip;
-use shader_calls::call_sites;
-use shader_calls::definition_enabled;
-use shader_record::ShaderRecord;
-use shader_record::load_module;
+use hana_shader_testing::ShaderRecord;
+use hana_shader_testing::call_sites;
+use hana_shader_testing::definition_enabled;
+use hana_shader_testing::load_module;
 
 struct ShaderSource {
     source_path: &'static str,
@@ -329,7 +323,7 @@ fn diegetic_app() -> Result<App, String> {
     for _ in 0..4 {
         app.update();
     }
-    shader_record::wait_for_shaders(&mut app)?;
+    hana_shader_testing::wait_for_shaders(&mut app)?;
     Ok(app)
 }
 

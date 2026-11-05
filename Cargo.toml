@@ -18,6 +18,7 @@ members  = [
   "crates/hana_rigging",
   "crates/hana_rigging_scripted",
   "crates/hana_rubric",
+  "crates/hana_shader_testing",
   "crates/hana_valence",
 ]
 resolver = "3"
@@ -47,6 +48,7 @@ hana_metrics          = { path = "crates/hana_metrics" }
 hana_rigging          = { path = "crates/hana_rigging" }
 hana_rigging_scripted = { path = "crates/hana_rigging_scripted" }
 hana_rubric           = { path = "crates/hana_rubric" }
+hana_shader_testing   = { path = "crates/hana_shader_testing" }
 hana_valence          = { path = "crates/hana_valence", default-features = false }
 
 #

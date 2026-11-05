@@ -40,8 +40,9 @@ rand = { workspace = true }
 getrandom = { workspace = true }
 
 [dev-dependencies]
-naga.workspace       = true
-serde_json.workspace = true
+hana_shader_testing.workspace = true
+naga.workspace                = true
+serde_json.workspace          = true
 # Deliberately not `default`: that pulls bevy's `audio` feature, and cargo
 # unifies features across the workspace build, so one dev-dependency asking for
 # it puts `AudioPlugin` into `DefaultPlugins` for every test binary. Audio

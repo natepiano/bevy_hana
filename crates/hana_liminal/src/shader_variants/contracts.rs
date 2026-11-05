@@ -1,19 +1,16 @@
 //! Linked contracts checked by the single liminal descriptor recorder.
 
-#[path = "../../../hana_diegetic/tests/shader_record/calls.rs"]
-mod shader_calls;
-
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 
 use bevy::shader::ShaderDefVal;
+use hana_shader_testing::call_sites;
+use hana_shader_testing::definition_enabled;
 use naga::AddressSpace;
 use naga::ArraySize;
 use naga::Expression;
 use naga::Module;
 use naga::TypeInner;
-use shader_calls::call_sites;
-use shader_calls::definition_enabled;
 
 use super::SOURCES;
 use crate::constants::HULL_MESH_BIND_GROUP_SLOT;

@@ -1,5 +1,8 @@
-//! Shared Naga validation, contract extraction and opt-in shader records.
+//! Checks that each shader variant links and validates and each contract matches. JSON records are
+//! optional output.
 
+mod calls;
+mod directory;
 mod schema;
 mod types;
 
@@ -7,6 +10,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::io::ErrorKind;
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -25,6 +29,10 @@ use bevy::shader::Source;
 use bevy::shader::ValidateShader;
 use bevy::tasks::block_on;
 use bevy::tasks::futures_lite::StreamExt;
+pub use calls::call_sites;
+pub use calls::definition_enabled;
+pub use directory::RecordDirectory;
+use naga::Module;
 use naga::valid::Capabilities;
 use naga::valid::ValidationFlags;
 use naga::valid::Validator;
@@ -42,7 +50,10 @@ use schema::SharedShaderContract;
 const SHADER_LOAD_MAX_UPDATES: usize = 1024;
 
 /// Waits for shader libraries and their transitive imports before copying them into a cache.
-pub(super) fn wait_for_shaders(app: &mut App) -> Result<(), String> {
+///
+/// # Errors
+/// Returns an error if shader imports or loads remain incomplete.
+pub fn wait_for_shaders(app: &mut App) -> Result<(), String> {
     // Assets::iter excludes pending loads. Enumerate the embedded source so even a library
     // with no loaded importer yet participates in the AssetServer readiness check.
     let embedded_paths = block_on(async {
@@ -129,10 +140,13 @@ pub(super) fn wait_for_shaders(app: &mut App) -> Result<(), String> {
 }
 
 /// Keeps a validated composed module without creating a GPU shader module.
-pub(super) fn load_module(
+///
+/// # Errors
+/// Returns an error if the shader source cannot parse or validate.
+pub fn load_module(
     source: ShaderCacheSource<'_>,
     _: &ValidateShader,
-) -> Result<naga::Module, ShaderCacheError> {
+) -> Result<Module, ShaderCacheError> {
     let module = match source {
         ShaderCacheSource::Wgsl(text) => naga::front::wgsl::parse_str(&text)
             .map_err(|error| ShaderCacheError::CreateShaderModule(error.to_string()))?,
@@ -178,13 +192,13 @@ struct LinkedVariant {
 }
 
 /// Records distinct ordered descriptor definitions for one owning crate.
-pub(super) struct ShaderRecord {
+pub struct ShaderRecord {
     crate_name: String,
     sources:    Vec<String>,
     roots:      BTreeMap<String, BTreeMap<Vec<ShaderDefinition>, LinkedVariant>>,
 }
 
-fn contract(module: &naga::Module, definitions: &[ShaderDefVal]) -> Result<ShaderContract, String> {
+fn contract(module: &Module, definitions: &[ShaderDefVal]) -> Result<ShaderContract, String> {
     let material_group = definitions.iter().find_map(|definition| match definition {
         ShaderDefVal::UInt(name, value) if name == "MATERIAL_BIND_GROUP" => Some(*value),
         ShaderDefVal::Int(name, value) if name == "MATERIAL_BIND_GROUP" => {
@@ -230,7 +244,8 @@ fn contract(module: &naga::Module, definitions: &[ShaderDefVal]) -> Result<Shade
 
 impl ShaderRecord {
     /// Names product sources, including imported modules, without reading evidence.
-    pub(super) fn new(crate_name: &str, sources: &[&str]) -> Self {
+    #[must_use]
+    pub fn new(crate_name: &str, sources: &[&str]) -> Self {
         Self {
             crate_name: crate_name.into(),
             sources:    sources.iter().map(|source| (*source).into()).collect(),
@@ -239,11 +254,14 @@ impl ShaderRecord {
     }
 
     /// Extracts a contract only when output is requested; the cache already validates.
-    pub(super) fn record(
+    ///
+    /// # Errors
+    /// Returns an error if the requested shader record cannot validate or serialize.
+    pub fn record(
         &mut self,
         source_path: &str,
         definitions: &[ShaderDefVal],
-        module: &naga::Module,
+        module: &Module,
     ) -> Result<(), String> {
         if std::env::var_os("HANA_SHADER_RECORD_DIR").is_none() {
             return Ok(());
@@ -251,11 +269,15 @@ impl ShaderRecord {
         self.record_linked(source_path, definitions, module)
     }
 
-    pub(super) fn record_linked(
+    /// Records a validated variant without an environment variable check.
+    ///
+    /// # Errors
+    /// Returns an error if the shader contract cannot validate or serialize.
+    pub fn record_linked(
         &mut self,
         source_path: &str,
         definitions: &[ShaderDefVal],
-        module: &naga::Module,
+        module: &Module,
     ) -> Result<(), String> {
         let definitions_key = definitions
             .iter()
@@ -284,19 +306,26 @@ impl ShaderRecord {
     }
 
     /// Replaces this crate's evidence in the combined record when output is requested.
-    pub(super) fn finish(self) -> Result<(), String> {
+    ///
+    /// # Errors
+    /// Returns an error if record files cannot read, hash, or write.
+    pub fn finish(self) -> Result<(), String> {
         let Some(directory) = std::env::var_os("HANA_SHADER_RECORD_DIR") else {
             return Ok(());
         };
         self.finish_in(Path::new(&directory))
     }
 
-    pub(super) fn finish_in(self, directory: &Path) -> Result<(), String> {
+    /// Writes this crate's records to the specified directory.
+    ///
+    /// # Errors
+    /// Returns an error if record files cannot read, hash, or write.
+    pub fn finish_in(self, directory: &Path) -> Result<(), String> {
         std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
         let record_path = directory.join("variants.json");
         let mut evidence = match std::fs::read_to_string(&record_path) {
             Ok(text) => ShaderEvidence::read(&text)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => ShaderEvidence::default(),
+            Err(error) if error.kind() == ErrorKind::NotFound => ShaderEvidence::default(),
             Err(error) => return Err(error.to_string()),
         };
         let replaced_paths = evidence
@@ -316,7 +345,7 @@ impl ShaderRecord {
         let target = directory.join(&self.crate_name);
         match std::fs::remove_dir_all(&target) {
             Ok(()) => {},
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) if error.kind() == ErrorKind::NotFound => {},
             Err(error) => return Err(error.to_string()),
         }
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -422,7 +451,7 @@ struct LinkedDigest {
 fn read_digests(path: &Path) -> Result<Vec<LinkedDigest>, String> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error.to_string()),
     };
     text.lines()

@@ -2,11 +2,16 @@
 
 use naga::AddressSpace;
 use naga::ArraySize;
+use naga::Handle;
 use naga::ImageClass;
 use naga::ImageDimension;
+use naga::Module;
 use naga::Scalar;
 use naga::ScalarKind;
+use naga::ShaderStage;
 use naga::StorageAccess;
+use naga::StorageFormat;
+use naga::Type;
 use naga::TypeInner;
 
 fn scalar_name(scalar: Scalar) -> Result<&'static str, String> {
@@ -48,21 +53,21 @@ pub(super) fn address_space(space: AddressSpace) -> Result<String, String> {
     })
 }
 
-pub(super) const fn stage_name(stage: naga::ShaderStage) -> &'static str {
+pub(super) const fn stage_name(stage: ShaderStage) -> &'static str {
     match stage {
-        naga::ShaderStage::Vertex => "vertex",
-        naga::ShaderStage::Task => "task",
-        naga::ShaderStage::Mesh => "mesh",
-        naga::ShaderStage::Fragment => "fragment",
-        naga::ShaderStage::Compute => "compute",
-        naga::ShaderStage::RayGeneration => "ray_generation",
-        naga::ShaderStage::Miss => "miss",
-        naga::ShaderStage::AnyHit => "any_hit",
-        naga::ShaderStage::ClosestHit => "closest_hit",
+        ShaderStage::Vertex => "vertex",
+        ShaderStage::Task => "task",
+        ShaderStage::Mesh => "mesh",
+        ShaderStage::Fragment => "fragment",
+        ShaderStage::Compute => "compute",
+        ShaderStage::RayGeneration => "ray_generation",
+        ShaderStage::Miss => "miss",
+        ShaderStage::AnyHit => "any_hit",
+        ShaderStage::ClosestHit => "closest_hit",
     }
 }
 
-fn array_size(module: &naga::Module, size: ArraySize) -> Result<String, String> {
+fn array_size(module: &Module, size: ArraySize) -> Result<String, String> {
     match size {
         ArraySize::Constant(count) => Ok(count.to_string()),
         ArraySize::Dynamic => Ok("runtime".into()),
@@ -106,56 +111,53 @@ fn image_type(dim: ImageDimension, arrayed: bool, class: ImageClass) -> Result<S
     }
 }
 
-const fn storage_format(format: naga::StorageFormat) -> &'static str {
+const fn storage_format(format: StorageFormat) -> &'static str {
     match format {
-        naga::StorageFormat::R8Unorm => "r8unorm",
-        naga::StorageFormat::R8Snorm => "r8snorm",
-        naga::StorageFormat::R8Uint => "r8uint",
-        naga::StorageFormat::R8Sint => "r8sint",
-        naga::StorageFormat::R16Uint => "r16uint",
-        naga::StorageFormat::R16Sint => "r16sint",
-        naga::StorageFormat::R16Float => "r16float",
-        naga::StorageFormat::Rg8Unorm => "rg8unorm",
-        naga::StorageFormat::Rg8Snorm => "rg8snorm",
-        naga::StorageFormat::Rg8Uint => "rg8uint",
-        naga::StorageFormat::Rg8Sint => "rg8sint",
-        naga::StorageFormat::R32Uint => "r32uint",
-        naga::StorageFormat::R32Sint => "r32sint",
-        naga::StorageFormat::R32Float => "r32float",
-        naga::StorageFormat::Rg16Uint => "rg16uint",
-        naga::StorageFormat::Rg16Sint => "rg16sint",
-        naga::StorageFormat::Rg16Float => "rg16float",
-        naga::StorageFormat::Rgba8Unorm => "rgba8unorm",
-        naga::StorageFormat::Rgba8Snorm => "rgba8snorm",
-        naga::StorageFormat::Rgba8Uint => "rgba8uint",
-        naga::StorageFormat::Rgba8Sint => "rgba8sint",
-        naga::StorageFormat::Bgra8Unorm => "bgra8unorm",
-        naga::StorageFormat::Rgb10a2Uint => "rgb10a2uint",
-        naga::StorageFormat::Rgb10a2Unorm => "rgb10a2unorm",
-        naga::StorageFormat::Rg11b10Ufloat => "rg11b10ufloat",
-        naga::StorageFormat::R64Uint => "r64uint",
-        naga::StorageFormat::Rg32Uint => "rg32uint",
-        naga::StorageFormat::Rg32Sint => "rg32sint",
-        naga::StorageFormat::Rg32Float => "rg32float",
-        naga::StorageFormat::Rgba16Uint => "rgba16uint",
-        naga::StorageFormat::Rgba16Sint => "rgba16sint",
-        naga::StorageFormat::Rgba16Float => "rgba16float",
-        naga::StorageFormat::Rgba32Uint => "rgba32uint",
-        naga::StorageFormat::Rgba32Sint => "rgba32sint",
-        naga::StorageFormat::Rgba32Float => "rgba32float",
-        naga::StorageFormat::R16Unorm => "r16unorm",
-        naga::StorageFormat::R16Snorm => "r16snorm",
-        naga::StorageFormat::Rg16Unorm => "rg16unorm",
-        naga::StorageFormat::Rg16Snorm => "rg16snorm",
-        naga::StorageFormat::Rgba16Unorm => "rgba16unorm",
-        naga::StorageFormat::Rgba16Snorm => "rgba16snorm",
+        StorageFormat::R8Unorm => "r8unorm",
+        StorageFormat::R8Snorm => "r8snorm",
+        StorageFormat::R8Uint => "r8uint",
+        StorageFormat::R8Sint => "r8sint",
+        StorageFormat::R16Uint => "r16uint",
+        StorageFormat::R16Sint => "r16sint",
+        StorageFormat::R16Float => "r16float",
+        StorageFormat::Rg8Unorm => "rg8unorm",
+        StorageFormat::Rg8Snorm => "rg8snorm",
+        StorageFormat::Rg8Uint => "rg8uint",
+        StorageFormat::Rg8Sint => "rg8sint",
+        StorageFormat::R32Uint => "r32uint",
+        StorageFormat::R32Sint => "r32sint",
+        StorageFormat::R32Float => "r32float",
+        StorageFormat::Rg16Uint => "rg16uint",
+        StorageFormat::Rg16Sint => "rg16sint",
+        StorageFormat::Rg16Float => "rg16float",
+        StorageFormat::Rgba8Unorm => "rgba8unorm",
+        StorageFormat::Rgba8Snorm => "rgba8snorm",
+        StorageFormat::Rgba8Uint => "rgba8uint",
+        StorageFormat::Rgba8Sint => "rgba8sint",
+        StorageFormat::Bgra8Unorm => "bgra8unorm",
+        StorageFormat::Rgb10a2Uint => "rgb10a2uint",
+        StorageFormat::Rgb10a2Unorm => "rgb10a2unorm",
+        StorageFormat::Rg11b10Ufloat => "rg11b10ufloat",
+        StorageFormat::R64Uint => "r64uint",
+        StorageFormat::Rg32Uint => "rg32uint",
+        StorageFormat::Rg32Sint => "rg32sint",
+        StorageFormat::Rg32Float => "rg32float",
+        StorageFormat::Rgba16Uint => "rgba16uint",
+        StorageFormat::Rgba16Sint => "rgba16sint",
+        StorageFormat::Rgba16Float => "rgba16float",
+        StorageFormat::Rgba32Uint => "rgba32uint",
+        StorageFormat::Rgba32Sint => "rgba32sint",
+        StorageFormat::Rgba32Float => "rgba32float",
+        StorageFormat::R16Unorm => "r16unorm",
+        StorageFormat::R16Snorm => "r16snorm",
+        StorageFormat::Rg16Unorm => "rg16unorm",
+        StorageFormat::Rg16Snorm => "rg16snorm",
+        StorageFormat::Rgba16Unorm => "rgba16unorm",
+        StorageFormat::Rgba16Snorm => "rgba16snorm",
     }
 }
 
-pub(super) fn binding_type(
-    module: &naga::Module,
-    handle: naga::Handle<naga::Type>,
-) -> Result<String, String> {
+pub(super) fn binding_type(module: &Module, handle: Handle<Type>) -> Result<String, String> {
     type_name(module, handle).map_err(|error| {
         format!(
             "type {}: {error}",
@@ -164,7 +166,7 @@ pub(super) fn binding_type(
     })
 }
 
-fn type_name(module: &naga::Module, handle: naga::Handle<naga::Type>) -> Result<String, String> {
+fn type_name(module: &Module, handle: Handle<Type>) -> Result<String, String> {
     match &module.types[handle].inner {
         TypeInner::Scalar(scalar) => Ok(scalar_name(*scalar)?.into()),
         TypeInner::Vector { size, scalar } => {

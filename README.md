@@ -25,7 +25,14 @@ crates above build against their real dependencies.
 - [`hana_lading`](crates/hana_lading)
 - [`hana_metrics`](crates/hana_metrics)
 - [`hana_rigging_scripted`](crates/hana_rigging_scripted)
+- [`hana_shader_testing`](crates/hana_shader_testing)
 - [`hana_valence`](crates/hana_valence)
+
+## CI
+
+CI builds the examples and compiles the tests against their real dependencies.
+GitHub-hosted runners have no GPU, so mirror CI does not run the tests.
+Hana CI runs the same tests on a GPU from the same source.
 
 ## License
 
