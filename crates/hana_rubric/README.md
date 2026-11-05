@@ -8,7 +8,7 @@
 `hana_rubric` provides the JSONC keymap foundation for Bevy applications. It owns command IDs,
 load diagnostics, keymap layering, and reload support.
 
-> **Work in progress.** This crate is in active development (v0.1.0) and not
+> **Work in progress.** This crate is in active development (v0.2.0) and not
 > subject to semver stability guarantees. APIs will change without notice
 > between commits. Do not depend on this in production code yet.
 
@@ -391,6 +391,7 @@ surface. `fairy_dust` is an example crate; nothing in it is a reusable contract.
 
 | Version           | Bevy |
 |-------------------|------|
+| hana_rubric 0.2.0 | 0.20 |
 | hana_rubric 0.1.0 | 0.19 |
 
 ## License
