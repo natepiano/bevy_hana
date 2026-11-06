@@ -4,7 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.2.0] - 2026-11-06
+
+### Added
+
+- `OutlineDepthTexture` exposes camera surface depth and expanded outline seeds. `OutlineDepthTest` and `OutlineDepthTestPlugin` let overlay materials hide behind outlined and transmissive surfaces.
+
+### Changed
+
+- Requires Bevy 0.20.
+- Outline shaders move from WGSL to WESL, including the `hana_liminal::view_helpers` shader import.
+- Outline rendering skips flood-texture preparation when no outlines are active and no old flood textures need removal.
+
+### Fixed
+
+- Opaque and transmissive surfaces occlude outlines behind them, including outlines from other groups.
+- Removing a source outline removes its propagated copies after mesh removal, reparenting, or barrier changes. Explicitly authored replacement outlines remain intact.
+- Propagated outline changes reach descendant meshes that also have children.
+- Replacing `Mesh3d` on an outlined entity generates outline normals for the replacement mesh.
 
 ## [0.1.1] - 2026-09-17
 

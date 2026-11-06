@@ -7,10 +7,11 @@
 
 A Bevy plugin for rendering 3D mesh outlines using jump-flood and hull-extrusion methods.
 
-> **Renamed.** This crate was published as `bevy_liminal` through v0.0.5. The
-> API is unchanged; only the crate name and its `TypePath` strings differ.
+> **Renamed from `bevy_liminal`.** Releases through 0.0.6 were published under
+> that name; 0.1.0 is the first release as `hana_liminal`. The rename itself
+> changed only the crate name, its `TypePath` strings and its shader import path.
 
-> **Work in progress.** This crate is in active development (v0.1.1) and not
+> **Work in progress.** This crate is in active development (v0.2.0) and not
 > subject to semver stability guarantees. APIs will change without notice
 > between commits. Do not depend on this in production code yet.
 
@@ -52,6 +53,8 @@ Three rendering methods, each suited to different use cases:
 - **ScreenHull** -- Vertex extrusion with pixel width. Outline thickness stays constant on screen.
 
 ```rust
+use hana_liminal::Outline;
+
 // JumpFlood (default) -- 3px screen-space outline
 Outline::jump_flood(3.0).build();
 
@@ -71,6 +74,7 @@ All outline methods support three overlap modes for controlling how outlines int
 - **PerMesh** -- Every individual mesh gets its own outline boundary.
 
 ```rust
+use hana_liminal::Outline;
 use hana_liminal::OverlapMode;
 
 Outline::screen_hull(2.0)
@@ -87,6 +91,8 @@ Hull methods automatically generate smoothed outline normals when an `Outline` c
 Set intensity > 1.0 to produce HDR glow when used with Bevy's bloom. Requires an HDR camera with bloom enabled -- without HDR, values above 1.0 are clamped. In multi-camera setups, HDR must be consistent across all cameras or rendering silently breaks ([bevy#15467](https://github.com/bevyengine/bevy/issues/15467)).
 
 ```rust
+use hana_liminal::Outline;
+
 Outline::jump_flood(3.0)
     .with_intensity(5.0)
     .build();
@@ -100,6 +106,7 @@ Adding `Outline` to a parent entity automatically propagates it through the `Chi
 
 | Version     | Bevy |
 |-------------|------|
+| 0.2.0       | 0.20 |
 | 0.1.0–0.1.1 | 0.19 |
 
 ## License

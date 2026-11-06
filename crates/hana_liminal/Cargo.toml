@@ -11,7 +11,7 @@ name              = "hana_liminal"
 readme            = "README.md"
 repository        = "https://github.com/natepiano/bevy_hana"
 rust-version      = "1.92.0"
-version           = "0.2.0-dev"
+version           = "0.2.0"
 
 [lints]
 workspace = true
