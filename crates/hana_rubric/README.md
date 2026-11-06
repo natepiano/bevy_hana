@@ -389,10 +389,10 @@ surface. `fairy_dust` is an example crate; nothing in it is a reusable contract.
 
 ## Version Compatibility
 
-| Version           | Bevy |
-|-------------------|------|
-| hana_rubric 0.2.0 | 0.20 |
-| hana_rubric 0.1.0 | 0.19 |
+| Version | Bevy |
+|---------|------|
+| 0.2.0   | 0.20 |
+| 0.1.0   | 0.19 |
 
 ## License
 

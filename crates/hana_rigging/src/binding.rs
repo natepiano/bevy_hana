@@ -4380,7 +4380,7 @@ impl ApplyConfigurationSource {
 /// Whether authored inventory permits driver operations for a configured device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Reflect)]
 pub enum ConfiguredDeviceMode {
-    /// The kernel may later ask a driver to capture, apply, and poll this device's endpoints.
+    /// The kernel may later ask a driver to apply configurations to this device's endpoints.
     Managed,
     /// Reporters may enumerate the device passively, but no driver operation may touch it.
     Offline,

@@ -105,7 +105,7 @@ pub enum AttemptInvalidation {
 pub enum AttemptEnding {
     /// The endpoint driver reported this terminal outcome.
     Reported(DriverOutcomeStatus),
-    /// Kernel validation ended the attempt for this reason before another driver poll.
+    /// Kernel validation ended the attempt for this reason before the driver completed it.
     Invalidated(AttemptInvalidation),
     /// The erased driver boundary could not complete the typed driver call.
     ContractFailed(DriverContractFailureReport),

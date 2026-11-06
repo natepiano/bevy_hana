@@ -361,11 +361,10 @@ discard the coordinate safely.
 
 ## Version Compatibility
 
-| Version                     | Bevy |
-|-----------------------------|------|
-| `hana_clerestory` 0.4       | 0.19 |
-| `hana_clerestory` 0.3       | 0.19 |
-| `bevy_clerestory` 0.1 – 0.2 | 0.19 |
+| Version | Bevy |
+|---------|------|
+| 0.4     | 0.20 |
+| 0.3     | 0.19 |
 
 ## Platform Support
 

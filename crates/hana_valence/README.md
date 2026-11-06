@@ -454,11 +454,11 @@ cargo run -p hana_valence --example staggered_unfold
 No example uses the optional `tween` feature. It gates the `bevy_tween`
 dependency for the tween adapter, which arrives in a later phase.
 
-## Bevy compatibility
+## Version Compatibility
 
-| hana_valence | Bevy |
-|--------------|------|
-| main         | 0.19 |
+| Version | Bevy |
+|---------|------|
+| main    | 0.20 |
 
 ## License
 

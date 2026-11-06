@@ -98,11 +98,9 @@ Adding `Outline` to a parent entity automatically propagates it through the `Chi
 
 ## Version Compatibility
 
-| Version                   | Bevy |
-|---------------------------|------|
-| hana_liminal 0.1.0–0.1.1  | 0.19 |
-| bevy_liminal 0.0.2–0.0.6  | 0.19 |
-| bevy_liminal 0.0.0–0.0.1  | 0.18 |
+| Version     | Bevy |
+|-------------|------|
+| 0.1.0–0.1.1 | 0.19 |
 
 ## License
 

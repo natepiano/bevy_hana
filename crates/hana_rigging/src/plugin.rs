@@ -67,7 +67,7 @@ pub enum RiggingSystems {
     /// Guarded established-session failures are processed after consumer preparation and before
     /// any replacement apply can be selected or dispatched.
     SessionLoss,
-    /// Kernel attempt systems later start, poll, retry, and escalate endpoint applies.
+    /// Kernel attempt systems later start, retry, and escalate endpoint applies.
     Apply,
 }
 

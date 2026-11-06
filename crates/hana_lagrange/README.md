@@ -243,15 +243,10 @@ For `egui` integration — preventing camera input while egui has focus — see 
 
 ## Version Compatibility
 
-| Version                | Bevy |
-|------------------------|------|
-| `hana_lagrange` 0.5.0  | 0.19 |
-| `hana_lagrange` 0.4.0  | 0.19 |
-| `bevy_lagrange` 0.3.0  | 0.19 |
-| `bevy_lagrange` 0.2.0  | 0.19 |
-| `bevy_lagrange` 0.1.0  | 0.19 |
-| `bevy_lagrange` 0.0.4  | 0.19 |
-| `bevy_lagrange` 0.0.3  | 0.18 |
+| Version | Bevy |
+|---------|------|
+| 0.5.0   | 0.19 |
+| 0.4.0   | 0.19 |
 
 ## Credits
 

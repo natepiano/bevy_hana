@@ -288,14 +288,9 @@ cargo run --example sequence_drivers
 
 ## Version Compatibility
 
-| Crate | Version | Bevy |
-|-------|---------|------|
-| `hana_kana` | 0.4.0 | 0.19 |
-| `bevy_kana` | 0.3.1 | 0.19 |
-| `bevy_kana` | 0.3.0 | 0.19 |
-| `bevy_kana` | 0.2.0 | 0.19 |
-| `bevy_kana` | 0.1.0 | 0.19 |
-| `bevy_kana` | 0.0.6 | 0.18 |
+| Version | Bevy |
+|---------|------|
+| 0.4.0   | 0.19 |
 
 ## Usage
 

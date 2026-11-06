@@ -35,7 +35,7 @@ pub struct RiggingLimits {
     /// gets extra time, while an attempt that never finishes must not run forever.
     ///
     /// Defaults to 5 seconds — small next to any realistic hardware deadline, large enough to
-    /// cover one slow poll.
+    /// cover one slow completion.
     pub apply_overrun:   Duration,
     /// How long confirmed absence remains retained before the device is retired.
     ///

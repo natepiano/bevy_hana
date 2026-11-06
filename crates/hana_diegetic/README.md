@@ -194,11 +194,11 @@ between them, and `A` and `B` fly the camera to angles that show off each
 problem. To see what they cost, run `diegetic_text_stress`, press `A` to cycle
 the modes, and watch the frame time go up and down.
 
-## Bevy compatibility
+## Version Compatibility
 
-| hana_diegetic | Bevy  |
-|---------------|-------|
-| main          | 0.18  |
+| Version | Bevy |
+|---------|------|
+| main    | 0.20 |
 
 ## Examples
 

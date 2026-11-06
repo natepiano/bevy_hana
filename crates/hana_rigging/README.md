@@ -9,7 +9,7 @@ A Bevy kernel for durable device identity, presence, availability, and recovery
 policy. Hardware providers perform I/O and report their full device set to this
 crate; the crate does not enumerate or operate hardware itself.
 
-> **Work in progress.** This crate is in active development (v0.1.0) and not
+> **Work in progress.** This crate is in active development (v0.2.0) and not
 > subject to semver stability guarantees. APIs will change without notice
 > between commits. Do not depend on this in production code yet.
 
@@ -46,7 +46,7 @@ physical unit.
 - **Recovery policy** — per binding, decide whether a saved configuration is
   forgotten, retained, reapplied on request, or reapplied when the unit returns
 - **Authorized applies** — drivers configure hardware only through kernel-issued
-  permits, on attempts the kernel starts, polls, deadlines, and retires
+  permits, on attempts the kernel starts, validates, limits, and retires
 - **Identity adjudication** — when a replacement unit occupies a departed one's
   slot, the kernel raises a question for a human instead of guessing
 - **Entity mirror** — every kernel fact is projected onto Bevy entities as
@@ -75,9 +75,14 @@ slot — a human decides), `WrongUnit`, or `Unverified`.
 ## Usage
 
 Add the plugin, register the identity schemes your providers are allowed to
-report, and register the reporters and drivers that touch hardware:
+report, and register the reporters and drivers that touch hardware.
+`WindowDriver`, `MonitorReporter`, `WindowPlacement`, and `enumerate_monitors`
+are application-defined. The binding snippet uses a saved `DeviceKey` named
+`saved_key`.
 
 ```rust ignore
+use std::time::Duration;
+
 use bevy::prelude::*;
 use hana_rigging::prelude::*;
 
@@ -98,7 +103,7 @@ let reporter = app.add_device_reporter(
                 scheme: SchemeName::new("edid")?,
             },
         )),
-    std::time::Duration::from_secs(10),
+        Duration::from_secs(10),
     ),
 );
 ```
@@ -129,48 +134,53 @@ starting each apply, the kernel calls
 - `Reached(target)` proves that the driver can reach the target. This is the
   only outcome that proceeds to `start_apply`, and the kernel passes that exact
   `target: Self::Target` into the call.
-- `TargetDetached` means the application entity the driver operates is not
-  attached for this lifetime, even if the physical device is healthy. No apply
-  starts.
-- `DeviceUnavailable(error)` retains the classified `DeviceAccessError` for
-  kernel policy. No apply starts.
+- `Deferred(wait)` names the state change that can make the target reachable. No
+  apply starts. `TargetWait::Reporter` carries the reporter and its
+  `DeviceAccessError`. `TargetWait::ApplicationRoleAttachmentRequired` waits for
+  an application entity. `TargetWait::ApplicationCapabilityRegistrationRequired`
+  waits for reflected capability registration.
 
-`ApplyStart` no longer exists; these `TargetResolution` variants carry its
-former outcomes. `start_apply` returns `()` and reports later progress through `poll`. The
-kernel uses `DeviceAccessError::apply_failure_disposition()` for the same
-class-to-policy decision whether the error came from target resolution or a
-started apply: `Reconsider`, `AwaitClearance`, or `Fault`. A reconsidered
-resolution failure rolls back the unstarted attempt and emits no attempt-ending
-event. The role's reflected `RoleStatus` retains the actionable wait, retry run,
-and last started-attempt ending for operator diagnostics.
+`start_apply` returns `()` and reports its terminal result through the one-use
+`AttemptCompletion` from `ApplyContext`. A driver can store that authority in
+`DriverLedger` and call `succeed_attempt`, `fail_attempt`, or `abort_attempt`
+when the work ends. Target deferral starts no attempt and emits no attempt-ending
+event. Read `RoleStatus::view()` for the actionable wait and retry state.
+
+After success, the kernel calls `established` with a `SessionLease`. The kernel
+calls `cancel_apply` when it invalidates an attempt and `release_session` when a
+session ends.
 
 Bind an application-stable role to a device endpoint, and state every policy
-explicitly. There are no implicit recovery defaults hiding in the kernel:
+explicitly. `BindingPolicy::new` sets flow monitoring to
+`FlowExpectation::NotMonitored`:
 
 ```rust ignore
-app.world_mut().resource_mut::<Bindings>().register(Binding {
-    role:     RoleKey::new("presenter-display")?,
-    endpoint: DeviceEndpoint { device: saved_key, id: EndpointId::Whole },
-    driver,
-    recovery: RecoveryPolicy::ReapplyOnReturn,
-    retry:    RetryOn::NewRevision,
-    on_abort: OnAbort::Revert,
-    on_loss:  OnSessionLoss::Recreate,
-    requested: RequestedConfiguration::new(WindowPlacement { left: 0, top: 0 }),
-    last_known_good: LastKnownGoodConfiguration::default(),
-    apply_deadline:  ApplyDeadline::ProcessDefault,
-    flow_expectation: FlowExpectation::NotMonitored,
-})?;
+register_binding(
+    app.world_mut(),
+    BindingAuthoring::new(
+        RoleKey::new("presenter-display")?,
+        DeviceEndpoint::whole(saved_key),
+        driver,
+        WindowPlacement { left: 0, top: 0 },
+        BindingPolicy::new(
+            RecoveryPolicy::ReapplyOnReturn,
+            RetryOn::NewRevision,
+            OnAbort::Revert,
+            OnSessionLoss::Recreate,
+            ApplyDeadline::ProcessDefault,
+        ),
+    ),
+)?;
 ```
 
 Then read `RoleStatus` off the mirrored entities, or observe `DeviceArrived`, `DeviceChange`,
 `IdentityChanged`, `LiveRoleChanged`, `RetiredRoleChanged`, `RegistrationAttemptEnded`, and the
 discovery events.
 
-The `rigging_kernel` example is a complete headless run: two reporters pushing
-overlapping scans that agree on one panel and disagree about everything else, an
-authored inventory entry, one apply attempt driven to a terminal outcome, and a
-provoked departure. It ships with the crate — `cargo run --example rigging_kernel`.
+The `rigging_kernel` example runs two reporters with overlapping scans for one
+DMX universe and separate displays. It adds an authored inventory entry,
+completes one apply attempt, and provokes a departure. It ships with the crate —
+`cargo run --example rigging_kernel`.
 
 A second example, `identity_decision`, walks the displaced-unit adjudication
 path end to end. It lives in the [source repository](https://github.com/natepiano/bevy_hana/tree/main/crates/hana_rigging/examples)
@@ -179,11 +189,11 @@ device harness that is not itself published.
 
 ## Schedule
 
-`RiggingPlugin` chains five ordered sets in `Update`, exposed as
+`RiggingPlugin` chains six ordered sets in `Update`, exposed as
 `RiggingSystems` so integration crates can place their own systems precisely:
 
 ```text
-Collect → Reconcile → Prepare → SessionLoss → Apply
+Collect → RoleEntityRecovery → Reconcile → Prepare → SessionLoss → Apply
 ```
 
 `Prepare` is deliberately empty — it is the one interval where identity is
@@ -201,14 +211,15 @@ These are enforced, not aspirational:
   `Forget`
 - Resources are authoritative, entity components are read-only mirrors
 - `resolve_target` must return `Reached` before `start_apply` runs;
-  `start_apply` returns immediately, and every poll re-validates that the
-  attempt still targets the same physical unit
+  `start_apply` returns immediately. The kernel validates active attempts before
+  it accepts their completions
 
 ## Version Compatibility
 
-| Version            | Bevy |
-|--------------------|------|
-| hana_rigging 0.1.0 | 0.19 |
+| Version | Bevy |
+|---------|------|
+| 0.2.0   | 0.20 |
+| 0.1.0   | 0.19 |
 
 ## License
 

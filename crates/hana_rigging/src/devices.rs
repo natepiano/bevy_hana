@@ -1338,7 +1338,7 @@ impl Attempts {
 /// Failure from asking the attempt registry for another identifier.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub(crate) enum AttemptIssueError {
-    /// The registry cannot issue again without reusing an identifier a driver may still poll.
+    /// The registry cannot issue again without reusing an identifier a driver may still hold.
     #[error("attempt identifier sequence is exhausted")]
     SequenceExhausted,
 }
