@@ -14,7 +14,7 @@
 
 ---
 
-> **Work in progress.** This crate is in active development (v0.4.0) and not
+> **Work in progress.** This crate is in active development (v0.5.0) and not
 > subject to semver stability guarantees. APIs will change without notice
 > between commits. Do not depend on this in production code yet.
 
@@ -90,7 +90,7 @@ Convenience traits that replace bare `as` casts for common numeric conversions, 
 |-------|------|------------|
 | `ToU8` | `f32`, `u32`, `usize` | `cast_possible_truncation`, `cast_sign_loss` |
 | `ToU16` | `usize`, `u32`, `f32` | `cast_possible_truncation`, `cast_sign_loss` |
-| `ToF32` | `i32`, `u32`, `usize`, `f64` | `cast_precision_loss`, `cast_possible_truncation` |
+| `ToF32` | `i32`, `i64`, `u32`, `usize`, `f64` | `cast_precision_loss`, `cast_possible_truncation` |
 | `ToI32` | `usize`, `u32`, `f32`, `f64` | `cast_possible_truncation`, `cast_possible_wrap` |
 | `ToU32` | `usize`, `i32`, `f32`, `f64`, `u64` | `cast_possible_truncation`, `cast_sign_loss` |
 | `ToUsize` | `u32`, `f32` | `cast_possible_truncation`, `cast_sign_loss` |
@@ -103,6 +103,8 @@ use hana_kana::ToF32;
 use hana_kana::ToU32;
 
 let sides: u32 = 8;
+let j: u32 = 2;
+let positions = [bevy::math::Vec3::ZERO; 8];
 let angle = (j.to_f32() / sides.to_f32()) * std::f32::consts::TAU;
 let index = positions.len().to_u32();
 ```
@@ -169,6 +171,8 @@ implements `CascadeRootResource<A>` on that type and selects it instead, which
 lets an attribute serve as its own root:
 
 ```rust
+use bevy::prelude::*;
+use hana_kana::CascadePlugin;
 use hana_kana::CascadeRootResource;
 
 #[derive(Clone, Copy, Debug, PartialEq, Reflect, Resource)]
@@ -216,11 +220,12 @@ contradictory direction and repetition signs, and crossings that contradict the
 final direction or repetition count. A round trip that returns to its start
 stays expressible.
 
-A producer entity carries `SequenceDriver { target }`. Bevy's required
-components pull in `SequenceEvaluation { scope, easing }`, whose `Default` is
-`SequenceEvaluation::AUTHORED_WHOLE` — whole sequence, domain-authored easing —
-so a scope and an easing relationship are always present values rather than
-absences. Inserting or changing `SequenceDriver` requests ownership without
+A producer entity carries `SequenceDriver::new(target)`. Bevy's required
+components add `SequenceEvaluation`, whose default is
+`SequenceEvaluation::AUTHORED_WHOLE`. This selects the whole sequence and
+domain-authored easing. Use `SequenceEvaluation::new(scope, easing)` to select
+another scope or easing relationship. Inserting or changing `SequenceDriver`
+requests ownership without
 displacing a producer that already holds the target; the rejected claim
 triggers `SequenceDriverClaimRejected` and changes nothing. Inserting
 `SequenceDriverTakeover` beside it performs the one explicit takeover, records
@@ -255,16 +260,17 @@ reflection-only. `EasingSampler` reports `Eased` or `NonFinite` without world
 or asset access; the shared layer never substitutes linear easing.
 
 `SequenceEasing` states how a producer's curve relates to authored stage easing:
-`Authored`, `ReplacedBy(Easing)`, or `ComposedWith(Easing)`. A one-stage scope
-treats the curve as output easing, so anticipation and overshoot are allowed. A
-whole-sequence or multi-stage scope treats it as a remap of scope progress, so
-`SequenceEasingSampler` rejects a curve that overshoots or reverses instead of
-distorting stage boundaries.
+`Authored`, `ReplacedBy(Easing)`, or `ComposedWith(Easing)`. A
+`SequenceScope::Stage` scope treats the curve as output easing, so anticipation
+and overshoot are allowed. `SequenceScope::WholeSequence` and
+`SequenceScope::StageRange` remap scope progress. `SequenceEasingSampler`
+rejects a curve that overshoots or reverses for these scopes, including a range
+with one stage.
 
 Enable the optional `tween` feature to produce movement with `bevy_tween`:
 
 ```toml
-hana_kana = { version = "0.4.0", features = ["tween"] }
+hana_kana = { version = "0.5.0", features = ["tween"] }
 ```
 
 `SequenceTweenAdapterPlugin<TimeCtx>` creates and advances no clock. Install
@@ -290,6 +296,7 @@ cargo run --example sequence_drivers
 
 | Version | Bevy |
 |---------|------|
+| 0.5.0   | 0.20 |
 | 0.4.0   | 0.19 |
 
 ## Usage
@@ -298,7 +305,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-hana_kana = "0.4.0"
+hana_kana = "0.5.0"
 ```
 
 Run the example:

@@ -5,7 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] - 2026-11-05
+
+### Added
+
+- `resolve_entity_cascade_with` resolves a proposed local cascade value without inserting it or changing its cache.
+- `Resolved::set_insert_listener` registers a callback for resolved-cache insertions. A later registration replaces the callback.
+- Under `math`, `ToI64` converts `f32` to `i64` with truncation and saturation. `ToF32` also accepts `i64`.
+- `Easing`, `EasingCurve`, `SequencePosition`, `SequenceStageId`, `SequenceStagesRevision`, and `SequenceTime` implement serialization. `SequenceTime` serializes whole seconds as a decimal string.
+
+### Changed
+
+- Requires Bevy 0.20.
+- **Breaking:** `Cascade<T>` and `Resolved<A>` reserve their `on_insert` hooks. Use observers or `Resolved::set_insert_listener` instead of registering another insertion hook.
+
+### Fixed
+
+- Inserting `Cascade<A>` with a supplied `Resolved<A>` cache refreshes stale cache values before `Update`.
 
 ## [0.4.0] - 2026-08-22
 
