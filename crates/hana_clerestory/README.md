@@ -9,9 +9,9 @@
 A Bevy plugin that saves and restores window placement, handles mixed-scale
 monitors, and can recover windows after a monitor reconnects.
 
-> **Renamed.** This crate was published as `bevy_clerestory` through v0.2.0. The
-> API and feature names are unchanged; only the crate name and its `TypePath`
-> strings differ.
+> **Renamed from `bevy_clerestory`.** Releases through 0.2.0 were published under
+> that name; 0.3.0 is the first release as `hana_clerestory`. The rename itself
+> changed only the crate name and its `TypePath` strings.
 
 ## Motivation
 
@@ -56,7 +56,6 @@ when displays are disconnected or reconnected, so an index is useful for the cur
 is not a permanent monitor identity.
 
 - `monitors.at(physical_x, physical_y)` – Find the monitor containing a position (physical pixels)
-- `monitors.by_index(index)` – Find the monitor currently reporting `index`
 - `monitors.first()` – Get the first monitor in winit's current order; this is not necessarily the primary monitor
 - `monitors.closest_to(physical_x, physical_y)` – Find the closest monitor to a position (physical pixels)
 - `monitors.iter()` – Iterate over each current monitor entity and its `MonitorDescriptor`
@@ -185,8 +184,8 @@ Run `cargo run --example restore_window` for a complete interactive example.
 
 Durable display identity, roles, policies, and attempts belong to `hana_rigging`. Clerestory keeps
 only current monitor geometry and window-specific target preparation. A display reporter produces
-the exact durable `DeviceKey`; the kernel issues `DeviceId`, `RoleKey`, and `AttemptRef` values and
-owns their lifetimes.
+the exact durable `DeviceKey`. Applications author `RoleKey` values. The kernel issues
+`DeviceId` and `AttemptRef` values and owns their lifetimes.
 
 Clerestory maps recovery markers to kernel policy when it authors a window binding:
 
@@ -196,19 +195,16 @@ Clerestory maps recovery markers to kernel policy when it authors a window bindi
 | `RecoverOnReturn` | `ReapplyOnReturn` | Preserve the departed endpoint and return automatically when that display is available. |
 | `RecoverOnRequest` | `ReapplyOnRequest` | Preserve the departed endpoint and wait for binding-targeted `ReapplyConfiguration`. |
 | Both markers | `ReapplyOnRequest` | Use request-controlled recovery and log one warning. Marker insertion order does not affect the result. |
-| Not authored by Clerestory | `Retain` | Preserve and report state without providing a path that reapplies window output. |
 
 The markers are authoring-time configuration. Inserting one after Clerestory has authored the
 window's binding does not change that binding's policy. Markers are valid only on an entity
 carrying `ManagedWindow`; a marker on another entity logs one warning and authors no role.
 
-When a display leaves at runtime, the binding's `waiting_work` records the departure work a user or
-application can act on. `RecoverOnReturn` records restoration work that the returning display
+Use `Bindings::waiting_work(role)` to read the departure work a user or application can act on. `RecoverOnReturn` records restoration work that the returning display
 discharges automatically. `RecoverOnRequest` records application-request work that
 `ReapplyConfiguration` consumes. A fallback rebind does not cancel this work.
 
-`LastKnownGoodConfiguration::Known` contains the driver-specific window placement established by a
-safe readback. The binding lifecycle and configured offline mode decide whether persistence may
+`Bindings::binding(role)?.last_known_good()` returns the driver-specific configuration after an accepted successful apply. The binding lifecycle and configured offline mode decide whether persistence may
 write that value; Clerestory has no second writable/frozen registry.
 
 `ConfiguredWindowManagerPlugin::build` registers the display integration, window endpoint driver,
@@ -219,14 +215,16 @@ derives durable identity from monitor index, proximity, or enumeration order.
 
 #### Startup reveal and runtime departure
 
-Each hidden managed window owns a `SavedDisplayRevealWait`. If no normal restore can
-reveal it before that bounded wait ends, Clerestory distinguishes two outcomes:
+Each hidden managed window owns a `SavedDisplayRevealWait`. When that bounded wait
+ends, Clerestory uses the kernel status to select the next action:
 
-- `NoSavedConfiguration` reveals a role that has never established a saved configuration.
-- `SavedDisplayUnavailable` logs a warning naming the role and elapsed wait, fits the saved
-  geometry onto the live display where the window launched, and reveals it.
+- A role with no saved configuration keeps its opening position and becomes visible.
+- An absent display or disabled reporter permits fallback placement. Clerestory logs a warning,
+  fits saved geometry onto the opening display, and reveals the window.
+- An active apply or retry continues waiting.
+- A stopped role or another blocking application condition reveals the window without applying saved geometry.
 
-For `SavedDisplayUnavailable`, the saved target continues to name the absent display for every
+After a startup fallback, the saved target continues to name the absent display for every
 recovery policy until the user moves the window. That move adopts the live display. This startup
 behavior is distinct from runtime departure: `Forget` adopts the surviving display during the
 fallback, while `RecoverOnReturn` and `RecoverOnRequest` retain the departed endpoint for their
@@ -234,10 +232,10 @@ respective return paths.
 
 #### Requests, availability, and retirement
 
-`LiveRoleChanged::Status` reports kernel role availability. An application-controlled request uses
-`ReapplyConfiguration`, targeted at the binding entity for that role. The kernel acts only when the
-binding uses `RecoveryPolicy::ReapplyOnRequest` and its `WaitingWork` is
-`ApplicationRequestOwed`; the same request cannot start a startup restore or bypass another policy.
+`LiveRoleChanged` carries `LiveRoleChange::Status` when the kernel role status changes. An application-controlled request uses
+`ReapplyConfiguration`, targeted at the binding entity for that role. The request clears
+`WaitingWork::ReapplyRequestOwed`, which `RecoverOnRequest` records after departure.
+It cannot start a startup restore or replace the fresh binding required by `RecoveryPolicy::Forget`.
 
 Use the public `primary_window_role()` and `managed_window_role(name)` constructors instead of
 reproducing Clerestory's role strings. Both return `Result<RoleKey, RoleKeyError>`.
@@ -323,7 +321,6 @@ above are checked by these named tests:
   `recovery/fallback_and_return.rs`.
 - Per-role bounded reveal, unavailable-target retention, adoption after a move, and a managed
   window created after startup: `reveals_a_bound_role_whose_display_is_absent`,
-  `saved_display_unavailable_probe_reveals_then_adopts_after_move`,
   `a_startup_revealed_stranded_window_rebinds_when_moved_to_a_live_display`, and
   `a_late_managed_window_is_authored_revealed_and_only_saves_after_a_move`.
 
@@ -415,7 +412,7 @@ In your `Cargo.toml`, you can selectively enable features:
 
 ```toml
 [dependencies]
-hana_clerestory = { version = "0.3", default-features = false, features = ["workaround-winit-4341"] }
+hana_clerestory = { version = "0.4", default-features = false, features = ["workaround-winit-4341"] }
 ```
 
 ## License
