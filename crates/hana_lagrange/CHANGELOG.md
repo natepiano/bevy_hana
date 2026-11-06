@@ -9,13 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > [bevy_panorbit_camera](https://github.com/Plonq/bevy_panorbit_camera). Thank you
 > for graciously allowing this project to build on your foundation.
 
-## [Unreleased]
+## [0.6.0] - 2026-11-06
 
 ### Added
 
-- `transform_from_orbit` returns the pose an `OrbitCam` writes for a yaw, pitch,
-  radius, focus, projection and `CameraBasis`, so a caller can know where the
-  eye stands before the camera moves there.
+- `CameraControllerHandover` switches between orbit and free cameras at the current view. `OrbitCamHeldForReturn` keeps the orbit settings, and `orbit_pose_for_view` computes the return pose.
+- `transform_from_orbit` returns the pose an `OrbitCam` writes for a yaw, pitch, radius, focus, projection and `CameraBasis`, so a caller can know where the eye stands before the camera moves there.
+- `OrbitCamLineScroll` binds line-scroll input to orbit, pan, or zoom. `OrbitCamBlenderLikePreset::line_scroll_input_gain` enables this input in that preset.
+- `CameraScrollInputDisabled` withholds camera scroll and keeps other controls. `CameraDragClaim` lets a widget reserve a pointer drag.
+- `FitBounds` supplies bounds for entities without meshes. `OutsideFitBounds` excludes helper meshes. `ZoomToFit::world_bounds` frames supplied world-space points. `FitViewportInsets` reserves window-edge space for `AnimateToFit`. `LookAtAndZoomToFit::facing` frames a target from a supplied world-space direction.
+- `CameraMove`, `CameraMoveError`, `CameraEvaluationError`, `FreeCamRollTarget`, `Position`, `Focus`, `Radius`, `Roll`, and `OrbitAngles` implement serialization.
+- The `test-support` feature adds `input_test_app`.
+
+### Changed
+
+- Requires Bevy 0.20.
+- **Breaking:** `FreeCamKeyboardMousePreset` enables trackpad look by default. `FreeCamTrackpadLook` supports custom bindings. Use `without_trackpad_look` to disable it. Replace `slow_toggle_key` with `with_slow_toggle_key` or `without_slow_toggle`.
+- **Breaking:** Control summaries replace optional labels and direction values with `SlowModeHint`, `ActionColumnLabel`, `FreeCamDirectionFilter`, and `ZoomRowFilter`. `OrbitCamTrackpadScroll` gains `mod_keys`.
+- **Breaking:** `LookAtAndZoomToFit` gains a private facing field. Construct it with `LookAtAndZoomToFit::new` and its builders instead of a struct literal.
+
+### Fixed
+
+- Camera drags can use cursor movement when raw motion is unavailable.
+- Fits exclude hidden descendants and keep the requested target's own geometry.
 
 ## [0.5.0] - 2026-08-23
 

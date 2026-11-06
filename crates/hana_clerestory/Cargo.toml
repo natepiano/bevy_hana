@@ -9,7 +9,7 @@ license.workspace = true
 name              = "hana_clerestory"
 readme            = "README.md"
 repository        = "https://github.com/natepiano/bevy_hana"
-version           = "0.4.0"
+version           = "0.5.0-dev"
 
 [lib]
 name = "hana_clerestory"

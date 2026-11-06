@@ -4,9 +4,9 @@
 
 # `hana_lagrange`
 
-> **Renamed.** This crate was published as `bevy_lagrange` through v0.3.0. The
-> API and feature names are unchanged; only the crate name and its `TypePath`
-> strings differ.
+> **Renamed from `bevy_lagrange`.** Releases through 0.3.0 were published under
+> that name; 0.4.0 is the first release as `hana_lagrange`. The rename itself
+> changed only the crate name and its `TypePath` strings.
 
 > **Work in progress.** This crate is in active development and not subject to
 > semver stability guarantees. APIs will change without notice between commits.
@@ -63,11 +63,13 @@ Default mouse controls:
 | Right Mouse | Pan |
 | Scroll Wheel | Zoom |
 
-The default input mode is `OrbitCamPreset::simple_mouse()`. Insert
-`OrbitCamPreset::blender_like()` for editor navigation, use
-`OrbitCamBindings` for app-owned keymaps or gamepad mappings, and use
-`OrbitCamManual` with `OrbitCamManualInputWriter` only when your app computes
-orbit, pan, or zoom intent itself.
+The default input mode is
+`OrbitCamInputMode::Preset(OrbitCamPreset::simple_mouse())`. Insert
+`OrbitCamInputMode::Preset(OrbitCamPreset::blender_like())` for editor navigation.
+Use `OrbitCamInputMode::Bindings(bindings)` for app-owned keymaps or gamepad
+mappings built with `OrbitCamBindings`. Use `OrbitCamInputMode::Manual` with
+`OrbitCamManualInputWriter` only when your app computes orbit, pan, or zoom
+intent itself.
 
 Blender-like controls:
 
@@ -122,7 +124,7 @@ stays on `OrbitCam`. User input bindings live on input-mode components.
 
 ## Event-Driven Camera Control
 
-Enable the `fit_overlay` feature:
+Enable the optional `fit_overlay` feature for the debug overlay:
 
 ```toml
 hana_lagrange = { version = "...", features = ["fit_overlay"] }
@@ -237,7 +239,7 @@ update (with `ZoomBegin` before, and `ZoomEnd` after, for `ZoomToFit`).
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `fit_overlay` | no | Zoom-to-fit, camera animations, event-driven control, and debug overlay |
+| `fit_overlay` | no | Debug overlay for fit targets |
 
 For `egui` integration — preventing camera input while egui has focus — see [`docs/egui.md`](docs/egui.md).
 
@@ -245,6 +247,7 @@ For `egui` integration — preventing camera input while egui has focus — see 
 
 | Version | Bevy |
 |---------|------|
+| 0.6.0   | 0.20 |
 | 0.5.0   | 0.19 |
 | 0.4.0   | 0.19 |
 
