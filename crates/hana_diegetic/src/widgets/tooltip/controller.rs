@@ -40,6 +40,11 @@ use super::materialization::TooltipReadiness;
 use super::materialization::TooltipWidthConstraint;
 use super::materialization::TooltipWidthConstraintRequest;
 use super::placement::TooltipPlacementState;
+use super::resize;
+use super::resize::TooltipResize;
+use super::resize::TooltipResizePending;
+use super::resize::WorldTooltipResizeFitPending;
+use super::resize::WorldTooltipUpdatePending;
 use super::target::MeshAnchorTarget;
 use super::target::TooltipTarget;
 #[cfg(test)]
@@ -48,6 +53,7 @@ use super::target::TooltipTargetSpace;
 use super::visibility::TooltipShownPending;
 #[cfg(test)]
 use crate::layout::Anchor;
+use crate::layout::Dimension;
 #[cfg(test)]
 use crate::layout::LayoutTree;
 #[cfg(test)]
@@ -104,6 +110,12 @@ impl Deref for Tooltips {
 
 /// Extension methods for checked standalone tooltip authoring.
 pub trait TooltipCommandsExt {
+    /// Resizes the label and frame of materialized world help without restarting its reveal.
+    fn resize_tooltip(&mut self, controller: Entity, label_size: impl Into<Dimension>);
+
+    /// Resolves a world tooltip again after its target geometry changes late in the frame.
+    fn refresh_tooltip(&mut self, controller: Entity);
+
     /// Reserves and returns a tooltip controller entity.
     ///
     /// A target is a checked handle that carries its coordinate space —
@@ -161,9 +173,45 @@ pub trait TooltipCommandsExt {
     fn spawn_tooltip<Target>(&mut self, target: Target, tooltip: Tooltip) -> Entity
     where
         Target: TooltipTarget;
+
+    /// Updates a standalone tooltip's content without restarting its hover delay
+    /// or dismissing visible help. Its target and controller identity stay fixed.
+    fn update_tooltip(&mut self, controller: Entity, tooltip: Tooltip);
 }
 
+#[derive(Component)]
+pub(super) struct TooltipContentChanged;
+
 impl TooltipCommandsExt for Commands<'_, '_> {
+    fn update_tooltip(&mut self, controller: Entity, tooltip: Tooltip) {
+        self.queue(move |world: &mut BevyWorld| {
+            let Ok(mut entity) = world.get_entity_mut(controller) else {
+                return;
+            };
+            let materialized = entity.contains::<MaterializedTooltip>();
+            entity.insert(tooltip);
+            // Only a built surface rebuilds now. An unbuilt tooltip reads the new
+            // content when hover first prepares it, so hidden help builds no surface.
+            if materialized {
+                entity.insert((TooltipContentChanged, PrepareTooltip));
+            }
+        });
+    }
+
+    fn resize_tooltip(&mut self, controller: Entity, label_size: impl Into<Dimension>) {
+        self.run_system_cached_with(
+            resize::resize_world_tooltip,
+            TooltipResize {
+                controller,
+                label_size: label_size.into(),
+            },
+        );
+    }
+
+    fn refresh_tooltip(&mut self, controller: Entity) {
+        self.entity(controller).insert(WorldTooltipUpdatePending);
+    }
+
     fn spawn_tooltip<Target>(&mut self, target: Target, tooltip: Tooltip) -> Entity
     where
         Target: TooltipTarget,
@@ -281,6 +329,9 @@ pub(crate) fn remove_materialized_state(
         TooltipWidthConstraintRequest,
         TooltipPresentationCamera,
         TooltipShownPending,
+        TooltipResizePending,
+        WorldTooltipResizeFitPending,
+        WorldTooltipUpdatePending,
         ScreenTooltipAttachmentCorrection,
         PrepareTooltip,
     )>();

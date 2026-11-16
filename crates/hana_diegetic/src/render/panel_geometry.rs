@@ -61,6 +61,7 @@ use super::ElementIndex;
 use super::PanelChildSystems;
 use super::clip;
 use super::constants;
+use super::constants::SDF_CLIP_EDGE_ROUNDING;
 use super::constants::SDF_STROKE_SHADER_HANDLE;
 use super::draw_order::DrawCommandDepth;
 use super::draw_order::DrawOrder;
@@ -958,7 +959,13 @@ impl StoredResolvedSdfSurface {
             border_widths: self.border_widths,
             clip_rect: self.clip_rect,
             render_layers,
-            shadow_casting,
+            // The tooltip drop shadow is a painted blur, not a solid body, so
+            // it never casts a light shadow, whatever the panel cascade says.
+            shadow_casting: if matches!(self.record_role, SdfRecordRole::TooltipShadow(_)) {
+                ShadowCasting::Off
+            } else {
+                shadow_casting
+            },
         }
     }
 }
@@ -1317,19 +1324,41 @@ fn sdf_surface_clip_rect(
     )
 }
 
+/// Converts a layout-space clip rect to shader-local coordinates around the
+/// centre of `bounds`.
+///
+/// Each edge is measured from the matching edge of `bounds`, so a clip edge on
+/// the bounds edge gives the same value as the mesh half-size that
+/// `resolve_sdf_surface` computes, and `ResolvedSdfSurface::clip_rect_limits_mesh`
+/// reports no trim for it.
 fn sdf_local_clip_rect(
     bounds: BoundingBox,
     clip_rect: BoundingBox,
     points_to_world: f32,
     pad: f32,
 ) -> Vec4 {
-    let (cx, cy) = bounds.center();
-    let left = (clip_rect.x - cx) * points_to_world;
-    let right = (clip_rect.x + clip_rect.width - cx) * points_to_world;
+    let half_width = bounds.width * points_to_world * 0.5;
+    let half_height = bounds.height * points_to_world * 0.5;
+    let left = clip_edge_offset(clip_rect.x, bounds.x).mul_add(points_to_world, -half_width);
+    let right = clip_edge_offset(clip_rect.x + clip_rect.width, bounds.x + bounds.width)
+        .mul_add(points_to_world, half_width);
     // The SDF shader reconstructs UV.y = 0 (the top vertex) as negative Y.
-    let top = (clip_rect.y - cy) * points_to_world;
-    let bottom = (clip_rect.y + clip_rect.height - cy) * points_to_world;
+    let top = clip_edge_offset(clip_rect.y, bounds.y).mul_add(points_to_world, -half_height);
+    let bottom = clip_edge_offset(clip_rect.y + clip_rect.height, bounds.y + bounds.height)
+        .mul_add(points_to_world, half_height);
     Vec4::new(left - pad, top - pad, right + pad, bottom + pad)
+}
+
+/// Returns `clip_edge - bounds_edge` in layout points, or zero when the two
+/// edges differ by no more than `SDF_CLIP_EDGE_ROUNDING`.
+fn clip_edge_offset(clip_edge: f32, bounds_edge: f32) -> f32 {
+    let offset = clip_edge - bounds_edge;
+    let rounding = SDF_CLIP_EDGE_ROUNDING * clip_edge.abs().max(bounds_edge.abs());
+    if offset.abs() <= rounding {
+        0.0
+    } else {
+        offset
+    }
 }
 
 /// Resolves the panel or element material that applies to an `ElementSurface`.
@@ -1612,6 +1641,46 @@ mod tests {
         // The shader maps a top vertex's UV.y = 0 to local.y = -half_height.
         assert!(clip.y <= -5.0 && clip.w > -5.0);
         assert!(clip.w < 0.0, "a top-only clip must exclude the lower half");
+    }
+
+    #[test]
+    fn viewport_one_ulp_inside_its_content_does_not_trim_the_mesh() {
+        let points_to_world = 0.000_352_777_8;
+        let bounds = BoundingBox {
+            x:      0.0,
+            y:      0.0,
+            width:  753.332_8,
+            height: 110.393_72,
+        };
+        // `clip::panel_viewport` converts the fitted panel size back to points.
+        let viewport = BoundingBox {
+            height: bounds.height.next_down(),
+            ..bounds
+        };
+        let pad = constants::SDF_AA_PADDING;
+        let clip = sdf_local_clip_rect(bounds, viewport, points_to_world, pad);
+        let mesh_half_height = (bounds.height * points_to_world).mul_add(0.5, pad);
+
+        assert_eq!(clip.y.to_bits(), (-mesh_half_height).to_bits());
+        assert_eq!(clip.w.to_bits(), mesh_half_height.to_bits());
+    }
+
+    #[test]
+    fn clip_one_point_inside_its_bounds_trims_the_mesh() {
+        let bounds = BoundingBox {
+            x:      0.0,
+            y:      0.0,
+            width:  753.332_8,
+            height: 110.393_72,
+        };
+        let clip_rect = BoundingBox {
+            height: bounds.height - 1.0,
+            ..bounds
+        };
+        let pad = constants::SDF_AA_PADDING;
+        let clip = sdf_local_clip_rect(bounds, clip_rect, 1.0, pad);
+
+        assert!(clip.w < bounds.height.mul_add(0.5, pad));
     }
 
     /// Minimal measurer for geometry tests that include text commands.

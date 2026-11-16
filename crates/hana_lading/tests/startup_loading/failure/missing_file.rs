@@ -29,13 +29,8 @@ use hana_lading::DiskAssets;
 use hana_lading::DiskAssetsPlugin;
 use hana_lading::LoadFailed;
 
+use crate::support;
 use crate::support::SETTLE_UPDATES;
-use crate::support::assert_fixture_absent;
-use crate::support::image_app;
-use crate::support::preregister_image_loader;
-use crate::support::register_image_loader;
-use crate::support::test_asset_plugin;
-use crate::support::update_until;
 
 // pacing
 const EXIT_LOOP_WAIT: Duration = Duration::from_millis(1);
@@ -83,8 +78,8 @@ fn assert_root_still_loading(set: Res<MissingAssets>, asset_server: Res<AssetSer
 
 #[test]
 fn failure_missing_file() {
-    assert_fixture_absent(MISSING_ABSENT_PATH);
-    let mut app = image_app();
+    support::assert_fixture_absent(MISSING_ABSENT_PATH);
+    let mut app = support::image_app();
     app.add_plugins(DiskAssetsPlugin::<MissingAssets>::default())
         .init_resource::<MissingLog>()
         .add_systems(Startup, assert_root_still_loading)
@@ -107,7 +102,7 @@ fn failure_missing_file() {
             log.resolved_failures = Some(event.failures());
         });
 
-    update_until(&mut app, |world| {
+    support::update_until(&mut app, |world| {
         world.resource::<MissingLog>().resolved_failures.is_some()
     });
     for _ in 0..SETTLE_UPDATES {
@@ -131,14 +126,14 @@ fn failure_missing_file() {
 
 #[test]
 fn exit_on_failure_pattern() {
-    assert_fixture_absent(MISSING_ABSENT_PATH);
+    support::assert_fixture_absent(MISSING_ABSENT_PATH);
     let mut app = App::new();
     app.add_plugins((
         MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(EXIT_LOOP_WAIT)),
-        test_asset_plugin(),
+        support::test_asset_plugin(),
     ));
-    preregister_image_loader(&mut app);
-    register_image_loader(&mut app);
+    support::preregister_image_loader(&mut app);
+    support::register_image_loader(&mut app);
     app.add_plugins(DiskAssetsPlugin::<MissingAssets>::default())
         .add_observer(
             |_: On<AssetSetLoadFailed>, mut exit: MessageWriter<AppExit>| {

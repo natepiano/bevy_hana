@@ -27,6 +27,7 @@ use bevy::prelude::Color;
 use bevy::prelude::Commands;
 use bevy::prelude::Component;
 use bevy::prelude::DetectChanges;
+use bevy::prelude::DetectChangesMut;
 use bevy::prelude::Entity;
 use bevy::prelude::GlobalTransform;
 use bevy::prelude::Handle;
@@ -1689,8 +1690,9 @@ pub(super) fn update_panel_line_batch_bounds(
             continue;
         };
         let center = (min + max) * 0.5;
-        *transform = Transform::from_translation(center);
-        *global = GlobalTransform::from(*transform);
+        let pose = Transform::from_translation(center);
+        transform.set_if_neq(pose);
+        global.set_if_neq(GlobalTransform::from(pose));
         *aabb = Aabb {
             center:       Vec3A::ZERO,
             half_extents: Vec3A::from((max - min) * 0.5),

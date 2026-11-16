@@ -35,24 +35,19 @@ use hana_valence::AnchorPose;
 use hana_valence::Displacement;
 use hana_valence::Orientation;
 
+use crate::anchor_demo;
 use crate::anchor_demo::AnchorChain;
 use crate::anchor_demo::AnchorSelection;
 use crate::anchor_demo::AnchorTile;
 use crate::anchor_demo::Autofit;
 use crate::anchor_demo::ShowAnchorMarkers;
 use crate::anchor_demo::Spin;
-use crate::anchor_demo::begin_spin;
-use crate::anchor_demo::build_tile_tree;
-use crate::anchor_demo::collect_tiles_by_order;
-use crate::anchor_demo::freeze_spin;
-use crate::anchor_demo::spawn_anchor_scene;
-use crate::anchor_demo::tile_link_delta;
-use crate::anchor_demo::toggle_spin;
 use crate::constants::*;
 use crate::hinge::ChainArrangement;
 use crate::hinge::FoldDirection;
 use crate::hinge::FoldTravel;
 use crate::hinge::HingeChain;
+use crate::presentation;
 use crate::presentation::AnchorPanelMaterials;
 
 /// Which capability scene is on screen; its menu entry highlights.
@@ -98,7 +93,7 @@ impl ModeMorph {
 
     /// Eased progress on `[0, 1]`.
     fn progress(self) -> f32 {
-        crate::presentation::smoothstep((self.timer / MODE_MORPH_SECS).clamp(0.0, 1.0))
+        presentation::smoothstep((self.timer / MODE_MORPH_SECS).clamp(0.0, 1.0))
     }
 }
 
@@ -120,7 +115,7 @@ pub(crate) fn spawn_scene(
     show_marker: bool,
     materials: &AnchorPanelMaterials,
 ) {
-    spawn_anchor_scene(commands, selection, anchor_count, show_marker, materials);
+    anchor_demo::spawn_anchor_scene(commands, selection, anchor_count, show_marker, materials);
 }
 
 /// Number keys switch capabilities. Anchor (`1`) and Spin (`2`) share the
@@ -153,7 +148,7 @@ pub(crate) fn handle_capability_input(
     };
     if index == active.index {
         if index == SPIN_INDEX {
-            toggle_spin(&mut spin, &tiles, &mut commands);
+            anchor_demo::toggle_spin(&mut spin, &tiles, &mut commands);
         }
         return;
     }
@@ -164,9 +159,9 @@ pub(crate) fn handle_capability_input(
         // the chain stops at its current rotation.
         active.index = index;
         if index == SPIN_INDEX {
-            toggle_spin(&mut spin, &tiles, &mut commands);
+            anchor_demo::toggle_spin(&mut spin, &tiles, &mut commands);
         } else {
-            freeze_spin(&mut spin);
+            anchor_demo::freeze_spin(&mut spin);
         }
         return;
     }
@@ -232,7 +227,7 @@ fn arm_mode_morph(
     for (entity, tile, _, pose) in tiles {
         if let Err(error) = commands.set_tree(
             entity,
-            build_tile_tree(to_index, tile.order, count, selection, show_marker),
+            anchor_demo::build_tile_tree(to_index, tile.order, count, selection, show_marker),
         ) {
             error!("failed to replace anchor tile {entity:?} tree: {error}");
         }
@@ -282,7 +277,8 @@ pub(crate) fn advance_mode_morph(
     // turns the outgoing link delta into the incoming one, so the chain lands on
     // the incoming layout.
     let end_translation = Displacement::from(
-        tile_link_delta(morph.to_index, *selection) - tile_link_delta(morph.from_index, *selection),
+        anchor_demo::tile_link_delta(morph.to_index, *selection)
+            - anchor_demo::tile_link_delta(morph.from_index, *selection),
     );
     for (tile_morph, mut pose) in &mut poses {
         let Some(tile_morph) = tile_morph else {
@@ -304,7 +300,7 @@ pub(crate) fn advance_mode_morph(
     if morph.to_index == SPIN_INDEX {
         // Landing on Spin from another mode starts the envelope immediately;
         // `finalize_mode_morph` already left each anchored tile a pose to drive.
-        begin_spin(&mut spin);
+        anchor_demo::begin_spin(&mut spin);
     }
     morph.active = false;
 }
@@ -319,7 +315,7 @@ fn finalize_mode_morph(
     all_tiles: &Query<(Entity, &AnchorTile)>,
     commands: &mut Commands,
 ) {
-    let (by_order, live) = collect_tiles_by_order(all_tiles);
+    let (by_order, live) = anchor_demo::collect_tiles_by_order(all_tiles);
     for &entity in by_order.iter().take(live).skip(1) {
         let mut tile = commands.entity(entity);
         tile.remove::<TileMorph>();

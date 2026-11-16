@@ -16,7 +16,6 @@ use bevy::camera::visibility::RenderLayers;
 use bevy::camera::visibility::ViewVisibility;
 use bevy::ecs::system::RunSystemOnce;
 use bevy::mesh::Mesh3d;
-use bevy::picking::hover::PickingInteraction;
 use bevy::picking::mesh_picking::ray_cast::MeshRayCast;
 use bevy::picking::mesh_picking::ray_cast::MeshRayCastSettings;
 use bevy::picking::mesh_picking::ray_cast::RayCastVisibility;
@@ -55,6 +54,9 @@ use hana_valence::AnchorSite;
 use hana_valence::AnchoredTo;
 use hana_valence::Displacement;
 use hana_valence::ResolvedAnchorGeometry;
+
+#[path = "../src/test_pointer.rs"]
+mod test_pointer;
 
 const VIEW: Vec2 = Vec2::new(800.0, 600.0);
 const MARGIN: f32 = 8.0;
@@ -111,6 +113,7 @@ impl Scene {
             .init_resource::<Shows>()
             .add_observer(record_show)
             .add_plugins(HeadlessDiegeticUiPlugin);
+        test_pointer::install_mesh(&mut app);
         let mut window_component = Window::default();
         window_component.resolution.set(view.x, view.y);
         let window = app
@@ -563,11 +566,33 @@ fn hovering_noninteractive_child_keeps_the_parent_tooltip() {
     let mut scene = Scene::new(Vec3::ZERO, sized_tooltip(40.0, 20.0));
     scene.show();
     scene.assert_visible_inside_view();
+    let mesh = scene
+        .app
+        .world_mut()
+        .resource_mut::<Assets<Mesh>>()
+        .add(Cuboid::from_size(Vec3::splat(0.1)));
+    // The widget's noninteractive mesh child receives a genuine ray hit. Its
+    // tooltip is still owned by the original widget, not this child.
     let title = scene
         .app
         .world_mut()
-        .spawn((ChildOf(scene.control), PickingInteraction::Hovered))
+        .spawn((
+            ChildOf(scene.control),
+            Mesh3d(mesh),
+            Transform::from_xyz(0.0, 0.0, 0.1),
+            Visibility::Visible,
+        ))
         .id();
+    // Propagate the child's local offset and build its raycast bounds before
+    // clearing focus, so this frame hands off directly to real pointer hover.
+    scene.app.update();
+    let point = scene
+        .app
+        .world()
+        .get::<GlobalTransform>(title)
+        .expect("child pose")
+        .translation();
+    test_pointer::move_world(&mut scene.app, scene.camera, point);
     scene.app.world_mut().trigger(ClearWidgetFocus {
         window: scene.window,
     });

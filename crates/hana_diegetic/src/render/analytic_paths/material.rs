@@ -741,7 +741,7 @@ mod tests {
             vertex_pull
                 .contains("let design_span_x = record.uv_size.x * packed_path.bounds_min_size.z;")
         );
-        assert!(vertex_pull.contains("let layout_em = packed_path.text_em_size * record.rect_size.x\n                / max(design_span_x, LINE_AA_EPSILON);"));
+        assert!(vertex_pull.contains("let layout_em = packed_path.text_em_size * abs(record.rect_size.x)\n                / max(design_span_x, LINE_AA_EPSILON);"));
         assert!(
             vertex_pull
                 .contains("let pixels_per_em = layout_em / max(units_per_pixel, LINE_AA_EPSILON);")

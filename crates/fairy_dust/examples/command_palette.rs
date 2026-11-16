@@ -31,6 +31,7 @@ use fairy_dust::Face;
 use fairy_dust::OrbitCam;
 use fairy_dust::OrbitCamPose;
 use fairy_dust::TitleBar;
+use fairy_dust::TitleBarControl;
 use fairy_dust::command_palette_recovery_keystroke;
 use fairy_dust::sprinkle_example;
 /// Names the configuration directory the example's keymap is read from and
@@ -135,8 +136,8 @@ fn title_bar() -> TitleBar {
 
 /// The palette's recovery chord renders per platform. Fairy Dust reads it
 /// directly so it also works while authored keymap bindings are unavailable.
-fn palette_control() -> String {
-    format!("{} Palette", command_palette_recovery_keystroke().label())
+fn palette_control() -> TitleBarControl {
+    TitleBarControl::shortcut(command_palette_recovery_keystroke(), "Palette")
 }
 
 fn configure_camera(orbit_cam: &mut OrbitCam) { HOME_POSE.apply_to(orbit_cam); }

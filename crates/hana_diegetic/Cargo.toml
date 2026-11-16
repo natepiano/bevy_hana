@@ -57,7 +57,7 @@ criterion                     = { workspace = true }
 fairy_dust                    = { workspace = true }
 hana_clerestory               = { workspace = true }
 hana_lagrange                 = { workspace = true, features = ["fit_overlay"] }
-hana_metrics                  = { workspace = true }
+hana_metrics                  = { workspace = true, features = ["render"] }
 hana_shader_testing.workspace = true
 image                         = { workspace = true, features = ["png"] }
 naga                          = { workspace = true }

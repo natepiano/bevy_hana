@@ -15,13 +15,8 @@ use hana_lading::DiskAssets;
 use hana_lading::DiskAssetsPlugin;
 use hana_lading::LoadFailed;
 
+use crate::support;
 use crate::support::SETTLE_UPDATES;
-use crate::support::app_with_test_assets;
-use crate::support::assert_fixture_absent;
-use crate::support::drain_asset_events_until;
-use crate::support::preregister_image_loader;
-use crate::support::register_image_loader;
-use crate::support::update_until;
 
 // fixture paths relative to the test asset source root
 const MISSING_FIRST_PATH: &str = "missing/first.png";
@@ -51,10 +46,10 @@ struct OrderLog {
 
 #[test]
 fn first_failure_follows_declaration_order() {
-    assert_fixture_absent(MISSING_FIRST_PATH);
-    assert_fixture_absent(MISSING_SECOND_PATH);
-    let mut app = app_with_test_assets();
-    preregister_image_loader(&mut app);
+    support::assert_fixture_absent(MISSING_FIRST_PATH);
+    support::assert_fixture_absent(MISSING_SECOND_PATH);
+    let mut app = support::app_with_test_assets();
+    support::preregister_image_loader(&mut app);
     app.add_plugins(DiskAssetsPlugin::<FailOrder>::default())
         .init_resource::<OrderLog>()
         .add_observer(|event: On<AssetSetLoadFailed>, mut log: ResMut<OrderLog>| {
@@ -84,8 +79,8 @@ fn first_failure_follows_declaration_order() {
         let fail_order = app.world().resource::<FailOrder>();
         (fail_order.first.id(), fail_order.second.id())
     };
-    register_image_loader(&mut app);
-    drain_asset_events_until(&mut app, move |world| {
+    support::register_image_loader(&mut app);
+    support::drain_asset_events_until(&mut app, move |world| {
         let asset_server = world.resource::<AssetServer>();
         matches!(
             asset_server.get_load_state(first_id),
@@ -95,7 +90,7 @@ fn first_failure_follows_declaration_order() {
             Some(LoadState::Failed(_))
         )
     });
-    update_until(&mut app, |world| {
+    support::update_until(&mut app, |world| {
         world.resource::<OrderLog>().resolved_failures.is_some()
     });
 

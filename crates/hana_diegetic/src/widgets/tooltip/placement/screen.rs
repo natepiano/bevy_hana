@@ -72,6 +72,8 @@ use crate::widgets::TOOLTIP_SHADOW_EXTENT;
 use crate::widgets::TooltipBoundary;
 use crate::widgets::WidgetAnchorRect;
 use crate::widgets::WidgetOf;
+use crate::widgets::constants::CARD_HELP_CLEARANCE_PIXELS;
+use crate::widgets::constants::TOOLTIP_VIEWPORT_MARGIN;
 use crate::widgets::constants::TooltipPaintedReach;
 use crate::widgets::tooltip;
 use crate::widgets::tooltip::MaterializedTooltip;
@@ -655,10 +657,12 @@ fn screen_side_room_reflow(
         .truncate()
         .length()
         * target.layout_scale.x.abs();
-    let right_start = target.bounds.top_left().x + target.bounds.size().x + gap + reach.sides;
-    let left_end = target.bounds.top_left().x - gap - reach.sides;
-    let right = viewport.max.x - crate::widgets::constants::TOOLTIP_VIEWPORT_MARGIN - right_start;
-    let left = left_end - viewport.min.x - crate::widgets::constants::TOOLTIP_VIEWPORT_MARGIN;
+    // Reserve the source clearance and the shadow at the far viewport edge.
+    let body_gap = gap.max(reach.sides + CARD_HELP_CLEARANCE_PIXELS);
+    let right_start = target.bounds.top_left().x + target.bounds.size().x + body_gap + reach.sides;
+    let left_end = target.bounds.top_left().x - body_gap - reach.sides;
+    let right = viewport.max.x - TOOLTIP_VIEWPORT_MARGIN - right_start;
+    let left = left_end - viewport.min.x - TOOLTIP_VIEWPORT_MARGIN;
     let top =
         (target.bounds.size().y - input.panel.height()).mul_add(0.5, target.bounds.top_left().y);
     let rooms = boundary::horizontal_room_before_floating_panels(
@@ -1057,7 +1061,6 @@ fn fit_tooltip_in_viewport_avoiding_occluders(
 )]
 mod tests {
     use bevy::ecs::system::RunSystemOnce;
-    use bevy::picking::hover::PickingInteraction;
     use bevy::prelude::MinimalPlugins;
     use bevy::prelude::TimerMode;
     use bevy::time::TimeUpdateStrategy;
@@ -1130,6 +1133,7 @@ mod tests {
         app.add_plugins((MinimalPlugins, TransformPlugin))
             .insert_resource(DiegeticTextMeasurer::default())
             .add_plugins((HeadlessLayoutPlugin, WidgetsPlugin, ScreenSpacePlugin));
+        crate::test_support::tooltip_hover::install(&mut app);
         app
     }
 
@@ -1171,7 +1175,13 @@ mod tests {
 
     fn tooltip_target_tree() -> crate::LayoutTree {
         let mut builder = LayoutBuilder::new(100.0, 50.0);
-        builder.with(El::new().size(50.0, 20.0).button("action"), |_| {});
+        builder.with(
+            El::new()
+                .size(50.0, 20.0)
+                .background(bevy::prelude::Color::WHITE)
+                .button("action"),
+            |_| {},
+        );
         builder.build()
     }
 
@@ -1211,6 +1221,7 @@ mod tests {
         tree.with(
             El::new()
                 .size(100.0, 30.0)
+                .background(bevy::prelude::Color::WHITE)
                 .button("action")
                 .tooltip(tooltip),
             |_| {},
@@ -1245,9 +1256,7 @@ mod tests {
             WidgetEntity::<Screen>::from_validated(button, panel, PanelSpace::Screen),
             PanelAttachment::new(Anchor::TopRight, Anchor::BottomRight),
         );
-        app.world_mut()
-            .entity_mut(button)
-            .insert(PickingInteraction::Hovered);
+        crate::test_support::tooltip_hover::hover(&mut app, button);
         for _ in 0..60 {
             app.update();
         }
@@ -1725,6 +1734,7 @@ mod tests {
         tree.with(
             El::new()
                 .size(40.0, 20.0)
+                .background(bevy::prelude::Color::WHITE)
                 .editable_field("action", field, TextStyle::new(10.0)),
             |_| {},
         );
@@ -1761,11 +1771,10 @@ mod tests {
             }),
             |builder| {
                 builder.with(
-                    El::new().size(40.0, 20.0).editable_field(
-                        "action",
-                        field_spec,
-                        TextStyle::new(10.0),
-                    ),
+                    El::new()
+                        .size(40.0, 20.0)
+                        .background(bevy::prelude::Color::WHITE)
+                        .editable_field("action", field_spec, TextStyle::new(10.0)),
                     |_| {},
                 );
             },
@@ -1774,9 +1783,8 @@ mod tests {
             .commands()
             .set_tree(panel, moved_tree.build())
             .expect("field tree edit");
-        app.world_mut()
-            .entity_mut(field)
-            .insert(PickingInteraction::Hovered);
+        app.update();
+        crate::test_support::tooltip_hover::hover(&mut app, field);
         let timer = bevy::prelude::Timer::new(std::time::Duration::ZERO, TimerMode::Once);
         app.world_mut()
             .entity_mut(controller)
@@ -1811,7 +1819,17 @@ mod tests {
             .id();
         let bounds = PanelScreenBounds::new(Vec2::new(80.0, 80.0), Vec2::new(40.0, 20.0))
             .expect("target bounds");
-        let target = app.world_mut().spawn_empty().id();
+        let mut target_tree = LayoutBuilder::new(40.0, 20.0);
+        target_tree.with(El::new().size(40.0, 20.0), |_| {});
+        let target_panel = DiegeticPanel::screen()
+            .size(Px(40.0), Px(20.0))
+            .anchor(Anchor::TopLeft)
+            .screen_position(80.0, 80.0)
+            .window_entity(window)
+            .with_tree(target_tree.build())
+            .build()
+            .expect("screen target surface");
+        let target = app.world_mut().spawn(target_panel).id();
         let handle = app.world_mut().commands().screen_anchor_target(
             target,
             crate::screen_space::ScreenAnchorTarget::new(
@@ -1842,9 +1860,7 @@ mod tests {
         app.world_mut()
             .entity_mut(controller)
             .insert(crate::widgets::tooltip::declaration::TooltipPhase::Visible);
-        app.world_mut()
-            .entity_mut(target)
-            .insert(PickingInteraction::Hovered);
+        crate::test_support::tooltip_hover::hover(&mut app, target);
         let moved = PanelScreenBounds::new(Vec2::new(180.0, 130.0), Vec2::new(40.0, 20.0))
             .expect("moved bounds");
         app.world_mut()
@@ -1856,6 +1872,13 @@ mod tests {
                 RenderLayers::layer(0),
                 Unit::Pixels,
             ));
+        assert!(
+            app.world_mut()
+                .get_mut::<DiegeticPanel>(target)
+                .expect("target surface")
+                .set_screen_position(Vec2::new(180.0, 130.0)),
+            "the screen target must accept its moved position"
+        );
         app.update();
         assert_eq!(
             app.world()
@@ -2103,7 +2126,15 @@ mod tests {
         assert!(constrained_width.is_some());
         assert_eq!(
             app.world().get::<TooltipReadiness>(controller),
-            Some(&TooltipReadiness::Ready)
+            Some(&TooltipReadiness::Ready),
+            "width={constrained_width:?}; placement={:?}; request={:?}",
+            app.world().get::<TooltipPlacementState>(controller),
+            app.world()
+                .get::<TooltipWidthConstraintRequest>(controller)
+                .map(|request| match request {
+                    TooltipWidthConstraintRequest::Apply(width) => Some(*width),
+                    TooltipWidthConstraintRequest::Restore => None,
+                }),
         );
 
         if let Some(mut window) = app.world_mut().get_mut::<Window>(window) {
@@ -2231,7 +2262,7 @@ mod tests {
         ));
         assert!(
             footprint.painted.top_left().y + footprint.painted.size().y
-                <= 60.0 - crate::widgets::constants::TOOLTIP_VIEWPORT_MARGIN
+                <= 60.0 - TOOLTIP_VIEWPORT_MARGIN
         );
     }
 

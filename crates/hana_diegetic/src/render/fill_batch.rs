@@ -140,6 +140,7 @@ use crate::panel::DroppedSdfSurfaces;
 use crate::panel::FrameWork;
 use crate::render;
 use crate::screen_space::ScreenPixelEdgeSnap;
+use crate::screen_space::WidgetPixelEdgeSnap;
 use crate::widgets::SliderDirection;
 use crate::widgets::TooltipFor;
 use crate::widgets::TooltipPaintInsideBorder;
@@ -1939,6 +1940,7 @@ fn route_sdf_batch_records(
             &panel_treatments.tooltip_depth_priority,
             &panel_treatments.tooltip_edge_treatment,
             &panel_treatments.screen_pixel_edge_snap,
+            &panel_treatments.widget_pixel_edge_snap,
             &tooltip_hosts.panels,
             &mut store,
         );
@@ -1959,6 +1961,7 @@ struct SdfPanelTreatmentQueries<'w, 's> {
     tooltip_depth_priority: Query<'w, 's, (), With<TooltipDepthPriority>>,
     tooltip_edge_treatment: Query<'w, 's, &'static TooltipPaintInsideBorder>,
     screen_pixel_edge_snap: Query<'w, 's, (), With<ScreenPixelEdgeSnap>>,
+    widget_pixel_edge_snap: Query<'w, 's, (), With<WidgetPixelEdgeSnap>>,
 }
 
 /// A resolved surface with the panel facts that route it into a batch.
@@ -2058,6 +2061,7 @@ fn upsert_sdf_batch_records(
     tooltip_panels: &Query<(), With<render::TooltipDepthPriority>>,
     tooltip_paint_panels: &Query<&TooltipPaintInsideBorder>,
     edge_snap_panels: &Query<(), With<ScreenPixelEdgeSnap>>,
+    widget_edge_snap_panels: &Query<(), With<WidgetPixelEdgeSnap>>,
     computed_panels: &Query<&ComputedDiegeticPanel>,
     store: &mut SdfBatchStore,
 ) {
@@ -2093,7 +2097,17 @@ fn upsert_sdf_batch_records(
             // AA halo consumes the clear spacing between neighbouring controls.
             record.flags |= SDF_PAINT_INSIDE_BORDER_FLAG;
         }
-        if edge_snap_panels.contains(record.record_key.panel) {
+        let widget_face_snap = widget_edge_snap_panels.contains(record.record_key.panel)
+            && record.record_key.source_part.is_element()
+            && computed_panels
+                .get(record.record_key.panel)
+                .is_ok_and(|computed| {
+                    computed
+                        .widget_records()
+                        .iter()
+                        .any(|widget| widget.preorder() == record.record_key.element.get())
+                });
+        if edge_snap_panels.contains(record.record_key.panel) || widget_face_snap {
             record.flags |= SDF_PAINT_INSIDE_BORDER_FLAG | SDF_VIEW_ALIGNED_EDGE_SNAP_FLAG;
         }
         if let Ok(edge_treatment) = tooltip_paint_panels.get(record.record_key.panel) {
@@ -2129,6 +2143,7 @@ fn upsert_sdf_batch_records(
             record.oit_paint_order += render::TOOLTIP_NDC_DEPTH_PRIORITY;
         }
     }
+    keep_split_fills_behind_their_borders(&mut records);
     place_tooltip_shadows_behind_bodies(&mut records);
     for mut record in records {
         if routed.hidden.contains(&record.record_key) {
@@ -2139,6 +2154,43 @@ fn upsert_sdf_batch_records(
     store.retain_panel_records(panel, &routed.active);
     for (_, batch) in store.batches_mut() {
         batch.sort_pending_records();
+    }
+}
+
+/// Keeps every opaque split fill behind the border it was split from.
+///
+/// A tooltip lifts its frontmost opaque record to
+/// `OPAQUE_FILL_MAX_CLIP_NUDGE_LAYERS`, which can carry a split fill in front of
+/// its own blended border, and the fill's depth test then hides the border.
+/// The fill instead stays `OPAQUE_FILL_DEPTH_PUSH_LAYERS` behind its border, as
+/// on every other panel. The border does not move, so it cannot cover content
+/// drawn in front of it.
+fn keep_split_fills_behind_their_borders(records: &mut [ResolvedSdfBatchRecord]) {
+    let border_nudges: HashMap<(Entity, ElementIndex, SdfSourcePart), f32> = records
+        .iter()
+        .filter(|record| record.record_key.role == SdfRecordRole::Border)
+        .map(|record| {
+            let key = record.record_key;
+            (
+                (key.panel, key.element, key.source_part),
+                record.clip_depth_nudge,
+            )
+        })
+        .collect();
+    for fill in records.iter_mut().filter(|record| {
+        record.record_key.role == SdfRecordRole::Fill
+            && opaque_fill_depth_push(
+                record.batch_key.pipeline_compatibility.alpha,
+                record.batch_key.shadow,
+            ) > 0.0
+    }) {
+        let key = fill.record_key;
+        let split_surface = (key.panel, key.element, key.source_part);
+        if let Some(border_nudge) = border_nudges.get(&split_surface) {
+            fill.clip_depth_nudge = fill
+                .clip_depth_nudge
+                .min(border_nudge - OPAQUE_FILL_DEPTH_PUSH_LAYERS);
+        }
     }
 }
 
@@ -2719,24 +2771,17 @@ mod tests {
     use bevy::asset::Asset;
     use bevy::asset::AssetEvent;
     use bevy::asset::AssetPlugin;
-    use bevy::camera::RenderTarget;
-    use bevy::camera::RenderTargetInfo;
     use bevy::camera::visibility::RenderLayers;
     use bevy::ecs::change_detection::Tick;
     use bevy::ecs::message::Messages;
     use bevy::ecs::system::RunSystemOnce;
     use bevy::image::Image;
-    use bevy::picking::hover::PickingInteraction;
     use bevy::prelude::AlphaMode;
     use bevy::prelude::AssetApp;
-    use bevy::prelude::Camera;
     use bevy::prelude::ChildOf;
     use bevy::prelude::DetectChanges;
     use bevy::prelude::MinimalPlugins;
-    use bevy::prelude::PerspectiveProjection;
-    use bevy::prelude::Projection;
     use bevy::prelude::Quat;
-    use bevy::prelude::TransformPlugin;
     use bevy::prelude::UVec2;
     use bevy::prelude::Window;
     use bevy::prelude::default;
@@ -2746,7 +2791,6 @@ mod tests {
     use bevy::shader::Shader;
     use bevy::shader::ShaderDefVal;
     use bevy::window::PrimaryWindow;
-    use bevy::window::WindowRef;
     use hana_kana::ToF32;
     use hana_kana::ToI32;
 
@@ -2926,9 +2970,10 @@ mod tests {
     fn sdf_pipeline_app() -> App {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
-            .add_plugins(AssetPlugin::default())
-            .add_plugins(DisplayCompensationPlugin)
-            .add_plugins(TransformPlugin)
+            .add_plugins(AssetPlugin::default());
+        // MeshPlugin must precede the geometry cache that owns the picking quad.
+        crate::test_support::test_pointer::install_mesh(&mut app);
+        app.add_plugins(DisplayCompensationPlugin)
             .insert_resource(zero_measurer())
             .add_plugins(HeadlessLayoutPlugin)
             .init_asset::<Mesh>()
@@ -2946,6 +2991,7 @@ mod tests {
         app.insert_resource(SdfMaterial(default_material));
         app.insert_resource(Lighting::Lit);
         app.insert_resource(Sidedness::BothSides);
+        crate::test_support::tooltip_hover::install(&mut app);
         app
     }
 
@@ -3095,26 +3141,16 @@ mod tests {
         let viewport = UVec2::new(800, 600);
         let window = app
             .world_mut()
-            .spawn((Window::default(), PrimaryWindow))
-            .id();
-        let mut camera = Camera::default();
-        camera.computed.target_info = Some(RenderTargetInfo {
-            physical_size: viewport,
-            scale_factor:  1.0,
-        });
-        let mut projection = Projection::Perspective(PerspectiveProjection::default());
-        projection.update(800.0, 600.0);
-        camera.computed.clip_from_view = projection.get_clip_from_view();
-        let transform = Transform::from_xyz(0.0, 0.0, 5.0);
-        app.world_mut()
             .spawn((
-                camera,
-                RenderTarget::Window(WindowRef::Entity(window)),
-                RenderLayers::layer(0),
-                transform,
-                GlobalTransform::from(transform),
+                Window {
+                    resolution: viewport.into(),
+                    ..Default::default()
+                },
+                PrimaryWindow,
             ))
-            .id()
+            .id();
+        let transform = Transform::from_xyz(0.0, 0.0, 5.0);
+        crate::test_support::test_pointer::camera(app, window, transform)
     }
 
     fn one_surface_tree() -> LayoutTree {
@@ -3254,16 +3290,17 @@ mod tests {
             .get::<Tooltips>(widget)
             .and_then(|tooltips| tooltips.iter().next())
             .expect("tooltip controller should reify");
-        app.world_mut().entity_mut(widget).insert((
-            PickingInteraction::Hovered,
-            crate::widgets::TooltipPointerCamera::new(camera),
-        ));
+        crate::test_support::tooltip_hover::hover_with(&mut app, camera, widget);
         for _ in 0..TOOLTIP_REVEAL_SETTLE_FRAMES {
             app.update();
         }
         assert_eq!(
             app.world().get::<Visibility>(controller),
             Some(&Visibility::Inherited),
+            "target interaction: {:?}; hover: {:?}",
+            app.world()
+                .get::<bevy::picking::hover::PickingInteraction>(widget),
+            app.world().resource::<bevy::picking::hover::HoverMap>(),
         );
         assert_tooltip_surface_is_retained(&app, controller);
         ShownTooltipFixture {
@@ -3332,10 +3369,7 @@ mod tests {
             "tooltip render records should remain deferred until first reveal",
         );
 
-        app.world_mut().entity_mut(widget).insert((
-            PickingInteraction::Hovered,
-            crate::widgets::TooltipPointerCamera::new(camera),
-        ));
+        crate::test_support::tooltip_hover::hover_with(&mut app, camera, widget);
         for _ in 0..TOOLTIP_REVEAL_SETTLE_FRAMES {
             app.update();
             assert_eq!(
@@ -3380,9 +3414,7 @@ mod tests {
         let batch_gpu_identity = sdf_batch_gpu_identity_for_panel(&app, controller);
         clear_asset_events::<ShaderBuffer>(&mut app);
 
-        app.world_mut()
-            .entity_mut(widget)
-            .insert(PickingInteraction::None);
+        crate::test_support::tooltip_hover::leave(&mut app);
         app.update();
         let hidden_record = sdf_records(&app)
             .into_iter()
@@ -3424,9 +3456,7 @@ mod tests {
         assert_eq!(modified_asset_events_for(&app, &table_handle), 0);
         clear_asset_events::<ShaderBuffer>(&mut app);
 
-        app.world_mut()
-            .entity_mut(widget)
-            .insert(PickingInteraction::Hovered);
+        crate::test_support::tooltip_hover::hover(&mut app, widget);
         app.update();
         let reshown_tooltip_slots = panel_authored_slot_ids(&app, controller);
         assert_eq!(
@@ -3465,21 +3495,21 @@ mod tests {
             widget,
             controller,
         } = shown_tooltip_fixture();
-        app.world_mut()
-            .entity_mut(widget)
-            .insert(PickingInteraction::None);
+        crate::test_support::tooltip_hover::leave(&mut app);
         app.update();
+        // Input hits the current geometry; the same frame then moves and reveals
+        // the retained tooltip against its newly propagated target transform.
+        crate::test_support::tooltip_hover::hover(&mut app, widget);
         let mut panel_transform = app
             .world_mut()
             .get_mut::<Transform>(panel)
             .expect("the tooltip target panel should retain its transform");
         panel_transform.translation = Vec3::new(0.4, -0.2, 0.3);
-        app.world_mut()
-            .entity_mut(widget)
-            .insert(PickingInteraction::Hovered);
         app.update();
         assert_tooltip_retained_transform(&app, controller);
 
+        // The replacement must receive input at the panel's new position too.
+        crate::test_support::tooltip_hover::hover(&mut app, widget);
         assert!(
             app.world_mut()
                 .commands()
@@ -3540,9 +3570,7 @@ mod tests {
             .and_then(|tooltips| tooltips.iter().next())
             .expect("screen tooltip controller should reify");
 
-        app.world_mut()
-            .entity_mut(widget)
-            .insert(PickingInteraction::Hovered);
+        crate::test_support::tooltip_hover::hover(&mut app, widget);
         for _ in 0..TOOLTIP_REVEAL_SETTLE_FRAMES {
             app.update();
         }
@@ -5421,6 +5449,51 @@ mod tests {
     }
 
     #[test]
+    fn tooltip_shadow_casts_no_light_shadow_when_its_panel_casts() {
+        let mut app = sdf_pipeline_app();
+        let tree = LayoutBuilder::with_root(
+            El::new()
+                .width(Sizing::GROW)
+                .height(Sizing::GROW)
+                .background(Color::WHITE),
+        )
+        .build();
+        let tooltip = spawn_sdf_panel(&mut app, tree, StandardMaterial::default());
+        app.world_mut().entity_mut(tooltip).insert((
+            TooltipPaintInsideBorder::ViewAlignedWorldPixelGrid,
+            TooltipDepthPriority,
+        ));
+        settle_sdf_pipeline(&mut app);
+
+        let surfaces = app.world().resource::<ResolvedSdfSurfaceRegistry>();
+        let casting: Vec<(SdfRecordRole, ShadowCasting)> = surfaces
+            .surfaces()
+            .filter(|surface| surface.panel_entity() == tooltip)
+            .map(|surface| surface.as_resolved(RenderLayers::layer(0), ShadowCasting::On))
+            .filter(|surface| surface.element_index == ElementIndex::default())
+            .map(|surface| (surface.record_role, surface.shadow_casting))
+            .collect();
+        let shadow = casting
+            .iter()
+            .find(|(role, _)| matches!(role, SdfRecordRole::TooltipShadow(_)))
+            .expect("tooltip shadow surface");
+        let body = casting
+            .iter()
+            .find(|(role, _)| !matches!(role, SdfRecordRole::TooltipShadow(_)))
+            .expect("tooltip body surface");
+        assert_eq!(
+            shadow.1,
+            ShadowCasting::Off,
+            "the drop shadow keeps its own Off over the panel cascade"
+        );
+        assert_eq!(
+            body.1,
+            ShadowCasting::On,
+            "the body follows the panel cascade"
+        );
+    }
+
+    #[test]
     fn edge_snap_flags_route_for_tooltips_and_opt_in_screen_panels() {
         let mut app = sdf_pipeline_app();
         let window = app
@@ -5477,6 +5550,64 @@ mod tests {
         assert_marked_edge_snap_records(&records, marked_screen);
         assert_ordinary_edge_snap_records(&records, ordinary_control);
         assert_edge_snap_shader_contract(include_str!("../shaders/sdf_panel.wesl"));
+    }
+
+    #[test]
+    fn widget_edge_snap_leaves_child_paint_unchanged() {
+        let mut app = sdf_pipeline_app();
+        let mut builder = LayoutBuilder::new(Px(80.0), Px(40.0));
+        builder.with(
+            El::overlay()
+                .size(Px(80.0), Px(40.0))
+                .background(Color::BLACK)
+                .border(Border::all(Px(1.0), Color::WHITE))
+                .button("face"),
+            |builder| {
+                builder.with(
+                    El::new().size(Px(12.0), Px(12.0)).background(Color::WHITE),
+                    |_| {},
+                );
+            },
+        );
+        let panel = spawn_sdf_panel(&mut app, builder.build(), StandardMaterial::default());
+        app.world_mut()
+            .entity_mut(panel)
+            .insert(WidgetPixelEdgeSnap);
+        settle_sdf_pipeline(&mut app);
+        let computed = app
+            .world()
+            .get::<ComputedDiegeticPanel>(panel)
+            .expect("computed panel");
+        let face = computed
+            .widget_records()
+            .iter()
+            .next()
+            .expect("face widget")
+            .preorder();
+        let records = sdf_records(&app);
+        let mut faces = 0;
+        let mut children = 0;
+        for record in records
+            .iter()
+            .filter(|record| record.record_key.panel == panel)
+        {
+            let flags =
+                record.flags & (SDF_PAINT_INSIDE_BORDER_FLAG | SDF_VIEW_ALIGNED_EDGE_SNAP_FLAG);
+            if record.record_key.element.get() == face {
+                assert_eq!(
+                    flags,
+                    SDF_PAINT_INSIDE_BORDER_FLAG | SDF_VIEW_ALIGNED_EDGE_SNAP_FLAG
+                );
+                faces += 1;
+            } else {
+                assert_eq!(flags, 0, "content must keep authored coverage");
+                children += 1;
+            }
+        }
+        assert!(
+            faces > 0 && children > 0,
+            "exercise both face and content paint"
+        );
     }
 
     #[test]
@@ -5874,6 +6005,55 @@ mod tests {
                 .z
                 .to_bits()
         );
+    }
+
+    #[test]
+    fn tooltip_split_border_draws_in_front_of_its_opaque_fill() {
+        let mut app = image_sdf_pipeline_app();
+        let image = app
+            .world_mut()
+            .resource_mut::<Assets<Image>>()
+            .add(Image::default());
+        let tooltip = spawn_sdf_panel(
+            &mut app,
+            filled_clipped_image_border_tree(image),
+            StandardMaterial::default(),
+        );
+        app.world_mut()
+            .entity_mut(tooltip)
+            .insert(TooltipDepthPriority);
+        settle_sdf_pipeline(&mut app);
+
+        let records = sdf_records(&app);
+        let Some(fill_record) = records
+            .iter()
+            .find(|record| record.record_key.role == SdfRecordRole::Fill)
+        else {
+            panic!("the clipped tooltip should split out a fill record");
+        };
+        let Some(border_record) = records
+            .iter()
+            .find(|record| record.record_key.role == SdfRecordRole::Border)
+        else {
+            panic!("the clipped tooltip should split out a border record");
+        };
+
+        assert_eq!(
+            fill_record.batch_key.pipeline_compatibility.alpha,
+            BatchAlphaMode::Opaque
+        );
+        assert_eq!(
+            border_record.batch_key.pipeline_compatibility.alpha,
+            BatchAlphaMode::Blend
+        );
+        assert_ne!(border_record.paint_mask.bits(), 0);
+        assert!(
+            border_record.clip_depth_nudge > fill_record.clip_depth_nudge,
+            "the blended border must sort in front of its opaque fill: border {}, fill {}",
+            border_record.clip_depth_nudge,
+            fill_record.clip_depth_nudge,
+        );
+        assert!(border_record.oit_paint_order > fill_record.oit_paint_order);
     }
 
     #[test]

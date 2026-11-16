@@ -36,6 +36,7 @@ use bevy::camera::primitives::Aabb;
 use bevy::ecs::component::Mutable;
 use bevy::math::Vec3A;
 use bevy::prelude::Component;
+use bevy::prelude::DetectChangesMut;
 use bevy::prelude::Entity;
 use bevy::prelude::GlobalTransform;
 use bevy::prelude::Mat4;
@@ -170,8 +171,9 @@ pub(super) fn update_batch_bounds<F: MemberFamily>(
             continue;
         };
         let center = (min + max) * 0.5;
-        *transform = Transform::from_translation(center);
-        *global = GlobalTransform::from(*transform);
+        let pose = Transform::from_translation(center);
+        transform.set_if_neq(pose);
+        global.set_if_neq(GlobalTransform::from(pose));
         *aabb = Aabb {
             center:       Vec3A::ZERO,
             half_extents: Vec3A::from((max - min) * 0.5),

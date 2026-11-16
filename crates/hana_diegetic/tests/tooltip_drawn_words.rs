@@ -265,6 +265,36 @@ fn configure_scene_lighting(app: &mut App, lighting: SceneLighting) {
     }
 }
 
+/// Waits for the requested visibility and a solved visible panel layout.
+fn wait_for_panel_visibility(app: &mut CaseApp, panel: Entity, shown: bool) {
+    const PANEL_VISIBILITY_UPDATE_LIMIT: usize = 30;
+    let step = app
+        .world()
+        .resource::<Time<bevy::time::Virtual>>()
+        .max_delta();
+    let previous = std::mem::replace(
+        &mut *app
+            .world_mut()
+            .resource_mut::<bevy::time::TimeUpdateStrategy>(),
+        bevy::time::TimeUpdateStrategy::ManualDuration(step),
+    );
+    for _ in 0..PANEL_VISIBILITY_UPDATE_LIMIT {
+        app.update();
+        let visible = app
+            .world()
+            .get::<Visibility>(panel)
+            .is_some_and(|visibility| *visibility != Visibility::Hidden);
+        let layout_ready = app
+            .world()
+            .get::<hana_diegetic::ComputedDiegeticPanel>(panel)
+            .is_some_and(|panel| panel.layout().solved().is_some());
+        if visible == shown && (!shown || layout_ready) {
+            break;
+        }
+    }
+    app.insert_resource(previous);
+}
+
 fn shown_panel_app(
     contents: DrawnPanelCase,
     lighting: SceneLighting,
@@ -457,9 +487,7 @@ fn shown_panel_in_app(
         });
         tip
     };
-    for _ in 0..30 {
-        app.update();
-    }
+    wait_for_panel_visibility(&mut app, panel_entity, true);
     if app.world().get::<Visibility>(panel_entity) == Some(&Visibility::Hidden) {
         return Err("world panel remained hidden".to_string());
     }
@@ -1290,9 +1318,7 @@ fn set_tooltip_shown(tooltip: &mut ShownTooltip, shown: bool) -> Result<(), Stri
     } else {
         tooltip.app.world_mut().trigger(ClearWidgetFocus { window });
     }
-    for _ in 0..30 {
-        tooltip.app.update();
-    }
+    wait_for_panel_visibility(&mut tooltip.app, tooltip.tip, shown);
     let hidden = tooltip.app.world().get::<Visibility>(tooltip.tip) == Some(&Visibility::Hidden);
     if hidden == shown {
         return Err(format!(
@@ -1314,6 +1340,14 @@ fn show_tooltip_over_host(
     space: TooltipSpace,
     host: impl FnOnce(Entity) -> Result<DiegeticPanel, String>,
 ) -> Result<ShownTooltip, String> {
+    show_tooltip_over_host_at_distance(space, 5.0, host)
+}
+
+fn show_tooltip_over_host_at_distance(
+    space: TooltipSpace,
+    presentation_distance: f32,
+    host: impl FnOnce(Entity) -> Result<DiegeticPanel, String>,
+) -> Result<ShownTooltip, String> {
     let mut app = CaseApp::new();
     let mut window = Window::default();
     window.resolution.set(SHADOW_WINDOW.x, SHADOW_WINDOW.y);
@@ -1323,7 +1357,7 @@ fn show_tooltip_over_host(
         RenderTarget::Window(WindowRef::Entity(window)),
         Hdr,
         Tonemapping::KhronosPbrNeutral,
-        Transform::from_xyz(0.0, 0.0, 5.0)
+        Transform::from_xyz(0.0, 0.0, presentation_distance)
             .with_rotation(Quat::from_rotation_y(NONPARALLEL_PRESENTATION_ANGLE)),
     ));
     let host_panel = host(window)?;
@@ -1648,7 +1682,9 @@ fn capture_tooltip_shadow(
     framing: ShadowFraming,
     transparency: CaptureTransparency,
 ) -> Result<ShadowCaptures, String> {
-    let mut tooltip = show_tooltip_over_host(space, |window| shadow_host(space, window))?;
+    // Keep the shadow over the host ink after adding physical source clearance.
+    let mut tooltip =
+        show_tooltip_over_host_at_distance(space, 1.0, |window| shadow_host(space, window))?;
     let view = tooltip_view(&tooltip, space)?;
     let target = tooltip.app.target(full_region());
     let camera = spawn_shadow_camera(&mut tooltip.app, &view, space, transparency, target.clone());
@@ -1865,7 +1901,7 @@ fn world_tooltip_shadow_draws_when_only_the_shadow_is_in_view() -> Result<(), St
 fn world_tooltip_shadow_leaves_a_nearer_blended_surface_its_colour() -> Result<(), String> {
     const NEARER: f32 = 2.0;
     const NEARER_SURFACE: Color = Color::srgb(0.1, 0.3, 0.9);
-    let mut tooltip = show_tooltip_over_host(TooltipSpace::World, |window| {
+    let mut tooltip = show_tooltip_over_host_at_distance(TooltipSpace::World, 1.0, |window| {
         shadow_host(TooltipSpace::World, window)
     })?;
     let mut view = world_shadow_view(&tooltip.app, tooltip.tip)?;
@@ -1978,7 +2014,9 @@ fn bare_words_host(
     if matches!(space, TooltipSpace::World) {
         tooltip = tooltip.with_label_size(Pt(11.0));
     }
-    tooltip.text(words);
+    for line in words.lines() {
+        tooltip.text(line);
+    }
     match space {
         TooltipSpace::World => {
             let mut layout = LayoutBuilder::new(0.08, 0.04);
@@ -2101,6 +2139,8 @@ fn screen_and_world_tooltips_balance_descender_ink_inside_the_frame() -> Result<
     for (space, words) in [
         (TooltipSpace::Screen, "Processed image."),
         (TooltipSpace::World, "Processed image."),
+        (TooltipSpace::Screen, "RESET SCENE\nProcessed image."),
+        (TooltipSpace::World, "RESET SCENE\nProcessed image."),
     ] {
         let padding = drawn_words_padding(space, words)?;
         eprintln!("{space:?} {words:?}: drawn padding {padding:?} layout px");
@@ -3900,12 +3940,11 @@ fn keeps_its_gap(preferred: Placement, lead: f32, landed: Placement) -> Result<(
     )
     .ok_or_else(|| "the shown tooltip painted no body pixels".to_string())?;
     let (gap, centre_offset) = drawn_gap(landed, &body, &control);
-    // Above, the 11 px downward shadow needs more room than the authored 8 px
-    // body gap. The complete painted tooltip keeps 2 px clear of its source.
+    // Every tooltip clears its source by its shadow extent plus 2 px.
     let expected_gap = if matches!(landed, Placement::Above) {
         TOOLTIP_GAP_PX.max(f64::from(SHADOW_REACH_BELOW_PX) + 2.0)
     } else {
-        TOOLTIP_GAP_PX
+        TOOLTIP_GAP_PX.max(f64::from(SHADOW_BLUR_PX) + 2.0)
     };
     eprintln!(
         "{preferred:?} tooltip landed {landed:?}: gap {gap} px, centre offset {centre_offset} \

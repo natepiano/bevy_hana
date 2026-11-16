@@ -6,8 +6,8 @@ use bevy::prelude::StandardMaterial;
 use hana_liminal::OutlineMethod;
 
 use crate::benchmark_state::OutlinePresence;
+use crate::grid;
 use crate::grid::GridSpawnSpec;
-use crate::grid::spawn_grid;
 use crate::viewport::ViewportInfo;
 
 #[derive(Clone, Copy)]
@@ -40,7 +40,7 @@ pub(super) fn spawn_scenario(
         width,
         cube_fill,
     } = scenario.scenario_kind;
-    spawn_grid(
+    grid::spawn_grid(
         commands,
         meshes,
         materials,

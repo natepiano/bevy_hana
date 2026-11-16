@@ -141,10 +141,14 @@ fn quiet_payload_uploads() -> Result<(), String> {
 enum TextMeshAssets {
     ExistingBatches,
     DistinctAssets,
+    NewPanel,
 }
 
 fn changed_text_pixels() -> Result<(), String> {
-    text_pixels_with_mesh_assets(TextMeshAssets::ExistingBatches)
+    for case in [TextMeshAssets::ExistingBatches, TextMeshAssets::NewPanel] {
+        text_pixels_with_mesh_assets(case)?;
+    }
+    Ok(())
 }
 
 fn distinct_mesh_text_pixels() -> Result<(), String> {
@@ -159,7 +163,7 @@ fn text_pixels_with_mesh_assets(assets: TextMeshAssets) -> Result<(), String> {
     panel(&mut app, 1, "BBBBB", 72.0)?;
     app.settle()?;
     match assets {
-        TextMeshAssets::ExistingBatches => {},
+        TextMeshAssets::ExistingBatches | TextMeshAssets::NewPanel => {},
         TextMeshAssets::DistinctAssets => {
             // Identical payloads in separate mesh assets isolate sharing from
             // the retained text update and its first-frame buffer publication.
@@ -183,13 +187,21 @@ fn text_pixels_with_mesh_assets(assets: TextMeshAssets) -> Result<(), String> {
     let reference_mesh = text_mesh(&mut app, 1)?;
     let before = app.capture(retained.clone())?;
     let mesh = text_mesh(&mut app, 0)?;
-    let updated = app
-        .world_mut()
-        .run_system_once(move |mut text: PanelText| {
-            text.set_text(changed, &PanelElementId::named(LABEL), "BBBBB")
-        })
-        .map_err(|error| format!("set retained text: {error}"))?;
-    assert!(updated, "named text run was not changed");
+    match assets {
+        TextMeshAssets::NewPanel => {
+            app.world_mut().despawn(changed);
+            panel(&mut app, 0, "BBBBB", 72.0)?;
+        },
+        TextMeshAssets::ExistingBatches | TextMeshAssets::DistinctAssets => {
+            let updated = app
+                .world_mut()
+                .run_system_once(move |mut text: PanelText| {
+                    text.set_text(changed, &PanelElementId::named(LABEL), "BBBBB")
+                })
+                .map_err(|error| format!("set retained text: {error}"))?;
+            assert!(updated, "named text run was not changed");
+        },
+    }
     let [actual, expected] = paired_capture::capture_pair(&mut app, [retained, reference])?;
     let region = CaptureRegion::new(VIEW_SIZE, UVec2::ZERO, VIEW_SIZE);
     drawn_support::dump_pixels::<false>(

@@ -492,6 +492,13 @@ mod tests {
     use crate::persistence::PersistedWindowTargetV5;
     use crate::persistence::SavedWindowMode;
 
+    /// Updates that let a persistence fixture settle its bindings and saves.
+    const SETTLE_UPDATES: usize = 8;
+    /// The editor's windowed size in the full-screen fixture, in logical pixels.
+    const FIXTURE_WINDOWED_SIZE: UVec2 = UVec2::new(900, 700);
+    /// The editor's windowed offset on its monitor in the full-screen fixture, in logical pixels.
+    const FIXTURE_WINDOWED_OFFSET: IVec2 = IVec2::new(100, 80);
+
     struct TestWindowDriver;
 
     impl EndpointDriver for TestWindowDriver {
@@ -617,7 +624,7 @@ mod tests {
             if matches!(managed_membership, ManagedMembership::Present) {
                 app.world_mut().spawn(ManagedWindowName("inspector".into()));
             }
-            for _ in 0..8 {
+            for _ in 0..SETTLE_UPDATES {
                 app.update();
             }
             {
@@ -675,8 +682,8 @@ mod tests {
             .world_mut()
             .spawn((
                 Window {
-                    resolution: (900, 700).into(),
-                    position: WindowPosition::At(IVec2::new(100, 80)),
+                    resolution: FIXTURE_WINDOWED_SIZE.into(),
+                    position: WindowPosition::At(FIXTURE_WINDOWED_OFFSET),
                     ..Default::default()
                 },
                 PrimaryWindow,
@@ -719,22 +726,11 @@ mod tests {
     #[test]
     fn full_screen_editor_retains_windowed_geometry_through_driver_return() -> Result<(), String> {
         let (mut harness, window, policy) = full_screen_persistence_fixture()?;
-        for _ in 0..8 {
-            harness.app.update();
-        }
-        let states = harness.persisted_roles()?;
-        let editor = states
-            .get(&harness.primary_role)
-            .ok_or("editor was not saved")?;
-        assert_eq!(
-            editor.saved_window_mode,
-            SavedWindowMode::BorderlessFullscreen
-        );
-        assert_eq!((editor.logical_width, editor.logical_height), (900, 700));
-        assert_eq!(
-            editor.position,
-            PersistedPosition::MonitorOffset(IVec2::new(100, 80))
-        );
+        settle_and_assert_saved_editor(
+            &mut harness,
+            SavedWindowMode::BorderlessFullscreen,
+            "editor was not saved",
+        )?;
 
         // A full-screen launch has only the persisted windowed placement to retain.
         harness
@@ -742,22 +738,11 @@ mod tests {
             .world_mut()
             .entity_mut(window)
             .remove::<WindowedPlacement>();
-        for _ in 0..8 {
-            harness.app.update();
-        }
-        let states = harness.persisted_roles()?;
-        let editor = states
-            .get(&harness.primary_role)
-            .ok_or("full-screen launch was not saved")?;
-        assert_eq!(
-            editor.saved_window_mode,
-            SavedWindowMode::BorderlessFullscreen
-        );
-        assert_eq!((editor.logical_width, editor.logical_height), (900, 700));
-        assert_eq!(
-            editor.position,
-            PersistedPosition::MonitorOffset(IVec2::new(100, 80))
-        );
+        settle_and_assert_saved_editor(
+            &mut harness,
+            SavedWindowMode::BorderlessFullscreen,
+            "full-screen launch was not saved",
+        )?;
 
         harness.app.insert_resource(WindowDriverId(harness.driver));
         WindowPlacementConfiguration::toggle_full_screen(harness.app.world_mut(), window);
@@ -769,18 +754,32 @@ mod tests {
             .get_mut::<Window>(window)
             .ok_or("editor window missing")?
             .mode = WindowMode::Windowed;
-        for _ in 0..8 {
+        settle_and_assert_saved_editor(
+            &mut harness,
+            SavedWindowMode::Windowed,
+            "return was not saved",
+        )?;
+        Ok(())
+    }
+
+    fn settle_and_assert_saved_editor(
+        harness: &mut PersistenceHarness,
+        saved_window_mode: SavedWindowMode,
+        missing: &str,
+    ) -> Result<(), String> {
+        for _ in 0..SETTLE_UPDATES {
             harness.app.update();
         }
         let states = harness.persisted_roles()?;
-        let editor = states
-            .get(&harness.primary_role)
-            .ok_or("return was not saved")?;
-        assert_eq!(editor.saved_window_mode, SavedWindowMode::Windowed);
-        assert_eq!((editor.logical_width, editor.logical_height), (900, 700));
+        let editor = states.get(&harness.primary_role).ok_or(missing)?;
+        assert_eq!(editor.saved_window_mode, saved_window_mode);
+        assert_eq!(
+            UVec2::new(editor.logical_width, editor.logical_height),
+            FIXTURE_WINDOWED_SIZE
+        );
         assert_eq!(
             editor.position,
-            PersistedPosition::MonitorOffset(IVec2::new(100, 80))
+            PersistedPosition::MonitorOffset(FIXTURE_WINDOWED_OFFSET)
         );
         Ok(())
     }
@@ -819,11 +818,11 @@ mod tests {
             return Err("window driver received another configuration type".into());
         };
         assert_eq!(requested.saved_window_mode, SavedWindowMode::Windowed);
-        assert_eq!(requested.logical_size, UVec2::new(900, 700));
+        assert_eq!(requested.logical_size, FIXTURE_WINDOWED_SIZE);
         assert_eq!(
             requested.position,
             EstablishedWindowPosition::Restorable {
-                logical_offset: IVec2::new(100, 80),
+                logical_offset: FIXTURE_WINDOWED_OFFSET,
             }
         );
         Ok(())

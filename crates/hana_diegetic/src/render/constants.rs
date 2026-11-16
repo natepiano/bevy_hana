@@ -47,6 +47,14 @@ pub(super) const DEFAULT_ROUGHNESS: f32 = 0.95;
 pub(super) const FIRST_PRIVATE_VIEW_RENDER_LAYER: usize = 32;
 
 // sdf rendering
+/// Relative float rounding between a clip edge and the matching edge of the
+/// bounds it clips.
+///
+/// Scaled by the larger edge coordinate, a difference at or below it is
+/// rounding, not a trim. `clip::panel_viewport` converts the panel size from
+/// its layout unit back to points, so a viewport fitted to its content can end
+/// one or two ulps inside the content's bounds.
+pub(super) const SDF_CLIP_EDGE_ROUNDING: f32 = 4.0 * f32::EPSILON;
 /// World-space padding added to each SDF quad mesh beyond the SDF boundary.
 /// Gives the exterior anti-aliasing ramp room to render — without this, the
 /// mesh edge coincides with the SDF boundary and the AA fade-out is clipped.

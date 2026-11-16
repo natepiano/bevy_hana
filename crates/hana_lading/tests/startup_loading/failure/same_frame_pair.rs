@@ -14,9 +14,7 @@ use hana_lading::DiskAssets;
 use hana_lading::DiskAssetsPlugin;
 use hana_lading::LoadFailed;
 
-use crate::support::assert_fixture_absent;
-use crate::support::image_app;
-use crate::support::update_until;
+use crate::support;
 
 // fixture paths relative to the test asset source root
 const MISSING_SHARED_PATH: &str = "missing/shared.png";
@@ -55,8 +53,8 @@ struct PairLog {
 
 #[test]
 fn two_failures_one_frame() {
-    assert_fixture_absent(MISSING_SHARED_PATH);
-    let mut app = image_app();
+    support::assert_fixture_absent(MISSING_SHARED_PATH);
+    let mut app = support::image_app();
     app.add_plugins((
         DiskAssetsPlugin::<FailOne>::default(),
         DiskAssetsPlugin::<FailTwo>::default(),
@@ -76,7 +74,7 @@ fn two_failures_one_frame() {
         log.failures_before_resolution = Some(log.failed_frames.len());
     });
 
-    update_until(&mut app, |world| {
+    support::update_until(&mut app, |world| {
         world
             .resource::<PairLog>()
             .failures_before_resolution

@@ -9,7 +9,6 @@ use bevy::prelude::Color;
 // wrapping, and an overflowing column would print over its neighbor.
 pub(super) const COMMAND_KEYSTROKE_COLOR: Color = Color::srgb(0.58, 0.63, 0.66);
 pub(super) const COMMAND_KEYSTROKE_COLUMN_WIDTH: f32 = 180.0;
-pub(super) const COMMAND_KEYSTROKE_MAX_CHARS: usize = 24;
 pub(super) const COMMAND_ROW_HEIGHT: f32 = 17.0;
 pub(super) const COMMAND_TEXT_SIZE: f32 = 12.0;
 pub(super) const COMMAND_TITLE_COLOR: Color = Color::srgb(0.82, 0.88, 0.92);

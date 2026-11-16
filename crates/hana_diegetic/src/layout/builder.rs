@@ -28,6 +28,7 @@
 
 use std::marker::PhantomData;
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 
 use bevy::asset::Handle;
 use bevy::color::Alpha;
@@ -593,6 +594,19 @@ where
 }
 
 impl LayoutTree {
+    /// Resizes authored tooltip text before the shared frame receives its new label size.
+    pub(crate) fn resize_tooltip_text(&mut self, scale: f32) {
+        for element in &mut self.elements {
+            match &mut element.content {
+                ElementContent::Text { config, .. } => *config = config.scaled(scale),
+                ElementContent::RichText(paragraph) => {
+                    *paragraph = Arc::new(paragraph.scaled(scale));
+                },
+                _ => {},
+            }
+        }
+    }
+
     /// Resolves the tooltip's default body and plain-string text into the stored blueprint.
     pub(crate) fn apply_tooltip_look(&mut self, unstyled_text: &[usize], text_style: TextStyle) {
         for &index in unstyled_text {

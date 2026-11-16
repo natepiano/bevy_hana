@@ -18,6 +18,8 @@ pub(super) const DEFAULT_TOOLTIP_GAP: f32 = 8.0;
 pub(super) const QUAD_ANCHOR_COUNT: usize = 9;
 pub(super) const QUAD_EDGE_COUNT: usize = 4;
 pub(super) const TOOLTIP_VIEWPORT_MARGIN: f32 = 8.0;
+/// Clear pixels between a tooltip shadow and its target.
+pub(super) const CARD_HELP_CLEARANCE_PIXELS: f32 = 2.0;
 
 /// How far a tooltip's soft shadow paints past its body, in tooltip layout
 /// pixels.
@@ -29,7 +31,7 @@ pub(super) const TOOLTIP_VIEWPORT_MARGIN: f32 = 8.0;
 /// mesh and clip, batch culling bounds, and tooltip placement all read this one
 /// extent.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct TooltipShadowExtent {
+pub struct TooltipShadowExtent {
     /// Distance from the shadow's edge to where its blur reaches zero.
     blur_support_px:    f32,
     /// Distance the shadow's rectangle sits below the body.
@@ -49,7 +51,8 @@ impl TooltipShadowExtent {
 
     /// The painted bounds' reach past the body, in the same local units: the
     /// blur on every side, and the downward offset more below.
-    pub(crate) fn painted_reach(self, points_to_world: f32) -> TooltipPaintedReach {
+    #[must_use]
+    pub fn painted_reach(self, points_to_world: f32) -> TooltipPaintedReach {
         let local = self.panel_local(points_to_world);
         TooltipPaintedReach {
             sides: local.blur_support,
@@ -70,17 +73,17 @@ pub(crate) struct TooltipShadowLocalExtent {
 
 /// How far a tooltip's shadow paints past its body on each side.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct TooltipPaintedReach {
+pub struct TooltipPaintedReach {
     /// Reach past the left and right edges.
-    pub(crate) sides: f32,
+    pub sides: f32,
     /// Reach above the top edge: the blur.
-    pub(crate) above: f32,
+    pub above: f32,
     /// Reach below the bottom edge: the blur plus the downward offset.
-    pub(crate) below: f32,
+    pub below: f32,
 }
 
 /// Every tooltip's shadow extent.
-pub(crate) const TOOLTIP_SHADOW_EXTENT: TooltipShadowExtent = TooltipShadowExtent {
+pub const TOOLTIP_SHADOW_EXTENT: TooltipShadowExtent = TooltipShadowExtent {
     blur_support_px:    8.0,
     downward_offset_px: 3.0,
 };

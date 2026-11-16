@@ -27,6 +27,7 @@ use hana_kana::ToUsize;
 
 use super::PreparedPanelText;
 use super::TextRunOf;
+use crate::ReadableBackFrame;
 use crate::render::PackedPathRecord;
 use crate::render::PathQuadRecord;
 use crate::render::TextFitMode;
@@ -106,8 +107,9 @@ impl GlyphFitState {
 /// view or transform changes. Only active settling runs request another frame.
 #[derive(Default, Resource)]
 pub(super) struct SmallTextFitStates {
-    views: Vec<LayeredFitView>,
-    runs:  HashMap<Entity, GlyphFitState>,
+    views:     Vec<LayeredFitView>,
+    runs:      HashMap<Entity, GlyphFitState>,
+    back_runs: HashMap<Entity, GlyphFitState>,
 }
 
 /// Active camera views with non-empty viewports, ordered from the first drawn
@@ -183,7 +185,7 @@ fn fitted_offset(
         return Vec2::ZERO;
     }
     let layout_units_per_design = quad.rect_size / design_span;
-    let layout_em = path.text_em_size * layout_units_per_design.x;
+    let layout_em = path.text_em_size * layout_units_per_design.x.abs();
     let design_bottom =
         (1.0 - quad.uv_min.y - quad.uv_size.y).mul_add(bounds_size.y, path.bounds_min_size.y);
     let baseline_y = design_bottom.mul_add(-layout_units_per_design.y, quad.rect_min.y);
@@ -273,7 +275,16 @@ pub(super) fn settle_small_text_fit(
         ),
     >,
     panel_layers: Query<Option<&RenderLayers>>,
-    changed_panel_layers: Query<Entity, Or<(Added<RenderLayers>, Changed<RenderLayers>)>>,
+    changed_panel_layers: Query<
+        Entity,
+        Or<(
+            Added<RenderLayers>,
+            Changed<RenderLayers>,
+            Changed<ReadableBackFrame>,
+        )>,
+    >,
+    frames: Query<Ref<GlobalTransform>>,
+    back_panels: Query<(Entity, &ReadableBackFrame)>,
     mut removed_panel_layers: RemovedComponents<RenderLayers>,
     mut removed_labels: RemovedComponents<PreparedPanelText>,
     mut fit: ResMut<SmallTextFitStates>,
@@ -282,6 +293,7 @@ pub(super) fn settle_small_text_fit(
 ) {
     for entity in removed_labels.read() {
         fit.runs.remove(&entity);
+        fit.back_runs.remove(&entity);
     }
     let current_views = current_views(&cameras);
     let views_changed = fit.views != current_views;
@@ -291,11 +303,15 @@ pub(super) fn settle_small_text_fit(
         active.extend(labels.iter().map(|(entity, ..)| entity));
     } else {
         active.extend(
-            fit.runs.iter().filter_map(|(entity, state)| {
-                (state.motion != FitMotion::Resting).then_some(*entity)
-            }),
+            fit.runs
+                .iter()
+                .chain(&fit.back_runs)
+                .filter_map(|(entity, state)| {
+                    (state.motion != FitMotion::Resting).then_some(*entity)
+                }),
         );
     }
+    activate_moved_back_panels(&mut active, &labels, &back_panels, &frames);
     let mut panels_with_changed_layers: HashSet<Entity> = changed_panel_layers.iter().collect();
     panels_with_changed_layers.extend(removed_panel_layers.read());
     if !panels_with_changed_layers.is_empty() {
@@ -311,72 +327,120 @@ pub(super) fn settle_small_text_fit(
     for entity in active {
         let Ok((_, prepared, run_of)) = labels.get(entity) else {
             fit.runs.remove(&entity);
+            fit.back_runs.remove(&entity);
             continue;
         };
         let panel_layers = panel_render_layers(run_of.panel(), &panel_layers);
         let view = view_rendering_panel_layers(&fit.views, &panel_layers);
-        let run = RunStorageKey::from(entity);
-        let Some(transform) = backend.batch_store().run_transform(run) else {
-            fit.runs.remove(&entity);
-            continue;
-        };
-        let Some(quads) = backend.batch_store().run_path_records(run) else {
-            fit.runs.remove(&entity);
-            continue;
-        };
-        let fit_target = if prepared.style_gate.aligns_cap_baseline_to_pixels() {
-            GlyphFitTarget::CapBaseline
-        } else {
-            GlyphFitTarget::FigureCrossbar
-        };
-        let text_fit_mode = match fit_target {
-            GlyphFitTarget::FigureCrossbar => TextFitMode::SmallGlyph,
-            GlyphFitTarget::CapBaseline => TextFitMode::CapBaseline,
-        };
-        let needs_new_state = fit.runs.get(&entity).is_none_or(|state| {
-            state.offsets.len() != quads.len() || (prepared.is_changed() && !prepared.render_only)
-        });
-        if needs_new_state {
-            let offsets = fitted_offsets_for_view(&backend, quads, transform, view, fit_target);
-            backend
-                .batch_store_mut()
-                .update_run_text_fit(run, &offsets, text_fit_mode);
-            fit.runs.insert(
+        let front = RunStorageKey::from(entity);
+        let SmallTextFitStates {
+            runs, back_runs, ..
+        } = &mut *fit;
+        for (run, states) in [(front, runs), (front.back(), back_runs)] {
+            update_run_fit(
+                run,
                 entity,
-                GlyphFitState {
-                    view,
-                    last_transform: transform,
-                    target: offsets.clone(),
-                    offsets,
-                    motion: FitMotion::Resting,
-                },
+                &prepared,
+                view,
+                &mut backend,
+                states,
+                &mut redraw,
             );
-            continue;
         }
-        let Some(state) = fit.runs.get_mut(&entity) else {
-            continue;
+    }
+}
+
+/// Activates text only when its readable back's stock frame moves.
+fn activate_moved_back_panels(
+    active: &mut HashSet<Entity>,
+    labels: &Query<(Entity, Ref<PreparedPanelText>, &TextRunOf)>,
+    back_panels: &Query<(Entity, &ReadableBackFrame)>,
+    frames: &Query<Ref<GlobalTransform>>,
+) {
+    if back_panels.is_empty() {
+        return;
+    }
+    let moved_back_panels: HashSet<_> = back_panels
+        .iter()
+        .filter(|(_, frame)| frames.get(frame.0).is_ok_and(|pose| pose.is_changed()))
+        .map(|(panel, _)| panel)
+        .collect();
+    if !moved_back_panels.is_empty() {
+        active.extend(labels.iter().filter_map(|(entity, _, owner)| {
+            moved_back_panels.contains(&owner.panel()).then_some(entity)
+        }));
+    }
+}
+
+fn update_run_fit(
+    run: RunStorageKey,
+    entity: Entity,
+    prepared: &Ref<'_, PreparedPanelText>,
+    view: FitViewState,
+    backend: &mut GlyphCache,
+    states: &mut HashMap<Entity, GlyphFitState>,
+    redraw: &mut Option<MessageWriter<RequestRedraw>>,
+) {
+    let Some(transform) = backend.batch_store().run_transform(run) else {
+        states.remove(&entity);
+        return;
+    };
+    let Some(quads) = backend.batch_store().run_path_records(run) else {
+        states.remove(&entity);
+        return;
+    };
+    let fit_target = if prepared.style_gate.aligns_cap_baseline_to_pixels() {
+        GlyphFitTarget::CapBaseline
+    } else {
+        GlyphFitTarget::FigureCrossbar
+    };
+    let text_fit_mode = match fit_target {
+        GlyphFitTarget::FigureCrossbar => TextFitMode::SmallGlyph,
+        GlyphFitTarget::CapBaseline => TextFitMode::CapBaseline,
+    };
+    let needs_new_state = states.get(&entity).is_none_or(|state| {
+        state.offsets.len() != quads.len() || (prepared.is_changed() && !prepared.render_only)
+    });
+    if needs_new_state {
+        let offsets = fitted_offsets_for_view(backend, quads, transform, view, fit_target);
+        backend
+            .batch_store_mut()
+            .update_run_text_fit(run, &offsets, text_fit_mode);
+        states.insert(
+            entity,
+            GlyphFitState {
+                view,
+                last_transform: transform,
+                target: offsets.clone(),
+                offsets,
+                motion: FitMotion::Resting,
+            },
+        );
+        return;
+    }
+    let Some(state) = states.get_mut(&entity) else {
+        return;
+    };
+    if view != state.view || transform != state.last_transform {
+        state.view = view;
+        state.last_transform = transform;
+        state.motion = FitMotion::Moving;
+        return;
+    }
+    if state.motion == FitMotion::Moving {
+        state.target = fitted_offsets_for_view(backend, quads, transform, view, fit_target);
+        state.motion = FitMotion::Settling {
+            frames_left: SETTLE_FRAMES,
         };
-        if view != state.view || transform != state.last_transform {
-            state.view = view;
-            state.last_transform = transform;
-            state.motion = FitMotion::Moving;
-            continue;
-        }
-        if state.motion == FitMotion::Moving {
-            state.target = fitted_offsets_for_view(&backend, quads, transform, view, fit_target);
-            state.motion = FitMotion::Settling {
-                frames_left: SETTLE_FRAMES,
-            };
-        }
-        if state.settle_one_frame() {
-            backend
-                .batch_store_mut()
-                .update_run_text_fit(run, &state.offsets, text_fit_mode);
-            if state.motion != FitMotion::Resting
-                && let Some(redraw) = redraw.as_mut()
-            {
-                redraw.write(RequestRedraw);
-            }
+    }
+    if state.settle_one_frame() {
+        backend
+            .batch_store_mut()
+            .update_run_text_fit(run, &state.offsets, text_fit_mode);
+        if state.motion != FitMotion::Resting
+            && let Some(redraw) = redraw.as_mut()
+        {
+            redraw.write(RequestRedraw);
         }
     }
 }
@@ -413,6 +477,7 @@ mod tests {
     use crate::render;
     use crate::render::AntiAlias;
     use crate::render::PathExtendedMaterial;
+    use crate::render::PathRenderRecord;
     use crate::render::display_compensation::DisplayCompensationPlugin;
     use crate::render::material_table::BatchAssetWrites;
     use crate::render::material_table::MaterialTableAppendReady;
@@ -579,6 +644,221 @@ mod tests {
             retained, fresh,
             "first-frame drawn records; retained state {:?}, original offsets {fit_before:?}",
             fit.runs[&runs[0]],
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reflected_small_glyphs_retain_the_front_vertical_fit() -> Result<(), String> {
+        let mut app = fitting_app()?;
+        let panel = spawn_fit_panel(&mut app, 0, "27.4 ms")?;
+        for _ in 0..6 {
+            app.update();
+        }
+        app.world_mut()
+            .run_system_once(move |mut text: crate::PanelText| {
+                text.set_style(
+                    panel,
+                    &crate::PanelElementId::named("fit-label"),
+                    crate::TextStyle::new(crate::Mm(8.0))
+                        .with_shadow_mode(GlyphShadowMode::None)
+                        .with_readable_back(),
+                )
+            })
+            .map_err(|error| format!("back style: {error}"))?;
+        for _ in 0..6 {
+            app.update();
+        }
+        let run = app
+            .world_mut()
+            .query::<(Entity, &TextRunOf)>()
+            .iter(app.world())
+            .find(|(_, owner)| owner.panel() == panel)
+            .map(|(entity, _)| entity)
+            .ok_or("reflected run")?;
+        let backend = app.world().resource::<GlyphCache>();
+        let records = backend
+            .batch_store()
+            .run_path_records(RunStorageKey::from(run))
+            .ok_or("reflected glyphs")?;
+        let front = records;
+        let back = backend
+            .batch_store()
+            .run_path_records(RunStorageKey::from(run).back())
+            .ok_or("back glyph records")?;
+        assert_ne!(front, []);
+        assert_eq!(front.len(), back.len());
+        assert!(
+            front
+                .iter()
+                .any(|glyph| glyph.text_fit_offset != Vec2::ZERO)
+        );
+        for (front, back) in front.iter().zip(back) {
+            assert!(front.rect_size.x > 0.0 && back.rect_size.x < 0.0);
+            assert_eq!(front.packed_path_index, back.packed_path_index);
+            assert_eq!(front.uv_min, back.uv_min);
+            assert_eq!(front.uv_size, back.uv_size);
+            assert_eq!(front.text_fit_offset, back.text_fit_offset);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn translated_and_rotated_back_words_keep_the_shared_panel_depth() -> Result<(), String> {
+        let mut app = fitting_app()?;
+        let panel = spawn_fit_panel(&mut app, 0, "Log")?;
+        app.world_mut().entity_mut(panel).insert(
+            Transform::from_xyz(1.7, 0.5, -0.9).with_rotation(bevy::prelude::Quat::from_euler(
+                bevy::prelude::EulerRot::XYZ,
+                0.14,
+                0.38,
+                0.05,
+            )),
+        );
+        for _ in 0..6 {
+            app.update();
+        }
+        app.world_mut()
+            .run_system_once(move |mut text: crate::PanelText| {
+                text.set_style(
+                    panel,
+                    &crate::PanelElementId::named("fit-label"),
+                    crate::TextStyle::new(crate::Mm(8.0)).with_readable_back(),
+                );
+            })
+            .map_err(|error| format!("back style: {error}"))?;
+        for _ in 0..6 {
+            app.update();
+        }
+        let backend = app.world().resource::<GlyphCache>();
+        let mut records = 0;
+        for (_, batch) in backend.batch_store().batches() {
+            let faces = batch.run_records();
+            assert_eq!(faces.len(), 2);
+            assert_eq!(
+                faces[0].panel_plane, faces[1].panel_plane,
+                "coplanar text must retain the exact shared depth for OIT ordering"
+            );
+            records += faces.len();
+        }
+        assert_eq!(records, 2);
+        Ok(())
+    }
+
+    /// The front and back records of the one readable-back run on `panel`.
+    fn front_and_back_records(
+        app: &mut App,
+        panel: Entity,
+    ) -> Result<(PathRenderRecord, PathRenderRecord), String> {
+        let run = app
+            .world_mut()
+            .query::<(Entity, &TextRunOf)>()
+            .iter(app.world())
+            .find(|(_, owner)| owner.panel() == panel)
+            .map(|(entity, _)| entity)
+            .ok_or("readable-back run")?;
+        let front_matrix = app
+            .world()
+            .get::<GlobalTransform>(run)
+            .ok_or("run transform")?
+            .to_matrix();
+        let records: Vec<_> = app
+            .world()
+            .resource::<GlyphCache>()
+            .batch_store()
+            .batches()
+            .flat_map(|(_, batch)| batch.run_records().to_vec())
+            .collect();
+        let [first, second] = records[..] else {
+            return Err(format!(
+                "expected a front and a back record: {}",
+                records.len()
+            ));
+        };
+        if first.transform == front_matrix {
+            Ok((first, second))
+        } else if second.transform == front_matrix {
+            Ok((second, first))
+        } else {
+            Err("no record has the front run transform".to_owned())
+        }
+    }
+
+    #[test]
+    fn readable_back_frame_mirrors_the_back_and_follows_a_frame_only_move() -> Result<(), String> {
+        let mut app = fitting_app()?;
+        let panel = spawn_fit_panel(&mut app, 0, "Log")?;
+        let frame = app
+            .world_mut()
+            .spawn(Transform::from_xyz(0.3, 0.0, -0.2))
+            .id();
+        app.world_mut()
+            .entity_mut(panel)
+            .insert(ReadableBackFrame(frame));
+        for _ in 0..6 {
+            app.update();
+        }
+        app.world_mut()
+            .run_system_once(move |mut text: crate::PanelText| {
+                text.set_style(
+                    panel,
+                    &crate::PanelElementId::named("fit-label"),
+                    crate::TextStyle::new(crate::Mm(8.0)).with_readable_back(),
+                );
+            })
+            .map_err(|error| format!("back style: {error}"))?;
+        for _ in 0..6 {
+            app.update();
+        }
+        let (front, back) = front_and_back_records(&mut app, panel)?;
+        let frame_origin = Vec3::new(0.3, 0.0, -0.2);
+        // The frame's vertical axis is the mirror: depth reflects through the
+        // frame origin, and height does not change.
+        let tolerance = 1.0e-5;
+        assert!(
+            (back.transform.w_axis.z - 2.0f32.mul_add(frame_origin.z, -front.transform.w_axis.z))
+                .abs()
+                < tolerance,
+            "back depth mirrors through the frame: front={:?}, back={:?}",
+            front.transform.w_axis,
+            back.transform.w_axis
+        );
+        assert!((back.transform.w_axis.y - front.transform.w_axis.y).abs() < tolerance);
+        let normal = front.panel_plane.truncate();
+        assert!(
+            (back.panel_plane.w - 2.0f32.mul_add(-normal.dot(frame_origin), -front.panel_plane.w))
+                .abs()
+                < tolerance,
+            "back plane reflects through the frame: front={:?}, back={:?}",
+            front.panel_plane,
+            back.panel_plane
+        );
+
+        let step = Vec3::new(0.25, 0.0, 0.1);
+        app.world_mut()
+            .entity_mut(frame)
+            .insert(Transform::from_translation(frame_origin + step));
+        for _ in 0..6 {
+            app.update();
+        }
+        let (moved_front, moved_back) = front_and_back_records(&mut app, panel)?;
+        assert_eq!(moved_front.transform, front.transform, "the front stays");
+        assert_eq!(
+            moved_front.panel_plane, front.panel_plane,
+            "the front plane stays"
+        );
+        let shift = moved_back.transform.w_axis.truncate() - back.transform.w_axis.truncate();
+        assert!(
+            (shift - 2.0 * step).length() < tolerance,
+            "the back moves twice the frame step: shift={shift:?}, step={step:?}"
+        );
+        assert!(
+            (moved_back.panel_plane.w - 2.0f32.mul_add(-normal.dot(step), back.panel_plane.w))
+                .abs()
+                < tolerance,
+            "the back plane follows the frame: before={:?}, after={:?}",
+            back.panel_plane,
+            moved_back.panel_plane
         );
         Ok(())
     }

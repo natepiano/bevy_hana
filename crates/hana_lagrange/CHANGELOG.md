@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Requires Bevy 0.20.1.
+
 ## [0.6.0] - 2026-11-06
 
 ### Added

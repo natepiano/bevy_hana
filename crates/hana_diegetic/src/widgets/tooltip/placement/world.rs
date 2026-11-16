@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use bevy::camera::NormalizedRenderTarget;
 use bevy::camera::RenderTarget;
 #[cfg(test)]
@@ -11,6 +13,7 @@ use bevy::prelude::Camera;
 use bevy::prelude::ChildOf;
 use bevy::prelude::Commands;
 use bevy::prelude::ContainsEntity;
+use bevy::prelude::DetectChanges;
 use bevy::prelude::Entity;
 use bevy::prelude::GlobalTransform;
 use bevy::prelude::InheritedVisibility;
@@ -32,6 +35,8 @@ use bevy::prelude::Without;
 use bevy::window::PrimaryWindow;
 #[cfg(test)]
 use bevy::window::WindowRef;
+use hana_kana::Resolved;
+use hana_kana::ToF32;
 use hana_valence::ResolvedAnchorGeometry;
 
 use super::boundary;
@@ -45,6 +50,7 @@ use super::placement_state::TooltipPlacementRunCount;
 use super::placement_state::TooltipPlacementState;
 use super::placement_state::TooltipWidthLimit;
 use super::placement_state::WorldAnchorFrame;
+use super::placement_state::WorldSideRoom;
 use super::placement_state::WorldTargetGeometry;
 use super::placement_state::WorldTargetObservation;
 use super::placement_state::WorldTooltipOcclusion;
@@ -64,8 +70,10 @@ use super::world_target::TargetControlRow;
 use super::world_target::TooltipCameraView;
 use super::world_target::WorldTargetChange;
 use super::world_target::WorldTooltipCardSources;
+use super::world_target::WorldTooltipGap;
 use super::world_target::WorldTooltipPlacementArea;
 use super::world_target::WorldTooltipTarget;
+use crate::cascade::FontUnit;
 use crate::layout::Anchor;
 #[cfg(test)]
 use crate::layout::Text;
@@ -86,6 +94,8 @@ use crate::widgets::PanelWidget;
 use crate::widgets::TOOLTIP_SHADOW_EXTENT;
 use crate::widgets::WidgetAnchorRect;
 use crate::widgets::WidgetOf;
+use crate::widgets::constants::CARD_HELP_CLEARANCE_PIXELS;
+use crate::widgets::constants::TOOLTIP_VIEWPORT_MARGIN;
 use crate::widgets::tooltip;
 use crate::widgets::tooltip::MaterializedTooltip;
 #[cfg(test)]
@@ -103,6 +113,7 @@ use crate::widgets::tooltip::TooltipWidthConstraint;
 use crate::widgets::tooltip::TooltipWidthConstraintRequest;
 use crate::widgets::tooltip::declaration::TooltipPhase;
 use crate::widgets::tooltip::materialization::WorldTooltipRasterFitAwaitingPlacement;
+use crate::widgets::tooltip::resize::WorldTooltipResizeFitPending;
 
 // Keep a small physical gap between a world tooltip and the surface it describes.
 // Mesh targets can use meters while panels use points or pixels, so convert
@@ -113,6 +124,12 @@ pub(in crate::widgets::tooltip) const WORLD_TOOLTIP_FRONT_CLEARANCE_METERS: f32 
 /// the help paint and its card edge at every camera distance.
 const WORLD_TOOLTIP_HELP_CAP_GAP_LABEL_RATIO: f32 = 0.8;
 
+/// The physical label gaps for card controls and standalone geometry.
+pub(super) struct WorldTooltipHelpGaps {
+    pub(super) card_meters:     f32,
+    pub(super) geometry_meters: f32,
+}
+
 fn update_world_target_geometry(
     placement: &mut Mut<'_, TooltipPlacementState>,
     geometry: &WorldTargetGeometry,
@@ -122,7 +139,9 @@ fn update_world_target_geometry(
             placement.world_target = WorldTargetObservation::LastObserved(Box::new(*geometry));
             WorldTargetChange::Initial
         },
-        WorldTargetObservation::LastObserved(current) if **current == *geometry => {
+        WorldTargetObservation::LastObserved(current)
+            if world_target_geometry_matches(current, geometry) =>
+        {
             WorldTargetChange::Stable
         },
         WorldTargetObservation::LastObserved(_) => {
@@ -132,10 +151,39 @@ fn update_world_target_geometry(
     }
 }
 
+// Transform propagation can change an axis by one float step without moving the target.
+fn world_target_geometry_matches(
+    current: &WorldTargetGeometry,
+    next: &WorldTargetGeometry,
+) -> bool {
+    current.layout_unit == next.layout_unit
+        && current.world_per_layout_unit == next.world_per_layout_unit
+        && current.world_per_layout_unit_z.to_bits() == next.world_per_layout_unit_z.to_bits()
+        && current
+            .anchors
+            .iter()
+            .zip(&next.anchors)
+            .all(|(current, next)| {
+                let position_precision = current
+                    .position
+                    .abs()
+                    .max(next.position.abs())
+                    .max_element()
+                    * f32::EPSILON;
+                current
+                    .position
+                    .abs_diff_eq(next.position, position_precision)
+                    && current.right.abs_diff_eq(next.right, f32::EPSILON)
+                    && current.up.abs_diff_eq(next.up, f32::EPSILON)
+                    && current.normal.abs_diff_eq(next.normal, f32::EPSILON)
+            })
+}
+
 pub(in crate::widgets::tooltip) fn resolve_world_tooltip_placements(
     mut controllers: Query<(
         Entity,
         &Tooltip,
+        &Resolved<FontUnit>,
         &TooltipFor,
         &MaterializedTooltip,
         &TooltipPhase,
@@ -147,6 +195,7 @@ pub(in crate::widgets::tooltip) fn resolve_world_tooltip_placements(
         Option<&TooltipWidthConstraintRequest>,
         &mut TooltipPlacementState,
         Option<&WorldTooltipRasterFitAwaitingPlacement>,
+        Option<&WorldTooltipResizeFitPending>,
     )>,
     panels: Query<(&DiegeticPanel, &GlobalTransform)>,
     widgets: Query<&WidgetOf, With<PanelWidget>>,
@@ -189,6 +238,7 @@ pub(in crate::widgets::tooltip) fn resolve_world_tooltip_placements(
     for (
         controller,
         tooltip,
+        font_unit,
         tooltip_for,
         materialized,
         phase,
@@ -200,12 +250,13 @@ pub(in crate::widgets::tooltip) fn resolve_world_tooltip_placements(
         width_request,
         mut placement,
         raster_fit,
+        resize_fit,
     ) in &mut controllers
     {
         if materialized.space() != PanelSpace::World {
             continue;
         }
-        if phase.is_visible() && raster_fit.is_none() {
+        if phase.is_visible() && raster_fit.is_none() && resize_fit.is_none() {
             continue;
         }
         if matches!(width_request, Some(TooltipWidthConstraintRequest::Restore)) {
@@ -230,8 +281,10 @@ pub(in crate::widgets::tooltip) fn resolve_world_tooltip_placements(
             occluders.scene_occlusion(controller, materialized.target, camera_layers);
         let decision = keep_visible_world_tooltip_placement(
             tooltip,
+            font_unit.0.0,
             materialized,
             phase,
+            resize_fit.is_some(),
             panel,
             computed,
             panel_global,
@@ -250,15 +303,14 @@ pub(in crate::widgets::tooltip) fn resolve_world_tooltip_placements(
             &screen_panels,
             &mut scene_occlusion,
         );
-        if phase.is_visible()
-            && matches!(
-                decision,
-                TooltipPlacementDecision::Move(_) | TooltipPlacementDecision::Fits
-            )
-        {
-            commands
-                .entity(controller)
-                .remove::<WorldTooltipRasterFitAwaitingPlacement>();
+        if matches!(
+            decision,
+            TooltipPlacementDecision::Move(_) | TooltipPlacementDecision::Fits
+        ) {
+            commands.entity(controller).remove::<(
+                WorldTooltipRasterFitAwaitingPlacement,
+                WorldTooltipResizeFitPending,
+            )>();
         }
         apply_world_placement_decision(
             controller,
@@ -351,8 +403,9 @@ fn world_tooltip_front_attachment(
 struct WorldTooltipGeometrySnapshot<'a> {
     camera:                &'a Camera,
     camera_transform:      GlobalTransform,
-    window:                Entity,
+    window:                Option<Entity>,
     viewport:              Rect,
+    inputs_changed:        bool,
     window_size:           Vec2,
     target:                WorldTooltipTarget,
     source:                TooltipProjectedFootprint,
@@ -368,6 +421,7 @@ impl WorldTooltipGeometrySnapshot<'_> {
             global_transform: &self.camera_transform,
             window:           self.window,
             viewport:         self.viewport,
+            inputs_changed:   self.inputs_changed,
         }
     }
 }
@@ -400,6 +454,77 @@ impl NeighbouringControlBounds {
             self.clears_target_row(painted, target)
         } else {
             !self.overlaps(painted)
+        }
+    }
+
+    fn around_target(
+        target_entity: Entity,
+        target: &WorldTooltipTarget,
+        camera: &TooltipCameraView<'_>,
+        widgets: &Query<
+            (Entity, &WidgetOf, &WidgetAnchorRect, &GlobalTransform),
+            With<PanelWidget>,
+        >,
+        card_sources: &WorldTooltipCardSources<'_, '_>,
+    ) -> Option<Self> {
+        let mut neighbours =
+            Self::around(target_entity, camera, widgets).with_authored_row(&target.placement_area);
+        neighbours
+            .0
+            .extend(card_sources.target_obstacles(target_entity, camera, target.bounds)?);
+        Some(neighbours)
+    }
+
+    /// Slide beside obstacles without increasing the target's normal-axis gap.
+    fn adjacent_shifts(
+        &self,
+        area: &WorldTooltipPlacementArea,
+        side: TooltipSide,
+        natural: TooltipProjectedFootprint,
+        mut shifts: Vec<Vec2>,
+        target: PanelScreenBounds,
+    ) -> Vec<Vec2> {
+        if !matches!(
+            area,
+            WorldTooltipPlacementArea::Viewport(_) | WorldTooltipPlacementArea::AdjacentCard(_)
+        ) {
+            return shifts;
+        }
+        let axis = |point: Vec2| if side.is_vertical() { point.x } else { point.y };
+        let start = axis(natural.painted.top_left());
+        let end = start + axis(natural.painted.size());
+        let target_start = axis(target.top_left());
+        let target_end = target_start + axis(target.size());
+        let lower = target_start - end;
+        let upper = target_end - start;
+        for obstacle in &self.0 {
+            for offset in [
+                axis(obstacle.top_left()) - end - CARD_HELP_CLEARANCE_PIXELS,
+                axis(obstacle.top_left() + obstacle.size()) - start + CARD_HELP_CLEARANCE_PIXELS,
+            ] {
+                let offset = offset.clamp(lower, upper);
+                let mut shift = shifts[0];
+                if side.is_vertical() {
+                    shift.x = offset;
+                } else {
+                    shift.y = offset;
+                }
+                if !shifts.contains(&shift) {
+                    shifts.push(shift);
+                }
+            }
+        }
+        shifts.sort_by(|a, b| a.length_squared().total_cmp(&b.length_squared()));
+        shifts
+    }
+
+    /// Match the control regions that `clears_tooltip` protects for this pass.
+    fn protected_regions(&self, pass: CardPlacementPass, target: PanelScreenBounds) -> Vec<Rect> {
+        if pass.overlays_card() {
+            let row = self.target_row_bounds(target);
+            vec![Rect::from_corners(row.min, row.max).inflate(CARD_HELP_CLEARANCE_PIXELS)]
+        } else {
+            self.0.iter().copied().map(screen_rect).collect()
         }
     }
 
@@ -536,8 +661,10 @@ impl NeighbouringControlBounds {
 
 fn keep_visible_world_tooltip_placement(
     tooltip: &Tooltip,
+    font_unit: Unit,
     materialized: &MaterializedTooltip,
     phase: &TooltipPhase,
+    resize_fit: bool,
     panel: &DiegeticPanel,
     computed: &ComputedDiegeticPanel,
     panel_global: &GlobalTransform,
@@ -578,6 +705,7 @@ fn keep_visible_world_tooltip_placement(
 ) -> TooltipPlacementDecision {
     let geometry = match resolve_world_tooltip_geometry(
         tooltip,
+        font_unit,
         materialized,
         phase,
         panel,
@@ -600,7 +728,7 @@ fn keep_visible_world_tooltip_placement(
         Ok(geometry) => geometry,
         Err(decision) => return decision,
     };
-    if phase.is_visible() {
+    if phase.is_visible() && !resize_fit {
         return snap_refitted_world_tooltip(panel, computed, panel_global, placement, &geometry);
     }
     fit_world_tooltip(
@@ -635,9 +763,23 @@ fn snap_refitted_world_tooltip(
         global,
         target,
         attachment,
-        geometry.source.body,
+        geometry.source,
         &camera,
-        TooltipPixelAlignment::Nearest,
+        if matches!(
+            target.placement_area,
+            WorldTooltipPlacementArea::AdjacentCard(_)
+        ) {
+            TooltipPixelAlignment::PreserveSourceGap(viewport::preferred_side(
+                attachment,
+                attachment
+                    .offset()
+                    .to_layout_units(target.layout_unit)
+                    .truncate(),
+            ))
+        } else {
+            TooltipPixelAlignment::Nearest
+        },
+        ViewportContainment::Contain,
     );
     if shift == Vec2::ZERO {
         return TooltipPlacementDecision::Fits;
@@ -661,6 +803,7 @@ fn snap_refitted_world_tooltip(
 
 fn resolve_world_tooltip_geometry<'a>(
     tooltip: &Tooltip,
+    font_unit: Unit,
     materialized: &MaterializedTooltip,
     phase: &TooltipPhase,
     panel: &DiegeticPanel,
@@ -709,17 +852,21 @@ fn resolve_world_tooltip_geometry<'a>(
     let camera = initial_camera_view.camera;
     let current_camera =
         camera_entity.and_then(|entity| current_camera_transform(entity, camera_transforms));
-    let camera_transform = current_camera.unwrap_or(*initial_camera_view.global_transform);
+    let camera_transform = current_camera
+        .as_ref()
+        .map_or(*initial_camera_view.global_transform, |(global, _)| *global);
     let mut camera_view = TooltipCameraView {
         camera:           initial_camera_view.camera,
         global_transform: &camera_transform,
         window:           initial_camera_view.window,
         viewport:         initial_camera_view.viewport,
+        inputs_changed:   initial_camera_view.inputs_changed
+            || current_camera.as_ref().is_some_and(|(_, changed)| *changed),
     };
-    let Ok(window) = windows.get(camera_view.window) else {
-        return Err(TooltipPlacementDecision::Unavailable);
-    };
-    let window_size = Vec2::new(window.width(), window.height());
+    let window_size = camera_view
+        .camera
+        .logical_target_size()
+        .ok_or(TooltipPlacementDecision::Unavailable)?;
     camera_view.viewport = world_placement_area(
         &camera_view,
         materialized.target,
@@ -729,10 +876,7 @@ fn resolve_world_tooltip_geometry<'a>(
     );
     let Some(target) = world_target::world_tooltip_target(
         materialized,
-        tooltip
-            .drawn_label_size
-            .to_meters(materialized.layout_unit.meters_per_unit())
-            * WORLD_TOOLTIP_HELP_CAP_GAP_LABEL_RATIO,
+        world_help_gaps(tooltip, font_unit, materialized.layout_unit),
         WORLD_TOOLTIP_FRONT_CLEARANCE_METERS,
         &camera_view,
         panels,
@@ -742,9 +886,14 @@ fn resolve_world_tooltip_geometry<'a>(
     ) else {
         return Err(TooltipPlacementDecision::Unavailable);
     };
-    let neighbouring_controls =
-        NeighbouringControlBounds::around(materialized.target, &camera_view, panel_widgets)
-            .with_authored_row(&target.placement_area);
+    let neighbouring_controls = NeighbouringControlBounds::around_target(
+        materialized.target,
+        &target,
+        &camera_view,
+        panel_widgets,
+        card_sources,
+    )
+    .ok_or(TooltipPlacementDecision::Unavailable)?;
     if world_reference_hidden(
         &target,
         &camera_view,
@@ -771,28 +920,50 @@ fn resolve_world_tooltip_geometry<'a>(
     ) else {
         return Err(TooltipPlacementDecision::Unavailable);
     };
-    let shadow_width = source.painted.size().x - source.body.size().x;
-    let Some(usable_width) =
-        viewport::usable_viewport_axis(camera_view.viewport.width() - shadow_width)
-    else {
-        return Err(TooltipPlacementDecision::Unavailable);
-    };
-    let Some(window_width) =
-        viewport::available_window_axis(camera_view.viewport.width() - shadow_width)
-    else {
-        return Err(TooltipPlacementDecision::Unavailable);
-    };
+    let widths = world_tooltip_width_budget(source, camera_view.viewport)
+        .ok_or(TooltipPlacementDecision::Unavailable)?;
     Ok(WorldTooltipGeometrySnapshot {
         camera,
         camera_transform,
         window: camera_view.window,
         viewport: camera_view.viewport,
+        inputs_changed: camera_view.inputs_changed,
         window_size,
         target,
         source,
-        usable_width,
-        window_width,
+        usable_width: widths.usable,
+        window_width: widths.window,
         neighbouring_controls,
+    })
+}
+
+fn world_help_gaps(tooltip: &Tooltip, font_unit: Unit, layout_unit: Unit) -> WorldTooltipHelpGaps {
+    WorldTooltipHelpGaps {
+        card_meters:     tooltip
+            .drawn_label_size
+            .to_meters(layout_unit.meters_per_unit())
+            * WORLD_TOOLTIP_HELP_CAP_GAP_LABEL_RATIO,
+        geometry_meters: tooltip
+            .drawn_label_size
+            .to_meters(font_unit.meters_per_unit())
+            * WORLD_TOOLTIP_HELP_CAP_GAP_LABEL_RATIO,
+    }
+}
+
+struct WorldTooltipWidthBudget {
+    usable: f32,
+    window: f32,
+}
+
+fn world_tooltip_width_budget(
+    source: TooltipProjectedFootprint,
+    viewport: Rect,
+) -> Option<WorldTooltipWidthBudget> {
+    let shadow_width = source.painted.size().x - source.body.size().x;
+    let available = viewport.width() - shadow_width;
+    Some(WorldTooltipWidthBudget {
+        usable: viewport::usable_viewport_axis(available)?,
+        window: viewport::available_window_axis(available)?,
     })
 }
 
@@ -837,19 +1008,23 @@ fn fit_world_tooltip(
     if !matches!(layout_decision, TooltipPlacementDecision::Fits) {
         return layout_decision;
     }
-    if placement.side_room_width == SideRoomWidth::Applied {
+    if placement.side_room_width == SideRoomWidth::Applied
+        && TooltipPlacementState::observe_world_side_room(
+            placement,
+            &world_side_room(materialized, geometry, screen_panels, primary_window),
+        )
+    {
+        // A narrowed tooltip grows back only when its side room changes. The
+        // widest rejected side would otherwise make it grow and fail each frame.
         let reflow = world_side_room_reflow(
             materialized,
             target,
             panel,
-            source,
-            geometry.viewport,
-            usable_width,
+            panel_global,
             width_limit,
-            &camera_view,
+            geometry,
             screen_panels,
             primary_window,
-            geometry.window_size,
             true,
         );
         if matches!(reflow, TooltipPlacementDecision::ConstrainSideRoomWidth(_)) {
@@ -872,20 +1047,66 @@ fn fit_world_tooltip(
     if !matches!(decision, TooltipPlacementDecision::Unavailable) {
         return decision;
     }
-    world_side_room_reflow(
+    let reflow = world_side_room_reflow(
         materialized,
         target,
         panel,
-        source,
-        geometry.viewport,
-        usable_width,
+        panel_global,
         width_limit,
-        &camera_view,
+        geometry,
         screen_panels,
         primary_window,
-        geometry.window_size,
         false,
-    )
+    );
+    if matches!(reflow, TooltipPlacementDecision::ConstrainSideRoomWidth(_)) {
+        TooltipPlacementState::observe_world_side_room(
+            placement,
+            &world_side_room(materialized, geometry, screen_panels, primary_window),
+        );
+    }
+    reflow
+}
+
+/// Reads the inputs that set a world tooltip's side room this frame.
+fn world_side_room(
+    materialized: &MaterializedTooltip,
+    geometry: &WorldTooltipGeometrySnapshot<'_>,
+    screen_panels: &Query<
+        (
+            Entity,
+            &DiegeticPanel,
+            Option<&Transform>,
+            Option<&ResolvedScreenPanelPosition>,
+            Option<&Visibility>,
+            Option<&InheritedVisibility>,
+            Option<&PanelAttachmentAuthored>,
+            Option<&ChildOf>,
+        ),
+        Without<MaterializedTooltip>,
+    >,
+    primary_window: &Query<Entity, With<PrimaryWindow>>,
+) -> WorldSideRoom {
+    let camera = geometry.camera_view();
+    WorldSideRoom {
+        view:          WorldTooltipView {
+            clip_from_view:  camera.camera.clip_from_view(),
+            world_from_view: camera.global_transform.to_matrix(),
+            viewport:        camera.viewport,
+        },
+        window_size:   geometry.window_size,
+        screen_panels: geometry.window.map_or_else(Vec::new, |window| {
+            boundary::floating_panel_bounds(
+                window,
+                materialized.target,
+                materialized.target,
+                &TooltipScreenLayer::World(geometry.camera.order),
+                geometry.window_size,
+                screen_panels,
+                primary_window,
+            )
+            .collect()
+        }),
+    }
 }
 
 fn world_placement_area(
@@ -907,8 +1128,11 @@ fn world_placement_area(
     >,
     primary_window: &Query<Entity, With<PrimaryWindow>>,
 ) -> Rect {
+    let Some(window) = camera.window else {
+        return camera.viewport;
+    };
     boundary::placement_area(
-        camera.window,
+        window,
         target,
         target,
         TooltipScreenLayer::World(camera.camera.order),
@@ -984,16 +1208,18 @@ fn world_reference_hidden(
 ) -> bool {
     !viewport::bounds_intersect_viewport(target.bounds, camera.viewport)
         || reveal_occlusion::world_target_fully_occluded(target, camera, scene_occlusion)
-        || boundary::floating_panel_covers(
-            camera.window,
-            materialized.target,
-            materialized.target,
-            TooltipScreenLayer::World(camera.camera.order),
-            window_size,
-            target.bounds,
-            screen_panels,
-            primary_window,
-        )
+        || camera.window.is_some_and(|window| {
+            boundary::floating_panel_covers(
+                window,
+                materialized.target,
+                materialized.target,
+                TooltipScreenLayer::World(camera.camera.order),
+                window_size,
+                target.bounds,
+                screen_panels,
+                primary_window,
+            )
+        })
 }
 
 fn world_layout_decision(
@@ -1047,11 +1273,9 @@ fn world_side_room_reflow(
     materialized: &MaterializedTooltip,
     target: &WorldTooltipTarget,
     panel: &DiegeticPanel,
-    source: TooltipProjectedFootprint,
-    viewport: Rect,
-    usable_width: f32,
+    panel_global: &GlobalTransform,
     width_limit: TooltipWidthLimit,
-    camera: &TooltipCameraView<'_>,
+    geometry: &WorldTooltipGeometrySnapshot<'_>,
     screen_panels: &Query<
         (
             Entity,
@@ -1066,54 +1290,208 @@ fn world_side_room_reflow(
         Without<MaterializedTooltip>,
     >,
     primary_window: &Query<Entity, With<PrimaryWindow>>,
-    window_size: Vec2,
     previously_applied: bool,
 ) -> TooltipPlacementDecision {
-    let gap = materialized
-        .authored_attachment
-        .offset()
-        .to_layout_units(target.layout_unit)
-        .truncate()
-        .length();
-    let body = source.body;
-    let projected_gap = gap * body.size().x / panel.width();
-    let shadow_side = (source.painted.size().x - body.size().x) * 0.5;
-    let shadow_above = body.top_left().y - source.painted.top_left().y;
-    let right_start =
-        target.bounds.top_left().x + target.bounds.size().x + projected_gap + shadow_side;
-    let left_end = target.bounds.top_left().x - projected_gap - shadow_side;
-    let right = viewport.max.x - crate::widgets::constants::TOOLTIP_VIEWPORT_MARGIN - right_start;
-    let left = left_end - viewport.min.x - crate::widgets::constants::TOOLTIP_VIEWPORT_MARGIN;
-    let top = (target.bounds.size().y - body.size().y).mul_add(0.5, target.bounds.top_left().y);
-    let rooms = boundary::horizontal_room_before_floating_panels(
-        camera.window,
-        materialized.target,
-        materialized.target,
-        TooltipScreenLayer::World(camera.camera.order),
-        window_size,
-        top - shadow_above,
-        source.painted.size().y,
-        right_start,
-        left_end,
-        [right.min(usable_width), left.min(usable_width)],
-        screen_panels,
-        primary_window,
-    );
-    let available = rooms.into_iter().fold(0.0, f32::max);
-    let desired = panel.width() * available / body.size().x;
-    if desired.is_finite()
-        && desired > 0.0
-        && (previously_applied || desired < panel.width() - 0.01)
+    let camera = geometry.camera_view();
+    let (authored, authored_layout, preferred, passes) =
+        world_placement_context(materialized, target);
+    let mut width = 0.0_f32;
+    for &pass in passes {
+        for (side, slide) in slides_for_placement_pass(preferred, target, camera.viewport, pass) {
+            let (source_anchor, target_anchor, layout_offset) =
+                world_candidate_layout(authored_layout, authored, preferred, side);
+            let attachment = panel_attachment(source_anchor, target_anchor, layout_offset);
+            let Some(natural) =
+                projected_world_tooltip_footprint(panel, panel_global, target, attachment, &camera)
+            else {
+                continue;
+            };
+            let candidate = WorldTooltipCandidate {
+                source_anchor,
+                target_anchor,
+                layout_offset,
+                target_anchor_frame: target.anchor(target_anchor),
+                natural,
+                pass,
+                side,
+            };
+            // Reflow from the same spots the placement tries, slides beside
+            // neighbouring controls included. The snap leaves each spot where
+            // it is: a tooltip too wide for the viewport would otherwise slide
+            // over its target, and the room beside the target would go unmeasured.
+            for shift in world_candidate_shifts(
+                target,
+                pass,
+                side,
+                slide,
+                natural,
+                camera.viewport,
+                &geometry.neighbouring_controls,
+            ) {
+                let WorldHelpProjection::Placed { footprint, .. } = project_world_help_for_shift(
+                    candidate,
+                    shift,
+                    panel,
+                    panel_global,
+                    target,
+                    &camera,
+                    &geometry.neighbouring_controls,
+                    ViewportContainment::Free,
+                ) else {
+                    continue;
+                };
+                if !tooltip_clears_source(footprint.painted, target.bounds) {
+                    continue;
+                }
+                let available = world_candidate_body_width(
+                    materialized.target,
+                    footprint,
+                    side,
+                    pass,
+                    geometry,
+                    screen_panels,
+                    primary_window,
+                );
+                let desired = panel.width() * available / footprint.body.size().x;
+                if desired.is_finite()
+                    && desired > 0.0
+                    && (previously_applied || desired < panel.width() - 0.01)
+                {
+                    width = width.max(desired);
+                }
+            }
+        }
+    }
+    if width > 0.0
         && match width_limit {
             TooltipWidthLimit::Natural => true,
             TooltipWidthLimit::Constrained(current) => {
-                (desired - current).abs() > 0.01 && (previously_applied || desired < current)
+                (width - current).abs() > 0.01 && (previously_applied || width < current)
             },
         }
     {
-        TooltipPlacementDecision::ConstrainSideRoomWidth(desired)
+        TooltipPlacementDecision::ConstrainSideRoomWidth(width)
     } else {
         TooltipPlacementDecision::Unavailable
+    }
+}
+
+/// Limit the body using the same shifted, pixel-aligned paint as the final checks.
+fn world_candidate_body_width(
+    tooltip_target: Entity,
+    footprint: TooltipProjectedFootprint,
+    side: TooltipSide,
+    pass: CardPlacementPass,
+    geometry: &WorldTooltipGeometrySnapshot<'_>,
+    screen_panels: &Query<
+        (
+            Entity,
+            &DiegeticPanel,
+            Option<&Transform>,
+            Option<&ResolvedScreenPanelPosition>,
+            Option<&Visibility>,
+            Option<&InheritedVisibility>,
+            Option<&PanelAttachmentAuthored>,
+            Option<&ChildOf>,
+        ),
+        Without<MaterializedTooltip>,
+    >,
+    primary_window: &Query<Entity, With<PrimaryWindow>>,
+) -> f32 {
+    let boundary = world_candidate_boundary(geometry, pass);
+    let painted_min = footprint.painted.top_left();
+    let painted_max = painted_min + footprint.painted.size();
+    let center = footprint.body.point(Anchor::Center).x;
+    let right_start = if side.is_vertical() {
+        center
+    } else {
+        painted_min.x
+    };
+    let left_end = if side.is_vertical() {
+        center
+    } else {
+        painted_max.x
+    };
+    let mut rooms = [boundary.max.x - right_start, left_end - boundary.min.x];
+    if !inside_card_overlay(&geometry.target.placement_area, pass) {
+        for control in geometry
+            .neighbouring_controls
+            .protected_regions(pass, geometry.target.bounds)
+        {
+            let control_min = control.min;
+            let control_max = control.max;
+            if control_min.y < painted_max.y && control_max.y > painted_min.y {
+                if control_max.x > right_start {
+                    rooms[0] = rooms[0].min(control_min.x - right_start);
+                }
+                if control_min.x < left_end {
+                    rooms[1] = rooms[1].min(left_end - control_max.x);
+                }
+            }
+        }
+    }
+    let rooms = geometry.window.map_or(rooms, |window| {
+        boundary::horizontal_room_before_floating_panels(
+            window,
+            tooltip_target,
+            tooltip_target,
+            TooltipScreenLayer::World(geometry.camera.order),
+            geometry.window_size,
+            painted_min.y,
+            footprint.painted.size().y,
+            right_start,
+            left_end,
+            rooms,
+            screen_panels,
+            primary_window,
+        )
+    });
+    let body_min = footprint.body.top_left().x;
+    let body_max = body_min + footprint.body.size().x;
+    let shadow_left = body_min - painted_min.x;
+    let shadow_right = painted_max.x - body_max;
+    let width = match side {
+        TooltipSide::Right => rooms[0] - shadow_left - shadow_right,
+        TooltipSide::Left => rooms[1] - shadow_left - shadow_right,
+        TooltipSide::Above | TooltipSide::Below => {
+            2.0 * (rooms[0] - shadow_right).min(rooms[1] - shadow_left)
+        },
+    };
+    // Body-size rounding and position rounding can each move an edge by half a physical pixel.
+    let pixel = geometry
+        .camera
+        .logical_viewport_size()
+        .zip(geometry.camera.physical_viewport_size())
+        .map_or(0.0, |(logical, physical)| logical.x / physical.x.to_f32());
+    width - pixel
+}
+
+fn world_candidate_boundary(
+    geometry: &WorldTooltipGeometrySnapshot<'_>,
+    pass: CardPlacementPass,
+) -> Rect {
+    let margin = if pass.overlays_card() {
+        0.0
+    } else {
+        crate::widgets::constants::TOOLTIP_VIEWPORT_MARGIN
+    };
+    let viewport = geometry.viewport.inflate(-margin);
+    if let WorldTooltipPlacementArea::Card { bounds, .. } = &geometry.target.placement_area
+        && matches!(
+            pass,
+            CardPlacementPass::Authored
+                | CardPlacementPass::Inside
+                | CardPlacementPass::InsideOverlapping
+        )
+    {
+        let card = screen_rect(*bounds);
+        viewport.intersect(if matches!(pass, CardPlacementPass::Authored) {
+            card
+        } else {
+            card.inflate(-CARD_HELP_CLEARANCE_PIXELS)
+        })
+    } else {
+        viewport
     }
 }
 
@@ -1156,15 +1534,14 @@ fn projected_world_tooltip_placement(
                 continue;
             };
             let target_anchor_frame = target.anchor(target_anchor);
-            let shifts = placement_candidate_shifts(
-                &target.placement_area,
+            let shifts = world_candidate_shifts(
+                target,
                 pass,
                 side,
                 slide,
                 natural,
-                target.bounds.top_left() + target.bounds.size() * 0.5,
-                target.bounds,
                 camera.viewport,
+                neighbouring_controls,
             );
             for shift in shifts {
                 let candidate = WorldTooltipCandidate {
@@ -1191,7 +1568,21 @@ fn projected_world_tooltip_placement(
         }
         // Spots clear of the border first, then fewest covered regions; the
         // stable sort keeps side and shift order on ties.
-        spots.sort_by_key(|spot| (spot.crosses_border, spot.covered));
+        spots.sort_by(|left, right| {
+            (left.crosses_border, left.covered)
+                .cmp(&(right.crosses_border, right.covered))
+                .then_with(|| {
+                    if matches!(
+                        target.placement_area,
+                        WorldTooltipPlacementArea::AdjacentCard(_)
+                    ) {
+                        left.tangent_displacement
+                            .total_cmp(&right.tangent_displacement)
+                    } else {
+                        Ordering::Equal
+                    }
+                })
+        });
         if let Some(spot) = spots.into_iter().find(|spot| {
             world_tooltip_candidate_is_visible(
                 panel,
@@ -1222,6 +1613,38 @@ fn projected_world_tooltip_placement(
     TooltipPlacementDecision::Unavailable
 }
 
+fn world_candidate_shifts(
+    target: &WorldTooltipTarget,
+    pass: CardPlacementPass,
+    side: TooltipSide,
+    movement: TooltipSlide,
+    natural: TooltipProjectedFootprint,
+    viewport: Rect,
+    neighbours: &NeighbouringControlBounds,
+) -> Vec<Vec2> {
+    let shifts = placement_candidate_shifts(
+        &target.placement_area,
+        pass,
+        side,
+        movement,
+        natural,
+        target.bounds.top_left() + target.bounds.size() * 0.5,
+        target.bounds,
+        viewport,
+    );
+    // An authored spot may keep its preferred side only while it stays aligned.
+    // Sliding to a corner must compete with the centered spots on other sides.
+    if matches!(pass, CardPlacementPass::Authored)
+        && matches!(
+            target.placement_area,
+            WorldTooltipPlacementArea::AdjacentCard(_)
+        )
+    {
+        return shifts;
+    }
+    neighbours.adjacent_shifts(&target.placement_area, side, natural, shifts, target.bounds)
+}
+
 fn world_help_spot_for_shift(
     candidate: WorldTooltipCandidate,
     shift: Vec2,
@@ -1231,42 +1654,83 @@ fn world_help_spot_for_shift(
     camera: &TooltipCameraView<'_>,
     neighbouring_controls: &NeighbouringControlBounds,
 ) -> WorldSpotEvaluation {
+    let cleared_shift =
+        world_help_clearance_shift(&candidate, shift, target, neighbouring_controls);
+    if matches!(
+        card_spot_fit(
+            &target.placement_area,
+            candidate.pass,
+            candidate.side,
+            candidate.natural,
+            cleared_shift,
+            target.bounds,
+        ),
+        CardSpotFit::Refused
+    ) {
+        return WorldSpotEvaluation::Refused;
+    }
+    match project_world_help_for_shift(
+        candidate,
+        shift,
+        panel,
+        panel_global,
+        target,
+        camera,
+        neighbouring_controls,
+        ViewportContainment::Contain,
+    ) {
+        WorldHelpProjection::Unavailable => WorldSpotEvaluation::Refused,
+        WorldHelpProjection::Placed {
+            attachment,
+            footprint,
+        } => checked_world_help_spot(
+            candidate.pass,
+            candidate.side,
+            attachment,
+            footprint,
+            target,
+            neighbouring_controls,
+        ),
+    }
+}
+
+fn project_world_help_for_shift(
+    candidate: WorldTooltipCandidate,
+    shift: Vec2,
+    panel: &DiegeticPanel,
+    panel_global: &GlobalTransform,
+    target: &WorldTooltipTarget,
+    camera: &TooltipCameraView<'_>,
+    neighbouring_controls: &NeighbouringControlBounds,
+    containment: ViewportContainment,
+) -> WorldHelpProjection {
     let shift = world_help_clearance_shift(&candidate, shift, target, neighbouring_controls);
     let WorldTooltipCandidate {
         source_anchor,
         target_anchor,
         layout_offset,
         target_anchor_frame,
-        natural,
         pass,
         side,
+        ..
     } = candidate;
-    if matches!(
-        card_spot_fit(
-            &target.placement_area,
-            pass,
-            side,
-            natural,
-            shift,
-            target.bounds
-        ),
-        CardSpotFit::Refused
-    ) {
-        return WorldSpotEvaluation::Refused;
-    }
     let Some(layout_offset) =
         shifted_world_layout_offset(layout_offset, shift, target_anchor_frame, target, camera)
     else {
-        return WorldSpotEvaluation::Refused;
+        return WorldHelpProjection::Unavailable;
     };
     let attachment = panel_attachment(source_anchor, target_anchor, layout_offset);
     let Some(placed) =
         projected_world_tooltip_footprint(panel, panel_global, target, attachment, camera)
     else {
-        return WorldSpotEvaluation::Refused;
+        return WorldHelpProjection::Unavailable;
     };
-    let alignment = if pass.overlays_card() {
-        TooltipPixelAlignment::ClearOfTargetRow(side)
+    let alignment = if pass.overlays_card()
+        || matches!(
+            target.placement_area,
+            WorldTooltipPlacementArea::AdjacentCard(_)
+        ) {
+        TooltipPixelAlignment::PreserveSourceGap(side)
     } else {
         TooltipPixelAlignment::Nearest
     };
@@ -1275,9 +1739,10 @@ fn world_help_spot_for_shift(
         panel_global,
         target,
         attachment,
-        placed.body,
+        placed,
         camera,
         alignment,
+        containment,
     );
     let layout_offset = if pixel_shift == Vec2::ZERO {
         layout_offset
@@ -1289,7 +1754,7 @@ fn world_help_spot_for_shift(
             target,
             camera,
         ) else {
-            return WorldSpotEvaluation::Refused;
+            return WorldHelpProjection::Unavailable;
         };
         snapped
     };
@@ -1297,16 +1762,12 @@ fn world_help_spot_for_shift(
     let Some(placed) =
         projected_world_tooltip_footprint(panel, panel_global, target, attachment, camera)
     else {
-        return WorldSpotEvaluation::Refused;
+        return WorldHelpProjection::Unavailable;
     };
-    checked_world_help_spot(
-        pass,
-        side,
+    WorldHelpProjection::Placed {
         attachment,
-        placed,
-        target,
-        neighbouring_controls,
-    )
+        footprint: placed,
+    }
 }
 
 /// The shadow belongs to the tooltip. Screen and world placement share this rule.
@@ -1325,11 +1786,7 @@ pub(super) fn tooltip_source_clearance_shift(
     shift: Vec2,
     source: PanelScreenBounds,
 ) -> Vec2 {
-    if let Ok(shifted) = PanelScreenBounds::new(painted.top_left() + shift, painted.size())
-        && tooltip_clears_source(shifted, source)
-    {
-        return Vec2::ZERO;
-    }
+    // Every source keeps the full shadow plus the same row padding.
     NeighbouringControlBounds(Vec::new()).target_row_clearance_shift(
         side,
         painted.top_left() + shift,
@@ -1351,14 +1808,13 @@ fn world_help_clearance_shift(
             candidate.natural.painted.size(),
             target.bounds,
         );
-    } else if !matches!(candidate.pass, CardPlacementPass::Authored) {
-        shift += tooltip_source_clearance_shift(
-            candidate.side,
-            candidate.natural.painted,
-            shift,
-            target.bounds,
-        );
     }
+    shift += tooltip_source_clearance_shift(
+        candidate.side,
+        candidate.natural.painted,
+        shift,
+        target.bounds,
+    );
     shift
 }
 
@@ -1397,6 +1853,16 @@ fn checked_world_help_spot(
         painted: placed.painted,
         crosses_border: !target.placement_area.clears_border(placed.painted),
         covered,
+        tangent_displacement: {
+            let displacement = placed.painted.top_left() + placed.painted.size() * 0.5
+                - target.bounds.top_left()
+                - target.bounds.size() * 0.5;
+            if side.is_vertical() {
+                displacement.x.abs()
+            } else {
+                displacement.y.abs()
+            }
+        },
         occlusion: if inside_overlay {
             WorldTooltipOcclusion::CardOverlay
         } else {
@@ -1419,22 +1885,64 @@ const fn inside_card_overlay(area: &WorldTooltipPlacementArea, pass: CardPlaceme
     )
 }
 
-/// Pixel alignment that preserves a flipped overlay's row clearance.
+/// Whether the pixel snap may move a body to keep it inside the viewport.
+#[derive(Clone, Copy)]
+enum ViewportContainment {
+    /// The snap keeps the painted footprint inside the viewport.
+    Contain,
+    /// The snap only rounds, so the spot stays beside its target.
+    Free,
+}
+
+/// Pixel alignment that preserves the source clearance already solved.
 #[derive(Clone, Copy)]
 enum TooltipPixelAlignment {
     Nearest,
-    ClearOfTargetRow(TooltipSide),
+    PreserveSourceGap(TooltipSide),
 }
 
 impl TooltipPixelAlignment {
     fn aligned(self, point: Vec2) -> Vec2 {
         let mut aligned = point.round();
-        if let Self::ClearOfTargetRow(side) = self {
+        if let Self::PreserveSourceGap(side) = self {
             match side {
-                TooltipSide::Above => aligned.y = point.y.floor(),
-                TooltipSide::Below => aligned.y = point.y.ceil(),
-                TooltipSide::Left => aligned.x = point.x.floor(),
-                TooltipSide::Right => aligned.x = point.x.ceil(),
+                TooltipSide::Above | TooltipSide::Below => aligned.y = point.y,
+                TooltipSide::Left | TooltipSide::Right => aligned.x = point.x,
+            }
+        }
+        aligned
+    }
+
+    fn within_viewport(
+        self,
+        point: Vec2,
+        footprint: TooltipProjectedFootprint,
+        viewport: Rect,
+        scale: Vec2,
+    ) -> Vec2 {
+        let mut aligned = self.aligned(point);
+        let margin = Vec2::splat(TOOLTIP_VIEWPORT_MARGIN);
+        let body = footprint.body.top_left();
+        let painted = footprint.painted;
+        let minimum = (viewport.min + margin + body - painted.top_left()) * scale;
+        let maximum = (viewport.max - margin + body - painted.top_left() - painted.size()) * scale;
+        for axis in 0..2 {
+            // The normal coordinate holds the exact shadow-plus-padding gap.
+            if matches!(
+                self,
+                Self::PreserveSourceGap(TooltipSide::Left | TooltipSide::Right)
+            ) && axis == 0
+                || matches!(
+                    self,
+                    Self::PreserveSourceGap(TooltipSide::Above | TooltipSide::Below)
+                ) && axis == 1
+            {
+                continue;
+            }
+            let low = minimum[axis].ceil();
+            let high = maximum[axis].floor();
+            if low <= high {
+                aligned[axis] = aligned[axis].clamp(low, high);
             }
         }
         aligned
@@ -1449,9 +1957,10 @@ fn view_aligned_body_pixel_shift(
     panel_global: &GlobalTransform,
     target: &WorldTooltipTarget,
     attachment: PanelAttachment,
-    body: PanelScreenBounds,
+    footprint: TooltipProjectedFootprint,
     camera: &TooltipCameraView<'_>,
     alignment: TooltipPixelAlignment,
+    containment: ViewportContainment,
 ) -> Vec2 {
     let Some(corners) = world_tooltip_corners(panel, panel_global, target, attachment) else {
         return Vec2::ZERO;
@@ -1485,13 +1994,20 @@ fn view_aligned_body_pixel_shift(
         return Vec2::ZERO;
     };
     let physical_per_logical = physical.as_vec2() / logical;
+    let body = footprint.body;
     let physical_per_layout =
         body.size() * physical_per_logical / Vec2::new(panel.width(), panel.height());
     if !physical_per_layout.is_finite() || physical_per_layout.min_element() < 1.0 {
         return Vec2::ZERO;
     }
-    alignment.aligned(body.top_left() * physical_per_logical) / physical_per_logical
-        - body.top_left()
+    let point = body.top_left() * physical_per_logical;
+    let aligned = match containment {
+        ViewportContainment::Contain => {
+            alignment.within_viewport(point, footprint, camera.viewport, physical_per_logical)
+        },
+        ViewportContainment::Free => alignment.aligned(point),
+    };
+    aligned / physical_per_logical - body.top_left()
 }
 
 fn world_placement_context(
@@ -1511,13 +2027,40 @@ fn world_placement_context(
     );
     let authored_layout = authored.offset().to_layout_units(target.layout_unit);
     let preferred = viewport::preferred_side(authored, authored_layout.truncate());
+    let authored_layout = resolve_world_placement_gap(authored_layout, preferred, target);
+    let authored = match target.gap {
+        WorldTooltipGap::Authored => authored,
+        WorldTooltipGap::DrawnLabel(_) => panel_attachment(
+            authored.source_anchor(),
+            authored.target_anchor(),
+            authored_layout,
+        ),
+    };
     let passes = card_placement_passes(&target.placement_area);
     (authored, authored_layout, preferred, passes)
 }
 
+fn resolve_world_placement_gap(
+    mut authored_layout: Vec3,
+    preferred: TooltipSide,
+    target: &WorldTooltipTarget,
+) -> Vec3 {
+    if let WorldTooltipGap::DrawnLabel(meters) = target.gap {
+        let gap = preferred.gap_offset(meters) / target.world_per_layout_unit;
+        if preferred.is_vertical() {
+            authored_layout.y = gap.y;
+        } else {
+            authored_layout.x = gap.x;
+        }
+    }
+    authored_layout
+}
+
 const fn card_placement_passes(area: &WorldTooltipPlacementArea) -> &'static [CardPlacementPass] {
     match area {
-        WorldTooltipPlacementArea::Viewport(_) => {
+        // Marked elements must apply their containment slide before accepting a spot.
+        WorldTooltipPlacementArea::Viewport(_) => &[CardPlacementPass::Inside],
+        WorldTooltipPlacementArea::AdjacentCard(_) => {
             &[CardPlacementPass::Authored, CardPlacementPass::Inside]
         },
         WorldTooltipPlacementArea::Card {
@@ -1569,16 +2112,18 @@ fn world_tooltip_candidate_is_visible(
     } else {
         viewport::bounds_fit_viewport(painted.top_left(), painted.size(), camera.viewport)
     };
-    let clears_floating = !boundary::floating_panel_overlaps(
-        camera.window,
-        tooltip_target,
-        tooltip_target,
-        TooltipScreenLayer::World(camera.camera.order),
-        window_size,
-        painted,
-        screen_panels,
-        primary_window,
-    );
+    let clears_floating = !camera.window.is_some_and(|window| {
+        boundary::floating_panel_overlaps(
+            window,
+            tooltip_target,
+            tooltip_target,
+            TooltipScreenLayer::World(camera.camera.order),
+            window_size,
+            painted,
+            screen_panels,
+            primary_window,
+        )
+    });
     let clears_scene = occlusion == WorldTooltipOcclusion::CardOverlay
         || !tooltip_quad_occluded(
             panel,
@@ -1637,16 +2182,27 @@ enum CardSpotFit {
 /// One spot a help box may take, with what it paints and the occupied card
 /// regions it covers.
 struct HelpSpot {
-    attachment:     PanelAttachment,
-    painted:        PanelScreenBounds,
+    attachment:           PanelAttachment,
+    painted:              PanelScreenBounds,
     /// Whether it lies across the border it keeps clear of, kept only when no
     /// clear spot shows.
-    crosses_border: bool,
-    covered:        usize,
-    occlusion:      WorldTooltipOcclusion,
+    crosses_border:       bool,
+    covered:              usize,
+    /// Distance along the selected edge from the target's center line.
+    tangent_displacement: f32,
+    occlusion:            WorldTooltipOcclusion,
+}
+
+enum WorldHelpProjection {
+    Unavailable,
+    Placed {
+        attachment: PanelAttachment,
+        footprint:  TooltipProjectedFootprint,
+    },
 }
 
 /// Geometry shared by the screen shifts evaluated for one side of a world tooltip.
+#[derive(Clone, Copy)]
 struct WorldTooltipCandidate {
     source_anchor:       Anchor,
     target_anchor:       Anchor,
@@ -1661,8 +2217,6 @@ enum WorldSpotEvaluation {
     Refused,
     Fits(HelpSpot),
 }
-
-const CARD_HELP_CLEARANCE_PIXELS: f32 = 2.0;
 
 /// The sides tried in `pass`, in order, each with how the help slides there.
 /// Card help slides by its card's rule, so its slide is the placement area's.
@@ -1679,7 +2233,11 @@ fn slides_for_placement_pass(
         )];
     }
     let sides = match (&target.placement_area, pass) {
-        (WorldTooltipPlacementArea::Viewport(bounds), _) => {
+        (
+            WorldTooltipPlacementArea::Viewport(bounds)
+            | WorldTooltipPlacementArea::AdjacentCard(bounds),
+            _,
+        ) => {
             let sides = viewport::tooltip_side_order(preferred, target.bounds, viewport);
             return bounds.slide_order(sides, target.bounds).collect();
         },
@@ -1757,7 +2315,10 @@ fn placement_candidate_shifts(
     let alignment = target.top_left() + target.size() * 0.5 - body.top_left() - body.size() * 0.5;
     match (area, pass) {
         (_, CardPlacementPass::Authored) => vec![Vec2::ZERO],
-        (WorldTooltipPlacementArea::Viewport(_), _) => {
+        (
+            WorldTooltipPlacementArea::Viewport(_) | WorldTooltipPlacementArea::AdjacentCard(_),
+            _,
+        ) => {
             vec![tooltip_slide.shift(side, natural, target_point, viewport)]
         },
         (
@@ -1889,7 +2450,7 @@ fn along_edge_in_viewport(
     alignment: Vec2,
     viewport: Rect,
 ) -> f32 {
-    let margin = crate::widgets::constants::TOOLTIP_VIEWPORT_MARGIN;
+    let margin = TOOLTIP_VIEWPORT_MARGIN;
     let axis = |point: Vec2| if side.is_vertical() { point.x } else { point.y };
     axis(alignment)
         + viewport::containment_shift(
@@ -2124,11 +2685,13 @@ fn panel_attachment(
 fn current_camera_transform(
     camera: Entity,
     transforms: &Query<(Ref<Transform>, Option<&ChildOf>)>,
-) -> Option<GlobalTransform> {
+) -> Option<(GlobalTransform, bool)> {
     let mut entity = camera;
     let mut chain = Vec::new();
+    let mut changed = false;
     loop {
         let (transform, parent) = transforms.get(entity).ok()?;
+        changed |= transform.is_changed();
         chain.push(*transform);
         let Some(parent) = parent else {
             break;
@@ -2141,7 +2704,7 @@ fn current_camera_transform(
         .fold(GlobalTransform::IDENTITY, |global, transform| {
             global.mul_transform(transform)
         });
-    Some(global)
+    Some((global, changed))
 }
 
 fn compatible_tooltip_camera<'a>(
@@ -2158,19 +2721,38 @@ fn compatible_tooltip_camera<'a>(
 ) -> Option<TooltipCameraView<'a>> {
     let (camera, global_transform, render_target, camera_layers) =
         cameras.get(input.camera).ok()?;
+    let inputs_changed = input.is_changed()
+        || camera.is_changed()
+        || global_transform.is_changed()
+        || render_target
+            .as_ref()
+            .is_some_and(bevy::ecs::change_detection::DetectChanges::is_changed)
+        || camera_layers
+            .as_ref()
+            .is_some_and(bevy::ecs::change_detection::DetectChanges::is_changed);
     let camera = camera.into_inner();
     let global_transform = global_transform.into_inner();
     if !camera.is_active {
         return None;
     }
     let primary = primary_window.single().ok();
-    let window_entity = match render_target?.into_inner().normalize(primary)? {
-        NormalizedRenderTarget::Window(window) => window.entity(),
-        NormalizedRenderTarget::Image(_)
-        | NormalizedRenderTarget::TextureView(_)
-        | NormalizedRenderTarget::None { .. } => return None,
-    };
-    let window = windows.get(window_entity).ok()?;
+    let (window_entity, target_size, target_changed) =
+        match render_target?.into_inner().normalize(primary)? {
+            NormalizedRenderTarget::Window(window) => {
+                let entity = window.entity();
+                let window = windows.get(entity).ok()?;
+                (
+                    Some(entity),
+                    Vec2::new(window.width(), window.height()),
+                    window.is_changed(),
+                )
+            },
+            NormalizedRenderTarget::Image(_) => (None, camera.logical_target_size()?, false),
+            NormalizedRenderTarget::TextureView(_) | NormalizedRenderTarget::None { .. } => {
+                return None;
+            },
+        };
+    let inputs_changed = inputs_changed || target_changed;
     let camera_layers = camera_layers.map_or_else(
         || RenderLayers::layer(0),
         |render_layers| render_layers.into_inner().clone(),
@@ -2178,14 +2760,15 @@ fn compatible_tooltip_camera<'a>(
     if !camera_layers.intersects(&materialized.render_layers) {
         return None;
     }
-    let viewport = camera.logical_viewport_rect().unwrap_or_else(|| {
-        tooltip::zero_origin_viewport(Vec2::new(window.width(), window.height()))
-    });
+    let viewport = camera
+        .logical_viewport_rect()
+        .unwrap_or_else(|| tooltip::zero_origin_viewport(target_size));
     viewport::valid_screen_size(viewport.size()).then_some(TooltipCameraView {
         camera,
         global_transform,
         window: window_entity,
         viewport,
+        inputs_changed,
     })
 }
 
@@ -2369,6 +2952,49 @@ mod tests {
     const DISTANT_WORLD_TARGET_Z: f32 = -45.0;
 
     const GEOMETRY_EPSILON: f32 = 1e-4;
+
+    #[test]
+    fn pixel_alignment_preserves_the_solved_source_gap_on_every_side() {
+        let point = Vec2::new(12.2, 20.7);
+        for side in [TooltipSide::Above, TooltipSide::Below] {
+            assert_eq!(
+                TooltipPixelAlignment::PreserveSourceGap(side).aligned(point),
+                Vec2::new(12.0, 20.7),
+            );
+        }
+        for side in [TooltipSide::Left, TooltipSide::Right] {
+            assert_eq!(
+                TooltipPixelAlignment::PreserveSourceGap(side).aligned(point),
+                Vec2::new(12.2, 21.0),
+            );
+        }
+    }
+
+    #[test]
+    fn tangent_pixel_alignment_keeps_the_shadow_inside_the_viewport() {
+        let body = PanelScreenBounds::new(Vec2::new(22.0, 380.0), Vec2::new(1408.0, 208.0))
+            .expect("body bounds");
+        let painted = PanelScreenBounds::new(
+            Vec2::new(19.920_315, 375.9203),
+            Vec2::new(1412.1555, 211.68988),
+        )
+        .expect("painted bounds");
+        let footprint = TooltipProjectedFootprint { body, painted };
+        let viewport = Rect::from_corners(Vec2::ZERO, Vec2::new(1440.0, 900.0));
+        let aligned = TooltipPixelAlignment::PreserveSourceGap(TooltipSide::Below).within_viewport(
+            body.top_left(),
+            footprint,
+            viewport,
+            Vec2::ONE,
+        );
+        let shift = aligned - body.top_left();
+        assert_eq!(aligned, Vec2::new(21.0, 380.0));
+        assert!(viewport::bounds_fit_viewport(
+            painted.top_left() + shift,
+            painted.size(),
+            viewport,
+        ));
+    }
 
     const MATERIALIZATION_UPDATES: usize = 5;
 
@@ -2773,7 +3399,7 @@ mod tests {
         );
         assert_eq!(shifts.len(), 1);
         let top_left = help.top_left() + shifts[0];
-        let margin = crate::widgets::constants::TOOLTIP_VIEWPORT_MARGIN;
+        let margin = TOOLTIP_VIEWPORT_MARGIN;
         assert!((top_left.y - 256.0).abs() < GEOMETRY_EPSILON);
         assert!((top_left.x - margin).abs() < GEOMETRY_EPSILON);
         assert!(viewport::bounds_fit_viewport(
@@ -3262,8 +3888,9 @@ mod tests {
         let camera_view = TooltipCameraView {
             camera,
             global_transform: camera_global,
-            window: Entity::PLACEHOLDER,
+            window: None,
             viewport,
+            inputs_changed: false,
         };
         let plane = crate::panel::PanelPlane::from_panel(panel, panel_global).ok()?;
         world_target::projected_points_bounds(
@@ -3275,6 +3902,95 @@ mod tests {
             ],
             &camera_view,
         )
+    }
+
+    #[test]
+    fn non_card_geometry_help_keeps_the_card_control_label_gap() -> Result<(), String> {
+        #[derive(Clone, Copy, Debug)]
+        enum HelpLabel {
+            Millimeters(f32),
+            Meters(f32),
+            DefaultPoints,
+        }
+        for label in [
+            HelpLabel::Millimeters(40.0),
+            HelpLabel::Millimeters(80.0),
+            HelpLabel::Meters(0.04),
+            HelpLabel::DefaultPoints,
+        ] {
+            let mut gaps = Vec::new();
+            for card_control in [false, true] {
+                let mut app = materialization_app();
+                let window = app
+                    .world_mut()
+                    .spawn((Window::default(), PrimaryWindow))
+                    .id();
+                let camera = spawn_presentation_camera(&mut app, window, RenderLayers::layer(0));
+                let half = Vec3A::new(0.04, 0.025, 0.0);
+                let target = mesh_target(&mut app, half);
+                if card_control {
+                    let card =
+                        Rect::from_corners(Vec2::new(-half.x, -half.y), Vec2::new(half.x, half.y));
+                    app.world_mut().entity_mut(target).insert(
+                        world_target::TooltipCardOccupiedRegions::new(target, card, vec![card]),
+                    );
+                }
+                let tooltip = Tooltip::new(El::column());
+                let mut tooltip = match label {
+                    HelpLabel::Millimeters(size) => tooltip
+                        .with_label_size(crate::Mm(size))
+                        .font_unit(Unit::Meters),
+                    HelpLabel::Meters(size) if card_control => tooltip
+                        .with_label_size(crate::Mm(size * 1000.0))
+                        .font_unit(Unit::Meters),
+                    HelpLabel::Meters(size) => {
+                        tooltip.with_label_size(size).font_unit(Unit::Meters)
+                    },
+                    HelpLabel::DefaultPoints if card_control => {
+                        tooltip.with_label_size(Pt(TextStyle::default().size()))
+                    },
+                    HelpLabel::DefaultPoints => tooltip,
+                };
+                tooltip.text("Help");
+                let controller = standalone_world_tooltip(&mut app, target, tooltip);
+                app.update();
+                prepare_tooltip(&mut app, controller);
+                app.world_mut()
+                    .entity_mut(controller)
+                    .insert(TooltipPresentationCamera::new(camera));
+                update_materialization(&mut app);
+                let help = projected_world_panel_bounds(&app, controller, camera)
+                    .ok_or("the tooltip must have projected drawing bounds")?;
+                let lens = app.world().get::<Camera>(camera).ok_or("camera missing")?;
+                let pose = app
+                    .world()
+                    .get::<GlobalTransform>(camera)
+                    .ok_or("camera pose missing")?;
+                let corners = [
+                    Vec3::new(-half.x, -half.y, 0.0),
+                    Vec3::new(half.x, half.y, 0.0),
+                ];
+                let points = corners.map(|point| lens.world_to_viewport(pose, point));
+                let [first, second] = points;
+                let first = first.map_err(|error| error.to_string())?;
+                let second = second.map_err(|error| error.to_string())?;
+                let min = first.min(second);
+                let max = first.max(second);
+                let help_min = help.top_left();
+                let help_max = help_min + help.size();
+                let gap = (help_min.x - max.x)
+                    .max(min.x - help_max.x)
+                    .max(help_min.y - max.y)
+                    .max(min.y - help_max.y);
+                assert!(gap > 0.0, "help must clear its source: {gap}");
+                gaps.push(gap);
+            }
+            assert!(
+                (gaps[0] - gaps[1]).abs() <= 2.0,
+                "a geometry tooltip must keep the card control's gap at label size {label:?}: {gaps:?}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -3642,8 +4358,8 @@ mod tests {
             .insert(TooltipPresentationCamera::new(camera));
 
         for _ in 0..MATERIALIZATION_UPDATES {
-            // Bevy's text-input IME system writes Window each frame, even when
-            // the viewport is unchanged. Camera writes can be unchanged too.
+            // The IME system writes Window each frame without changing its values.
+            // Camera writes can also preserve their values.
             let ime_enabled = app
                 .world()
                 .get::<Window>(window)

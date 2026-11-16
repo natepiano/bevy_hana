@@ -1,8 +1,8 @@
 # bevy_hana
 
-**Generated. Do not send pull requests here.** The tree is force-synced on each
-release; anything committed directly is overwritten. Issues are welcome -- fixes
-arrive here on the next release.
+**Generated. Do not send pull requests here.** The mirror syncs on each main landing.
+Each crate release adds a tagged release commit.
+The generator replaces direct changes. Report problems through issues.
 
 ## Published crates
 

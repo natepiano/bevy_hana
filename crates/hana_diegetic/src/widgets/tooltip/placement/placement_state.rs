@@ -3,7 +3,6 @@ use bevy::camera::visibility::RenderLayers;
 #[cfg(test)]
 use bevy::prelude::App;
 use bevy::prelude::Component;
-#[cfg(test)]
 use bevy::prelude::Entity;
 use bevy::prelude::Mat4;
 use bevy::prelude::Mut;
@@ -19,7 +18,6 @@ use bevy::window::PrimaryWindow;
 
 use crate::layout::Unit;
 use crate::panel::PanelAttachment;
-#[cfg(test)]
 use crate::panel::PanelScreenBounds;
 use crate::widgets::constants::QUAD_ANCHOR_COUNT;
 #[cfg(test)]
@@ -39,6 +37,7 @@ pub(in crate::widgets::tooltip) struct TooltipPlacementState {
     pub(super) world_occlusion:                 WorldTooltipOcclusion,
     pub(super) side_room_width:                 SideRoomWidth,
     world_view:                                 WorldTooltipViewObservation,
+    world_side_room:                            WorldSideRoomObservation,
     screen_viewport_width:                      ScreenViewportWidth,
 }
 
@@ -51,6 +50,7 @@ impl TooltipPlacementState {
             world_occlusion: WorldTooltipOcclusion::SceneBound,
             side_room_width: SideRoomWidth::Unused,
             world_view: WorldTooltipViewObservation::Unobserved,
+            world_side_room: WorldSideRoomObservation::Unobserved,
             screen_viewport_width: ScreenViewportWidth::Unobserved,
         }
     }
@@ -84,6 +84,38 @@ impl TooltipPlacementState {
         placement.world_view = WorldTooltipViewObservation::LastObserved(view);
         changed
     }
+
+    /// Records the side room and reports whether it differs from the last record.
+    pub(super) fn observe_world_side_room(
+        placement: &mut Mut<'_, Self>,
+        room: &WorldSideRoom,
+    ) -> bool {
+        if matches!(
+            &placement.world_side_room,
+            WorldSideRoomObservation::LastObserved(last) if **last == *room
+        ) {
+            return false;
+        }
+        placement.world_side_room = WorldSideRoomObservation::LastObserved(Box::new(room.clone()));
+        true
+    }
+}
+
+/// The inputs that set a world tooltip's side room.
+///
+/// A narrowed tooltip grows back only when these change. Rejected wide sides
+/// otherwise make it grow, fail and narrow again on every frame.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct WorldSideRoom {
+    pub(super) view:          WorldTooltipView,
+    pub(super) window_size:   Vec2,
+    pub(super) screen_panels: Vec<(Entity, PanelScreenBounds)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum WorldSideRoomObservation {
+    Unobserved,
+    LastObserved(Box<WorldSideRoom>),
 }
 
 /// The camera values that can change a world tooltip's available room.

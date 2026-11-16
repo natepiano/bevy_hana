@@ -17,6 +17,7 @@ use hana_diegetic::Sizing;
 use hana_diegetic::Text;
 use hana_diegetic::TextStyle;
 use hana_diegetic::TextWrap;
+use hana_diegetic::render_shortcut_hint;
 use hana_lagrange::ActionColumnLabel;
 use hana_lagrange::CameraControlActivation;
 use hana_lagrange::CameraControlBinding;
@@ -25,6 +26,7 @@ use hana_lagrange::ControlSpeed;
 use hana_lagrange::FreeCamActiveDirections;
 use hana_lagrange::InteractionSources;
 use hana_lagrange::SlowModeHint;
+use hana_rubric::ShortcutHint;
 
 use super::constants::ACTIVE_COLOR;
 use super::constants::CONNECTOR_CAP_SIZE;
@@ -67,6 +69,7 @@ enum SpeedColumn {
 #[derive(Clone, Copy)]
 struct GuidanceTableRow<'a> {
     label:                &'a str,
+    shortcut:             &'a ShortcutHint,
     value:                &'a str,
     label_activation:     CameraControlActivation,
     value_activation:     CameraControlActivation,
@@ -232,6 +235,7 @@ fn build_guidance_table(
                 build_slow_mode_row(
                     builder,
                     binding_label,
+                    &snapshot.slow_mode_shortcut,
                     display.slow_mode_active(),
                     label,
                     active,
@@ -247,6 +251,7 @@ fn build_guidance_table(
 fn build_slow_mode_row(
     builder: &mut LayoutBuilder,
     binding_label: &str,
+    shortcut: &ShortcutHint,
     slow_mode_active: bool,
     label: &TextStyle,
     active: &TextStyle,
@@ -277,16 +282,16 @@ fn build_slow_mode_row(
                     .height(Sizing::FIT)
                     .align_y(AlignY::Center),
                 |builder| {
-                    builder.text(
+                    render_shortcut_hint(builder, shortcut, binding_label, style, |word| {
                         screen_panels::screen_panel_ink_text(
-                            binding_label,
+                            word,
                             style.clone(),
                             fonts,
                             label_size,
                             PanelTextEdge::Last,
                         )
-                        .wrap(TextWrap::None),
-                    );
+                        .wrap(TextWrap::None)
+                    });
                     builder.with(
                         El::new()
                             .width(Sizing::grow_min(FEEDER_CELL_MIN))
@@ -528,16 +533,17 @@ fn build_guidance_table_row(
                     .height(row_height)
                     .align_y(row_alignment),
                 |builder| {
-                    builder.text(
+                    let style = style_for_activation(row.label_activation, label, active);
+                    render_shortcut_hint(builder, row.shortcut, row.label, style, |word| {
                         screen_panels::screen_panel_ink_text(
-                            row.label,
-                            style_for_activation(row.label_activation, label, active).clone(),
+                            word,
+                            style.clone(),
                             fonts,
                             label_size,
                             edge,
                         )
-                        .wrap(TextWrap::None),
-                    );
+                        .wrap(TextWrap::None)
+                    });
                     builder.with(
                         El::new()
                             .width(Sizing::grow_min(FEEDER_CELL_MIN))
@@ -619,6 +625,7 @@ fn table_rows_for_action(
             };
             GuidanceTableRow {
                 label:                row.label(),
+                shortcut:             row.shortcut(),
                 value:                action_value(row),
                 label_activation:     activation,
                 value_activation:     activation,
@@ -637,6 +644,7 @@ fn table_rows_for_action(
             .filter_map(|binding| {
                 setting_value(binding).map(|(value, activation)| GuidanceTableRow {
                     label: binding.label.as_str(),
+                    shortcut: &binding.shortcut,
                     value,
                     label_activation: CameraControlActivation::Inactive,
                     value_activation: activation,
@@ -706,6 +714,7 @@ mod tests {
     use hana_lagrange::FreeCamDirectionFilter;
     use hana_lagrange::InteractionSources;
     use hana_lagrange::SlowModeHint;
+    use hana_rubric::ShortcutHint;
 
     use super::build_guidance_tree;
     use crate::camera_control_panel::display::CameraGuidanceDisplay;
@@ -804,12 +813,13 @@ mod tests {
     fn free_camera_actions_reach_the_header_right_inset() -> Result<(), String> {
         let fonts = FontRegistry::new().map_err(|error| error.to_string())?;
         let snapshot = CameraGuidanceSnapshot {
-            camera_label: "Free camera".into(),
-            mode_label:   "Controls".into(),
-            mode_value:   "Mouse and keyboard".into(),
-            slow_mode:    SlowModeHint::NoDisplayableSlowToggle,
-            settings:     Vec::new(),
-            rows:         vec![
+            camera_label:       "Free camera".into(),
+            mode_label:         "Controls".into(),
+            mode_value:         "Mouse and keyboard".into(),
+            slow_mode_shortcut: ShortcutHint::NotAShortcut,
+            slow_mode:          SlowModeHint::NoDisplayableSlowToggle,
+            settings:           Vec::new(),
+            rows:               vec![
                 CameraGuidanceRow::new(CameraGuidanceAction::Look, "Right drag"),
                 CameraGuidanceRow::new(CameraGuidanceAction::Translate, "WASD"),
             ],
@@ -914,12 +924,13 @@ mod tests {
         assert!(fonts.is_ok());
         let Ok(fonts) = fonts else { return };
         let snapshot = |value| CameraGuidanceSnapshot {
-            camera_label: "Camera".to_string(),
-            mode_label:   "Mode".to_string(),
-            mode_value:   "Orbit".to_string(),
-            slow_mode:    SlowModeHint::NoDisplayableSlowToggle,
-            settings:     Vec::new(),
-            rows:         vec![
+            camera_label:       "Camera".to_string(),
+            mode_label:         "Mode".to_string(),
+            mode_value:         "Orbit".to_string(),
+            slow_mode_shortcut: ShortcutHint::NotAShortcut,
+            slow_mode:          SlowModeHint::NoDisplayableSlowToggle,
+            settings:           Vec::new(),
+            rows:               vec![
                 CameraGuidanceRow::new(CameraGuidanceAction::Zoom, "Zoom").with_action_label(value),
             ],
         };
@@ -1066,11 +1077,13 @@ mod tests {
 
     fn alignment_snapshot() -> CameraGuidanceSnapshot {
         CameraGuidanceSnapshot {
-            camera_label: "Camera".into(),
-            mode_label:   "Controls".into(),
-            mode_value:   "Custom".into(),
-            slow_mode:    SlowModeHint::ToggledBy("Alt S".into()),
-            settings:     vec![CameraControlBinding {
+            camera_label:       "Camera".into(),
+            mode_label:         "Controls".into(),
+            mode_value:         "Custom".into(),
+            slow_mode_shortcut: ShortcutHint::NotAShortcut,
+            slow_mode:          SlowModeHint::ToggledBy("Alt S".into()),
+            settings:           vec![CameraControlBinding {
+                shortcut:            ShortcutHint::NotAShortcut,
                 action:              CameraControlAction::Look,
                 label:               "Alt I".into(),
                 interaction_sources: InteractionSources::KEYBOARD,
@@ -1082,7 +1095,7 @@ mod tests {
                 action_label:        ActionColumnLabel::ActionName,
                 direction:           FreeCamDirectionFilter::AnySourceEngagement,
             }],
-            rows:         vec![
+            rows:               vec![
                 CameraGuidanceRow::new(CameraGuidanceAction::ZoomOut, "wheel"),
                 CameraGuidanceRow::new(CameraGuidanceAction::Look, "mouse")
                     .with_action_label("Replacement label"),

@@ -156,6 +156,22 @@ fn pull_vertex(vertex_index: u32, instance_index: u32) -> PulledVertex {
         return out;
     }
     let run = run_records[record.render_index];
+    // A negative width identifies a reflected glyph with reversed winding.
+    let face_x = sign(record.rect_size.x);
+    let rect_span = max(abs(record.rect_size), vec2<f32>(LINE_AA_EPSILON));
+    // Reject a hidden back before text fitting, margin expansion, or rasterization.
+    if face_x < 0.0 {
+        let normal = (run.transform * vec4<f32>(0.0, 0.0, -1.0, 0.0)).xyz;
+        let toward_eye = select(
+            view.world_position - run.transform[3].xyz,
+            view.world_from_view[2].xyz,
+            view.clip_from_view[3][3] == 1.0,
+        );
+        if dot(normal, toward_eye) <= 0.0 {
+            out.clip_position = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+            return out;
+        }
+    }
 
     // Corner order matches RunMeshBuilder::push_path:
     // 0 = (left, top), 1 = (right, top), 2 = (right, bottom), 3 = (left, bottom).
@@ -180,7 +196,7 @@ fn pull_vertex(vertex_index: u32, instance_index: u32) -> PulledVertex {
         let px_per_unit_y = -0.5 * y_ndc * view.viewport.w;
         let px_per_unit_x = 0.5 * x_ndc * view.viewport.z;
         let design_span_x = record.uv_size.x * packed_path.bounds_min_size.z;
-        let layout_em = packed_path.text_em_size * record.rect_size.x
+        let layout_em = packed_path.text_em_size * abs(record.rect_size.x)
             / max(design_span_x, LINE_AA_EPSILON);
         let pixels_per_em = layout_em * min(abs(px_per_unit_x), abs(px_per_unit_y));
         let small_text_fit_strength = smoothstep(5.0, 5.5, pixels_per_em)
@@ -197,14 +213,14 @@ fn pull_vertex(vertex_index: u32, instance_index: u32) -> PulledVertex {
             if (record.clip_edges & edge_x) == 0u {
                 local.x += local_shift.x;
             } else {
-                let relative_shift = local_shift.x / max(record.rect_size.x, LINE_AA_EPSILON);
+                let relative_shift = local_shift.x / (face_x * rect_span.x);
                 coverage_uv.x -= relative_shift * record.uv_size.x;
                 material_uv.x -= relative_shift * record.box_uv_size.x;
             }
             if (record.clip_edges & edge_y) == 0u {
                 local.y += local_shift.y;
             } else {
-                let relative_shift = local_shift.y / max(record.rect_size.y, LINE_AA_EPSILON);
+                let relative_shift = local_shift.y / rect_span.y;
                 coverage_uv.y += relative_shift * record.uv_size.y;
                 material_uv.y += relative_shift * record.box_uv_size.y;
             }
@@ -225,7 +241,7 @@ fn pull_vertex(vertex_index: u32, instance_index: u32) -> PulledVertex {
                 line_aa_margin_local(axis_y, base_clip, 1.0),
             );
             let design_span_x = record.uv_size.x * packed_path.bounds_min_size.z;
-            let layout_em = packed_path.text_em_size * record.rect_size.x
+            let layout_em = packed_path.text_em_size * abs(record.rect_size.x)
                 / max(design_span_x, LINE_AA_EPSILON);
             let pixels_per_em = layout_em / max(units_per_pixel, LINE_AA_EPSILON);
             let size_strength = clamp(
@@ -234,7 +250,7 @@ fn pull_vertex(vertex_index: u32, instance_index: u32) -> PulledVertex {
             );
             margin_px = TEXT_AA_MARGIN_PX * size_strength;
         }
-        let cap = max(record.rect_size.x, record.rect_size.y) * LINE_AA_MARGIN_MAX_RATIO;
+        let cap = max(rect_span.x, rect_span.y) * LINE_AA_MARGIN_MAX_RATIO;
         var margin_x = min(line_aa_margin_local(axis_x, base_clip, margin_px), cap);
         var margin_y = min(line_aa_margin_local(axis_y, base_clip, margin_px), cap);
         if packed_path.text_em_size > 0.0 {
@@ -243,10 +259,10 @@ fn pull_vertex(vertex_index: u32, instance_index: u32) -> PulledVertex {
             margin_x = select(margin_x, 0.0, (record.clip_edges & edge_x) != 0u);
             margin_y = select(margin_y, 0.0, (record.clip_edges & edge_y) != 0u);
         }
-        let sign_x = corner_x * 2.0 - 1.0;
+        let sign_x = (corner_x * 2.0 - 1.0) * face_x;
         let sign_y = corner_top * 2.0 - 1.0;
         local += vec2<f32>(sign_x * margin_x, sign_y * margin_y);
-        let inv_rect = vec2<f32>(1.0, 1.0) / max(record.rect_size, vec2<f32>(LINE_AA_EPSILON));
+        let inv_rect = vec2<f32>(face_x, 1.0) / rect_span;
         coverage_uv += vec2<f32>(
             sign_x * margin_x * record.uv_size.x * inv_rect.x,
             -sign_y * margin_y * record.uv_size.y * inv_rect.y,
@@ -267,8 +283,8 @@ fn pull_vertex(vertex_index: u32, instance_index: u32) -> PulledVertex {
 }
     out.clip_position = clip;
 
-    // Records carry no normal: rotate layout-space +z by the run transform.
-    out.world_normal = normalize((run.transform * vec4<f32>(0.0, 0.0, 1.0, 0.0)).xyz);
+    // Reversed winding also reverses the glyph normal.
+    out.world_normal = normalize((run.transform * vec4<f32>(0.0, 0.0, face_x, 0.0)).xyz);
 
     // `uv` is the material box UV consumed by Bevy PBR texture sampling.
     // `uv_b` is the analytic path coverage UV consumed by `analytic_path.wesl`.

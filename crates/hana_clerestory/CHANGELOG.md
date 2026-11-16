@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Requires Bevy 0.20.1.
+
 ## [0.4.0] - 2026-11-06
 
 ### Added

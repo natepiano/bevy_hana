@@ -23,3 +23,5 @@ pub use scroll::PointerScrollTarget;
 pub(in crate::widgets) use scroll::scroll_from_pointer;
 pub use size_gate::SizeGateExempt;
 pub use size_gate::WidgetScreenSizeGate;
+pub use size_gate::WidgetSizeEligibility;
+pub(in crate::widgets) use size_gate::update_size_eligibility;

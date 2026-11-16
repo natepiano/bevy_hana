@@ -1,6 +1,8 @@
+use bevy::camera::visibility::RenderLayers;
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::Camera;
 use bevy::prelude::ChildOf;
+use bevy::prelude::Commands;
 use bevy::prelude::Component;
 use bevy::prelude::Entity;
 use bevy::prelude::GlobalTransform;
@@ -14,9 +16,13 @@ use bevy::prelude::Vec3;
 use bevy::prelude::With;
 
 use crate::BoundingBox;
+use crate::ComputedDiegeticPanel;
 use crate::ComputedScrollRecord;
 use crate::DiegeticPanel;
 use crate::layout::VisibleScrollRegion;
+use crate::widgets::PanelWidget;
+use crate::widgets::WidgetHitArea;
+use crate::widgets::WidgetOf;
 use crate::widgets::anchor::WidgetAnchorRect;
 
 /// Exempts a panel and its descendants from the widget screen-size gate.
@@ -26,9 +32,8 @@ pub struct SizeGateExempt;
 /// Gates pointer picking by the smallest width of a projected hit rectangle.
 ///
 /// Sizes are logical screen points in the picking camera's viewport. Each
-/// evaluation uses the current projected size; no verdict survives the call.
-/// The zero default disables the gate. Hosts supply their current preference
-/// before `PickingSystems::Backend`; this input stores no picking verdict.
+/// frame evaluates the current projected size once for both picking and presentation.
+/// The zero default disables the gate.
 #[derive(Clone, Copy, Debug, Default, Reflect, Resource)]
 #[reflect(Resource)]
 pub struct WidgetScreenSizeGate {
@@ -62,6 +67,78 @@ impl WidgetScreenSizeGate {
     }
 
     fn disabled(self) -> bool { self.inert_below == 0.0 }
+}
+
+/// The current frame's size decision for each active presentation camera.
+///
+/// Picking reads its own camera; presentation dims when no camera admits the widget.
+/// Hosts may also read this decision to forward an inert control's background
+/// to its containing object without measuring the control a second time.
+#[derive(Component, Debug, Default, PartialEq, Eq)]
+pub struct WidgetSizeEligibility {
+    cameras: Vec<(Entity, bool)>,
+}
+
+impl WidgetSizeEligibility {
+    /// Whether this frame's size decision admits input from the given camera.
+    #[must_use]
+    pub fn accepts(&self, camera: Entity) -> bool {
+        self.cameras
+            .iter()
+            .any(|(view, accepts)| *view == camera && *accepts)
+    }
+
+    pub(in crate::widgets::interaction) fn inert(&self) -> bool {
+        !self.cameras.is_empty() && self.cameras.iter().all(|(_, accepts)| !accepts)
+    }
+}
+
+pub(in crate::widgets) fn update_size_eligibility(
+    size_picking: WidgetSizePicking,
+    cameras: Query<(Entity, &Camera, Option<&RenderLayers>)>,
+    panels: Query<(
+        &DiegeticPanel,
+        &ComputedDiegeticPanel,
+        &GlobalTransform,
+        Option<&RenderLayers>,
+    )>,
+    widgets: Query<(
+        Entity,
+        &PanelWidget,
+        &WidgetOf,
+        Option<&WidgetSizeEligibility>,
+    )>,
+    mut commands: Commands,
+) {
+    for (entity, widget, owner, previous) in &widgets {
+        let Ok((panel, computed, pose, layers)) = panels.get(owner.panel()) else {
+            continue;
+        };
+        let Some(record) = computed
+            .widget_records()
+            .iter()
+            .find(|record| record.id() == widget.id())
+        else {
+            continue;
+        };
+        let layers = layers.cloned().unwrap_or_default();
+        let mut decision = WidgetSizeEligibility::default();
+        for (view, camera, view_layers) in &cameras {
+            if !camera.is_active || !layers.intersects(&view_layers.cloned().unwrap_or_default()) {
+                continue;
+            }
+            let accepts = match record.hit_area() {
+                WidgetHitArea::Visible(rect) => {
+                    size_picking.accepts(owner.panel(), rect, panel, pose, view)
+                },
+                WidgetHitArea::FullyClipped => false,
+            };
+            decision.cameras.push((view, accepts));
+        }
+        if previous != Some(&decision) {
+            commands.entity(entity).insert(decision);
+        }
+    }
 }
 
 #[derive(SystemParam)]

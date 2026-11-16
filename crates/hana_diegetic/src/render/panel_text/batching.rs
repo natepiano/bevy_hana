@@ -48,6 +48,7 @@ use bevy::prelude::Color;
 use bevy::prelude::Commands;
 use bevy::prelude::Component;
 use bevy::prelude::DetectChanges;
+use bevy::prelude::DetectChangesMut;
 use bevy::prelude::Entity;
 use bevy::prelude::GlobalTransform;
 use bevy::prelude::Handle;
@@ -69,6 +70,7 @@ use bevy::prelude::Resource;
 use bevy::prelude::StandardMaterial;
 use bevy::prelude::Transform;
 use bevy::prelude::Vec2;
+use bevy::prelude::Vec3;
 use bevy::prelude::Visibility;
 use bevy::prelude::With;
 use bevy::render::camera::ExtractedCamera;
@@ -95,6 +97,7 @@ use super::PanelTextLayout;
 use super::PreparedPanelText;
 use super::layout::PanelTextDrawZIndex;
 use super::layout::PanelTextDrawZIndexRank;
+use crate::ReadableBackFrame;
 use crate::cascade::Cascade;
 use crate::cascade::HdrTextCoverageBias;
 use crate::cascade::Resolved;
@@ -512,12 +515,39 @@ pub(super) struct TextRunPanels<'w, 's> {
             Option<&'static RenderLayers>,
             &'static GlobalTransform,
             Has<TooltipDepthPriority>,
+            Option<&'static ReadableBackFrame>,
         ),
     >,
+    frames:           Query<'w, 's, &'static GlobalTransform>,
     visibility:       AncestorVisibility<'w, 's>,
 }
 
 impl TextRunPanels<'_, '_> {
+    /// Computes the back's placement and glyph centre from its referenced stock frame.
+    fn back_placement(
+        &self,
+        prepared: &PreparedPanelText,
+        front: &TextRunPlacement,
+        panel: &DiegeticPanel,
+        panel_transform: &GlobalTransform,
+        frame: Option<&ReadableBackFrame>,
+    ) -> TextBackPlacement {
+        if !prepared.style_gate.draws_readable_back() {
+            return TextBackPlacement::Plain;
+        }
+        let ink_centre = glyph_ink_centre(&prepared.prepared);
+        TextBackPlacement::Readable {
+            placement: readable_back_placement(
+                ink_centre,
+                front,
+                panel,
+                panel_transform,
+                frame.and_then(|frame| self.frames.get(frame.0).ok()),
+            ),
+            ink_centre,
+        }
+    }
+
     /// Whether a run draws nothing this frame. The run's own `Visibility`
     /// decides first; `Inherited` or none defers to its panel and every
     /// ancestor above it.
@@ -641,6 +671,7 @@ type ChangedTextPanelInput = Or<(
     Changed<RenderLayers>,
     Changed<GlobalTransform>,
     Changed<TooltipDepthPriority>,
+    Changed<ReadableBackFrame>,
 )>;
 
 type PanelTextEntityFilter = (
@@ -738,6 +769,7 @@ struct RemovedTextPanelInputs<'w, 's> {
     world_transform: RemovedComponents<'w, 's, GlobalTransform>,
     layers:          RemovedComponents<'w, 's, RenderLayers>,
     tooltip:         RemovedComponents<'w, 's, TooltipDepthPriority>,
+    back_frame:      RemovedComponents<'w, 's, ReadableBackFrame>,
 }
 
 impl RemovedTextPanelInputs<'_, '_> {
@@ -748,6 +780,7 @@ impl RemovedTextPanelInputs<'_, '_> {
             self.world_transform.read().count(),
             self.layers.read().count(),
             self.tooltip.read().count(),
+            self.back_frame.read().count(),
         ]
         .into_iter()
         .any(|count| count != 0)
@@ -760,6 +793,7 @@ impl RemovedTextPanelInputs<'_, '_> {
         panels.extend(self.world_transform.read());
         panels.extend(self.layers.read());
         panels.extend(self.tooltip.read());
+        panels.extend(self.back_frame.read());
         panels
     }
 }
@@ -779,6 +813,26 @@ pub(super) struct TextBatchRouteResources<'w, 's> {
     visual_overrides:      Res<'w, VisualOverrideIndex>,
     perf:                  ResMut<'w, DiegeticPerfStats>,
     commands:              Commands<'w, 's>,
+}
+
+impl TextBatchRouteResources<'_, '_> {
+    fn text_material_candidate(
+        &self,
+        material: &Handle<StandardMaterial>,
+        color: Color,
+        alpha: AlphaMode,
+        lighting: Lighting,
+    ) -> Option<MaterialSlotCandidate> {
+        text_material_candidate_for_frame(
+            material,
+            color,
+            alpha,
+            lighting,
+            &self.standard_materials,
+            &self.asset_server,
+            &self.text_material_default,
+        )
+    }
 }
 
 /// Retained material dependencies and runs awaiting publishable input.
@@ -1176,15 +1230,15 @@ fn route_changed_text_run(
         label_visibility,
     )) = runs.get(label_entity)
     else {
-        route.backend.batch_store_mut().remove_run(storage_key);
+        remove_text_run_faces(&mut route.backend, storage_key);
         route.invalidation.forget_run(label_entity);
         return;
     };
     let hidden = run_panels.run_is_hidden(label_visibility, child_of.parent());
-    let Ok((panel, panel_layers, panel_transform, tooltip_depth_priority)) =
+    let Ok((panel, panel_layers, panel_transform, tooltip_depth_priority, back_frame)) =
         run_panels.panels.get(child_of.parent())
     else {
-        route.backend.batch_store_mut().remove_run(storage_key);
+        remove_text_run_faces(&mut route.backend, storage_key);
         route.invalidation.forget_run(label_entity);
         return;
     };
@@ -1205,16 +1259,10 @@ fn route_changed_text_run(
         &material,
         route,
     );
-    let Some(material_candidate) = text_material_candidate_for_frame(
-        &material,
-        fill_color,
-        alpha_mode,
-        lighting,
-        &route.standard_materials,
-        &route.asset_server,
-        &route.text_material_default,
-    ) else {
-        route.backend.batch_store_mut().remove_run(storage_key);
+    let Some(material_candidate) =
+        route.text_material_candidate(&material, fill_color, alpha_mode, lighting)
+    else {
+        remove_text_run_faces(&mut route.backend, storage_key);
         route.invalidation.pending.insert(label_entity);
         return;
     };
@@ -1230,6 +1278,8 @@ fn route_changed_text_run(
         );
         return;
     }
+    let back_placement =
+        run_panels.back_placement(&prepared, &placement, panel, panel_transform, back_frame);
     let batch_key = batch_key_for_run(
         render::material::PanelDisplayTarget::from(panel.coordinate_space()),
         panel_layers,
@@ -1248,6 +1298,7 @@ fn route_changed_text_run(
             prepared: &prepared,
             panel_text_child: &panel_text_child,
             placement,
+            back_placement,
             depth_band: TextDepthBand::from(tooltip_depth_priority),
             anti_alias: cascades.anti_alias(label_entity),
             hdr_text_coverage_bias: cascades.hdr_text_coverage_bias(label_entity),
@@ -1311,8 +1362,13 @@ fn remove_emptied_panel_text_runs(
         invalidation.forget_run(label_entity);
         let storage_key = RunStorageKey::from(label_entity);
         material_table.refresh_text_run(storage_key);
-        backend.batch_store_mut().remove_run(storage_key);
+        remove_text_run_faces(backend, storage_key);
     }
+}
+
+fn remove_text_run_faces(backend: &mut GlyphCache, storage_key: RunStorageKey) {
+    backend.batch_store_mut().remove_run(storage_key);
+    backend.batch_store_mut().remove_run(storage_key.back());
 }
 
 fn update_hidden_text_run(
@@ -1323,7 +1379,7 @@ fn update_hidden_text_run(
     panel_text_child: &PanelTextLayout,
     material_candidate: MaterialSlotCandidate,
 ) {
-    backend.batch_store_mut().remove_run(storage_key);
+    remove_text_run_faces(backend, storage_key);
     // Retain the row while omitting glyph records so toggling a tooltip does
     // not renumber later materials in the shared table.
     if build_glyph_records(
@@ -1346,12 +1402,15 @@ fn update_existing_text_run_material(
 ) {
     let Some(material_slot) = append_text_material_row(builder, storage_key, material_candidate)
     else {
-        backend.batch_store_mut().remove_run(storage_key);
+        remove_text_run_faces(backend, storage_key);
         return;
     };
     backend
         .batch_store_mut()
         .update_run_material(storage_key, material_slot);
+    backend
+        .batch_store_mut()
+        .update_run_material(storage_key.back(), material_slot);
 }
 
 struct TextRunUpdate<'a> {
@@ -1362,6 +1421,7 @@ struct TextRunUpdate<'a> {
     prepared:               &'a PreparedPanelText,
     panel_text_child:       &'a PanelTextLayout,
     placement:              TextRunPlacement,
+    back_placement:         TextBackPlacement,
     depth_band:             TextDepthBand,
     anti_alias:             AntiAlias,
     hdr_text_coverage_bias: HdrTextCoverageBias,
@@ -1407,6 +1467,7 @@ fn apply_text_run_update(
             prepared:               input.prepared,
             panel_text_child:       input.panel_text_child,
             placement:              input.placement,
+            back_placement:         input.back_placement,
             depth_band:             input.depth_band,
             anti_alias:             input.anti_alias,
             hdr_text_coverage_bias: input.hdr_text_coverage_bias,
@@ -1431,6 +1492,7 @@ fn upsert_rebuilt_text_run(input: TextRunUpdate<'_>) {
         prepared,
         panel_text_child,
         placement,
+        back_placement,
         depth_band,
         anti_alias,
         hdr_text_coverage_bias,
@@ -1448,18 +1510,18 @@ fn upsert_rebuilt_text_run(input: TextRunUpdate<'_>) {
         panel_text_child,
     ) else {
         if backend.batch_store().is_routed(storage_key) {
-            backend.batch_store_mut().remove_run(storage_key);
+            remove_text_run_faces(backend, storage_key);
         }
         return;
     };
     if glyphs.is_empty() {
         // Clipping removed every quad: drop the run so nothing renders.
-        backend.batch_store_mut().remove_run(storage_key);
+        remove_text_run_faces(backend, storage_key);
         return;
     }
     let Some(material_slot) = append_text_material_row(builder, storage_key, material_candidate)
     else {
-        backend.batch_store_mut().remove_run(storage_key);
+        remove_text_run_faces(backend, storage_key);
         return;
     };
 
@@ -1472,6 +1534,32 @@ fn upsert_rebuilt_text_run(input: TextRunUpdate<'_>) {
         hdr_text_coverage_bias,
         material_slot,
     );
+    match back_placement {
+        TextBackPlacement::Plain => backend.batch_store_mut().remove_run(storage_key.back()),
+        TextBackPlacement::Readable {
+            placement: back_placement,
+            ink_centre,
+        } => {
+            let mut back_glyphs = glyphs.clone();
+            reflect_back_glyphs(&mut back_glyphs, ink_centre);
+            let back_record = run_record_for(
+                prepared,
+                panel_text_child,
+                back_placement,
+                depth_band,
+                anti_alias,
+                hdr_text_coverage_bias,
+                material_slot,
+            );
+            backend.batch_store_mut().upsert_run(
+                batch_key.clone(),
+                storage_key.back(),
+                DrawOrderIndex::from(panel_text_child.draw_ordinal),
+                back_glyphs,
+                back_record,
+            );
+        },
+    }
     backend.batch_store_mut().upsert_run(
         batch_key,
         storage_key,
@@ -1488,6 +1576,7 @@ struct RenderOnlyTextRunInput<'a> {
     prepared:               &'a PreparedPanelText,
     panel_text_child:       &'a PanelTextLayout,
     placement:              TextRunPlacement,
+    back_placement:         TextBackPlacement,
     depth_band:             TextDepthBand,
     anti_alias:             AntiAlias,
     hdr_text_coverage_bias: HdrTextCoverageBias,
@@ -1504,6 +1593,7 @@ fn refresh_text_run_record(input: RenderOnlyTextRunInput<'_>) {
         prepared,
         panel_text_child,
         placement,
+        back_placement,
         depth_band,
         anti_alias,
         hdr_text_coverage_bias,
@@ -1511,7 +1601,7 @@ fn refresh_text_run_record(input: RenderOnlyTextRunInput<'_>) {
     } = input;
     let Some(material_slot) = append_text_material_row(builder, storage_key, material_candidate)
     else {
-        backend.batch_store_mut().remove_run(storage_key);
+        remove_text_run_faces(backend, storage_key);
         return;
     };
     let record = run_record_for(
@@ -1526,6 +1616,26 @@ fn refresh_text_run_record(input: RenderOnlyTextRunInput<'_>) {
     backend
         .batch_store_mut()
         .update_run_record(storage_key, record);
+    match back_placement {
+        TextBackPlacement::Plain => backend.batch_store_mut().remove_run(storage_key.back()),
+        TextBackPlacement::Readable {
+            placement: back_placement,
+            ..
+        } => {
+            let back_record = run_record_for(
+                prepared,
+                panel_text_child,
+                back_placement,
+                depth_band,
+                anti_alias,
+                hdr_text_coverage_bias,
+                material_slot,
+            );
+            backend
+                .batch_store_mut()
+                .update_run_record(storage_key.back(), back_record);
+        },
+    }
 }
 
 /// Applies one widget visual-slot override to a routed text run.
@@ -1556,9 +1666,55 @@ fn apply_text_visual_override(
 /// `GlobalTransform` matrix plus any slot-override `offset` composed through
 /// the owning panel's global transform via [`offset_record_matrix`]. The
 /// text-run entity `Transform` and `PanelTextLayout` payload stay untouched.
+#[derive(Clone, Copy)]
 struct TextRunPlacement {
     transform:      Mat4,
     physical_plane: WorldPanelPlane,
+}
+
+#[derive(Clone, Copy)]
+enum TextBackPlacement {
+    Plain,
+    Readable {
+        placement:  TextRunPlacement,
+        ink_centre: f32,
+    },
+}
+
+/// Reflects the ink centre in the owning stock's frame, including its depth.
+fn readable_back_placement(
+    ink_centre: f32,
+    front: &TextRunPlacement,
+    panel: &DiegeticPanel,
+    panel_transform: &GlobalTransform,
+    frame: Option<&GlobalTransform>,
+) -> TextRunPlacement {
+    let mut transform = front.transform;
+    let physical_plane = if let Some(frame) = frame {
+        let world_centre = front
+            .transform
+            .transform_point3(Vec3::new(ink_centre, 0.0, 0.0));
+        let frame_matrix = frame.to_matrix();
+        let in_frame = frame_matrix.inverse().transform_point3(world_centre);
+        let back_centre =
+            frame_matrix.transform_point3(Vec3::new(-in_frame.x, in_frame.y, -in_frame.z));
+        transform.w_axis += (back_centre - world_centre).extend(0.0);
+        let mut plane = front.physical_plane;
+        plane.coefficients.w = 2.0f32.mul_add(
+            -plane.coefficients.truncate().dot(frame.translation()),
+            -plane.coefficients.w,
+        );
+        plane
+    } else {
+        let centre_x = panel.world_width().mul_add(0.5, -panel.anchor_offsets().0);
+        transform.w_axis += front.transform.x_axis * (2.0 * (centre_x - ink_centre));
+        // All coplanar labels must share the exact depth plane used by the card fill.
+        WorldPanelPlane::from_panel(panel_transform, -TEXT_Z_OFFSET)
+    };
+    TextRunPlacement {
+        transform,
+        physical_plane,
+    }
 }
 
 fn text_run_placement(
@@ -1756,21 +1912,38 @@ fn reconcile_batch_entities(input: ReconcileBatchEntities<'_, '_, '_>) {
 /// changed, so a static frame uploads nothing.
 pub(super) fn write_batch_run_transforms(
     labels: Query<
-        (Entity, Ref<GlobalTransform>, &ChildOf, &PanelTextLayout),
-        (With<TextContent>, With<PreparedPanelText>),
+        (
+            Entity,
+            Ref<GlobalTransform>,
+            &ChildOf,
+            &PanelTextLayout,
+            &PreparedPanelText,
+        ),
+        With<TextContent>,
     >,
-    panels: Query<&GlobalTransform, With<DiegeticPanel>>,
+    panels: Query<(&GlobalTransform, &DiegeticPanel, Option<&ReadableBackFrame>)>,
+    frames: Query<Ref<GlobalTransform>>,
     visual_overrides: Res<VisualOverrideIndex>,
     mut backend: ResMut<GlyphCache>,
 ) {
     let overrides_changed = visual_overrides.is_changed();
-    for (label_entity, transform, child_of, panel_text_child) in &labels {
-        if !transform.is_changed() && !overrides_changed {
+    for (label_entity, transform, child_of, panel_text_child, prepared) in &labels {
+        let readable_back = prepared.style_gate.draws_readable_back();
+        if !transform.is_changed() && !overrides_changed && !readable_back {
             continue;
         }
-        let Ok(panel_transform) = panels.get(child_of.parent()) else {
+        let Ok((panel_transform, panel, back_frame)) = panels.get(child_of.parent()) else {
             continue;
         };
+        let frame = readable_back
+            .then(|| back_frame.and_then(|frame| frames.get(frame.0).ok()))
+            .flatten();
+        if !transform.is_changed()
+            && !overrides_changed
+            && !frame.as_ref().is_some_and(DetectChanges::is_changed)
+        {
+            continue;
+        }
         let placement = text_run_placement(
             &transform,
             panel_transform,
@@ -1781,6 +1954,20 @@ pub(super) fn write_batch_run_transforms(
             placement.transform,
             placement.physical_plane.coefficients,
         );
+        if readable_back {
+            let back = readable_back_placement(
+                glyph_ink_centre(&prepared.prepared),
+                &placement,
+                panel,
+                panel_transform,
+                frame.as_deref(),
+            );
+            backend.batch_store_mut().update_run_transform(
+                RunStorageKey::from(label_entity).back(),
+                back.transform,
+                back.physical_plane.coefficients,
+            );
+        }
     }
 }
 
@@ -1813,8 +2000,9 @@ pub(super) fn update_batch_bounds(
         // The batch entity has no parent and propagation already ran, so the
         // pair is written directly; the vertex shader ignores it (placement
         // comes from run records) — this is sort/culling metadata only.
-        *transform = Transform::from_translation(center);
-        *global = GlobalTransform::from(*transform);
+        let pose = Transform::from_translation(center);
+        transform.set_if_neq(pose);
+        global.set_if_neq(GlobalTransform::from(pose));
         *aabb = Aabb {
             center:       Vec3A::ZERO,
             half_extents: Vec3A::from((max - min) * 0.5),
@@ -1992,6 +2180,36 @@ fn build_glyph_records(
         });
     }
     Some(records)
+}
+
+/// Returns the horizontal centre of the run's visible glyph bounds.
+fn glyph_ink_centre(prepared: &PreparedTextRun) -> f32 {
+    let (left, right) = prepared.glyphs().iter().fold(
+        (f32::INFINITY, f32::NEG_INFINITY),
+        |(left, right), glyph| {
+            let bounds = glyph.bounds();
+            let scale = glyph.bounds_scale().x;
+            let origin = glyph.origin().x;
+            (
+                left.min(bounds.min.x.mul_add(scale, origin)),
+                right.max(bounds.max.x.mul_add(scale, origin)),
+            )
+        },
+    );
+    if left.is_finite() && right.is_finite() {
+        f32::midpoint(left, right)
+    } else {
+        0.0
+    }
+}
+
+/// Reflects each glyph about the run's ink centre and reverses its winding.
+fn reflect_back_glyphs(records: &mut [PathQuadRecord], ink_centre: f32) {
+    let centre_twice = 2.0 * ink_centre;
+    for glyph in records {
+        glyph.rect_min.x = centre_twice - glyph.rect_min.x;
+        glyph.rect_size.x = -glyph.rect_size.x;
+    }
 }
 
 fn text_box_min_size(panel_text_child: &PanelTextLayout) -> (Vec2, Vec2) {

@@ -168,14 +168,20 @@ fn start_frame(
     } = marks.ready
     {
         let schedule_ms: f32 = schedules.iter().map(|reading| reading.accounted_ms()).sum();
-        let waiting = shared
-            .0
-            .waiting_for_render(frame)
-            .clamped(interval_ms - schedule_ms);
-        let extraction = shared
-            .0
-            .extraction(frame)
-            .clamped(interval_ms - schedule_ms - waiting.accounted_ms());
+        #[cfg(feature = "render")]
+        let (waiting, extraction, render) = (
+            shared.0.waiting_for_render(frame),
+            shared.0.extraction(frame),
+            shared.0.render_for(frame),
+        );
+        #[cfg(not(feature = "render"))]
+        let (waiting, extraction, render) = (
+            Reading::Unmeasured,
+            Reading::Unmeasured,
+            [Reading::Unmeasured; crate::RENDER_ROWS],
+        );
+        let waiting = waiting.clamped(interval_ms - schedule_ms);
+        let extraction = extraction.clamped(interval_ms - schedule_ms - waiting.accounted_ms());
         let other_ms =
             (interval_ms - schedule_ms - waiting.accounted_ms() - extraction.accounted_ms())
                 .max(0.0);
@@ -197,7 +203,7 @@ fn start_frame(
             render_graph,
             submit,
             cleanup,
-        ] = shared.0.render_for(frame);
+        ] = render;
         let readings: [Reading; ROWS] = [
             Reading::Measured(interval_ms),
             first,

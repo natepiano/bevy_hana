@@ -152,38 +152,15 @@ pub(super) fn horizontal_room_before_floating_panels(
     >,
     primary_window: &Query<Entity, With<PrimaryWindow>>,
 ) -> [f32; 2] {
-    for (entity, panel, transform, resolved, visibility, inherited, attachment, parent) in panels {
-        if entity == target_panel
-            || target_ancestor(entity, target_panel, panels)
-            || attached_to_tooltip_target(attachment, tooltip_target)
-            || !panel_is_drawn(visibility, inherited, parent)
-        {
-            continue;
-        }
-        let CoordinateSpace::Screen {
-            window: panel_window,
-            camera_order,
-            render_layers,
-            ..
-        } = panel.coordinate_space()
-        else {
-            continue;
-        };
-        if !panel_draws_above(*camera_order, render_layers, &tooltip_layer) {
-            continue;
-        }
-        let panel_window = match panel_window {
-            WindowRef::Primary => primary_window.single().ok(),
-            WindowRef::Entity(entity) => Some(*entity),
-        };
-        if panel_window != Some(window) {
-            continue;
-        }
-        let Some(bounds) = screen_space::screen_panel_rect(panel, resolved, transform, window_size)
-            .and_then(crate::screen_space::ScreenPanelRect::projected_bounds)
-        else {
-            continue;
-        };
+    for (_, bounds) in floating_panel_bounds(
+        window,
+        target_panel,
+        tooltip_target,
+        &tooltip_layer,
+        window_size,
+        panels,
+        primary_window,
+    ) {
         let panel_start = bounds.top_left();
         let panel_end = panel_start + bounds.size();
         if panel_start.y >= tooltip_top + tooltip_height || panel_end.y <= tooltip_top {
@@ -198,6 +175,63 @@ pub(super) fn horizontal_room_before_floating_panels(
         }
     }
     rooms.map(|room| room.max(0.0))
+}
+
+/// The drawn screen panels above a tooltip's layer in its window.
+pub(super) fn floating_panel_bounds<'a>(
+    window: Entity,
+    target_panel: Entity,
+    tooltip_target: Entity,
+    tooltip_layer: &'a TooltipScreenLayer,
+    window_size: Vec2,
+    panels: &'a Query<
+        (
+            Entity,
+            &DiegeticPanel,
+            Option<&Transform>,
+            Option<&ResolvedScreenPanelPosition>,
+            Option<&Visibility>,
+            Option<&InheritedVisibility>,
+            Option<&PanelAttachmentAuthored>,
+            Option<&ChildOf>,
+        ),
+        Without<MaterializedTooltip>,
+    >,
+    primary_window: &'a Query<Entity, With<PrimaryWindow>>,
+) -> impl Iterator<Item = (Entity, PanelScreenBounds)> + 'a {
+    panels.iter().filter_map(
+        move |(entity, panel, transform, resolved, visibility, inherited, attachment, parent)| {
+            if entity == target_panel
+                || target_ancestor(entity, target_panel, panels)
+                || attached_to_tooltip_target(attachment, tooltip_target)
+                || !panel_is_drawn(visibility, inherited, parent)
+            {
+                return None;
+            }
+            let CoordinateSpace::Screen {
+                window: panel_window,
+                camera_order,
+                render_layers,
+                ..
+            } = panel.coordinate_space()
+            else {
+                return None;
+            };
+            if !panel_draws_above(*camera_order, render_layers, tooltip_layer) {
+                return None;
+            }
+            let panel_window = match panel_window {
+                WindowRef::Primary => primary_window.single().ok(),
+                WindowRef::Entity(entity) => Some(*entity),
+            };
+            if panel_window != Some(window) {
+                return None;
+            }
+            screen_space::screen_panel_rect(panel, resolved, transform, window_size)
+                .and_then(crate::screen_space::ScreenPanelRect::projected_bounds)
+                .map(|bounds| (entity, bounds))
+        },
+    )
 }
 
 fn panel_is_drawn(

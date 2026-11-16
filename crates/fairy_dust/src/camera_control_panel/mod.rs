@@ -591,6 +591,7 @@ mod tests {
     use hana_lagrange::OrbitCamInputMode;
     use hana_lagrange::OrbitCamPreset;
     use hana_lagrange::ResolvedCameraInputRoute;
+    use hana_rubric::ShortcutHint;
 
     use super::*;
     use crate::constants::DEFAULT_PANEL_BACKGROUND;
@@ -641,12 +642,13 @@ mod tests {
             .build()
             .map_err(|error| error.to_string())?;
         let camera_snapshot = CameraGuidanceSnapshot {
-            camera_label: "Camera".to_string(),
-            mode_label:   "Controls".to_string(),
-            mode_value:   "Mouse".to_string(),
-            slow_mode:    SlowModeHint::NoDisplayableSlowToggle,
-            settings:     Vec::new(),
-            rows:         ["First", "Second", "Third"]
+            slow_mode_shortcut: ShortcutHint::NotAShortcut,
+            camera_label:       "Camera".to_string(),
+            mode_label:         "Controls".to_string(),
+            mode_value:         "Mouse".to_string(),
+            slow_mode:          SlowModeHint::NoDisplayableSlowToggle,
+            settings:           Vec::new(),
+            rows:               ["First", "Second", "Third"]
                 .into_iter()
                 .map(|label| CameraGuidanceRow::new(CameraGuidanceAction::Orbit, label))
                 .collect(),

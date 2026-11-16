@@ -4,6 +4,7 @@ use bevy::prelude::Commands;
 use bevy::prelude::Component;
 use bevy::prelude::Entity;
 use bevy::prelude::Has;
+use bevy::prelude::Or;
 use bevy::prelude::Query;
 use bevy::prelude::Reflect;
 use bevy::prelude::ReflectComponent;
@@ -11,6 +12,7 @@ use bevy::prelude::ReflectResource;
 use bevy::prelude::Resource;
 use bevy::prelude::With;
 
+use super::WidgetSizeEligibility;
 use crate::cascade::Cascade;
 use crate::cascade::Resolved;
 use crate::panel::DiegeticPanel;
@@ -98,13 +100,29 @@ impl PanelWidgetWriter<'_, '_> {
 
 pub(in crate::widgets) fn resolve_interactivity(
     widgets: Query<
-        (Entity, &Resolved<WidgetInteractivity>, Has<WidgetDisabled>),
-        (With<PanelWidget>, Changed<Resolved<WidgetInteractivity>>),
+        (
+            Entity,
+            &Resolved<WidgetInteractivity>,
+            Option<&WidgetSizeEligibility>,
+            Has<WidgetDisabled>,
+        ),
+        (
+            With<PanelWidget>,
+            Or<(
+                Changed<Resolved<WidgetInteractivity>>,
+                Changed<WidgetSizeEligibility>,
+            )>,
+        ),
     >,
     mut commands: Commands,
 ) {
-    for (entity, resolved, disabled) in &widgets {
-        match (resolved.0, disabled) {
+    for (entity, resolved, size, disabled) in &widgets {
+        let interactivity = if size.is_some_and(WidgetSizeEligibility::inert) {
+            WidgetInteractivity::Disabled
+        } else {
+            resolved.0
+        };
+        match (interactivity, disabled) {
             (WidgetInteractivity::Disabled, false) => {
                 commands.entity(entity).insert(WidgetDisabled(()));
             },

@@ -36,12 +36,18 @@ use bevy::prelude::Transform;
 use bevy::prelude::Vec2;
 use bevy::prelude::debug;
 use bevy::prelude::warn;
+use hana_rubric::KeystrokeLabel;
+use hana_rubric::KeystrokeLabelPart;
+use hana_rubric::ModifierSymbol;
+use hana_rubric::ShortcutHint;
 pub use lucide_generated::LucideIcon;
 
 use crate::constants::DIAGNOSTIC_LOG_TARGET;
+use crate::layout::AlignY;
 use crate::layout::El;
 use crate::layout::LayoutBuilder;
 use crate::layout::Sizing;
+use crate::layout::Text;
 use crate::layout::TextInkMeasurement;
 use crate::layout::TextStyle;
 use crate::panel::ComputedDiegeticPanel;
@@ -99,6 +105,90 @@ impl Icon {
         style.set_font_id(font_id.0);
         style.set_size(box_size_in_points);
         (self.glyph.codepoint().to_string(), style)
+    }
+}
+
+/// Draws a shortcut's typed modifier symbols and words using one shared Lucide mapping.
+///
+/// Symbols use the adjacent text's point size and colour. The text factory preserves the
+/// caller's font-derived line-box trimming, so centred icons align with the drawn key words.
+/// Consecutive symbols are adjacent, with no plus signs between them.
+pub fn render_keystroke_label(
+    builder: &mut LayoutBuilder,
+    label: &KeystrokeLabel,
+    style: &TextStyle,
+    mut text: impl FnMut(String) -> Text,
+) {
+    if !label
+        .parts()
+        .iter()
+        .any(|part| matches!(part, KeystrokeLabelPart::Symbol(_)))
+    {
+        builder.text(text(label.words(" ")));
+        return;
+    }
+    builder.with(
+        El::row()
+            .width(Sizing::FIT)
+            .height(Sizing::FIT)
+            .align_y(AlignY::Center),
+        |builder| {
+            let mut words = String::new();
+            for (index, part) in label.parts().iter().enumerate() {
+                match part {
+                    KeystrokeLabelPart::Symbol(symbol) => {
+                        if !words.is_empty() {
+                            words.push(' ');
+                            builder.text(text(std::mem::take(&mut words)));
+                        }
+                        let glyph = match symbol {
+                            ModifierSymbol::Control => LucideIcon::ChevronUp,
+                            ModifierSymbol::Alt => LucideIcon::Option,
+                            ModifierSymbol::Shift => LucideIcon::ArrowBigUp,
+                            ModifierSymbol::Command => LucideIcon::Command,
+                        };
+                        builder.icon(Icon::new(glyph).size(style.size()).color(style.color()));
+                    },
+                    KeystrokeLabelPart::Word(word) => {
+                        if !words.is_empty()
+                            || (index > 0
+                                && matches!(
+                                    label.parts()[index - 1],
+                                    KeystrokeLabelPart::Symbol(_)
+                                ))
+                        {
+                            words.push(' ');
+                        }
+                        words.push_str(word);
+                    },
+                    KeystrokeLabelPart::SequenceSeparator => {
+                        if !words.is_empty() {
+                            builder.text(text(std::mem::take(&mut words)));
+                        }
+                        builder.text(text("  ".to_owned()));
+                    },
+                }
+            }
+            if !words.is_empty() {
+                builder.text(text(words));
+            }
+        },
+    );
+}
+
+/// Renders typed shortcut metadata, or the original plain status text when no shortcut exists.
+pub fn render_shortcut_hint(
+    builder: &mut LayoutBuilder,
+    hint: &ShortcutHint,
+    plain_text: &str,
+    style: &TextStyle,
+    mut text: impl FnMut(String) -> Text,
+) {
+    match hint {
+        ShortcutHint::Keys(label) => render_keystroke_label(builder, label, style, text),
+        ShortcutHint::NotAShortcut => {
+            builder.text(text(plain_text.to_owned()));
+        },
     }
 }
 

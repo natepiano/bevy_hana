@@ -11,6 +11,7 @@ mod fixtures;
 
 use std::hint::black_box;
 
+use bevy::color::Color;
 use criterion::BatchSize;
 use criterion::Criterion;
 use criterion::criterion_group;
@@ -20,11 +21,14 @@ use fixtures::rows::ROW_COUNTS;
 use fixtures::rows::generate_status_rows;
 use hana_diegetic::FontRegistry;
 use hana_diegetic::MeasureTextFn;
+use hana_diegetic::SpanStyle;
 use hana_diegetic::TextDimensions;
 use hana_diegetic::TextMeasure;
 use hana_diegetic::TextStyle;
 use hana_diegetic::bench_support::ShapedTextCache;
 use hana_diegetic::bench_support::create_parley_measurer;
+use hana_diegetic::bench_support::create_parley_rich_measurer;
+use hana_diegetic::bench_support::rich_paragraph;
 
 fn bench_text_shaping(c: &mut Criterion) {
     let registry = FontRegistry::new().unwrap_or_else(|error| {
@@ -158,9 +162,6 @@ criterion_group!(benches, bench_text_shaping);
 criterion_main!(benches);
 
 fn rich_footer_paragraph() -> hana_diegetic::RichParagraph {
-    use bevy::color::Color;
-    use hana_diegetic::SpanStyle;
-    use hana_diegetic::bench_support::rich_paragraph;
     let bright = SpanStyle::new().with_color(Color::WHITE);
     let separator = SpanStyle::new().with_word_spacing((-FONT_SIZE).mul_add(0.6, 4.0));
     rich_paragraph(
@@ -200,7 +201,6 @@ fn measure_rich_footer(
 }
 
 fn bench_rich_footer(c: &mut Criterion, rows: usize, registry: &FontRegistry) {
-    use hana_diegetic::bench_support::create_parley_rich_measurer;
     let paragraphs = vec![rich_footer_paragraph(); rows];
     let counts: Vec<String> = (1..=rows).map(|row| format!("{row} of {rows}")).collect();
     let plain = create_parley_measurer(registry.font_context(), registry.family_names());

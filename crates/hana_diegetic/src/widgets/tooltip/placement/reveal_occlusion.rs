@@ -33,7 +33,9 @@ use super::placement_state::WorldTooltipOcclusion;
 use super::world_target;
 use super::world_target::TooltipCameraView;
 use super::world_target::WorldTooltipTarget;
+use crate::cascade::Resolved;
 use crate::layout::Anchor;
+use crate::layout::Sidedness;
 use crate::panel::DiegeticPanel;
 use crate::panel::PanelOwned;
 use crate::panel::PanelPlane;
@@ -143,12 +145,18 @@ impl WorldTooltipRevealOcclusion<'_, '_> {
     }
 }
 
-/// A scene mesh's render layers, its standard material when it has one, and
-/// whether it is a panel's interaction mesh.
+/// A scene mesh's layers, material, interaction role, and panel owner.
 type SceneMesh = (
     Option<&'static RenderLayers>,
     Option<&'static MeshMaterial3d<StandardMaterial>>,
     Has<PanelInteractionMesh>,
+    Option<&'static PanelOwned>,
+);
+
+type OccludingPanel = (
+    &'static DiegeticPanel,
+    &'static GlobalTransform,
+    Option<&'static Resolved<Sidedness>>,
 );
 
 /// The scene meshes that can hide a world tooltip or its target from a camera.
@@ -159,16 +167,15 @@ pub(in crate::widgets::tooltip) struct SceneOccluders<'w, 's> {
     materials:      Option<Res<'w, Assets<StandardMaterial>>>,
     children:       Query<'w, 's, &'static Children>,
     tooltip_meshes: Query<'w, 's, (Entity, &'static PanelOwned), With<Mesh3d>>,
+    panels:         Query<'w, 's, OccludingPanel>,
 }
 
 impl<'w, 's> SceneOccluders<'w, 's> {
     /// Occlusion as seen by `camera_layers` for the tooltip `controller` owns,
     /// anchored on `target`.
     ///
-    /// Neither the tooltip's own meshes nor its target's hide it: the target's
-    /// subtree holds the surfaces the tooltip names, such as a jack's invisible
-    /// pick face, while every other panel's interaction mesh still stands for
-    /// that panel's drawn face.
+    /// The tooltip and target meshes do not hide the tooltip.
+    /// Other panel meshes hide it only when the ray reaches a drawn side.
     pub(super) fn scene_occlusion(
         &mut self,
         controller: Entity,
@@ -191,6 +198,7 @@ impl<'w, 's> SceneOccluders<'w, 's> {
             camera_layers,
             meshes: &self.meshes,
             materials: self.materials.as_deref(),
+            panels: &self.panels,
         }
     }
 }
@@ -203,6 +211,7 @@ pub(super) enum SceneOcclusion<'a, 'w, 's> {
         camera_layers: RenderLayers,
         meshes:        &'a Query<'w, 's, SceneMesh, With<Mesh3d>>,
         materials:     Option<&'a Assets<StandardMaterial>>,
+        panels:        &'a Query<'w, 's, OccludingPanel>,
     },
     NoMeshAssets,
 }
@@ -215,6 +224,7 @@ impl SceneOcclusion<'_, '_, '_> {
             camera_layers,
             meshes,
             materials,
+            panels,
         } = self
         else {
             return false;
@@ -227,11 +237,16 @@ impl SceneOcclusion<'_, '_, '_> {
             !own_meshes.contains(&entity)
                 && meshes
                     .get(entity)
-                    .is_ok_and(|(layers, material, interaction)| {
+                    .is_ok_and(|(layers, material, interaction, owner)| {
                         layers
                             .cloned()
                             .unwrap_or_else(|| RenderLayers::layer(0))
                             .intersects(camera_layers)
+                            && panel_draws_toward_ray(
+                                owner.map_or(entity, |owner| owner.owner()),
+                                direction,
+                                panels,
+                            )
                             && (interaction || !see_through(material, *materials))
                     })
         };
@@ -242,6 +257,25 @@ impl SceneOcclusion<'_, '_, '_> {
             .cast_ray(Ray3d::new(origin, direction), &settings)
             .iter()
             .any(|(_, hit)| hit.distance < to_point.length() - 0.001)
+    }
+}
+
+fn panel_draws_toward_ray(entity: Entity, direction: Dir3, panels: &Query<OccludingPanel>) -> bool {
+    let Ok((panel, pose, sidedness)) = panels.get(entity) else {
+        return true;
+    };
+    let sidedness = sidedness.map_or(Sidedness::BothSides, |value| *value.value());
+    if sidedness == Sidedness::BothSides {
+        return true;
+    }
+    let Ok(plane) = PanelPlane::from_panel(panel, pose) else {
+        return true;
+    };
+    let toward_front = direction.dot(plane.normal()) < 0.0;
+    match sidedness {
+        Sidedness::FrontOnly => toward_front,
+        Sidedness::BackOnly => !toward_front,
+        Sidedness::BothSides => true,
     }
 }
 
@@ -294,9 +328,18 @@ fn control_fully_occluded(
 
 #[cfg(test)]
 mod tests {
+    use bevy::camera::primitives::Aabb;
+    use bevy::camera::visibility::InheritedVisibility;
+    use bevy::camera::visibility::ViewVisibility;
+    use bevy::ecs::system::RunSystemOnce;
+    use bevy::picking::mesh_picking::ray_cast::RayCastBackfaces;
     use bevy::prelude::App;
+    use bevy::prelude::Mesh;
     use bevy::prelude::MinimalPlugins;
+    use bevy::prelude::Quat;
+    use bevy::prelude::Rectangle;
     use bevy::prelude::Transform;
+    use bevy::prelude::Vec2;
     use bevy::transform::TransformPlugin;
 
     use super::*;
@@ -304,6 +347,140 @@ mod tests {
     use crate::screen_space::ScreenSpacePlugin;
     use crate::text::DiegeticTextMeasurer;
     use crate::widgets::WidgetsPlugin;
+
+    #[derive(Clone, Copy, Debug)]
+    enum PanelMeshRole {
+        Root,
+        OwnedInteraction,
+    }
+
+    struct PanelOcclusionScene {
+        app:    App,
+        target: Entity,
+    }
+
+    impl PanelOcclusionScene {
+        fn new(sidedness: Sidedness, rotation: Quat, role: PanelMeshRole) -> Result<Self, String> {
+            let mut app = App::new();
+            app.add_plugins(MinimalPlugins)
+                .init_resource::<Assets<Mesh>>();
+            let panel = DiegeticPanel::world()
+                .size(2.0, 2.0)
+                .build()
+                .map_err(|error| error.to_string())?;
+            let pose = Transform::from_xyz(0.0, 0.0, 2.0).with_rotation(rotation);
+            let root = app
+                .world_mut()
+                .spawn((
+                    panel,
+                    pose,
+                    GlobalTransform::from(pose),
+                    Resolved(sidedness),
+                ))
+                .id();
+            let mesh = app
+                .world_mut()
+                .resource_mut::<Assets<Mesh>>()
+                .add(Rectangle::new(2.0, 2.0));
+            let mesh_entity = match role {
+                PanelMeshRole::Root => root,
+                PanelMeshRole::OwnedInteraction => app
+                    .world_mut()
+                    .spawn((
+                        PanelOwned::from(root),
+                        PanelInteractionMesh::new(Vec2::splat(2.0), Vec2::ZERO),
+                        GlobalTransform::from(pose),
+                    ))
+                    .id(),
+            };
+            app.world_mut().entity_mut(mesh_entity).insert((
+                Mesh3d(mesh),
+                RayCastBackfaces,
+                Aabb::from_min_max(Vec3::new(-1.0, -1.0, 0.0), Vec3::new(1.0, 1.0, 0.0)),
+                InheritedVisibility::VISIBLE,
+                ViewVisibility::VISIBLE,
+            ));
+            let target = app.world_mut().spawn_empty().id();
+            Ok(Self { app, target })
+        }
+
+        fn blocks(&mut self) -> Result<bool, String> {
+            let target = self.target;
+            self.app
+                .world_mut()
+                .run_system_once(move |mut occluders: SceneOccluders| {
+                    occluders
+                        .scene_occlusion(Entity::PLACEHOLDER, target, RenderLayers::layer(0))
+                        .blocks(Vec3::new(0.0, 0.0, 5.0), Vec3::ZERO)
+                })
+                .map_err(|error| error.to_string())
+        }
+
+        fn add_opaque_mesh(&mut self) {
+            let mesh = self
+                .app
+                .world_mut()
+                .resource_mut::<Assets<Mesh>>()
+                .add(Rectangle::new(2.0, 2.0));
+            self.app.world_mut().spawn((
+                Mesh3d(mesh),
+                Aabb::from_min_max(Vec3::new(-1.0, -1.0, 0.0), Vec3::new(1.0, 1.0, 0.0)),
+                GlobalTransform::from(Transform::from_xyz(0.0, 0.0, 1.0)),
+                InheritedVisibility::VISIBLE,
+                ViewVisibility::VISIBLE,
+            ));
+        }
+    }
+
+    #[test]
+    fn an_opaque_mesh_behind_an_undrawn_panel_still_hides_a_tooltip() -> Result<(), String> {
+        for role in [PanelMeshRole::Root, PanelMeshRole::OwnedInteraction] {
+            for (sidedness, rotation) in [
+                (
+                    Sidedness::FrontOnly,
+                    Quat::from_rotation_y(std::f32::consts::PI),
+                ),
+                (Sidedness::BackOnly, Quat::IDENTITY),
+            ] {
+                let mut scene = PanelOcclusionScene::new(sidedness, rotation, role)?;
+                assert!(
+                    !scene.blocks()?,
+                    "an undrawn {sidedness:?} {role:?} must not hide help"
+                );
+                scene.add_opaque_mesh();
+                assert!(
+                    scene.blocks()?,
+                    "an excluded {sidedness:?} {role:?} must not mask the opaque mesh behind it"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_panel_seen_from_its_drawn_side_still_hides_a_tooltip() -> Result<(), String> {
+        for role in [PanelMeshRole::Root, PanelMeshRole::OwnedInteraction] {
+            for (sidedness, rotation) in [
+                (Sidedness::FrontOnly, Quat::IDENTITY),
+                (
+                    Sidedness::BackOnly,
+                    Quat::from_rotation_y(std::f32::consts::PI),
+                ),
+                (Sidedness::BothSides, Quat::IDENTITY),
+                (
+                    Sidedness::BothSides,
+                    Quat::from_rotation_y(std::f32::consts::PI),
+                ),
+            ] {
+                let mut scene = PanelOcclusionScene::new(sidedness, rotation, role)?;
+                assert!(
+                    scene.blocks()?,
+                    "a drawn {sidedness:?} {role:?} must hide help"
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn idle_frames_skip_occluder_transform_refresh() {

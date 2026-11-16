@@ -60,13 +60,10 @@ use hana_valence::Displacement;
 use hana_valence::Orientation;
 
 use crate::constants::*;
+use crate::hinge;
 use crate::hinge::HingeChain;
-use crate::hinge::advance_hinge;
-use crate::hinge::build_hinge_number_tree;
-use crate::hinge::hinge_accent;
-use crate::hinge::hinge_paused;
+use crate::presentation;
 use crate::presentation::AnchorPanelMaterials;
-use crate::presentation::smoothstep;
 use crate::scene::ActiveCapability;
 use crate::scene::ModeMorph;
 
@@ -315,7 +312,7 @@ impl AnchorTransition {
         if !self.active {
             return 1.0;
         }
-        smoothstep((self.timer / ANCHOR_TRANSITION_SECS).clamp(0.0, 1.0))
+        presentation::smoothstep((self.timer / ANCHOR_TRANSITION_SECS).clamp(0.0, 1.0))
     }
 }
 
@@ -507,7 +504,7 @@ pub(crate) fn build_tile_tree(
     show_marker: bool,
 ) -> LayoutTree {
     if mode == HINGE_CHAIN_INDEX {
-        build_hinge_number_tree(order, count)
+        hinge::build_hinge_number_tree(order, count)
     } else {
         build_anchor_tile_tree(
             order,
@@ -601,8 +598,8 @@ pub(crate) fn advance_animations(
     if !spin.paused {
         advance_spin(&mut spin, dt);
     }
-    if !hinge_paused(&hinge) {
-        advance_hinge(&mut hinge, dt);
+    if !hinge::hinge_paused(&hinge) {
+        hinge::advance_hinge(&mut hinge, dt);
     }
     advance_anchor_transition(&mut transition, dt);
 }
@@ -699,7 +696,7 @@ fn advance_spin(spin: &mut Spin, dt: f32) {
     match phase {
         SpinPhase::Rising => {
             spin.timer += dt;
-            let ease = smoothstep((spin.timer / SPIN_EASE_SECS).clamp(0.0, 1.0));
+            let ease = presentation::smoothstep((spin.timer / SPIN_EASE_SECS).clamp(0.0, 1.0));
             spin.angle = (SPIN_RATE_RAD * ease).mul_add(dt, spin.angle);
             if spin.timer >= SPIN_EASE_SECS {
                 spin.phase = Some(SpinPhase::Holding);
@@ -710,7 +707,7 @@ fn advance_spin(spin: &mut Spin, dt: f32) {
         },
         SpinPhase::Falling => {
             spin.timer += dt;
-            let ease = smoothstep((spin.timer / SPIN_EASE_SECS).clamp(0.0, 1.0));
+            let ease = presentation::smoothstep((spin.timer / SPIN_EASE_SECS).clamp(0.0, 1.0));
             spin.angle = (spin.fall_to - spin.fall_from).mul_add(ease, spin.fall_from);
             if spin.timer >= SPIN_EASE_SECS {
                 spin.phase = None;
@@ -1083,7 +1080,7 @@ pub(crate) fn reconcile_panels(
     ));
     for (entity, tile) in &tiles {
         let tree = if mode == HINGE_CHAIN_INDEX {
-            build_hinge_number_tree(tile.order, count)
+            hinge::build_hinge_number_tree(tile.order, count)
         } else {
             build_anchor_tile_tree(
                 tile.order,
@@ -1251,8 +1248,8 @@ pub(crate) fn draw_anchor_link(
         gizmos.line_gradient(
             target_point,
             source_point,
-            hinge_accent(order - 1, live),
-            hinge_accent(order, live),
+            hinge::hinge_accent(order - 1, live),
+            hinge::hinge_accent(order, live),
         );
     }
 }
@@ -1312,7 +1309,7 @@ fn build_anchor_tile_tree(
     per_link_depth: f32,
     show_marker: bool,
 ) -> LayoutTree {
-    let accent = hinge_accent(order, count);
+    let accent = hinge::hinge_accent(order, count);
     let show_source = order >= 1;
     let show_target = order + 1 < count;
     let depth_mm = (order >= 1).then_some(tile_depth_mm(order, per_link_depth));

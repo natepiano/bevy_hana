@@ -3,12 +3,25 @@
 //! The reflected [`FrameTiming`] resource is the service surface.
 //! Rows keep their last measured sample; main and render rows can overlap.
 
+mod definition;
+mod demand;
 mod main_thread;
+mod observation;
+mod reading;
+mod recording;
+#[cfg(feature = "render")]
 mod render_thread;
+#[cfg(test)]
+mod test_support;
+#[cfg(feature = "test")]
+mod testing;
+mod window;
 
 use std::array;
 use std::sync::Arc;
+#[cfg(feature = "render")]
 use std::sync::atomic::AtomicU32;
+#[cfg(feature = "render")]
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -17,6 +30,70 @@ use bevy_app::Plugin;
 use bevy_ecs::prelude::Resource;
 use bevy_ecs::reflect::ReflectResource;
 use bevy_reflect::Reflect;
+pub use definition::Counter;
+pub use definition::CounterUnit;
+pub use definition::CumulativeCounterSample;
+pub use definition::ExternalCounterEpoch;
+pub use definition::Freshness;
+pub use definition::Gauge;
+pub use definition::GaugeMeaning;
+pub use definition::GaugeSemantics;
+pub use definition::IntervalGaugeSample;
+pub use definition::IntervalSummaryKind;
+pub use definition::InvalidMetricSample;
+pub use definition::InvalidObservationInterval;
+pub use definition::InvalidPercentile;
+pub use definition::InvalidSmoothingPolicy;
+pub use definition::MeasurementCadence;
+pub use definition::MetricCapability;
+pub use definition::MetricCapabilityFailure;
+pub use definition::MetricDefinition;
+pub use definition::MetricDescriptor;
+pub use definition::MetricKind;
+pub use definition::MetricKindName;
+pub use definition::MetricRegistrationError;
+pub use definition::MetricSelection;
+pub use definition::MetricStatistic;
+pub use definition::MetricUnit;
+pub use definition::NativeDiagnosticDescription;
+pub use definition::SmoothingMethod;
+pub use definition::SmoothingPolicy;
+pub use definition::StatisticKind;
+pub use definition::TimingSpan;
+pub use definition::validate_metric_path;
+pub use demand::ActiveMetricSource;
+pub use demand::MetricSubscription;
+pub use demand::MetricSubscriptionError;
+pub use demand::MetricsSettings;
+pub use demand::ObservationEpoch;
+pub use demand::SourceKey;
+pub use demand::SubscriptionStatus;
+pub use demand::subscribe_metrics;
+pub use observation::CausalId;
+pub use observation::FrameContext;
+pub use observation::MainUpdateId;
+pub use observation::MetricNumber;
+pub use observation::ObservationContext;
+pub use observation::ObservationInterval;
+pub use observation::OperationContext;
+pub use observation::OperationId;
+pub use observation::RenderUpdateId;
+pub use observation::RunOffset;
+pub use recording::MeasurementFailure;
+pub use recording::MetricQuality;
+pub use recording::MetricRecorder;
+pub use recording::MetricsPlugin;
+pub use recording::MetricsSystems;
+pub use recording::ObservationClock;
+pub use recording::ObservationExtent;
+pub use recording::RetainedObservation;
+pub use recording::describe_diagnostic;
+pub use recording::register_metric;
+#[cfg(feature = "test")]
+pub use testing::ManualRunClock;
+pub use window::Percentile;
+pub use window::SampleWindow;
+pub use window::WindowReduction;
 
 const PEAK_WINDOW_MS: u64 = 5000;
 
@@ -33,6 +110,7 @@ impl Plugin for FrameTimingPlugin {
             .register_type::<FrameTiming>();
         app.insert_resource(PeakHistory::default());
         main_thread::build(app);
+        #[cfg(feature = "render")]
         render_thread::install(app, shared);
     }
 
@@ -258,6 +336,7 @@ impl Reading {
 
     /// Cross-thread encoding; NaN never comes from a duration, so it stands for
     /// `Unmeasured`.
+    #[cfg(feature = "render")]
     const fn to_bits(self) -> u32 {
         match self {
             Self::Measured(value) => value.to_bits(),
@@ -265,6 +344,7 @@ impl Reading {
         }
     }
 
+    #[cfg(feature = "render")]
     const fn from_bits(bits: u32) -> Self {
         let value = f32::from_bits(bits);
         if value.is_nan() {
@@ -373,31 +453,47 @@ struct SharedTiming(Arc<CrossThreadTiming>);
 /// reader can tell a reading for its record from a stale one.
 struct CrossThreadTiming {
     epoch:            Instant,
+    #[cfg(feature = "render")]
     extract_frame:    AtomicU32,
+    #[cfg(feature = "render")]
     wait_frame:       [AtomicU32; 3],
+    #[cfg(feature = "render")]
     wait_ms:          [AtomicU32; 3],
+    #[cfg(feature = "render")]
     extraction_frame: [AtomicU32; 3],
+    #[cfg(feature = "render")]
     extraction_ms:    [AtomicU32; 3],
+    #[cfg(feature = "render")]
     render_frame:     [AtomicU32; 3],
+    #[cfg(feature = "render")]
     render_ms:        [[AtomicU32; RENDER_ROWS]; 3],
 }
 
+#[cfg(feature = "render")]
 const fn slot(frame: u32) -> usize { frame as usize % 3 }
 
 impl CrossThreadTiming {
     fn new(epoch: Instant) -> Self {
         Self {
             epoch,
+            #[cfg(feature = "render")]
             extract_frame: AtomicU32::new(u32::MAX),
+            #[cfg(feature = "render")]
             wait_frame: array::from_fn(|_| AtomicU32::new(u32::MAX)),
+            #[cfg(feature = "render")]
             wait_ms: array::from_fn(|_| AtomicU32::new(0)),
+            #[cfg(feature = "render")]
             extraction_frame: array::from_fn(|_| AtomicU32::new(u32::MAX)),
+            #[cfg(feature = "render")]
             extraction_ms: array::from_fn(|_| AtomicU32::new(0)),
+            #[cfg(feature = "render")]
             render_frame: array::from_fn(|_| AtomicU32::new(u32::MAX)),
+            #[cfg(feature = "render")]
             render_ms: array::from_fn(|_| array::from_fn(|_| AtomicU32::new(0))),
         }
     }
 
+    #[cfg(feature = "render")]
     fn publish_render(&self, frame: u32, readings: [Reading; RENDER_ROWS]) {
         let slot = slot(frame);
         for (cell, reading) in self.render_ms[slot].iter().zip(readings) {
@@ -406,6 +502,7 @@ impl CrossThreadTiming {
         self.render_frame[slot].store(frame, Ordering::Release);
     }
 
+    #[cfg(feature = "render")]
     fn render_for(&self, frame: u32) -> [Reading; RENDER_ROWS] {
         let slot = slot(frame);
         if self.render_frame[slot].load(Ordering::Acquire) != frame {
@@ -414,11 +511,13 @@ impl CrossThreadTiming {
         array::from_fn(|row| Reading::from_bits(self.render_ms[slot][row].load(Ordering::Relaxed)))
     }
 
+    #[cfg(feature = "render")]
     fn waiting_for_render(&self, frame: u32) -> Reading {
         let slot = slot(frame);
         reading_for(frame, &self.wait_frame[slot], &self.wait_ms[slot])
     }
 
+    #[cfg(feature = "render")]
     fn extraction(&self, frame: u32) -> Reading {
         let slot = slot(frame);
         reading_for(
@@ -429,6 +528,7 @@ impl CrossThreadTiming {
     }
 }
 
+#[cfg(feature = "render")]
 fn reading_for(frame: u32, measured_frame: &AtomicU32, value: &AtomicU32) -> Reading {
     if measured_frame.load(Ordering::Acquire) != frame {
         return Reading::Unmeasured;
@@ -439,6 +539,20 @@ fn reading_for(frame: u32, measured_frame: &AtomicU32, value: &AtomicU32) -> Rea
 fn duration_ms(start: Instant, end: Instant) -> f32 {
     end.saturating_duration_since(start).as_secs_f32() * 1000.0
 }
+
+pub use reading::BoundaryCoverage;
+pub use reading::MetricCatalogue;
+pub use reading::MetricEstimate;
+pub use reading::MetricLookup;
+pub use reading::MetricReader;
+pub use reading::MetricReading;
+pub use reading::MetricSeries;
+pub use reading::MetricWindow;
+pub use reading::ObservedBoundaries;
+pub use reading::RequestedWindow;
+pub use reading::SequenceRange;
+pub use reading::UnavailableReason;
+pub use reading::WindowCoverage;
 
 #[cfg(test)]
 mod tests {

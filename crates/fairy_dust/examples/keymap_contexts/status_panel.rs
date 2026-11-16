@@ -12,6 +12,7 @@ use bevy::prelude::Transform;
 use bevy::prelude::With;
 use fairy_dust::StatsPanelRow;
 use fairy_dust::StatsPanelSection;
+use fairy_dust::command_palette_recovery_keystroke;
 use fairy_dust::diegetic_stats_sections_panel;
 use fairy_dust::palette_binding_presentation;
 use hana_rubric::ActiveKeymapContext;
@@ -21,12 +22,13 @@ use hana_rubric::CommandRegistry;
 use hana_rubric::EffectiveKeymapPublication;
 use hana_rubric::EffectiveKeymapStatus;
 use hana_rubric::KeymapBindings;
+use hana_rubric::KeystrokeLabel;
+use hana_rubric::ShortcutHint;
 use hana_rubric::query_command_palette;
 
 use super::ContextSceneEffect;
 use super::ExampleInvocationSummary;
 use super::commands;
-use super::palette_control;
 
 /// Marks the example-owned panel that presents Rubric's public routing state.
 #[derive(Component)]
@@ -125,16 +127,17 @@ fn context_status_sections(
         StatsPanelSection::new(
             "Palette agreement",
             [
-                StatsPanelRow::new(
-                    "global route",
-                    canonical_palette_binding(
-                        command_registry,
-                        active_context,
-                        effective_keymap_status,
-                        keymap_bindings,
-                    ),
+                canonical_palette_binding(
+                    command_registry,
+                    active_context,
+                    effective_keymap_status,
+                    keymap_bindings,
                 ),
-                StatsPanelRow::new("recovery", format!("protected {}", palette_control())),
+                StatsPanelRow::new("recovery", "").with_value_shortcut(
+                    KeystrokeLabel::plain("protected")
+                        .then(command_palette_recovery_keystroke().label())
+                        .then_words("Palette"),
+                ),
             ],
         ),
         StatsPanelSection::new(
@@ -246,7 +249,7 @@ fn canonical_palette_binding(
     active_context: &ActiveKeymapContext,
     effective_keymap_status: &EffectiveKeymapStatus,
     keymap_bindings: &KeymapBindings,
-) -> String {
+) -> StatsPanelRow {
     let command_id = CommandId::declared::<commands::ShowGlobalRoute>();
     let query_result = query_command_palette(
         command_registry,
@@ -260,8 +263,20 @@ fn canonical_palette_binding(
         .iter()
         .find(|row| row.command().id() == &command_id)
         .map_or_else(
-            || String::from("declared command unavailable to the palette"),
-            |row| palette_binding_presentation(row.binding()).to_string(),
+            || {
+                StatsPanelRow::new(
+                    "global route",
+                    "declared command unavailable to the palette",
+                )
+            },
+            |row| {
+                let presentation = palette_binding_presentation(row.binding());
+                let row = StatsPanelRow::new("global route", presentation.text());
+                match presentation.shortcut() {
+                    ShortcutHint::Keys(label) => row.with_value_shortcut(label.clone()),
+                    ShortcutHint::NotAShortcut => row,
+                }
+            },
         )
 }
 
@@ -299,6 +314,10 @@ fn permanent_control_rows() -> [StatsPanelRow; 5] {
         StatsPanelRow::new("2", "running"),
         StatsPanelRow::new("3", "resting"),
         StatsPanelRow::new("4", "dimension lock"),
-        StatsPanelRow::new(palette_control(), "command palette recovery"),
+        StatsPanelRow::new("", "command palette recovery").with_label_shortcut(
+            command_palette_recovery_keystroke()
+                .label()
+                .then_words("Palette"),
+        ),
     ]
 }

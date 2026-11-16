@@ -275,6 +275,16 @@ impl PanelText<'_, '_> {
         data.restyle_run(element_idx, style);
         true
     }
+
+    /// Reads the lone run's authored style, before layout converts its units or
+    /// shaping derives a render style. Returns `None` for a missing or ambiguous run.
+    #[must_use]
+    pub fn sole_style(&self, panel: Entity) -> Option<&TextStyle> {
+        let child = self.sole_run_entity(panel)?;
+        let element = self.layouts.get(child).ok()?.element_idx;
+        let (data, _, _) = self.panels.get(panel).ok()?;
+        data.tree().element_style(element)
+    }
 }
 
 /// Resolves a run `id` to a live entity against `data`'s `id → Entity` index,

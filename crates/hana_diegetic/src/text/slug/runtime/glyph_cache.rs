@@ -57,10 +57,33 @@ impl PreparedTextRun {
 /// Stable per-label run identifier, derived from the label entity so the same
 /// label addresses the same batch-store slot every frame.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct RunStorageKey(u64);
+pub(crate) struct RunStorageKey {
+    entity: u64,
+    face:   RunFace,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum RunFace {
+    Front,
+    Back,
+}
+
+impl RunStorageKey {
+    pub(crate) const fn back(self) -> Self {
+        Self {
+            face: RunFace::Back,
+            ..self
+        }
+    }
+}
 
 impl From<Entity> for RunStorageKey {
-    fn from(label: Entity) -> Self { Self(label.to_bits()) }
+    fn from(label: Entity) -> Self {
+        Self {
+            entity: label.to_bits(),
+            face:   RunFace::Front,
+        }
+    }
 }
 
 /// `GlyphCache` resource: owns the glyph cache and the batch store.

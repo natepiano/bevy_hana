@@ -504,6 +504,11 @@ fn fragment(
     let pixel_size = vec2<f32>(fwidth(local.x), fwidth(local.y));
     let local_dx = dpdx(local.x);
     let local_dy = dpdy(local.y);
+    // Pixel boundaries describe panel edges only when the panel axes follow
+    // the viewport axes. Keep the ordinary world-plane ramp for oblique views.
+    let axis_aligned_edge_snap = view_aligned_edge_snap
+        && abs(dpdy(local.x)) <= abs(local_dx) * 0.001
+        && abs(dpdx(local.y)) <= abs(local_dy) * 0.001;
     let inflated = inflate_subpixel_half_size(record.half_size, pixel_size);
     let paint_inside_border = (record.flags & SDF_PAINT_INSIDE_BORDER_FLAG) != 0u;
     let keep_snapped_edges_inside =
@@ -519,16 +524,16 @@ fn fragment(
     let edge_local = select(
         local,
         local - vec2(snapped_x.x, snapped_y.x),
-        view_aligned_edge_snap,
+        axis_aligned_edge_snap,
     );
     let effective_half_size = select(
         inflated.xy,
         vec2(snapped_x.y, snapped_y.y),
-        view_aligned_edge_snap,
+        axis_aligned_edge_snap,
     );
     let coverage_scale = inflated.z;
     let outer_dist = sd_rounded_box(edge_local, effective_half_size, record.corner_radii);
-    let outer_aa = edge_aa_width(outer_dist, view_aligned_edge_snap);
+    let outer_aa = edge_aa_width(outer_dist, axis_aligned_edge_snap);
     if paint_inside_border && outer_dist >= 0.0 {
         discard;
     }
@@ -570,7 +575,7 @@ fn fragment(
     let inner_offset = border_center_offset(border_widths);
     let inner_radii = inner_corner_radii(record, border_widths);
     let inner_dist = sd_rounded_box(edge_local - inner_offset, max(inner_hs, vec2(0.0)), inner_radii);
-    let inner_aa = edge_aa_width(inner_dist, view_aligned_edge_snap);
+    let inner_aa = edge_aa_width(inner_dist, axis_aligned_edge_snap);
     let inner_alpha = 1.0 - smoothstep(-inner_aa, inner_aa, inner_dist);
     let classic_border_alpha = outer_alpha * (1.0 - inner_alpha);
     let stroke_center = 0.5 * (outer_dist + inner_dist);

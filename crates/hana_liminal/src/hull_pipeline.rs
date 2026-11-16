@@ -188,7 +188,7 @@ impl SpecializedMeshPipeline for HullPipeline {
             }
         }
 
-        descriptor.vertex.shader_defs.extend(shader_defs.clone());
+        descriptor.vertex.shader_defs.extend(shader_defs);
 
         let color_format = if key.dynamic_range.is_hdr() {
             TextureFormat::Rgba16Float
@@ -197,11 +197,13 @@ impl SpecializedMeshPipeline for HullPipeline {
         };
 
         descriptor.fragment = Some(FragmentState {
-            constants: Vec::default(),
-            shader: HULL_SHADER_HANDLE,
-            shader_defs,
+            constants:   Vec::default(),
+            shader:      HULL_SHADER_HANDLE,
+            // Keep view definitions (notably DEPTH_PREPASS and MULTISAMPLED)
+            // when replacing the mesh fragment shader with the outline shader.
+            shader_defs: descriptor.vertex.shader_defs.clone(),
             entry_point: Some(FRAGMENT_SHADER_ENTRY_POINT.into()),
-            targets: vec![Some(ColorTargetState {
+            targets:     vec![Some(ColorTargetState {
                 format:     color_format,
                 blend:      Some(BlendState::ALPHA_BLENDING),
                 write_mask: ColorWrites::ALL,
@@ -220,7 +222,9 @@ impl SpecializedMeshPipeline for HullPipeline {
         descriptor.label = Some(HULL_OUTLINE_PIPELINE_LABEL.into());
         descriptor.layout.push(self.outline_layout.clone());
         descriptor.layout.push(self.depth_layout.clone());
-        descriptor.primitive.cull_mode = Some(Face::Front);
+        // The mask already removes the source interior. Drawing the front shell
+        // keeps a coplanar neighbor from hiding its stroke behind the back shell.
+        descriptor.primitive.cull_mode = Some(Face::Back);
 
         Ok(descriptor)
     }

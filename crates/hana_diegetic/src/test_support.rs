@@ -16,3 +16,9 @@ pub(crate) fn configure_click_interval(app: &mut App, clicks: usize) {
         .resource_mut::<PickingSettings>()
         .multi_click_interval = interval;
 }
+
+#[path = "test_pointer.rs"]
+pub(crate) mod test_pointer;
+
+#[path = "tooltip_test_hover.rs"]
+pub(crate) mod tooltip_hover;

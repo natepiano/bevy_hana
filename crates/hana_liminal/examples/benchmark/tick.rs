@@ -20,13 +20,12 @@ use bevy::prelude::Window;
 use bevy::prelude::With;
 use bevy::prelude::info;
 
+use crate::benchmark_state;
 use crate::benchmark_state::BenchmarkMode;
 use crate::benchmark_state::BenchmarkPhase;
 use crate::benchmark_state::BenchmarkState;
 use crate::benchmark_state::ExitBehavior;
 use crate::benchmark_state::OutlinePresence;
-use crate::benchmark_state::next_outline_method;
-use crate::benchmark_state::outline_method_label;
 use crate::constants::AUTO_BENCHMARK_COMPLETE_MESSAGE;
 use crate::constants::AUTO_BENCHMARK_START_MESSAGE;
 use crate::constants::AUTO_EXIT_DELAY_SECS;
@@ -43,10 +42,9 @@ use crate::constants::SCENARIOS;
 use crate::constants::STARTUP_COMPLETE_MESSAGE;
 use crate::constants::WARMUP_FRAMES;
 use crate::grid::BenchmarkEntity;
-use crate::results::compute_statistics;
-use crate::results::write_results;
-use crate::scenarios::spawn_scenario;
-use crate::viewport::compute_viewport_info;
+use crate::results;
+use crate::scenarios;
+use crate::viewport;
 
 #[derive(SystemParam)]
 pub(super) struct BenchmarkTickParams<'w, 's> {
@@ -148,9 +146,9 @@ fn handle_setup_phase(
     let Ok(window) = windows.single() else {
         return;
     };
-    let viewport = compute_viewport_info(camera_transform, projection, window);
+    let viewport = viewport::compute_viewport_info(camera_transform, projection, window);
 
-    spawn_scenario(
+    scenarios::spawn_scenario(
         commands,
         meshes,
         materials,
@@ -185,7 +183,7 @@ fn measure_phase(state: &mut BenchmarkState, time: &Time<Real>) {
 
 fn handle_analyze_phase(state: &mut BenchmarkState) {
     let result_name = state.result_name();
-    let result = compute_statistics(&result_name, &mut state.frame_times);
+    let result = results::compute_statistics(&result_name, &mut state.frame_times);
     info!(
         "  {} — average: {:.milliseconds_precision$}ms, median: {:.milliseconds_precision$}ms, 95th: {:.milliseconds_precision$}ms, ~{:.frames_per_second_precision$} FPS",
         result.name,
@@ -222,7 +220,7 @@ fn handle_analyze_phase(state: &mut BenchmarkState) {
 
     state.outline_presence = OutlinePresence::Disabled;
     if state.benchmark_mode == BenchmarkMode::Auto {
-        write_results(&state.results);
+        results::write_results(&state.results);
         if state.exit_behavior == ExitBehavior::OnComplete {
             info!("Auto benchmark complete, exiting in {AUTO_EXIT_DELAY_SECS}s");
             state.benchmark_phase = BenchmarkPhase::ExitDelay;
@@ -246,7 +244,7 @@ fn handle_exit_delay_phase(state: &mut BenchmarkState, time: &Time<Real>) {
 
 pub(super) fn handle_input(input: Res<ButtonInput<KeyCode>>, mut state: ResMut<BenchmarkState>) {
     if input.just_pressed(KeyCode::KeyL) && !state.results.is_empty() {
-        write_results(&state.results);
+        results::write_results(&state.results);
         return;
     }
 
@@ -261,8 +259,11 @@ pub(super) fn handle_input(input: Res<ButtonInput<KeyCode>>, mut state: ResMut<B
     }
 
     if input.just_pressed(KeyCode::KeyM) {
-        let new_outline_method = next_outline_method(state.outline_method);
-        info!("Outline mode: {}", outline_method_label(new_outline_method));
+        let new_outline_method = benchmark_state::next_outline_method(state.outline_method);
+        info!(
+            "Outline mode: {}",
+            benchmark_state::outline_method_label(new_outline_method)
+        );
         state.outline_method = new_outline_method;
         state.benchmark_mode = BenchmarkMode::Interactive;
         state.outline_presence = OutlinePresence::Disabled;

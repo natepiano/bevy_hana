@@ -122,8 +122,7 @@ pub use interaction::WidgetControlSummary;
 pub use interaction::WidgetDisabled;
 pub use interaction::WidgetPrimaryPressOwnership;
 pub use interaction::WidgetScreenSizeGate;
-#[cfg(test)]
-pub(crate) use tooltip::TooltipPointerCamera;
+pub use interaction::WidgetSizeEligibility;
 /// Dims a control's linked caption while leaving its appearance and interaction enabled.
 ///
 /// Add this marker to a widget entity. Focus, input routing, and widget events
@@ -132,7 +131,9 @@ pub(crate) use tooltip::TooltipPointerCamera;
 #[reflect(Component)]
 pub struct WidgetDimmed;
 
-pub(crate) use constants::TOOLTIP_SHADOW_EXTENT;
+pub use constants::TOOLTIP_SHADOW_EXTENT;
+pub use constants::TooltipPaintedReach;
+pub use constants::TooltipShadowExtent;
 pub(crate) use interaction::WidgetFocusAuthority;
 pub use interaction::WidgetFocusChangeCause;
 pub use interaction::WidgetFocusChanged;
@@ -190,6 +191,7 @@ pub use tooltip::TooltipShown;
 pub use tooltip::TooltipTarget;
 pub use tooltip::TooltipTargetEntity;
 pub use tooltip::TooltipTargetSpace;
+pub use tooltip::TooltipWorldUpdate;
 pub use tooltip::Tooltips;
 pub(crate) use tooltip::remove_materialized_state as remove_materialized_tooltip_state;
 pub(crate) use tooltip::select_window_presentation_camera;
@@ -357,7 +359,12 @@ impl Plugin for WidgetsPlugin {
         configure_widget_system_sets(app);
         app.add_systems(
             PreUpdate,
-            interaction::update_hits
+            (
+                interaction::update_size_eligibility,
+                ApplyDeferred,
+                interaction::update_hits,
+            )
+                .chain()
                 .run_if(resource_exists::<RayMap>.and_then(resource_exists::<Assets<Mesh>>))
                 .in_set(PickingSystems::Backend),
         )

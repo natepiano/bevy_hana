@@ -230,7 +230,10 @@ pub(super) fn press(
     let entity = press.event_target();
     let widget = pointer.widgets.get(entity).ok();
     let panel_entity = widget.map_or(entity, |(_, _, owner, _)| owner.panel());
-    if let Ok((panel, computed, transform, _, _)) = pointer.panels.get(panel_entity) {
+    if let Ok((panel, computed, transform, _, locked)) = pointer.panels.get(panel_entity) {
+        if locked {
+            return;
+        }
         let record = if let Some((widget, kind, _, disabled)) = widget {
             computed.field_records().iter().find(|record| {
                 *kind == WidgetKind::EditableField
@@ -341,9 +344,12 @@ pub(super) fn drag(
     else {
         return;
     };
-    let Ok((panel, computed, transform, _, _)) = pointer.panels.get(*panel) else {
+    let Ok((panel, computed, transform, _, locked)) = pointer.panels.get(*panel) else {
         return;
     };
+    if locked {
+        return;
+    }
     let Ok((camera, camera_transform, render_target)) = cameras.get(capture.camera) else {
         return;
     };

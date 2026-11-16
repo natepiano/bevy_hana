@@ -55,7 +55,8 @@ hana_valence          = { path = "crates/hana_valence", default-features = false
 # External dependencies
 #
 anyhow = "1.0.104"
-bevy = { version = "0.20.0", default-features = false, features = [
+async-channel = "2.5.0"
+bevy = { version = "0.20.1", default-features = false, features = [
   "3d",
   "bevy_dev_tools",
   "bevy_remote",
@@ -76,34 +77,34 @@ bevy = { version = "0.20.0", default-features = false, features = [
   "webp",
 ] }
 bevy-inspector-egui = "0.38.0"
-bevy_app = { version = "0.20.0", features = ["reflect_auto_register", "std"] }
-bevy_asset = "0.20.0"
-bevy_camera = "0.20.0"
-bevy_color = { version = "0.20.0", features = ["bevy_reflect"] }
-bevy_curve = "0.20.0"
-bevy_diagnostic = "0.20.0"
-bevy_ecs = { version = "0.20.0", features = [
+bevy_app = { version = "0.20.1", features = ["reflect_auto_register", "std"] }
+bevy_asset = "0.20.1"
+bevy_camera = "0.20.1"
+bevy_color = { version = "0.20.1", features = ["bevy_reflect"] }
+bevy_curve = "0.20.1"
+bevy_diagnostic = "0.20.1"
+bevy_ecs = { version = "0.20.1", features = [
   "bevy_reflect",
   "reflect_auto_register",
   "std",
 ] }
 bevy_enhanced_input = { version = "0.27.2", features = ["reflect"] }
-bevy_log = "0.20.0"
+bevy_log = "0.20.1"
 bevy_lookup_curve = { version = "0.13.0", default-features = false, features = [
   "bevy_asset",
   "bevy_reflect",
 ] }
-bevy_math = { version = "0.20.0", features = ["bevy_reflect", "std"] }
-bevy_platform = { version = "0.20.0", default-features = false, features = [
+bevy_math = { version = "0.20.1", features = ["bevy_reflect", "std"] }
+bevy_platform = { version = "0.20.1", default-features = false, features = [
   "std",
 ] }
-bevy_reflect = { version = "0.20.0", features = ["glam"] }
-bevy_remote = "0.20.0"
-bevy_render = "0.20.0"
-bevy_scene = "0.20.0"
-bevy_state = "0.20.0"
-bevy_time = { version = "0.20.0", default-features = false, features = ["std"] }
-bevy_transform = { version = "0.20.0", features = ["std"] }
+bevy_reflect = { version = "0.20.1", features = ["glam"] }
+bevy_remote = "0.20.1"
+bevy_render = "0.20.1"
+bevy_scene = "0.20.1"
+bevy_state = "0.20.1"
+bevy_time = { version = "0.20.1", default-features = false, features = ["std"] }
+bevy_transform = { version = "0.20.1", features = ["std"] }
 bevy_tween = { version = "0.14.1", default-features = false }
 bitflags = "2"
 blake3 = "1.8.7"
@@ -154,6 +155,7 @@ pipewire = "0.10.1"
 proc-macro2 = "1.0.107"
 quote = "1.0.47"
 rand = "0.10.3"
+rapier3d = "0.36.1"
 raw-window-handle = "0.6"
 ron = "0.12.2"
 schemars = "1.2.2"
@@ -249,12 +251,23 @@ split-debuginfo = "unpacked"
 # Optimize dependencies even in dev builds; keeps own-crate incremental compiles fast.
 [profile.dev.package."*"]
 opt-level = 3
-# Incremental ThinLTO reused stale objects in the vendored path crates and left undefined symbols.
+# Incremental compilation is off for every crate built at opt-level > 0 (here and in each
+# workspace block below). At opt-level > 0 rustc runs local ThinLTO, which renames promoted
+# symbols to `<name>.llvm.<module hash>`; incremental reuse of an old object keeps a reference
+# to the old hash, and the link fails with undefined `.llvm.*` symbols (Mac, 2026-10-19 and
+# 2026-11-13).
 incremental = false
 
 # Cable routing searches thousands of grid cells per cable; unoptimised it runs about 20x slower,
 # so cables take seconds to settle after Open in a dev build.
 [profile.dev.package.hana_conduit]
+incremental = false
+opt-level   = 3
+
+[profile.dev.package.rapier3d]
+opt-level = 3
+
+[profile.dev.package.parry3d]
 opt-level = 3
 
 # Every other workspace crate except `hana` builds at opt-level 1. Measured 2026-10-28 through
@@ -263,77 +276,106 @@ opt-level = 3
 # these crates cost 32 s more (116.9 / 149.0 s). `hana` stays at 0 because its rebuild is the
 # edit loop. One block per crate, not `[profile.dev]`: only a package block overrides
 # `build-override` for the proc-macro `hana_tool_macros`.
+# Each optimized workspace block also sets `incremental = false`, for the `.llvm.*` link
+# defect named at `[profile.dev.package."*"]`. Measured 2026-11-13 on natedev: an edit in
+# hana_diegetic rebuilds about 65 s slower (load-scaled); `codegen-units = 1` also avoids the
+# defect but cost more, both after an edit and from cold.
 [profile.dev.package.fairy_dust]
-opt-level = 1
+incremental = false
+opt-level   = 1
 
 [profile.dev.package.hana_animation]
-opt-level = 1
+incremental = false
+opt-level   = 1
 
 [profile.dev.package.hana_catalyst]
-opt-level = 1
+incremental = false
+opt-level   = 1
 
 [profile.dev.package.hana_clerestory]
-opt-level = 1
+incremental = false
+opt-level   = 1
 
 [profile.dev.package.hana_diegetic]
-opt-level = 1
+incremental = false
+opt-level   = 1
 
 [profile.dev.package.hana_effects]
-opt-level = 1
+incremental = false
+opt-level   = 1
 
 [profile.dev.package.hana_kana]
-opt-level = 1
+incremental = false
+opt-level   = 1
 
 [profile.dev.package.hana_lading]
-opt-level = 1
+incremental = false
+opt-level   = 1
 
 [profile.dev.package.hana_lagrange]
-opt-level = 1
+incremental = false
+opt-level   = 1
 
 [profile.dev.package.hana_liminal]
-opt-level = 1
+incremental = false
+opt-level   = 1
 
 [profile.dev.package.hana_metrics]
-opt-level = 1
+incremental = false
+opt-level   = 1
 
 [profile.dev.package.hana_mimesis_tools]
-opt-level = 1
+incremental = false
+opt-level   = 1
 
 [profile.dev.package.hana_organon]
-opt-level = 1
+incremental = false
+opt-level   = 1
 
 [profile.dev.package.hana_origami]
-opt-level = 1
+incremental = false
+opt-level   = 1
 
 [profile.dev.package.hana_prosody]
-opt-level = 1
+incremental = false
+opt-level   = 1
 
 [profile.dev.package.hana_rigging]
-opt-level = 1
+incremental = false
+opt-level   = 1
 
 [profile.dev.package.hana_rigging_scripted]
-opt-level = 1
+incremental = false
+opt-level   = 1
 
 [profile.dev.package.hana_rubric]
-opt-level = 1
+incremental = false
+opt-level   = 1
 
 [profile.dev.package.hana_sdf]
-opt-level = 1
+incremental = false
+opt-level   = 1
 
 [profile.dev.package.hana_tool_macros]
-opt-level = 1
+incremental = false
+opt-level   = 1
 
 [profile.dev.package.hana_tool_schema]
-opt-level = 1
+incremental = false
+opt-level   = 1
 
 [profile.dev.package.hana_tools]
-opt-level = 1
+incremental = false
+opt-level   = 1
 
 [profile.dev.package.hana_valence]
-opt-level = 1
+incremental = false
+opt-level   = 1
 
 [profile.dev.package.hana_video]
-opt-level = 1
+incremental = false
+opt-level   = 1
 
 [profile.dev.package.hana_works]
-opt-level = 1
+incremental = false
+opt-level   = 1

@@ -18,6 +18,7 @@ use hana_lagrange::OrbitCamPreset;
 use hana_lagrange::ZoomDirection;
 use hana_lagrange::ZoomRowFilter;
 use hana_lagrange::describe_controls;
+use hana_rubric::ShortcutHint;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum CameraGuidanceContent {
@@ -226,6 +227,7 @@ impl From<CameraControlAction> for CameraGuidanceAction {
 pub struct CameraGuidanceRow {
     action:                     CameraGuidanceAction,
     label:                      String,
+    shortcut:                   ShortcutHint,
     camera_interaction_sources: InteractionSources,
     speed:                      ControlSpeed,
     action_label:               ActionColumnLabel,
@@ -239,6 +241,7 @@ impl CameraGuidanceRow {
         Self {
             action,
             label: label.into(),
+            shortcut: ShortcutHint::NotAShortcut,
             camera_interaction_sources: InteractionSources::NONE,
             speed: ControlSpeed::Normal,
             action_label: ActionColumnLabel::ActionName,
@@ -292,6 +295,8 @@ impl CameraGuidanceRow {
     #[must_use]
     pub fn label(&self) -> &str { &self.label }
 
+    pub(super) const fn shortcut(&self) -> &ShortcutHint { &self.shortcut }
+
     /// Returns the role of the right-column label.
     #[must_use]
     pub const fn action_label(&self) -> &ActionColumnLabel { &self.action_label }
@@ -310,6 +315,7 @@ impl CameraGuidanceRow {
         let mut row = Self::new(CameraGuidanceAction::from(binding.action), binding.label)
             .with_camera_interaction_sources(binding.interaction_sources)
             .with_speed(binding.speed);
+        row.shortcut = binding.shortcut;
         row.action_label = binding.action_label;
         row.direction = binding.direction;
         row

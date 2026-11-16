@@ -1,4 +1,4 @@
-//! Linked contracts checked by the single liminal descriptor recorder.
+//! Linked contracts checked by the liminal descriptor tests.
 
 use std::collections::BTreeMap;
 use std::collections::HashSet;

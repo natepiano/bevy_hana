@@ -38,6 +38,7 @@ bevy = { workspace = true, features = [
 bevy_enhanced_input = { workspace = true }
 bitflags = { workspace = true }
 hana_kana = { workspace = true }
+hana_rubric = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 
@@ -48,7 +49,6 @@ fairy_dust      = { workspace = true }
 float-cmp       = { workspace = true }
 hana_clerestory = { workspace = true }
 hana_diegetic   = { workspace = true }
-hana_rubric     = { workspace = true }
 serde_json      = { workspace = true }
 
 [[example]]

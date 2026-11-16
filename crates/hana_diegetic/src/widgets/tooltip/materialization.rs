@@ -6,6 +6,7 @@ use bevy::window::WindowRef;
 use hana_valence::AnchorSite;
 use hana_valence::ResolvedAnchorGeometry;
 
+use super::controller::TooltipContentChanged;
 use super::controller::TooltipFor;
 use super::declaration::AuthoredTooltipTargetSpace;
 use super::declaration::PrepareTooltip;
@@ -17,6 +18,8 @@ use super::declaration::TooltipPhase;
 use super::placement;
 use super::placement::TooltipPlacementResult;
 use super::placement::TooltipPlacementState;
+use super::resize::TooltipResizePending;
+use super::resize::WorldTooltipResizeFitPending;
 use super::target::MeshAnchorTarget;
 use crate::cascade::CascadeEntityCommandsExt;
 use crate::constants::DIAGNOSTIC_LOG_TARGET;
@@ -211,6 +214,8 @@ enum WorldTooltipRasterCalibration {
 pub(super) struct WorldTooltipRasterFitAwaitingPlacement;
 
 impl WorldTooltipFrameProjection {
+    pub(super) const fn layout_scale(&self) -> Vec3 { self.world_scale }
+
     /// A newly changed grid gets one frame to settle. Continuous motion must
     /// not withhold already fitted help while calibration waits for the view.
     pub(super) const fn allows_reveal(&self) -> bool {
@@ -241,6 +246,91 @@ impl WorldTooltipFrameProjection {
     }
 }
 
+pub(super) fn materialized_tooltip_content_changed(
+    controllers: Query<(), (With<MaterializedTooltip>, With<TooltipContentChanged>)>,
+) -> bool {
+    !controllers.is_empty()
+}
+
+pub(super) fn rebuild_resized_tooltips(
+    controllers: Query<(
+        Entity,
+        &Tooltip,
+        &MaterializedTooltip,
+        &TooltipResizePending,
+        &Transform,
+        Option<&TooltipPresentationCamera>,
+        Option<&TooltipWidthConstraint>,
+    )>,
+    projection_entities: Query<(&GlobalTransform, Option<&Camera>)>,
+    anchor_geometry: Query<&ResolvedAnchorGeometry>,
+    panels: Query<&DiegeticPanel>,
+    windows: Query<&Window>,
+    defaults: Res<crate::cascade::PanelDefaults>,
+    surface_material: Res<TooltipSurfaceMaterial>,
+    text: Option<(Res<FontRegistry>, Res<DiegeticTextMeasurer>)>,
+    mut commands: Commands,
+) {
+    let text_measure = text
+        .as_ref()
+        .map_or(TooltipTextMeasure::TextNotReady, |(fonts, measurer)| {
+            TooltipTextMeasure::Ready { fonts, measurer }
+        });
+    for (entity, tooltip, materialized, pending, pose, camera, width) in &controllers {
+        let context = TooltipMaterializationContext {
+            target:        materialized.target,
+            presentation:  materialized.presentation,
+            layout_unit:   materialized.layout_unit,
+            render_layers: materialized.render_layers.clone(),
+        };
+        let Some(panel) = build_tooltip_panel(
+            tooltip,
+            tooltip.blueprint(),
+            &context,
+            &windows,
+            &surface_material.0,
+            defaults.panel_font_unit,
+            text_measure,
+            TooltipFrameRasterGrid::Unprojected,
+        ) else {
+            continue;
+        };
+        let (mut panel, grid) = size_world_tooltip_frame_to_projection(
+            tooltip,
+            panel,
+            pending.layout_scale,
+            &context,
+            camera,
+            &projection_entities,
+            &anchor_geometry,
+            &panels,
+            &windows,
+            &surface_material.0,
+            defaults.panel_font_unit,
+            text_measure,
+        );
+        if let Some(width) = width {
+            panel::constrain_fit_width(&mut panel, width.0);
+        }
+        let pose = pose.with_scale(pending.layout_scale);
+        commands.run_system_cached_with(panel::apply_precompose_helper_panel, (entity, panel));
+        commands
+            .entity(entity)
+            .remove::<TooltipResizePending>()
+            .insert((
+                pose,
+                GlobalTransform::from(pose),
+                WorldTooltipResizeFitPending,
+                WorldTooltipFrameProjection {
+                    grid,
+                    observed_grid: grid,
+                    world_scale: pending.layout_scale,
+                    calibration: WorldTooltipRasterCalibration::Current,
+                },
+            ));
+    }
+}
+
 pub(super) fn materialize_requested_tooltips(
     help_controllers: Query<(Entity, &Tooltip, &TooltipPhase)>,
     controllers: Query<
@@ -250,6 +340,7 @@ pub(super) fn materialize_requested_tooltips(
             &TooltipFor,
             Option<&AuthoredTooltipTargetSpace>,
             Has<DiegeticPanel>,
+            Has<TooltipContentChanged>,
             Option<&Transform>,
             Option<&GlobalTransform>,
             Option<&Visibility>,
@@ -272,11 +363,7 @@ pub(super) fn materialize_requested_tooltips(
     text: Option<(Res<FontRegistry>, Res<DiegeticTextMeasurer>)>,
     mut commands: Commands,
 ) {
-    let text_measure = text
-        .as_ref()
-        .map_or(TooltipTextMeasure::TextNotReady, |(fonts, measurer)| {
-            TooltipTextMeasure::Ready { fonts, measurer }
-        });
+    let text_measure = TooltipTextMeasure::from_resources(text.as_ref());
     let sole_help = sole_help_controller(&help_controllers);
     for (
         controller,
@@ -284,6 +371,7 @@ pub(super) fn materialize_requested_tooltips(
         tooltip_for,
         authored_space,
         has_panel,
+        content_changed,
         previous_transform,
         previous_global,
         previous_visibility,
@@ -293,7 +381,7 @@ pub(super) fn materialize_requested_tooltips(
         if sole_help.is_some_and(|sole_help| sole_help != controller) {
             continue;
         }
-        if has_panel {
+        if has_panel && !content_changed {
             commands.entity(controller).remove::<PrepareTooltip>();
             continue;
         }
@@ -312,7 +400,7 @@ pub(super) fn materialize_requested_tooltips(
         ) else {
             continue;
         };
-        let Some(mut panel) = build_tooltip_panel(
+        let Some(panel) = build_tooltip_panel(
             tooltip,
             tooltip.blueprint(),
             &context,
@@ -325,12 +413,15 @@ pub(super) fn materialize_requested_tooltips(
             continue;
         };
         let width_constraint = initial_tooltip_width_constraint(tooltip, &context, &windows);
-        let world_scale = if tooltip.has_source_label_sized_text() {
-            world_tooltip_scale(context.target, &panel, &panels, &widgets, &panel_globals)
-        } else {
-            Vec3::ONE
-        };
-        let (sized_panel, frame_grid) = size_world_tooltip_frame_to_projection(
+        let world_scale = world_tooltip_scale(
+            tooltip,
+            context.target,
+            &panel,
+            &panels,
+            &widgets,
+            &panel_globals,
+        );
+        let (panel, frame_grid) = size_world_tooltip_frame_to_projection(
             tooltip,
             panel,
             world_scale,
@@ -344,14 +435,24 @@ pub(super) fn materialize_requested_tooltips(
             defaults.panel_font_unit,
             text_measure,
         );
-        panel = sized_panel;
-        let authored_attachment = tooltip.attachment();
+        if has_panel {
+            refresh_materialized_tooltip(
+                &mut commands,
+                controller,
+                panel,
+                &context,
+                frame_grid,
+                world_scale,
+                previous_transform,
+            );
+            continue;
+        }
         finish_tooltip_materialization(
             &mut commands,
             controller,
             panel,
             &context,
-            authored_attachment,
+            tooltip.attachment(),
             previous_transform,
             previous_global,
             previous_visibility,
@@ -359,6 +460,33 @@ pub(super) fn materialize_requested_tooltips(
             width_constraint,
             frame_grid,
         );
+    }
+}
+
+fn refresh_materialized_tooltip(
+    commands: &mut Commands,
+    controller: Entity,
+    panel: DiegeticPanel,
+    context: &TooltipMaterializationContext,
+    frame_grid: TooltipFrameRasterGrid,
+    world_scale: Vec3,
+    previous_transform: Option<&Transform>,
+) {
+    // Recompose the existing surface; removing it or its controller
+    // would reset TooltipPhase while the target is still hovered.
+    commands.run_system_cached_with(panel::apply_precompose_helper_panel, (controller, panel));
+    let mut entity = commands.entity(controller);
+    entity.remove::<(PrepareTooltip, TooltipContentChanged)>();
+    if matches!(context.presentation, TooltipPresentationSpace::World) {
+        entity.insert(WorldTooltipFrameProjection {
+            grid: frame_grid,
+            observed_grid: frame_grid,
+            world_scale,
+            calibration: WorldTooltipRasterCalibration::Current,
+        });
+        if let Some(pose) = previous_transform {
+            entity.insert((*pose).with_scale(world_scale));
+        }
     }
 }
 
@@ -387,7 +515,7 @@ fn finish_tooltip_materialization(
     };
     commands
         .entity(controller)
-        .remove::<(PrepareTooltip, PanelPicking)>()
+        .remove::<(PrepareTooltip, TooltipContentChanged, PanelPicking)>()
         .insert((
             panel,
             Visibility::Hidden,
@@ -632,12 +760,16 @@ fn sole_help_controller(controllers: &Query<(Entity, &Tooltip, &TooltipPhase)>) 
 /// width and ancestor scale. Fit sizing changes the tooltip's dimensions but
 /// keeps its points-to-world factor stable.
 fn world_tooltip_scale(
+    declaration: &Tooltip,
     target: Entity,
     tooltip: &DiegeticPanel,
     panels: &Query<&DiegeticPanel>,
     widgets: &Query<&WidgetOf, With<PanelWidget>>,
     globals: &Query<&GlobalTransform, With<DiegeticPanel>>,
 ) -> Vec3 {
+    if !declaration.has_source_label_sized_text() {
+        return Vec3::ONE;
+    }
     let owner = panels
         .get(target)
         .map(|_| target)
@@ -783,6 +915,15 @@ enum TooltipTextMeasure<'a> {
         measurer: &'a DiegeticTextMeasurer,
     },
     TextNotReady,
+}
+
+impl<'a> TooltipTextMeasure<'a> {
+    fn from_resources(text: Option<&'a (Res<FontRegistry>, Res<DiegeticTextMeasurer>)>) -> Self {
+        text.map_or(Self::TextNotReady, |(fonts, measurer)| Self::Ready {
+            fonts,
+            measurer,
+        })
+    }
 }
 
 pub(super) fn resolve_tooltip_look(
@@ -1147,31 +1288,35 @@ fn measured_tooltip_padding(
     let TooltipTextMeasure::Ready { fonts, measurer } = text_measure else {
         return balanced;
     };
-    let ink_run = (0..tree.len()).find_map(|index| {
-        let (Some(text), Some(style)) = (tree.element_text(index), tree.element_style(index))
-        else {
-            return None;
-        };
-        // The panel scales authored text to points before both layout and
-        // shaping. Measuring the tiny world-unit size directly makes parley
-        // quantize the run baseline to zero.
-        let scale = style.unit().map_or(font_unit.to_points(), Unit::to_points);
-        let measure = style.as_measure().scaled(scale);
-        let TextInkMeasurement::Visible(ink) = measure_drawn_ink(fonts, text, &measure) else {
-            return None;
-        };
-        let line = (measurer.measure_fn)(text, &measure);
-        Some((ink, line, measure))
-    });
-    let Some((ink, line, measure)) = ink_run else {
+    let ink_runs = (0..tree.len())
+        .filter_map(|index| {
+            let (Some(text), Some(style)) = (tree.element_text(index), tree.element_style(index))
+            else {
+                return None;
+            };
+            // The panel scales authored text to points before both layout and
+            // shaping. Measuring the tiny world-unit size directly makes parley
+            // quantize the run baseline to zero.
+            let scale = style.unit().map_or(font_unit.to_points(), Unit::to_points);
+            let measure = style.as_measure().scaled(scale);
+            let TextInkMeasurement::Visible(ink) = measure_drawn_ink(fonts, text, &measure) else {
+                return None;
+            };
+            let line = (measurer.measure_fn)(text, &measure);
+            Some((ink, line, measure))
+        })
+        .collect::<Vec<_>>();
+    let (Some((ink, line, measure)), Some((last_ink, last_line, _))) =
+        (ink_runs.first(), ink_runs.last())
+    else {
         return balanced;
     };
     let pixels_per_point = frame_scale.pixels_per_point();
     let left_slack = ink.left.max(0.0) * pixels_per_point;
     let right_slack = (line.width - ink.right).max(0.0) * pixels_per_point;
-    let cap = match measure_drawn_ink(fonts, "H", &measure) {
+    let cap = match measure_drawn_ink(fonts, "H", measure) {
         TextInkMeasurement::Visible(cap) => cap,
-        TextInkMeasurement::NoVisibleInk => ink,
+        TextInkMeasurement::NoVisibleInk => *ink,
     };
     let drawn_cap_height = (cap.bottom - cap.top) * pixels_per_point;
     // Solid raster bounds omit the antialiased edge of both the glyph and
@@ -1186,7 +1331,8 @@ fn measured_tooltip_padding(
     // the 9 px help floor, where an untrimmed bearing is most of a cap high.
     let horizontal_gap = ink_gap;
     let top_slack = ink.top.max(0.0) * pixels_per_point;
-    let bottom_slack = (line.height - ink.bottom).max(0.0) * pixels_per_point;
+    // The last run defines the lower ink edge of a column of help text.
+    let bottom_slack = (last_line.height - last_ink.bottom).max(0.0) * pixels_per_point;
     let vertical_gap = ink_gap;
     let horizontal = horizontal_gap.mul_add(2.0, -(left_slack + right_slack));
     let vertical = vertical_gap.mul_add(2.0, -(top_slack + bottom_slack));
@@ -1295,11 +1441,7 @@ pub(super) fn invalidate_stale_world_tooltip_frames(
     text: Option<(Res<FontRegistry>, Res<DiegeticTextMeasurer>)>,
     mut commands: Commands,
 ) {
-    let text_measure = text
-        .as_ref()
-        .map_or(TooltipTextMeasure::TextNotReady, |(fonts, measurer)| {
-            TooltipTextMeasure::Ready { fonts, measurer }
-        });
+    let text_measure = TooltipTextMeasure::from_resources(text.as_ref());
     for (entity, tooltip, phase, panel, materialized, camera, mut last, width_constraint) in
         &mut controllers
     {
@@ -1467,6 +1609,8 @@ pub(super) fn apply_tooltip_width_constraints(
     reason = "tests should panic on unexpected values"
 )]
 mod tests {
+    use std::time::Duration;
+
     use bevy::camera::PerspectiveProjection;
     use bevy::camera::Projection;
     use bevy::camera::RenderTarget;
@@ -1476,6 +1620,9 @@ mod tests {
     use bevy::color::Alpha;
     use bevy::ecs::system::RunSystemOnce;
     use bevy::mesh::Mesh3d;
+    use bevy::picking::backend::HitData;
+    use bevy::picking::hover::HoverMap;
+    use bevy::picking::pointer::PointerId;
     use bevy::prelude::App;
     use bevy::prelude::Camera;
     use bevy::prelude::Entity;
@@ -1494,6 +1641,7 @@ mod tests {
     use hana_valence::ResolvedAnchorGeometry;
 
     use super::*;
+    use crate::Anchor;
     use crate::HeadlessLayoutPlugin;
     use crate::LayoutBuilder;
     use crate::Mm;
@@ -1523,6 +1671,108 @@ mod tests {
     const TEST_CAMERA_DISTANCE: f32 = 5.0;
 
     const TEST_VIEWPORT: Vec2 = Vec2::new(800.0, 600.0);
+
+    #[derive(Default, Resource)]
+    struct ResizeVisibilityLog {
+        shown:  Vec<Entity>,
+        hidden: Vec<Entity>,
+    }
+
+    #[test]
+    fn resizing_visible_world_tooltip_keeps_its_controller_gap_and_reveal() -> Result<(), String> {
+        let mut app = materialization_app();
+        app.init_resource::<HoverMap>()
+            .init_resource::<ResizeVisibilityLog>()
+            .add_observer(
+                |event: On<TooltipShown>, mut log: ResMut<ResizeVisibilityLog>| {
+                    log.shown.push(event.entity);
+                },
+            )
+            .add_observer(
+                |event: On<TooltipHidden>, mut log: ResMut<ResizeVisibilityLog>| {
+                    log.hidden.push(event.entity);
+                },
+            );
+        let window = app
+            .world_mut()
+            .spawn((Window::default(), PrimaryWindow))
+            .id();
+        let camera = spawn_presentation_camera(&mut app, window, RenderLayers::layer(0));
+        let target = mesh_target(&mut app, Vec3A::new(0.04, 0.025, 0.005));
+        app.world_mut()
+            .resource_mut::<HoverMap>()
+            .entry(PointerId::Mouse)
+            .or_default()
+            .insert(target, HitData::new(camera, 1.0, None, None));
+        let make_tooltip = |size| {
+            let mut tooltip = Tooltip::new(El::column())
+                .with_label_size(Mm(size))
+                .font_unit(Unit::Meters)
+                .show_after(Duration::ZERO);
+            tooltip.text(("Help", TextStyle::new(Mm(size))));
+            tooltip
+        };
+        let controller = standalone_world_tooltip(&mut app, target, make_tooltip(20.0));
+        update_materialization(&mut app);
+        for label_size in [30.0, 10.0, 20.0] {
+            app.world_mut()
+                .commands()
+                .resize_tooltip(controller, Mm(label_size));
+            app.world_mut().flush();
+            for _ in 0..MATERIALIZATION_UPDATES {
+                assert!(matches!(
+                    app.world().get::<TooltipPhase>(controller),
+                    Some(TooltipPhase::Visible)
+                ));
+                assert_eq!(
+                    app.world().get::<Visibility>(controller),
+                    Some(&Visibility::Inherited)
+                );
+                app.update();
+            }
+            let reference = standalone_world_tooltip(&mut app, target, make_tooltip(label_size));
+            update_materialization(&mut app);
+            let measure_plane = |entity| -> Result<_, String> {
+                let panel = app
+                    .world()
+                    .get::<DiegeticPanel>(entity)
+                    .ok_or("help panel missing")?;
+                let pose = app
+                    .world()
+                    .get::<GlobalTransform>(entity)
+                    .ok_or("help pose missing")?;
+                let plane = PanelPlane::from_panel(panel, pose)
+                    .map_err(|error| format!("help plane: {error:?}"))?;
+                Ok([
+                    plane.point(Anchor::TopLeft),
+                    plane.point(Anchor::BottomRight),
+                ])
+            };
+            let resized = measure_plane(controller)?;
+            let expected = measure_plane(reference)?;
+            assert!(
+                resized
+                    .into_iter()
+                    .zip(expected)
+                    .all(|(actual, expected)| actual.abs_diff_eq(expected, 0.0001)),
+                "a resized help must match the fresh help's drawing and gap at {label_size} mm: {resized:?} versus {expected:?}"
+            );
+            app.world_mut().despawn(reference);
+        }
+        let log = app.world().resource::<ResizeVisibilityLog>();
+        assert_eq!(
+            log.shown
+                .iter()
+                .filter(|entity| **entity == controller)
+                .count(),
+            1
+        );
+        assert!(
+            !log.hidden.contains(&controller),
+            "resizing must not hide the existing help"
+        );
+        Ok(())
+    }
 
     fn built_tooltip_panel(
         app: &mut App,

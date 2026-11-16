@@ -30,8 +30,7 @@ use super::super::events::MismatchStates;
 use super::super::events::RestoredStates;
 use super::super::input;
 use super::super::input::SelectedVideoModes;
-use super::comparison::add_span;
-use super::comparison::build_comparison_spans;
+use super::comparison;
 
 #[derive(Component)]
 pub(crate) struct PrimaryDisplay;
@@ -81,14 +80,14 @@ pub(crate) fn update_primary_display(
         .entity(display_entity)
         .with_children(|child_spawner| {
             let monitor_row = input::format_monitor_row(current_monitor, &refresh_display);
-            add_span(
+            comparison::add_span(
                 child_spawner,
                 &text_font,
                 &format!("{monitor_row}\n\n"),
                 DEFAULT_COLOR,
             );
 
-            build_comparison_spans(
+            comparison::build_comparison_spans(
                 child_spawner,
                 cached_restored_state,
                 cached_mismatch_state,
@@ -97,14 +96,14 @@ pub(crate) fn update_primary_display(
                 &text_font,
             );
 
-            add_span(
+            comparison::add_span(
                 child_spawner,
                 &text_font,
                 &format!("{VIDEO_MODES_HEADER}{video_modes_display}\n"),
                 DEFAULT_COLOR,
             );
 
-            add_span(
+            comparison::add_span(
                 child_spawner,
                 &text_font,
                 &format!(
@@ -143,12 +142,12 @@ pub(crate) fn update_primary_display(
                     monitor_index,
                 ));
             }
-            add_span(child_spawner, &text_font, MANAGED_WINDOWS_HEADER, DEFAULT_COLOR);
+            comparison::add_span(child_spawner, &text_font, MANAGED_WINDOWS_HEADER, DEFAULT_COLOR);
             if managed_lines.is_empty() {
-                add_span(child_spawner, &text_font, NO_MANAGED_WINDOWS_TEXT, DEFAULT_COLOR);
+                comparison::add_span(child_spawner, &text_font, NO_MANAGED_WINDOWS_TEXT, DEFAULT_COLOR);
             } else {
                 for line in &managed_lines {
-                    add_span(child_spawner, &text_font, line, DEFAULT_COLOR);
+                    comparison::add_span(child_spawner, &text_font, line, DEFAULT_COLOR);
                 }
             }
         });

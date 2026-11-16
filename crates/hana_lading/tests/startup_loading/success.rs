@@ -18,9 +18,8 @@ use hana_lading::DiskAssetsPlugin;
 use hana_lading::LoadProgress;
 use hana_lading::Loaded;
 
+use crate::support;
 use crate::support::SETTLE_UPDATES;
-use crate::support::image_app;
-use crate::support::update_until;
 
 // fixture paths relative to the test asset source root
 const CHECKER_PATH: &str = "textures/checker.png";
@@ -78,7 +77,7 @@ struct SuccessLog {
 
 #[test]
 fn success_two_sets() {
-    let mut app = image_app();
+    let mut app = support::image_app();
     app.add_plugins((
         DiskAssetsPlugin::<SetOne>::default(),
         DiskAssetsPlugin::<SetTwo>::default(),
@@ -104,7 +103,7 @@ fn success_two_sets() {
         },
     );
 
-    update_until(&mut app, |world| {
+    support::update_until(&mut app, |world| {
         world
             .resource::<SuccessLog>()
             .entries

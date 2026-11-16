@@ -7,7 +7,9 @@ use bevy::color::Color;
 use bevy::pbr::StandardMaterial;
 use bevy::prelude::AlphaMode;
 use bevy::prelude::Component;
+use bevy::prelude::Entity;
 use bevy::prelude::Reflect;
+use bevy::prelude::ReflectComponent;
 use bevy::prelude::ReflectResource;
 use bevy::prelude::Resource;
 
@@ -159,8 +161,7 @@ pub enum ShadowCasting {
 
 /// Which faces of a panel surface or shape render, by back/front-face culling.
 ///
-/// Text and icon ink always render only their front face, independently of
-/// the surface's sidedness, so a panel back never displays mirrored words.
+/// Glyph faces use separate culling. Readable text backs use reflected glyphs.
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Reflect)]
 #[reflect(Resource)]
 pub enum Sidedness {
@@ -214,7 +215,22 @@ enum CapBaselinePixelAlignment {
     WholePixels,
 }
 
+/// Places readable back text about another entity's vertical axis and depth plane.
+///
+/// Attach this component to the text's panel. The frame's local origin marks the stock centre.
+/// Both entities must have a `GlobalTransform`. Their axes must be parallel.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Reflect)]
+#[reflect(Component)]
+pub struct ReadableBackFrame(pub Entity);
+
 // ── TextStyle ────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Reflect)]
+enum TextBack {
+    #[default]
+    Plain,
+    Readable,
+}
 
 /// Unified text styling for both layout (panel) text and standalone world text.
 ///
@@ -248,6 +264,7 @@ pub struct TextStyle {
     align:                        TextAlign,
     anchor:                       Anchor,
     render_mode:                  GlyphRenderMode,
+    back:                         TextBack,
     /// Per-label glyph-shadow authoring.
     shadow_mode:                  Cascade<GlyphShadowMode>,
     /// Per-label shadow-casting authoring.
@@ -286,6 +303,7 @@ impl PartialEq for TextStyle {
             && self.align == other.align
             && self.anchor == other.anchor
             && self.render_mode == other.render_mode
+            && self.back == other.back
             && self.shadow_mode == other.shadow_mode
             && self.shadow_casting == other.shadow_casting
             && self.lighting == other.lighting
@@ -326,6 +344,7 @@ impl TextStyle {
             align:                        TextAlign::Left,
             anchor:                       Anchor::Center,
             render_mode:                  GlyphRenderMode::Text,
+            back:                         TextBack::Plain,
             shadow_mode:                  Cascade::Inherit,
             shadow_casting:               Cascade::Inherit,
             lighting:                     Cascade::Inherit,
@@ -386,7 +405,7 @@ impl TextStyle {
     #[must_use]
     pub(crate) const fn shadow_casting(&self) -> Cascade<ShadowCasting> { self.shadow_casting }
 
-    /// Text and icon ink is always front-only, independent of its panel surface.
+    /// Each glyph face uses front culling, including reflected back glyphs.
     #[must_use]
     pub(crate) const fn sidedness() -> Cascade<Sidedness> {
         Cascade::Override(Sidedness::FrontOnly)
@@ -435,6 +454,24 @@ impl TextStyle {
             self.cap_baseline_pixel_alignment,
             CapBaselinePixelAlignment::WholePixels
         )
+    }
+
+    /// Adds a readable back reflected about this run's ink centre.
+    #[must_use]
+    pub const fn with_readable_back(mut self) -> Self {
+        self.back = TextBack::Readable;
+        self
+    }
+
+    /// Removes the readable back while preserving the front style.
+    #[must_use]
+    pub const fn without_readable_back(mut self) -> Self {
+        self.back = TextBack::Plain;
+        self
+    }
+
+    pub(crate) const fn draws_readable_back(&self) -> bool {
+        matches!(self.back, TextBack::Readable)
     }
 
     // ── Chained (with_*) setters ──────────────────────────────────────────
@@ -814,6 +851,7 @@ impl TextStyle {
             // Render-only — explicitly skipped.
             color: _,
             render_mode: _,
+            back: _,
             shadow_mode: _,
             shadow_casting: _,
             lighting: _,
@@ -858,6 +896,7 @@ impl TextStyle {
             // Render-only.
             color: _,
             render_mode: _,
+            back: _,
             shadow_mode: _,
             shadow_casting: _,
             lighting: _,
@@ -909,6 +948,7 @@ impl TextStyle {
             font_features,
             color: _,
             render_mode: _,
+            back,
             shadow_mode: _,
             shadow_casting: _,
             lighting: _,
@@ -930,6 +970,7 @@ impl TextStyle {
             && *anchor == other.anchor
             && *font_features == other.font_features
             && *cap_baseline_pixel_alignment == other.cap_baseline_pixel_alignment
+            && *back == other.back
     }
 }
 
@@ -1069,6 +1110,16 @@ mod tests {
     }
 
     // ── TextStyle::gating_eq ───────────────────────────────────────
+
+    #[test]
+    fn readable_back_rebuilds_geometry_without_changing_measurement() {
+        let front = TextStyle::new(14.0);
+        let both = front.clone().with_readable_back();
+        assert!(front.layout_eq_excluding_visuals(&both));
+        assert!(!front.gating_eq(&both));
+        assert!(!front.draws_readable_back());
+        assert!(both.for_shaping(Anchor::Center).draws_readable_back());
+    }
 
     #[test]
     fn gating_eq_true_for_identical_style() {

@@ -14,10 +14,25 @@ version.workspace    = true
 [lints]
 workspace = true
 
+[features]
+default = []
+render  = ["dep:bevy_render"]
+test    = []
+
 [dependencies]
 bevy_app.workspace        = true
 bevy_diagnostic.workspace = true
 bevy_ecs.workspace        = true
 bevy_reflect.workspace    = true
-bevy_render.workspace     = true
+bevy_render               = { workspace = true, optional = true }
 bevy_state.workspace      = true
+hana_kana                 = { workspace = true, default-features = false }
+serde                     = { workspace = true }
+
+[dev-dependencies]
+hana_metrics = { workspace = true, features = ["test"] }
+serde_json   = { workspace = true }
+
+[[test]]
+name              = "breakdown"
+required-features = ["render"]

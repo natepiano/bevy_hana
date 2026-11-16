@@ -2,6 +2,7 @@
 
 mod anchoring;
 mod constants;
+mod widget_pixel_edge_snap;
 
 pub use anchoring::ScreenAnchorTarget;
 pub(crate) use anchoring::ScreenAttachmentResolveDiagnostics;
@@ -64,6 +65,7 @@ use constants::SCREEN_SPACE_CAMERA_Z;
 use constants::SCREEN_SPACE_LIGHT_ILLUMINANCE;
 use constants::SCREEN_SPACE_PANEL_RESIZE_EPSILON;
 use hana_valence::ResolvedAnchorGeometry;
+pub use widget_pixel_edge_snap::WidgetPixelEdgeSnap;
 
 use crate::constants::DIAGNOSTIC_LOG_TARGET;
 use crate::layout::Sizing;
@@ -107,10 +109,11 @@ pub struct ScreenSpaceLight {
     view_layers: RenderLayers,
 }
 
-/// Requests physical-pixel-aligned outer edges for a screen-space panel.
+/// Requests physical-pixel-aligned outer edges for a panel viewed face-on.
 ///
 /// The panel's fill and border stay inside the snapped outer edge, allowing a
 /// one-physical-pixel border to draw at one consistent weight on every side.
+/// Oblique world panels retain antialiased edges in their authored plane.
 #[derive(Clone, Component, Copy, Debug, Default)]
 pub struct ScreenPixelEdgeSnap;
 

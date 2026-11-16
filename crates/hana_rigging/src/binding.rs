@@ -3930,6 +3930,12 @@ fn project_status(
                     detail:       detail.clone(),
                     resumes_when: ResumeCondition::ExplicitRestart,
                 },
+                DriverStopReason::ConsentRequired { detail } => {
+                    StoppedStatusView::ConsentRequired {
+                        detail:       detail.clone(),
+                        resumes_when: ResumeCondition::ExplicitRestart,
+                    }
+                },
                 DriverStopReason::Unsupported { .. } => StoppedStatusView::Unsupported {
                     reason:       DriverStopReasonView::from(reason),
                     resumes_when: ResumeCondition::ExplicitRestart,

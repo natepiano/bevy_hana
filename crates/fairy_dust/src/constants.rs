@@ -153,7 +153,7 @@ pub(crate) const FOLD_PLAY_CONTROL_ID: &str = "fold_play";
 pub(crate) const FOLD_PLAY_CONTROL_LABEL: &str = "P Play";
 pub(crate) const FOLD_PLAY_RESERVE_LABEL: &str = "fold play";
 pub(crate) const UNFOLD_CONTROL_ID: &str = "unfold_step";
-pub(crate) const UNFOLD_CONTROL_LABEL: &str = "Shift Space Unfold";
+pub(crate) const UNFOLD_CONTROL_ACTION_LABEL: &str = "Unfold";
 
 // ground plane defaults
 pub(crate) const GROUND_PLANE_ALPHA: f32 = 0.78;

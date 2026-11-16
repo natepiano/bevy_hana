@@ -5,6 +5,8 @@ use bevy::prelude::ChildOf;
 use bevy::prelude::Children;
 use bevy::prelude::Commands;
 use bevy::prelude::Entity;
+use bevy::prelude::Has;
+use bevy::prelude::Insert;
 use bevy::prelude::Mesh3d;
 use bevy::prelude::On;
 use bevy::prelude::Query;
@@ -84,49 +86,93 @@ pub(crate) fn propagate_outline_to_descendants(
     }
 }
 
-/// When a new child is added to the hierarchy, check if any ancestor has `Outline`
-/// and propagate it. Handles glTF scene loading where children spawn after the parent.
+/// Inherit from the current parent on insertion or reparenting, including meshes
+/// under a moved branch. Empty non-mesh children need no ancestor walk.
 pub(crate) fn propagate_outline_on_child_added(
-    added: On<Add<ChildOf>>,
-    child_mesh_query: Query<(), (With<Mesh3d>, Without<NoOutline>)>,
-    outline_query: Query<&Outline>,
-    ownership_query: Query<&PropagatedOutlineOwnership>,
+    added: On<Insert<ChildOf>>,
+    candidates: Query<(&ChildOf, Has<Mesh3d>), (Without<NoOutline>, Without<OutlineBarrier>)>,
+    mesh_query: Query<(), (With<Mesh3d>, Without<NoOutline>)>,
+    outline_query: Query<(&Outline, Option<&PropagatedOutlineOwnership>)>,
     barrier_query: Query<(), With<OutlineBarrier>>,
+    children_query: Query<&Children>,
     parent_query: Query<&ChildOf>,
     mut commands: Commands,
 ) {
     let child = added.entity;
-    if !child_mesh_query.contains(child) {
+    if outline_query.is_empty() {
+        return;
+    }
+    let Ok((child_of, is_mesh)) = candidates.get(child) else {
+        return;
+    };
+    if !is_mesh && !children_query.contains(child) {
+        return;
+    }
+    // An independently authored outline remains the source for its subtree.
+    if outline_query.get(child).is_ok_and(|(_, ownership)| {
+        !matches!(
+            ownership,
+            Some(PropagatedOutlineOwnership::InheritedFrom(_))
+        )
+    }) {
         return;
     }
 
     // Follow `parent_query` through `ChildOf::parent` until a source `Outline` is
     // found. An `OutlineBarrier` on the child or any ancestor below the outline
     // shields the child from inheriting it.
-    let mut current = child;
+    let mut current = child_of.parent();
     loop {
+        if let Ok((outline, ownership)) = outline_query.get(current) {
+            // Preserve `Outline::group_source` when the parent outline is already propagated.
+            let source = match ownership {
+                Some(PropagatedOutlineOwnership::InheritedFrom(source)) => *source,
+                _ => current,
+            };
+            let mut propagated = outline.clone();
+            propagated.group_source = Some(outline.group_source.unwrap_or(current));
+            if is_mesh {
+                commands.entity(child).try_insert((
+                    propagated.clone(),
+                    PropagatedOutlineOwnership::InheritedFrom(source),
+                ));
+            }
+            let mut stack: Vec<Entity> = children_query
+                .get(child)
+                .map(|children| children.iter().collect())
+                .unwrap_or_default();
+            while let Some(target) = stack.pop() {
+                // An authored source owns its whole subtree, including inherited
+                // mesh copies below it. Do not visit those copies from outside.
+                if barrier_query.contains(target)
+                    || outline_query.get(target).is_ok_and(|(_, ownership)| {
+                        !matches!(
+                            ownership,
+                            Some(PropagatedOutlineOwnership::InheritedFrom(_))
+                        )
+                    })
+                {
+                    continue;
+                }
+                if mesh_query.contains(target) {
+                    commands.entity(target).try_insert((
+                        propagated.clone(),
+                        PropagatedOutlineOwnership::InheritedFrom(source),
+                    ));
+                }
+                if let Ok(children) = children_query.get(target) {
+                    stack.extend(children.iter());
+                }
+            }
+            return;
+        }
         if barrier_query.contains(current) {
             return;
         }
-        let Ok(child_of) = parent_query.get(current) else {
+        let Ok(parent) = parent_query.get(current) else {
             return;
         };
-        let parent = child_of.parent();
-        if let Ok(outline) = outline_query.get(parent) {
-            // Preserve `Outline::group_source` when the parent outline is already propagated.
-            let source = match ownership_query.get(parent) {
-                Ok(PropagatedOutlineOwnership::InheritedFrom(source)) => *source,
-                _ => parent,
-            };
-            let mut propagated = outline.clone();
-            propagated.group_source = Some(outline.group_source.unwrap_or(parent));
-            commands.entity(child).try_insert((
-                propagated,
-                PropagatedOutlineOwnership::InheritedFrom(source),
-            ));
-            return;
-        }
-        current = parent;
+        current = parent.parent();
     }
 }
 
@@ -134,48 +180,52 @@ pub(crate) fn propagate_outline_on_child_added(
 /// Handles glTF scene loading where `Mesh3d` may be added after `ChildOf`.
 pub(crate) fn propagate_outline_on_mesh_added(
     added: On<Add<Mesh3d>>,
-    no_outline_query: Query<(), With<NoOutline>>,
-    outline_query: Query<&Outline>,
-    ownership_query: Query<&PropagatedOutlineOwnership>,
+    candidates: Query<
+        &ChildOf,
+        (
+            Without<NoOutline>,
+            Without<Outline>,
+            Without<OutlineBarrier>,
+        ),
+    >,
+    outline_query: Query<(&Outline, Option<&PropagatedOutlineOwnership>)>,
     barrier_query: Query<(), With<OutlineBarrier>>,
     parent_query: Query<&ChildOf>,
-    existing_outline: Query<(), With<Outline>>,
     mut commands: Commands,
 ) {
     let child = added.entity;
-    if no_outline_query.contains(child) {
+    if outline_query.is_empty() {
         return;
     }
-    if existing_outline.contains(child) {
+    let Ok(child_of) = candidates.get(child) else {
         return;
-    }
+    };
 
     // Follow `parent_query` through `ChildOf::parent` until an `Outline` is
     // found. An `OutlineBarrier` on the child or any ancestor below the outline
     // shields the child from inheriting it.
-    let mut current = child;
+    let mut current = child_of.parent();
     loop {
-        if barrier_query.contains(current) {
-            return;
-        }
-        let Ok(child_of) = parent_query.get(current) else {
-            return;
-        };
-        let parent = child_of.parent();
-        if let Ok(outline) = outline_query.get(parent) {
-            let source = match ownership_query.get(parent) {
-                Ok(PropagatedOutlineOwnership::InheritedFrom(source)) => *source,
-                _ => parent,
+        if let Ok((outline, ownership)) = outline_query.get(current) {
+            let source = match ownership {
+                Some(PropagatedOutlineOwnership::InheritedFrom(source)) => *source,
+                _ => current,
             };
             let mut propagated = outline.clone();
-            propagated.group_source = Some(outline.group_source.unwrap_or(parent));
+            propagated.group_source = Some(outline.group_source.unwrap_or(current));
             commands.entity(child).try_insert((
                 propagated,
                 PropagatedOutlineOwnership::InheritedFrom(source),
             ));
             return;
         }
-        current = parent;
+        if barrier_query.contains(current) {
+            return;
+        }
+        let Ok(parent) = parent_query.get(current) else {
+            return;
+        };
+        current = parent.parent();
     }
 }
 

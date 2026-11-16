@@ -5,29 +5,50 @@
     reason = "regression fixtures fail immediately when required field state is absent"
 )]
 
+use bevy::camera::Hdr;
+use bevy::camera::RenderTarget;
+use bevy::ecs::system::RunSystemOnce;
 use bevy::input::ButtonState;
 use bevy::input::InputPlugin;
 use bevy::input::keyboard::Key;
 use bevy::input::keyboard::KeyboardInput;
 use bevy::input::keyboard::NativeKey;
+use bevy::picking::backend::HitData;
+use bevy::picking::pointer::Location;
+use bevy::picking::pointer::PointerId;
 use bevy::prelude::App;
+use bevy::prelude::Camera;
+use bevy::prelude::Camera3d;
 use bevy::prelude::Color;
 use bevy::prelude::Commands;
 use bevy::prelude::Entity;
 use bevy::prelude::KeyCode;
 use bevy::prelude::MinimalPlugins;
+use bevy::prelude::Msaa;
 use bevy::prelude::On;
+use bevy::prelude::Pointer;
+use bevy::prelude::PointerButton;
+use bevy::prelude::PointerClick;
 use bevy::prelude::ResMut;
 use bevy::prelude::Resource;
+use bevy::prelude::Transform;
+use bevy::prelude::UVec2;
+use bevy::prelude::Vec2;
+use bevy::prelude::Vec3;
 use bevy::prelude::Window;
+use bevy::render::view::DebandDither;
+use bevy::render::view::Tonemapping;
 use bevy::window::Ime;
 use bevy::window::WindowFocused;
 use bevy::window::WindowRef;
 use hana_diegetic::AlignX;
 use hana_diegetic::AlignY;
+use hana_diegetic::Anchor;
 use hana_diegetic::Border;
 use hana_diegetic::BoundingBox;
 use hana_diegetic::ComputedDiegeticPanel;
+use hana_diegetic::ControlMetrics;
+use hana_diegetic::ControlPalette;
 use hana_diegetic::DiegeticPanel;
 use hana_diegetic::DiegeticTextMeasurer;
 use hana_diegetic::El;
@@ -46,9 +67,14 @@ use hana_diegetic::ImeRejectCommit;
 use hana_diegetic::ImeRejection;
 use hana_diegetic::ImeTarget;
 use hana_diegetic::LayoutBuilder;
+use hana_diegetic::Mm;
 use hana_diegetic::Padding;
+use hana_diegetic::PanelAnchorGeometryParam;
+use hana_diegetic::PanelAnchorPoints;
+use hana_diegetic::PanelPicking;
 use hana_diegetic::Px;
 use hana_diegetic::RenderCommandKind;
+use hana_diegetic::Sizing;
 use hana_diegetic::Text;
 use hana_diegetic::TextAlign;
 use hana_diegetic::TextStyle;
@@ -121,10 +147,6 @@ fn ime_field_caret_keeps_the_right_inner_padding_for_short_and_scrolled_text() {
 #[test]
 fn ime_field_candidate_anchor_keeps_the_caret_inside_the_right_inner_padding() -> Result<(), String>
 {
-    use bevy::ecs::system::RunSystemOnce;
-    use hana_diegetic::PanelAnchorGeometryParam;
-    use hana_diegetic::PanelAnchorPoints;
-
     for text in ["999", "12345678901234567890"] {
         let mut scene = FieldScene::with_text_style(
             FieldContract::Integer,
@@ -723,17 +745,6 @@ fn drawn_number_field_scene() -> Result<DrawnNumberField, String> {
 }
 
 fn drawn_field_scene(field_panel: DiegeticPanel) -> Result<DrawnNumberField, String> {
-    use bevy::camera::Hdr;
-    use bevy::camera::RenderTarget;
-    use bevy::prelude::Camera;
-    use bevy::prelude::Camera3d;
-    use bevy::prelude::Msaa;
-    use bevy::prelude::Transform;
-    use bevy::prelude::UVec2;
-    use bevy::prelude::Vec3;
-    use bevy::render::view::DebandDither;
-    use bevy::render::view::Tonemapping;
-
     let mut app = drawn_support::CaseApp::new();
     let size = UVec2::new(420, 180);
     let projection = bevy::camera::Projection::Perspective(bevy::camera::PerspectiveProjection {
@@ -878,10 +889,6 @@ fn drawn_number_field_keeps_the_bottom_border(
 }
 
 fn drawn_number_field_panel() -> Result<DiegeticPanel, String> {
-    use hana_diegetic::Anchor;
-    use hana_diegetic::Mm;
-    use hana_diegetic::PanelPicking;
-
     let mut builder = LayoutBuilder::with_widget_root(
         El::row()
             .size(100.0, 24.0)
@@ -903,15 +910,6 @@ fn drawn_number_field_panel() -> Result<DiegeticPanel, String> {
 }
 
 fn open_drawn_field(app: &mut App, window: Entity, camera: Entity, panel: Entity) {
-    use bevy::picking::backend::HitData;
-    use bevy::picking::pointer::Location;
-    use bevy::picking::pointer::PointerId;
-    use bevy::prelude::Pointer;
-    use bevy::prelude::PointerButton;
-    use bevy::prelude::PointerClick;
-    use bevy::prelude::Vec2;
-    use bevy::prelude::Vec3;
-
     let field = app
         .world()
         .iter_entities()
@@ -974,12 +972,6 @@ fn ime_field_text_value_draws_shared_border_and_left_aligned_text() -> Result<()
 }
 
 fn drawn_text_value_field() -> Result<(), String> {
-    use hana_diegetic::Anchor;
-    use hana_diegetic::ControlMetrics;
-    use hana_diegetic::ControlPalette;
-    use hana_diegetic::Mm;
-    use hana_diegetic::PanelPicking;
-    use hana_diegetic::Sizing;
     let metrics = ControlMetrics::from_label_size(13.0_f32);
     let mut builder = LayoutBuilder::with_widget_root(
         El::row()

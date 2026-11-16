@@ -13,8 +13,10 @@ use bevy::render::pipelined_rendering::PipelinedRenderingPlugin;
 use bevy::render::render_resource::CachedPipelineState;
 use bevy::render::render_resource::PipelineCache;
 use bevy::render::render_resource::PipelineDescriptor;
+use bevy::render::render_resource::PollType;
 use bevy::render::render_resource::RenderPipelineDescriptor;
 use bevy::render::render_resource::TextureFormat;
+use bevy::render::renderer::RenderDevice;
 use bevy::shader::ShaderCacheError;
 use bevy::window::ExitCondition;
 use bevy::winit::WinitPlugin;
@@ -308,8 +310,9 @@ fn update_until_no_pipeline_compiles(app: &mut App) {
         .sub_app(RenderApp)
         .world()
         .resource::<PipelineCache>()
-        .pipelines()
-        .any(|pipeline| matches!(pipeline.state, CachedPipelineState::Creating(_)))
+        .waiting_pipelines()
+        .next()
+        .is_some()
     {
         app.update();
     }
@@ -366,6 +369,55 @@ fn first_frame_waits_for_its_text_and_later_text_compiles_without_holding_a_fram
     let result = assert_first_frame_shaders_in_place(&app)
         .and_then(|()| assert_first_frame_text_pipelines_ready(&mut app))
         .and_then(|()| assert_later_text_pipeline_does_not_hold_its_frame(&mut app));
+    finish_render_app(app)?;
+    result
+}
+
+// Load 65 distinct shader assets before the first text frame.
+const SHADER_BACKLOG_SIZE: usize = 65;
+const PROBE_SHADER: &str = "
+@vertex fn vertex() -> @builtin(position) vec4<f32> {
+    return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+}
+@fragment fn fragment() -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0);
+}";
+
+fn add_shader_backlog(app: &mut App) -> Vec<Handle<Shader>> {
+    (0..SHADER_BACKLOG_SIZE)
+        .map(|index| {
+            app.world_mut()
+                .resource_mut::<Assets<Shader>>()
+                .add(Shader::from_wgsl(
+                    PROBE_SHADER,
+                    format!("unrelated-backlog-{index}.wgsl"),
+                ))
+        })
+        .collect()
+}
+
+fn finish_render_app(mut app: App) -> Result<(), String> {
     update_until_no_pipeline_compiles(&mut app);
+    let device = app
+        .sub_app(RenderApp)
+        .world()
+        .resource::<RenderDevice>()
+        .clone();
+    let finished = device
+        .wgpu_device()
+        .poll(PollType::wait_indefinitely())
+        .map_err(|error| error.to_string());
+    drop(app);
+    drop(device);
+    finished.map(|_| ())
+}
+
+#[test]
+fn cold_first_frame_draws_its_text_with_more_than_one_batch_of_loaded_shaders() -> Result<(), String>
+{
+    let mut app = asynchronous_compile_app();
+    let _shaders = add_shader_backlog(&mut app);
+    let result = assert_first_frame_text_pipelines_ready(&mut app);
+    finish_render_app(app)?;
     result
 }

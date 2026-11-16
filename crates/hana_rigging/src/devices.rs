@@ -332,6 +332,7 @@ impl DriverObservedClaim {
             // never started, or Hana's own prior session still closing. Recording either as a
             // claim would tell the register another application owns the unit.
             DeviceAccessError::Cancelled { .. }
+            | DeviceAccessError::ConsentRequired { .. }
             | DeviceAccessError::Absent { .. }
             | DeviceAccessError::Unresponsive { .. }
             | DeviceAccessError::Releasing { .. }

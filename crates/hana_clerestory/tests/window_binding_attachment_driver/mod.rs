@@ -26,9 +26,8 @@ use crate::RequestedWindowPlacement;
 use crate::WindowManagerPlugin;
 use crate::WindowPlacementConfiguration;
 use crate::attach_window_to_binding_role;
-use crate::driver::window_attempt_lookup;
-use crate::driver::window_session_lookup;
-use crate::managed::window_for_role_entity;
+use crate::driver;
+use crate::managed;
 use crate::persistence::EstablishedWindowPlacement;
 use crate::persistence::EstablishedWindowPosition;
 use crate::restore::InjectedWinitWindows;
@@ -246,7 +245,7 @@ impl AttachmentFixture {
         };
         let attempt = restoration.attempt();
         assert!(
-            matches!(window_attempt_lookup(self.app.world(), &self.role), AttemptLookup::Applying(found) if found == attempt)
+            matches!(driver::window_attempt_lookup(self.app.world(), &self.role), AttemptLookup::Applying(found) if found == attempt)
         );
         for _ in 0..8 {
             self.advance();
@@ -310,7 +309,7 @@ impl AttachmentFixture {
         for _ in 0..16 {
             self.advance();
             if matches!(
-                window_session_lookup(self.app.world(), &self.role),
+                driver::window_session_lookup(self.app.world(), &self.role),
                 SessionLookup::Holding(_)
             ) {
                 break;
@@ -324,7 +323,7 @@ impl AttachmentFixture {
                 .is_none()
         );
         assert!(matches!(
-            window_session_lookup(self.app.world(), &self.role),
+            driver::window_session_lookup(self.app.world(), &self.role),
             SessionLookup::Holding(_)
         ));
         self.assert_established_readback(window);
@@ -353,7 +352,7 @@ fn real_window_driver_defers_until_attachment_applies_and_reattaches_replaced_ro
         status.view()
     );
     assert_eq!(
-        window_for_role_entity(fixture.app.world(), original_role),
+        managed::window_for_role_entity(fixture.app.world(), original_role),
         None
     );
     let bindings = fixture.app.world().resource::<Bindings>();
@@ -385,7 +384,8 @@ fn real_window_driver_defers_until_attachment_applies_and_reattaches_replaced_ro
     attach_window_to_binding_role(fixture.app.world_mut(), window, &fixture.role)
         .expect("attach replacement role");
     fixture.apply_and_read_back(window, "binding replacement");
-    let SessionLookup::Holding(session) = window_session_lookup(fixture.app.world(), &fixture.role)
+    let SessionLookup::Holding(session) =
+        driver::window_session_lookup(fixture.app.world(), &fixture.role)
     else {
         panic!("replacement establishes the window session");
     };
@@ -403,11 +403,11 @@ fn real_window_driver_defers_until_attachment_applies_and_reattaches_replaced_ro
     attach_window_to_binding_role(fixture.app.world_mut(), window, &fixture.role)
         .expect("reattach current role entity");
     assert_eq!(
-        window_for_role_entity(fixture.app.world(), replacement),
+        managed::window_for_role_entity(fixture.app.world(), replacement),
         Some(window)
     );
     assert!(matches!(
-        window_session_lookup(fixture.app.world(), &fixture.role),
+        driver::window_session_lookup(fixture.app.world(), &fixture.role),
         SessionLookup::Holding(current) if current == session
     ));
     fixture.app.world_mut().despawn(window);
@@ -416,12 +416,12 @@ fn real_window_driver_defers_until_attachment_applies_and_reattaches_replaced_ro
         fixture.advance();
     }
     assert_eq!(
-        window_for_role_entity(fixture.app.world(), replacement),
+        managed::window_for_role_entity(fixture.app.world(), replacement),
         None
     );
     assert!(
         !matches!(
-            window_session_lookup(fixture.app.world(), &fixture.role),
+            driver::window_session_lookup(fixture.app.world(), &fixture.role),
             SessionLookup::Holding(_)
         ),
         "a despawned window cannot remain an established driver session"

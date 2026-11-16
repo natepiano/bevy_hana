@@ -27,6 +27,7 @@ use hana_diegetic::Anchor;
 use hana_diegetic::CascadeEntityCommandsExt as _;
 use hana_diegetic::ComputedDiegeticPanel;
 use hana_diegetic::DiegeticPanel;
+use hana_diegetic::DiegeticPanelCommands;
 use hana_diegetic::DiegeticPerfStats;
 use hana_diegetic::DiegeticText;
 use hana_diegetic::DisplayCompensationReadiness;
@@ -50,6 +51,8 @@ use hana_diegetic::StableTransparency;
 use hana_diegetic::TextContent;
 use hana_diegetic::TextStyle;
 use hana_diegetic::Unit;
+
+const GLYPH_PANEL_SIDE_MM: f32 = 100.0;
 
 const SIDE: u32 = 256;
 const SIDE_F32: f32 = 256.0;
@@ -186,8 +189,77 @@ fn closer_to(pixel: [u8; 3], first: [u8; 3], second: [u8; 3]) -> bool {
     color_distance(pixel, first) < color_distance(pixel, second)
 }
 
+fn record_scene_context(scene: GlyphScene, camera_pitch_rad: f32) {
+    DUMP_CONTEXT.with(|context| {
+        *context.borrow_mut() = format!(
+            "pixels_per_em={} phase=({},{}) pitch={} scene={scene:?}",
+            scene.pixels_per_em,
+            scene.offset_px.fract(),
+            scene.offset_y_px.fract(),
+            camera_pitch_rad,
+        );
+    });
+}
+
+struct GlyphCapture {
+    app:    CaseApp,
+    target: Handle<Image>,
+    panel:  Entity,
+    camera: Entity,
+}
+
+impl GlyphCapture {
+    fn new(scene: GlyphScene) -> Result<Self, String> {
+        let (mut app, target) = setup_scene(scene)?;
+        let world = app.world_mut();
+        let panel = world
+            .query_filtered::<Entity, With<DiegeticPanel>>()
+            .single(world)
+            .map_err(|error| format!("glyph panel: {error}"))?;
+        let camera = world
+            .query::<(Entity, &RenderTarget)>()
+            .iter(world)
+            .find(|(_, target)| matches!(target, RenderTarget::Image(_)))
+            .map(|(entity, _)| entity)
+            .ok_or("glyph image camera is missing")?;
+        Ok(Self {
+            app,
+            target,
+            panel,
+            camera,
+        })
+    }
+
+    fn read(&mut self, scene: GlyphScene) -> Result<DrawnPixels, String> {
+        record_scene_context(scene, 0.0);
+        let world = self.app.world_mut();
+        world
+            .get_mut::<Transform>(self.camera)
+            .ok_or("glyph image camera is missing")?
+            .translation
+            .z = scene.camera_distance();
+        let pixel_world = scene.font_mm * 0.001 / scene.pixels_per_em;
+        *world
+            .get_mut::<Transform>(self.panel)
+            .ok_or("glyph panel pose is missing")? = Transform::from_xyz(
+            scene.offset_px * pixel_world,
+            scene.offset_y_px * pixel_world,
+            0.0,
+        )
+        .with_rotation(Quat::from_rotation_y(scene.tilt_degrees.to_radians()));
+        world
+            .commands()
+            .set_tree(
+                self.panel,
+                glyph_layout(scene, GLYPH_PANEL_SIDE_MM, GLYPH_PANEL_SIDE_MM),
+            )
+            .map_err(|error| format!("glyph panel tree: {error}"))?;
+        read_scene(&mut self.app, self.target.clone())
+    }
+}
+
 fn setup_scene(scene: GlyphScene) -> Result<(CaseApp, Handle<Image>), String> {
-    setup_scene_with_panel_width(scene, 100.0)
+    setup_scene_with_panel_width(scene, GLYPH_PANEL_SIDE_MM)
 }
 
 fn setup_scene_with_panel_width(
@@ -212,15 +284,7 @@ fn setup_scene_with_panel_width_and_pitch(
         CaptureRegion::new(UVec2::splat(SIDE), UVec2::ZERO, UVec2::splat(SIDE))
     };
     DUMP_REGION.with(|dump_region| *dump_region.borrow_mut() = region);
-    DUMP_CONTEXT.with(|context| {
-        *context.borrow_mut() = format!(
-            "pixels_per_em={} phase=({},{}) pitch={} scene={scene:?}",
-            scene.pixels_per_em,
-            scene.offset_px.fract(),
-            scene.offset_y_px.fract(),
-            camera_pitch_rad,
-        );
-    });
+    record_scene_context(scene, camera_pitch_rad);
     let mut app = CaseApp::new();
     app.world_mut().insert_resource(Lighting::Unlit);
     app.insert_resource(ClearColor(Color::BLACK));
@@ -270,7 +334,7 @@ fn setup_scene_with_panel_width_and_pitch(
         &mut app,
         scene,
         panel_width_mm,
-        100.0,
+        GLYPH_PANEL_SIDE_MM,
         Vec2::new(scene.offset_px, scene.offset_y_px),
         camera_pitch_rad,
     )?;
@@ -278,14 +342,11 @@ fn setup_scene_with_panel_width_and_pitch(
     Ok((app, target))
 }
 
-fn spawn_glyph_panel(
-    app: &mut App,
+fn glyph_layout(
     scene: GlyphScene,
     panel_width_mm: f32,
     panel_height_mm: f32,
-    center_px: Vec2,
-    camera_pitch_rad: f32,
-) -> Result<(), String> {
+) -> hana_diegetic::LayoutTree {
     let mut layout = LayoutBuilder::new(panel_width_mm, panel_height_mm);
     layout.with(
         El::new()
@@ -302,10 +363,21 @@ fn spawn_glyph_panel(
             ));
         },
     );
+    layout.build()
+}
+
+fn spawn_glyph_panel(
+    app: &mut App,
+    scene: GlyphScene,
+    panel_width_mm: f32,
+    panel_height_mm: f32,
+    center_px: Vec2,
+    camera_pitch_rad: f32,
+) -> Result<(), String> {
     let panel = DiegeticPanel::world()
         .size(Mm(panel_width_mm), Mm(panel_height_mm))
         .anchor(Anchor::Center)
-        .with_tree(layout.build())
+        .with_tree(glyph_layout(scene, panel_width_mm, panel_height_mm))
         .build()
         .map_err(|error| format!("invalid text panel: {error}"))?;
     let pixel_world = scene.font_mm * 0.001 / scene.pixels_per_em;
@@ -331,16 +403,16 @@ fn spawn_glyph_panel(
 }
 
 fn render(scene: GlyphScene) -> Result<DrawnPixels, String> {
-    let (app, target) = setup_scene(scene)?;
-    read_scene(app, target)
+    let (mut app, target) = setup_scene(scene)?;
+    read_scene(&mut app, target)
 }
 
 fn render_with_panel_width(scene: GlyphScene, panel_width_mm: f32) -> Result<DrawnPixels, String> {
-    let (app, target) = setup_scene_with_panel_width(scene, panel_width_mm)?;
-    read_scene(app, target)
+    let (mut app, target) = setup_scene_with_panel_width(scene, panel_width_mm)?;
+    read_scene(&mut app, target)
 }
 
-fn read_scene(app: CaseApp, target: Handle<Image>) -> Result<DrawnPixels, String> {
+fn read_scene(app: &mut CaseApp, target: Handle<Image>) -> Result<DrawnPixels, String> {
     let region = DUMP_REGION.with(|region| *region.borrow());
     read_scene_bytes(app, target).map(|pixels| {
         if region.size == region.full_size {
@@ -534,7 +606,7 @@ fn render_units_a4_article(scale_factor: u32) -> Result<(Vec<u8>, CaptureRegion)
         .entity(panel)
         .override_font_unit(Unit::Points)
         .override_lighting(Lighting::Unlit);
-    read_scene_bytes(app, target).map(|pixels| (pixels, region))
+    read_scene_bytes(&mut app, target).map(|pixels| (pixels, region))
 }
 
 fn units_a4_body_has_no_more_lone_near_black_pixels_than_pre_phase() -> Result<(), String> {
@@ -586,9 +658,38 @@ fn units_a4_body_has_no_more_lone_near_black_pixels_than_pre_phase() -> Result<(
     Ok(())
 }
 
-fn read_scene_bytes(mut app: CaseApp, target: Handle<Image>) -> Result<Vec<u8>, String> {
-    app.settle()?;
-    capture_scene_bytes(&mut app, target)
+fn read_scene_bytes(app: &mut CaseApp, target: Handle<Image>) -> Result<Vec<u8>, String> {
+    // These cases reuse one panel and keep each sample's full settle.
+    let reuse_panel = matches!(
+        drawn_support::current_case_name(),
+        "zero_dot_is_absent_through_nine_pixels_per_em_and_draws_at_ten"
+            | "small_text_weight_and_position_change_smoothly_at_fit_boundaries"
+            | "small_dark_glyph_open_spaces_have_no_isolated_black_pixel"
+    );
+    let cameras = {
+        let world = app.world_mut();
+        world
+            .query::<(Entity, &RenderTarget, &mut Camera)>()
+            .iter_mut(world)
+            .filter_map(|(entity, target, mut camera)| {
+                if reuse_panel && camera.is_active && matches!(target, RenderTarget::Image(_)) {
+                    camera.is_active = false;
+                    Some(entity)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let settled = app.settle();
+    for camera in cameras {
+        app.world_mut()
+            .get_mut::<Camera>(camera)
+            .ok_or("glyph image camera is missing")?
+            .is_active = true;
+    }
+    settled?;
+    capture_scene_bytes(app, target)
 }
 
 fn capture_scene_bytes(app: &mut CaseApp, target: Handle<Image>) -> Result<Vec<u8>, String> {
@@ -695,8 +796,8 @@ fn world_text_scene(alpha: AlphaMode, text: &'static str) -> (CaseApp, Handle<Im
 }
 
 fn render_world_text(alpha: AlphaMode, text: &'static str) -> Result<DrawnPixels, String> {
-    let (app, target) = world_text_scene(alpha, text);
-    read_scene(app, target)
+    let (mut app, target) = world_text_scene(alpha, text);
+    read_scene(&mut app, target)
 }
 
 fn eight_grid_x_offset(first_eight: usize, column: u16, pixels_per_em: f32) -> f32 {
@@ -739,7 +840,7 @@ fn render_counter_phase_grid(
             )?;
         }
     }
-    read_scene(app, target)
+    read_scene(&mut app, target)
 }
 
 fn linear_channel(channel: u8) -> f32 {
@@ -751,6 +852,7 @@ fn linear_channel(channel: u8) -> f32 {
     }
 }
 
+const SETTLED_SIZE_UPDATES: usize = 5;
 const DARKNESS_SIDE: u32 = 512;
 const DARKNESS_SIDE_F32: f32 = 512.0;
 
@@ -908,8 +1010,13 @@ fn settled_small_text_ink_has_no_new_neighboring_size_jumps() -> Result<(), Stri
                     .ok_or_else(|| "settled text camera disappeared".to_string())?;
                 camera.translation = Vec3::new(0.0, distance * pitch.sin(), distance * pitch.cos());
             }
-            for _ in 0..5 {
-                app.update();
+            for _ in 0..SETTLED_SIZE_UPDATES {
+                if step == 0 {
+                    app.update();
+                } else {
+                    // The fit settles in the main world. Render only the checked frame.
+                    app.main_mut().update();
+                }
             }
             let pixels = capture_scene_bytes(&mut app, target.clone())?;
             let ink = settled_label_ink(&pixels, region, pixels_per_em, &centers);
@@ -1370,22 +1477,29 @@ fn eights_in_short_runs_keep_both_counters_lighter_than_ink_at_every_phase_and_t
 
 fn zero_dot_is_absent_through_nine_pixels_per_em_and_draws_at_ten() -> Result<(), String> {
     let mut failures = Vec::new();
+    let scene = GlyphScene {
+        text:          "0",
+        fill:          DARK_FILL,
+        ink:           LIGHT_INK,
+        font_mm:       10.0,
+        pixels_per_em: 6.0,
+        offset_px:     0.0,
+        offset_y_px:   0.0,
+        tilt_degrees:  0.0,
+        alpha_mode:    AlphaMode::Blend,
+        drawing_path:  DrawingPath::Standard,
+    };
+    let mut capture = GlyphCapture::new(scene)?;
     for pixels_per_em in [6.0_f32, 8.0, 8.5, 9.0, 10.0, 12.0] {
         let mut dot_draws_at_any_phase = false;
         for offset in [0.0_f32, 0.25, 0.5, 0.75] {
             let scene = GlyphScene {
-                text: "0",
-                fill: DARK_FILL,
-                ink: LIGHT_INK,
-                font_mm: 10.0,
                 pixels_per_em,
                 offset_px: offset,
                 offset_y_px: offset,
-                tilt_degrees: 0.0,
-                alpha_mode: AlphaMode::Blend,
-                drawing_path: DrawingPath::Standard,
+                ..scene
             };
-            let pixels = render(scene)?;
+            let pixels = capture.read(scene)?;
             let (left, top, right, bottom) = pixels.ink_bounds(scene)?;
             let center = (left.midpoint(right), top.midpoint(bottom));
             let color = pixels.rgb(center.0, center.1);
@@ -1535,23 +1649,30 @@ fn small_zero_and_eight_counters_stay_below_sixty_percent_of_their_walls() -> Re
 
 fn small_text_weight_and_position_change_smoothly_at_fit_boundaries() -> Result<(), String> {
     for sizes in [[4.999, 5.0, 5.001], [8.999, 9.0, 9.001]] {
+        let scene = GlyphScene {
+            text:          "8888",
+            fill:          DARK_FILL,
+            ink:           LIGHT_INK,
+            font_mm:       10.0,
+            pixels_per_em: sizes[0],
+            offset_px:     0.0,
+            offset_y_px:   0.0,
+            tilt_degrees:  0.0,
+            alpha_mode:    AlphaMode::Blend,
+            drawing_path:  DrawingPath::Standard,
+        };
+        let mut capture = GlyphCapture::new(scene)?;
         for offset_px in [0.0, 0.25, 0.5, 0.75] {
             let mut samples = Vec::new();
             for pixels_per_em in sizes {
                 let scene = GlyphScene {
-                    text: "8888",
-                    fill: DARK_FILL,
-                    ink: LIGHT_INK,
-                    font_mm: 10.0,
                     pixels_per_em,
                     offset_px,
                     offset_y_px: offset_px,
-                    tilt_degrees: 0.0,
-                    alpha_mode: AlphaMode::Blend,
-                    drawing_path: DrawingPath::Standard,
+                    ..scene
                 };
-                let pixels = render(scene)?;
-                let blank = render(GlyphScene { text: "", ..scene })?;
+                let pixels = capture.read(scene)?;
+                let blank = capture.read(GlyphScene { text: "", ..scene })?;
                 let page_top =
                     SIDE_F32 / 2.0 - scene.offset_y_px - 50.0 * scene.pixels_per_em / scene.font_mm;
                 let mut mass = 0.0_f32;
@@ -1871,23 +1992,31 @@ fn real_inline_editor_caret_and_selection_align_with_small_glyph() -> Result<(),
 fn small_dark_glyph_open_spaces_have_no_isolated_black_pixel() -> Result<(), String> {
     let mut failures = Vec::new();
     for path in [DrawingPath::Standard, DrawingPath::Stable] {
+        let scene = GlyphScene {
+            text:          "m",
+            fill:          WHITE,
+            ink:           BLACK,
+            font_mm:       12.0 * 25.4 / 72.0,
+            pixels_per_em: 6.0,
+            offset_px:     0.0,
+            offset_y_px:   0.0,
+            tilt_degrees:  0.0,
+            alpha_mode:    AlphaMode::Blend,
+            drawing_path:  path,
+        };
+        let mut capture = GlyphCapture::new(scene)?;
         for whole_pixels_per_em in 6_u16..=9 {
             let pixels_per_em = f32::from(whole_pixels_per_em);
             for text in ["m", "0", "4"] {
                 for offset_px in [0.125, 0.75] {
                     let scene = GlyphScene {
                         text,
-                        fill: WHITE,
-                        ink: BLACK,
-                        font_mm: 12.0 * 25.4 / 72.0,
                         pixels_per_em,
                         offset_px,
                         offset_y_px: offset_px,
-                        tilt_degrees: 0.0,
-                        alpha_mode: AlphaMode::Blend,
-                        drawing_path: path,
+                        ..scene
                     };
-                    let pixels = render(scene)?;
+                    let pixels = capture.read(scene)?;
                     let (left, top, right, bottom) = scene.text_bounds();
                     let mut lone = Vec::new();
                     let mut visible = 0;

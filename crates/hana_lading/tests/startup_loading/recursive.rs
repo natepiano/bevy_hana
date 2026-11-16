@@ -29,9 +29,8 @@ use hana_lading::LoadFailed;
 use hana_lading::LoadProgress;
 use hana_lading::Loaded;
 
+use crate::support;
 use crate::support::SETTLE_UPDATES;
-use crate::support::app_with_test_assets;
-use crate::support::update_until;
 
 // fixture loader extensions
 const DEPS_EXTENSION: &str = "deps";
@@ -179,7 +178,7 @@ struct RecursiveLog {
 #[test]
 fn recursive_dependencies_gate_and_fail() {
     let gate = Arc::new(ChildGate::default());
-    let mut app = app_with_test_assets();
+    let mut app = support::app_with_test_assets();
     app.init_asset::<DependingAsset>()
         .init_asset::<GatedAsset>()
         .register_asset_loader(DependingLoader)
@@ -206,9 +205,9 @@ fn recursive_dependencies_gate_and_fail() {
         );
 
     let entered_gate = gate.clone();
-    update_until(&mut app, move |_| entered_gate.entered());
+    support::update_until(&mut app, move |_| entered_gate.entered());
     let root_id = app.world().resource::<RecursiveAssets>().root.id();
-    update_until(&mut app, move |world| {
+    support::update_until(&mut app, move |world| {
         matches!(
             world.resource::<AssetServer>().get_load_state(root_id),
             Some(LoadState::Loaded)
@@ -229,7 +228,7 @@ fn recursive_dependencies_gate_and_fail() {
     }
 
     gate.release();
-    update_until(&mut app, |world| {
+    support::update_until(&mut app, |world| {
         world.resource::<RecursiveLog>().resolved_failures.is_some()
     });
 

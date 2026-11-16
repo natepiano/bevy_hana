@@ -88,12 +88,14 @@ use hana_rubric::KeymapBindings;
 use hana_rubric::KeymapLoadFailures;
 use hana_rubric::KeymapPathAvailability;
 use hana_rubric::KeymapSystems;
+use hana_rubric::KeystrokeLabel;
 use hana_rubric::KeystrokeRouting;
 use hana_rubric::PaletteBinding;
 use hana_rubric::PaletteRowCursor;
 use hana_rubric::PaletteRowStep;
 use hana_rubric::PaletteSelectionOutcome;
 use hana_rubric::ReflectKeymapCommand;
+use hana_rubric::ShortcutHint;
 use hana_rubric::command;
 use hana_rubric::query_command_palette;
 
@@ -164,16 +166,23 @@ impl Plugin for CommandPalettePlugin {
 /// The value keeps `PaletteBinding`'s typed result at the query boundary and owns only the
 /// user-facing wording needed by a panel, title bar, or status surface.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PaletteBindingPresentation(String);
+pub struct PaletteBindingPresentation {
+    text:     String,
+    shortcut: ShortcutHint,
+}
 
 impl PaletteBindingPresentation {
     /// Returns the user-facing text for this command's current binding result.
     #[must_use]
-    pub fn text(&self) -> &str { &self.0 }
+    pub fn text(&self) -> &str { &self.text }
+
+    /// Returns the shared symbol-and-word presentation for rendering this binding.
+    #[must_use]
+    pub const fn shortcut(&self) -> &ShortcutHint { &self.shortcut }
 }
 
 impl Display for PaletteBindingPresentation {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result { self.0.fmt(formatter) }
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result { self.text.fmt(formatter) }
 }
 
 /// Presents one typed Rubric palette binding with the wording Fairy Dust uses everywhere.
@@ -194,7 +203,16 @@ pub fn palette_binding_presentation(
         },
         PaletteBinding::UnmaterializableStateDimensions => String::from("invalid state snapshot"),
     };
-    PaletteBindingPresentation(text)
+    let shortcut = match palette_binding {
+        PaletteBinding::ApplicationRecovery(keystroke) => {
+            ShortcutHint::Keys(KeystrokeLabel::plain("protected").then(keystroke.label()))
+        },
+        PaletteBinding::BoundTo(sequence) => {
+            ShortcutHint::Keys(KeystrokeLabel::from_sequence(sequence))
+        },
+        _ => ShortcutHint::NotAShortcut,
+    };
+    PaletteBindingPresentation { text, shortcut }
 }
 
 /// Joins Rubric's sorted missing-dimension names for one concurrent recovery context.
@@ -1126,7 +1144,6 @@ mod tests {
     use self::test_support::palette_test_app;
     use super::*;
 
-    const LOADED_COMMAND_KEYSTROKE: &str = "ctrl-shift-r";
     const LOADED_COMMAND_TITLE: &str = "Restart example";
     const REVEAL_FAILURE_ACTION_LABEL: &str = "Reveal";
     const CANONICAL_CONTEXT_DEFAULTS: &str =
@@ -2204,7 +2221,9 @@ mod tests {
         let first_presentation = palette_tree_text(&mut app);
         assert!(first_presentation.contains("first rejected document"));
         assert!(first_presentation.contains(REVEAL_FAILURE_ACTION_LABEL));
-        assert!(first_presentation.contains(LOADED_COMMAND_KEYSTROKE));
+        assert!(first_presentation.contains("Icon { glyph: ChevronUp,"));
+        assert!(first_presentation.contains("Icon { glyph: ArrowBigUp,"));
+        assert!(first_presentation.contains("text: \" R\""));
         assert!(matches!(
             app.world().resource::<KeymapBindings>().authored(),
             hana_rubric::AuthoredKeymapBindings::Loaded(_)
@@ -2219,7 +2238,9 @@ mod tests {
         assert!(second_presentation.contains("second rejected document"));
         assert!(!second_presentation.contains("first rejected document"));
         assert!(second_presentation.contains(REVEAL_FAILURE_ACTION_LABEL));
-        assert!(second_presentation.contains(LOADED_COMMAND_KEYSTROKE));
+        assert!(second_presentation.contains("Icon { glyph: ChevronUp,"));
+        assert!(second_presentation.contains("Icon { glyph: ArrowBigUp,"));
+        assert!(second_presentation.contains("text: \" R\""));
         assert!(matches!(
             app.world().resource::<KeymapBindings>().authored(),
             hana_rubric::AuthoredKeymapBindings::Loaded(_)

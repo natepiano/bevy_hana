@@ -15,10 +15,8 @@ use hana_lading::Loaded;
 use super::missing_file::MISSING_ABSENT_PATH;
 use super::missing_file::MissingAssets;
 use crate::success::SetTwo;
+use crate::support;
 use crate::support::SETTLE_UPDATES;
-use crate::support::assert_fixture_absent;
-use crate::support::image_app;
-use crate::support::update_until;
 
 #[derive(Resource, Default)]
 struct MixedLog {
@@ -30,8 +28,8 @@ struct MixedLog {
 
 #[test]
 fn mixed_outcome() {
-    assert_fixture_absent(MISSING_ABSENT_PATH);
-    let mut app = image_app();
+    support::assert_fixture_absent(MISSING_ABSENT_PATH);
+    let mut app = support::image_app();
     app.add_plugins((
         DiskAssetsPlugin::<SetTwo>::default(),
         DiskAssetsPlugin::<MissingAssets>::default(),
@@ -52,7 +50,7 @@ fn mixed_outcome() {
         log.resolved_events.push(event.failures());
     });
 
-    update_until(&mut app, |world| {
+    support::update_until(&mut app, |world| {
         !world.resource::<MixedLog>().resolved_events.is_empty()
     });
     for _ in 0..SETTLE_UPDATES {

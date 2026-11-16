@@ -131,14 +131,10 @@ pub(crate) fn generate_normals_on_outline_added(
 /// `Outline`, generate outline normals on the mesh asset if not already present.
 pub(crate) fn generate_normals_on_mesh_added(
     added: On<Insert<Mesh3d>>,
-    mesh_query: Query<&Mesh3d>,
-    outline_query: Query<(), With<Outline>>,
+    mesh_query: Query<&Mesh3d, With<Outline>>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
     let entity = added.entity;
-    if !outline_query.contains(entity) {
-        return;
-    }
     let Ok(mesh3d) = mesh_query.get(entity) else {
         return;
     };
@@ -146,12 +142,17 @@ pub(crate) fn generate_normals_on_mesh_added(
 }
 
 fn generate_normals_for_handle(id: AssetId<Mesh>, meshes: &mut Assets<Mesh>) {
+    // Shared meshes already prepared for another entity need no mutable asset
+    // access: get_mut would publish another Modified event on every insertion.
+    if meshes
+        .get(id)
+        .is_none_or(|mesh| mesh.attribute(ATTRIBUTE_OUTLINE_NORMAL).is_some())
+    {
+        return;
+    }
     let Some(mut mesh) = meshes.get_mut(id) else {
         return;
     };
-    if mesh.attribute(ATTRIBUTE_OUTLINE_NORMAL).is_some() {
-        return;
-    }
     generate_outline_normals(&mut mesh);
 }
 

@@ -62,7 +62,6 @@ use hana_diegetic::ScreenSpaceCamera;
 use hana_diegetic::SurfaceShadow;
 use hana_diegetic::TextStyle;
 use hana_diegetic::Tooltip;
-use hana_shader_testing::ShaderRecord;
 use hana_shader_testing::call_sites;
 use hana_shader_testing::definition_enabled;
 use hana_shader_testing::load_module;
@@ -111,6 +110,22 @@ const ALPHA_MODES: [AlphaMode; 7] = [
     AlphaMode::Multiply,
     AlphaMode::AlphaToCoverage,
 ];
+/// The prepass keys that also get a descriptor with an empty material bind group.
+const STRIPPED_PREPASS_KEYS: [MeshPipelineKey; 2] = [
+    MeshPipelineKey::DEPTH_PREPASS,
+    MeshPipelineKey::DEPTH_PREPASS.union(MeshPipelineKey::NORMAL_PREPASS),
+];
+
+/// The transparency mode of one offscreen test camera.
+#[derive(Clone, Copy)]
+enum CameraTransparency {
+    Sorted,
+    OrderIndependent,
+}
+
+impl CameraTransparency {
+    const ALL: [Self; 2] = [Self::Sorted, Self::OrderIndependent];
+}
 
 fn scenario_tree(image: Handle<Image>, alpha_mode: AlphaMode) -> LayoutTree {
     let line = PanelLine::new((2.0, 2.0), (30.0, 18.0))
@@ -203,7 +218,7 @@ fn spawn_tooltip_host(app: &mut App) -> Result<Entity, String> {
 }
 
 fn spawn_cameras(app: &mut App, window: Entity) {
-    for oit in [false, true] {
+    for transparency in CameraTransparency::ALL {
         let target =
             app.world_mut()
                 .resource_mut::<Assets<Image>>()
@@ -221,7 +236,7 @@ fn spawn_cameras(app: &mut App, window: Entity) {
             RenderTarget::Image(target.into()),
             Transform::from_xyz(0.0, 0.0, 0.1).looking_at(Vec3::ZERO, Vec3::Y),
         ));
-        if oit {
+        if matches!(transparency, CameraTransparency::OrderIndependent) {
             camera.insert(OrderIndependentTransparencySettings::default());
         }
     }
@@ -250,7 +265,8 @@ fn diegetic_app() -> Result<App, String> {
                 ..default()
             })
             .set(RenderPlugin {
-                synchronous_pipeline_compilation: true,
+                // Descriptor checks do not need completed GPU pipelines.
+                synchronous_pipeline_compilation: false,
                 ..default()
             })
             .disable::<WinitPlugin>()
@@ -413,9 +429,7 @@ fn prepass_descriptors(app: &App) -> Result<Vec<RenderPipelineDescriptor>, Strin
                 .specialize(key.clone(), &mesh.layout)
                 .map_err(|error| error.to_string())?;
             descriptors.push(descriptor);
-            if prepass == MeshPipelineKey::DEPTH_PREPASS
-                || prepass == (MeshPipelineKey::DEPTH_PREPASS | MeshPipelineKey::NORMAL_PREPASS)
-            {
+            if STRIPPED_PREPASS_KEYS.contains(&prepass) {
                 descriptors.push(stripped_prepass_descriptor(
                     &specializer,
                     key,
@@ -470,9 +484,9 @@ fn shader_variants() -> Result<(), String> {
         "plugin must register every inventoried source"
     );
     let source_paths = SOURCES.map(|source| source.source_path);
-    let mut record = ShaderRecord::new("hana_diegetic", &source_paths);
     let mut covered = HashSet::new();
     let mut definitions_seen = HashSet::new();
+    let mut validated = HashSet::new();
     for (index, descriptor) in descriptors.iter().enumerate() {
         for (handle, definitions) in
             std::iter::once((&descriptor.vertex.shader, &descriptor.vertex.shader_defs)).chain(
@@ -485,6 +499,9 @@ fn shader_variants() -> Result<(), String> {
             let Some(path) = owned.get(&handle.id()) else {
                 continue;
             };
+            if !validated.insert((handle.id(), definitions.clone())) {
+                continue;
+            }
             let module = cache
                 .get(index, handle.id(), definitions)
                 .map_err(|error| format!("{path}: {definitions:?}: {error}"))?;
@@ -508,7 +525,6 @@ fn shader_variants() -> Result<(), String> {
                     "view OIT without material OIT linked oit_draw: {path}: {definitions:?}"
                 );
             }
-            record.record(path, definitions, &module)?;
             covered.insert(*path);
             for definition in definitions {
                 if let ShaderDefVal::Bool(name, true) = definition {
@@ -518,7 +534,7 @@ fn shader_variants() -> Result<(), String> {
         }
     }
     require_scenario_coverage(&covered, &definitions_seen);
-    record.finish()
+    Ok(())
 }
 
 fn require_scenario_coverage(covered: &HashSet<&str>, definitions_seen: &HashSet<&str>) {

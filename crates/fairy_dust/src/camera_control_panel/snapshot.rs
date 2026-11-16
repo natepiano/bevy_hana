@@ -17,6 +17,7 @@ use hana_lagrange::SlowModeHint;
 use hana_lagrange::ZoomRowFilter;
 use hana_lagrange::describe_controls;
 use hana_lagrange::describe_controls_for;
+use hana_rubric::ShortcutHint;
 
 use super::display::LastZoomDirection;
 use super::guidance;
@@ -26,12 +27,13 @@ use super::guidance::CameraGuidanceRow;
 
 #[derive(Component, Clone, Debug, PartialEq, Eq)]
 pub(super) struct CameraGuidanceSnapshot {
-    pub(super) camera_label: String,
-    pub(super) mode_label:   String,
-    pub(super) mode_value:   String,
-    pub(super) slow_mode:    SlowModeHint,
-    pub(super) settings:     Vec<CameraControlBinding>,
-    pub(super) rows:         Vec<CameraGuidanceRow>,
+    pub(super) camera_label:       String,
+    pub(super) mode_label:         String,
+    pub(super) mode_value:         String,
+    pub(super) slow_mode:          SlowModeHint,
+    pub(super) slow_mode_shortcut: ShortcutHint,
+    pub(super) settings:           Vec<CameraControlBinding>,
+    pub(super) rows:               Vec<CameraGuidanceRow>,
 }
 
 /// Where the visible Home shortcut belongs for this panel snapshot.
@@ -69,6 +71,7 @@ pub(super) fn resolve_guidance_snapshot(
             mode_label: guidance.mode_label.resolve(&summary.mode_label).to_string(),
             mode_value: guidance.mode_value.resolve(&summary.mode_value).to_string(),
             slow_mode: summary.slow_mode,
+            slow_mode_shortcut: summary.slow_mode_shortcut,
             settings,
             rows: rows
                 .into_iter()
@@ -93,6 +96,7 @@ pub(super) fn resolve_guidance_snapshot(
         mode_label: summary.mode_label,
         mode_value: summary.mode_value,
         slow_mode: summary.slow_mode,
+        slow_mode_shortcut: summary.slow_mode_shortcut,
         settings,
         rows: rows
             .into_iter()

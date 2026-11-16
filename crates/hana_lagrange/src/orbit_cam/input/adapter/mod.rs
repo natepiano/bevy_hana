@@ -348,6 +348,31 @@ mod tests {
         app.update();
     }
 
+    fn write_modifier_keys(
+        app: &mut App,
+        window: Entity,
+        modifiers: &HashMap<KeyCode, Key>,
+        state: ButtonState,
+    ) {
+        for (&key_code, logical_key) in modifiers {
+            app.world_mut().write_message(KeyboardInput {
+                key_code,
+                logical_key: logical_key.clone(),
+                state,
+                text: None,
+                repeat: false,
+                window,
+            });
+        }
+    }
+
+    fn scroll_pixels(app: &mut App, delta: Vec2) {
+        *app.world_mut().resource_mut::<AccumulatedMouseScroll>() = AccumulatedMouseScroll {
+            unit: MouseScrollUnit::Pixel,
+            delta,
+        };
+    }
+
     type TestResult = Result<(), &'static str>;
 
     #[test]
@@ -369,22 +394,10 @@ mod tests {
             (KeyCode::ShiftLeft, Key::Shift),
         ]);
         // The screenshot overlay consumes the native Shift and Cmd releases.
-        for (&key_code, logical_key) in &held_modifiers {
-            app.world_mut().write_message(KeyboardInput {
-                key_code,
-                logical_key: logical_key.clone(),
-                state: ButtonState::Pressed,
-                text: None,
-                repeat: false,
-                window,
-            });
-        }
+        write_modifier_keys(&mut app, window, &held_modifiers, ButtonState::Pressed);
         app.update();
         let scroll = Vec2::new(4.0, 6.0);
-        *app.world_mut().resource_mut::<AccumulatedMouseScroll>() = AccumulatedMouseScroll {
-            unit:  MouseScrollUnit::Pixel,
-            delta: scroll,
-        };
+        scroll_pixels(&mut app, scroll);
         app.update();
         let input = camera_input(&app, camera)?;
         assert!(!input.has_orbit());
@@ -392,20 +405,8 @@ mod tests {
 
         // Send the keyboard releases produced by modifier reconciliation, without
         // another native Shift key event; otherwise this scroll continues to pan.
-        for (&key_code, logical_key) in &held_modifiers {
-            app.world_mut().write_message(KeyboardInput {
-                key_code,
-                logical_key: logical_key.clone(),
-                state: ButtonState::Released,
-                text: None,
-                repeat: false,
-                window,
-            });
-        }
-        *app.world_mut().resource_mut::<AccumulatedMouseScroll>() = AccumulatedMouseScroll {
-            unit:  MouseScrollUnit::Pixel,
-            delta: scroll,
-        };
+        write_modifier_keys(&mut app, window, &held_modifiers, ButtonState::Released);
+        scroll_pixels(&mut app, scroll);
         app.update();
         let input = camera_input(&app, camera)?;
         assert_eq!(input.orbit(), OrbitDelta::from(scroll));

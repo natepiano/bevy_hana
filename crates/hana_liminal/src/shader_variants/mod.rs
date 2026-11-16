@@ -20,7 +20,6 @@ use bevy::shader::ShaderDefVal;
 use bevy::window::ExitCondition;
 use bevy::winit::WinitPlugin;
 use contracts::OutlineContracts;
-use hana_shader_testing::ShaderRecord;
 
 use crate::constants::ATTRIBUTE_OUTLINE_NORMAL;
 use crate::constants::HAS_OUTLINE_NORMALS_SHADER_DEF;
@@ -71,7 +70,6 @@ fn headless_app(buffers: InstanceBuffers) -> App {
 fn shader_variants_for_descriptors(
     app: &App,
     descriptors: &[RenderPipelineDescriptor],
-    record: &mut ShaderRecord,
     contracts: &mut OutlineContracts,
 ) -> Result<(), String> {
     let device = app.world().resource::<RenderDevice>();
@@ -130,7 +128,6 @@ fn shader_variants_for_descriptors(
                 .get(0, handle.id(), definitions)
                 .map_err(|error| format!("{path}: {definitions:?}: {error}"))?;
             contracts.check(path, &module, definitions)?;
-            record.record(path, definitions, &module)?;
             roots.insert(path);
         }
     }
@@ -176,7 +173,6 @@ const ROOT_COUNT: usize = 4;
 
 #[test]
 fn shader_variants_link_morph_targets_and_distinct_uniform_arrays() -> Result<(), String> {
-    let mut record = hana_shader_testing::ShaderRecord::new(CRATE_NAME, SOURCES);
     let mut contracts = OutlineContracts::default();
     for buffers in [InstanceBuffers::Storage, InstanceBuffers::Uniform] {
         let mut app = headless_app(buffers);
@@ -192,10 +188,10 @@ fn shader_variants_link_morph_targets_and_distinct_uniform_arrays() -> Result<()
         if matches!(buffers, InstanceBuffers::Storage) {
             append_nondefault_outline_batches(&mut descriptors);
         }
-        shader_variants_for_descriptors(&app, &descriptors, &mut record, &mut contracts)?;
+        shader_variants_for_descriptors(&app, &descriptors, &mut contracts)?;
     }
     contracts.finish();
-    record.finish()
+    Ok(())
 }
 
 // A deliberately non-default extent catches loss of the WESL numeric constant.
@@ -333,13 +329,14 @@ fn outline_descriptors(
     Ok(descriptors)
 }
 
-fn outline_view_keys(mesh: &Mesh, dynamic_range: DynamicRange) -> [MeshPipelineKey; 4] {
+fn outline_view_keys(mesh: &Mesh, dynamic_range: DynamicRange) -> Vec<MeshPipelineKey> {
     [
         (1, MeshPipelineKey::VIEW_PROJECTION_PERSPECTIVE),
         (1, MeshPipelineKey::VIEW_PROJECTION_ORTHOGRAPHIC),
         (4, MeshPipelineKey::VIEW_PROJECTION_PERSPECTIVE),
         (4, MeshPipelineKey::VIEW_PROJECTION_ORTHOGRAPHIC),
     ]
+    .into_iter()
     .map(|(sample_count, projection)| {
         MeshPipelineKey::from_msaa_samples(sample_count)
             | MeshPipelineKey::from_target_format(if matches!(dynamic_range, DynamicRange::Hdr) {
@@ -353,6 +350,8 @@ fn outline_view_keys(mesh: &Mesh, dynamic_range: DynamicRange) -> [MeshPipelineK
             )
             | projection
     })
+    .flat_map(|key| [key, key | MeshPipelineKey::DEPTH_PREPASS])
+    .collect()
 }
 
 fn assert_product_definitions(

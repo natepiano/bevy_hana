@@ -90,7 +90,7 @@ impl Display for KeystrokeSequence {
                 formatter.write_str(" ")?;
             }
             if formatter.alternate() {
-                formatter.write_str(&keystroke.label())?;
+                keystroke.label().fmt(formatter)?;
             } else {
                 keystroke.fmt(formatter)?;
             }

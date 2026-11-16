@@ -1068,6 +1068,11 @@ pub enum DeviceAccessErrorView {
         /// Provider detail identifying the cancelled consent or closed session.
         detail: String,
     },
+    /// No person has given consent for this operation yet; this is not a fault.
+    ConsentRequired {
+        /// Provider detail naming the consent the operation waits for.
+        detail: String,
+    },
     /// Another owner holds exclusive access.
     Contended {
         /// Provider detail.
@@ -1116,6 +1121,7 @@ impl DeviceAccessErrorView {
     pub fn detail(&self) -> &str {
         match self {
             Self::Cancelled { detail }
+            | Self::ConsentRequired { detail }
             | Self::Contended { detail }
             | Self::Blocked { detail }
             | Self::Absent { detail }
@@ -1133,6 +1139,7 @@ impl Display for DeviceAccessErrorView {
             Self::Cancelled { detail } => {
                 write!(formatter, "permission was cancelled or revoked: {detail}")
             },
+            Self::ConsentRequired { detail } => write!(formatter, "waiting for consent: {detail}"),
             Self::Contended { detail } => write!(formatter, "device busy: {detail}"),
             Self::Blocked { detail } => write!(formatter, "device access was refused: {detail}"),
             Self::Absent { detail } => write!(formatter, "device is unreachable: {detail}"),
@@ -1370,6 +1377,9 @@ impl From<&DeviceAccessError> for DeviceAccessErrorView {
     fn from(error: &DeviceAccessError) -> Self {
         match error {
             DeviceAccessError::Cancelled { detail } => Self::Cancelled {
+                detail: detail.clone(),
+            },
+            DeviceAccessError::ConsentRequired { detail } => Self::ConsentRequired {
                 detail: detail.clone(),
             },
             DeviceAccessError::Contended { detail } => Self::Contended {

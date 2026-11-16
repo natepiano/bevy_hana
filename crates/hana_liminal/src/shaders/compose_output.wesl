@@ -1,3 +1,5 @@
+import hana_liminal::view_helpers::coplanar_depth_tolerance;
+
 @group(0) @binding(0) var screen_texture: texture_2d<f32>;
 @group(0) @binding(1) var texture_sampler: sampler;
 @group(0) @binding(2) var flood_texture: texture_2d<f32>;
@@ -27,6 +29,13 @@ struct VertexOutput {
 const SOURCE_CONTACT_METERS: f32 = 0.00025;
 
 fn foreground_gap(scene_depth: f32, outline_depth: f32, seed_surface: vec4<f32>) -> f32 {
+    // Treat depth rounding as contact before calculating the physical gap.
+    let depth_per_meter = select(
+        outline_depth / max(seed_surface.z, 0.000001), seed_surface.w, seed_surface.w > 0.0,
+    );
+    if scene_depth <= outline_depth + coplanar_depth_tolerance(max(scene_depth, outline_depth), depth_per_meter) {
+        return 0.0;
+    }
     if seed_surface.w > 0.0 {
         return (scene_depth - outline_depth) / seed_surface.w;
     }

@@ -4,21 +4,22 @@ mod declaration;
 mod materialization;
 mod placement;
 mod readiness;
+mod resize;
 mod target;
 mod visibility;
 use bevy::ecs::schedule::ApplyDeferred;
 use bevy::prelude::App;
+use bevy::prelude::Has;
 use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::Plugin;
 use bevy::prelude::PostUpdate;
+use bevy::prelude::PreUpdate;
 use bevy::prelude::Query;
 use bevy::prelude::SystemSet;
 use bevy::prelude::Update;
 use bevy::transform::TransformSystems;
 use declaration::TooltipPhase;
 use hana_valence::AnchorSystems;
-#[cfg(test)]
-pub(crate) use visibility::TooltipPointerCamera;
 
 use self::attachment::ScreenTooltipAttachmentCorrection;
 use self::attachment::attach_materialized_tooltips;
@@ -49,6 +50,8 @@ use self::materialization::invalidate_stale_materialized_tooltips;
 use self::materialization::invalidate_stale_world_tooltip_frames;
 use self::materialization::live_window;
 use self::materialization::materialize_requested_tooltips;
+use self::materialization::materialized_tooltip_content_changed;
+use self::materialization::rebuild_resized_tooltips;
 use self::materialization::zero_origin_viewport;
 pub use self::placement::TooltipCardOccupiedRegions;
 use self::placement::resolve_screen_tooltip_placements;
@@ -56,6 +59,11 @@ use self::placement::resolve_world_tooltip_placements;
 use self::readiness::finalize_tooltip_readiness;
 use self::readiness::tooltip_readiness_inputs_changed;
 use self::readiness::tooltip_readiness_or_reveal;
+pub use self::resize::TooltipWorldUpdate;
+use self::resize::WorldTooltipResizeFitPending;
+use self::resize::clear_world_tooltip_updates;
+use self::resize::resolve_world_tooltip_updates;
+use self::resize::world_tooltip_update_requested;
 pub use self::target::MeshAnchorCommandsExt;
 pub(crate) use self::target::MeshAnchorWarnings;
 pub use self::target::MeshFace;
@@ -84,6 +92,7 @@ pub(crate) use self::visibility::select_window_presentation_camera;
 use super::TooltipSystems;
 use super::WidgetSystems;
 use crate::PanelSystems;
+use crate::cascade::CascadeSet;
 use crate::panel;
 use crate::panel::PanelSpace;
 use crate::render::MaterialTableAppendReady;
@@ -104,10 +113,14 @@ enum TooltipPlacementSystems {
 }
 
 fn world_tooltip_placement_requested(
-    tooltips: Query<(&TooltipPhase, &MaterializedTooltip)>,
+    tooltips: Query<(
+        &TooltipPhase,
+        &MaterializedTooltip,
+        Has<WorldTooltipResizeFitPending>,
+    )>,
 ) -> bool {
-    tooltips.iter().any(|(phase, materialized)| {
-        matches!(phase, declaration::TooltipPhase::WaitingToShow(_))
+    tooltips.iter().any(|(phase, materialized, resize_fit)| {
+        (resize_fit || matches!(phase, declaration::TooltipPhase::WaitingToShow(_)))
             && materialized.space() == PanelSpace::World
     })
 }
@@ -128,6 +141,7 @@ impl Plugin for TooltipPlugin {
         let hidden_event = app.world_mut().register_event_key::<TooltipHidden>();
         app.insert_resource(TooltipHiddenEventKey(hidden_event));
         register_tooltip_observers(app);
+        app.add_systems(PreUpdate, rebuild_resized_tooltips);
         app.configure_sets(
             Update,
             (
@@ -155,6 +169,13 @@ impl Plugin for TooltipPlugin {
         .add_systems(
             Update,
             (
+                // Refresh existing content before layout. Replacing its tree
+                // after widget reification leaves animation one revision behind.
+                (materialize_requested_tooltips, ApplyDeferred)
+                    .chain()
+                    .run_if(materialized_tooltip_content_changed)
+                    .after(PanelSystems::ApplyTreeChanges)
+                    .before(CascadeSet::Propagate),
                 (advance_tooltip_visibility, retire_superseded_help_panels)
                     .chain()
                     .in_set(TooltipSystems::Eligibility),
@@ -193,6 +214,28 @@ impl Plugin for TooltipPlugin {
 }
 
 fn register_tooltip_post_update_systems(app: &mut App) {
+    app.configure_sets(
+        PostUpdate,
+        TooltipWorldUpdate
+            .after(AnchorSystems::Resolve)
+            .before(PanelChildSystems::Build)
+            .before(MaterialTableAppendReady)
+            .before(TransformSystems::Propagate),
+    )
+    .add_systems(
+        PostUpdate,
+        (
+            ApplyDeferred,
+            (resolve_world_tooltip_updates, clear_world_tooltip_updates)
+                .chain()
+                .run_if(world_tooltip_update_requested),
+        )
+            .chain()
+            .after(TooltipWorldUpdate)
+            .before(PanelChildSystems::Build)
+            .before(MaterialTableAppendReady)
+            .before(TransformSystems::Propagate),
+    );
     app.configure_sets(
         PostUpdate,
         (

@@ -1,12 +1,15 @@
 import bevy_pbr::render::{
     mesh_bindings::mesh,
     mesh_functions,
+    mesh_view_bindings::view,
     skinning,
     morph,
     morph::{morph_position, morph_normal, morph_tangent},
-    view_transformations::{position_world_to_clip, direction_world_to_clip, frag_coord_to_uv},
+    view_transformations::{position_world_to_clip, position_world_to_view, position_ndc_to_view, position_view_to_clip, direction_world_to_clip, frag_coord_to_uv},
 };
-import hana_liminal::view_helpers::get_viewport;
+import hana_liminal::view_helpers::{get_viewport, coplanar_depth_tolerance};
+@if(DEPTH_PREPASS)
+import bevy_pbr::render::mesh_view_bindings::depth_prepass_texture;
 
 struct Vertex {
     @builtin(instance_index) instance_index: u32,
@@ -47,7 +50,7 @@ struct Instance {
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,
-    @location(1) surface_depth: f32,
+    @location(1) surface_view: vec3<f32>,
     @location(2) @interpolate(flat) owner_id: f32,
     @location(3) @interpolate(flat) overlap: f32,
 };
@@ -165,7 +168,7 @@ fn vertex(vertex_no_morph: Vertex) -> VertexOutput {
         out.position = position_world_to_clip(expanded_world_position);
     }
 
-    out.surface_depth = surface_clip.z / surface_clip.w;
+    out.surface_view = position_world_to_view(world_position.xyz);
     out.owner_id = outline.owner_data.x;
     out.overlap = outline.overlap;
     out.color = vec4<f32>(
@@ -175,9 +178,54 @@ fn vertex(vertex_no_morph: Vertex) -> VertexOutput {
     return out;
 }
 
+struct FragmentOutput {
+    @location(0) color: vec4<f32>,
+    @builtin(frag_depth) depth: f32,
+};
+
+fn source_plane_at_uv(source_view: vec3<f32>, plane_normal: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
+    let pixel_ndc = uv * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
+    let ray_origin = position_ndc_to_view(vec3<f32>(pixel_ndc, 1.0));
+    let ray_direction = position_ndc_to_view(vec3<f32>(pixel_ndc, 0.5)) - ray_origin;
+    let plane_ray_dot = dot(plane_normal, ray_direction);
+    if abs(plane_ray_dot) > 1e-12 {
+        return ray_origin + ray_direction * (dot(plane_normal, source_view - ray_origin) / plane_ray_dot);
+    }
+    return source_view;
+}
+
 @fragment
-fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
+fn fragment(in: VertexOutput) -> FragmentOutput {
     let uv = frag_coord_to_uv(in.position.xy);
+    // Calculate the source plane independently of the expanded outline.
+    let plane_normal = cross(dpdx(in.surface_view), dpdy(in.surface_view));
+@if(DEPTH_PREPASS) {
+    // A hidden source must not draw an outline through a foreground surface.
+    let source_clip = position_view_to_clip(in.surface_view);
+    let source_uv = source_clip.xy / source_clip.w * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    let depth_size = vec2<i32>(textureDimensions(depth_prepass_texture));
+    let source_coords = clamp(vec2<i32>(source_uv * vec2<f32>(depth_size)), vec2<i32>(0), depth_size - vec2<i32>(1));
+    let sample_uv = (vec2<f32>(source_coords) + vec2<f32>(0.5)) / vec2<f32>(depth_size);
+    let source_at_sample = source_plane_at_uv(in.surface_view, plane_normal, sample_uv);
+    let sample_clip = position_view_to_clip(source_at_sample);
+    let source_depth = sample_clip.z / sample_clip.w;
+    let source_depth_per_meter = select(
+        source_depth / max(-source_at_sample.z, 0.000001),
+        view.clip_from_view[2].z, view.clip_from_view[3].w == 1.0,
+    );
+    if textureLoad(depth_prepass_texture, source_coords, 0) > source_depth + abs(source_depth_per_meter) * 0.00025 {
+        discard;
+    }
+}
+    let surface_view = source_plane_at_uv(in.surface_view, plane_normal, uv);
+    let surface_clip = position_view_to_clip(surface_view);
+    let surface_depth = surface_clip.z / surface_clip.w;
+    let depth_per_meter = select(
+        surface_depth / max(-surface_view.z, 0.000001),
+        view.clip_from_view[2].z, view.clip_from_view[3].w == 1.0,
+    );
+    var out: FragmentOutput;
+    out.depth = clamp(surface_depth + coplanar_depth_tolerance(surface_depth, depth_per_meter), 0.0, 1.0);
     let outlined_surface_depth = textureSample(outline_depth_texture, occlusion_sampler, uv);
 
     if outlined_surface_depth > 0.0 {
@@ -192,16 +240,18 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         // In reverse-Z: larger depth = closer to camera.
         // If our mesh surface is further away, this hull belongs to the
         // back mesh — discard it so only the front mesh's outline shows.
-        if in.surface_depth < outlined_surface_depth {
+        if out.depth < outlined_surface_depth {
             discard;
         }
 
         // Front mesh hull over back mesh surface.
         // overlap=0.0 (Merged): fully transparent at mesh-overlap pixels.
         // overlap=1.0 (Grouped/PerMesh): fully opaque per-group/per-mesh overlap rendering.
-        return vec4<f32>(in.color.rgb, in.color.a * in.overlap);
+        out.color = vec4<f32>(in.color.rgb, in.color.a * in.overlap);
+        return out;
     }
 
     // No outlined surface at this pixel — hull at silhouette in open space.
-    return in.color;
+    out.color = in.color;
+    return out;
 }

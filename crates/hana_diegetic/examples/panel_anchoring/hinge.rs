@@ -42,7 +42,7 @@ use hana_valence::Member;
 use crate::anchor_demo::AnchorChain;
 use crate::anchor_demo::AnchorTile;
 use crate::constants::*;
-use crate::presentation::smoothstep;
+use crate::presentation;
 use crate::scene::ActiveCapability;
 use crate::scene::ModeMorph;
 
@@ -294,7 +294,7 @@ pub(crate) fn advance_hinge(hinge: &mut HingeChain, dt: f32) {
         return;
     };
     hinge.timer += dt;
-    let progress = smoothstep((hinge.timer / HINGE_EASE_SECS).clamp(0.0, 1.0));
+    let progress = presentation::smoothstep((hinge.timer / HINGE_EASE_SECS).clamp(0.0, 1.0));
     let target = match phase {
         HingePhase::Unwrapping => 1.0,
         HingePhase::Folding => 0.0,

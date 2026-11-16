@@ -27,20 +27,6 @@ use crate::restore::NativeWindowReadbackPosition;
 use crate::restore::RetainedWindowedPhysicalPosition;
 use crate::restore::WindowRestoreAttempt;
 
-/// The native mode change and driver placement that restore the windowed view.
-#[derive(Component)]
-pub(crate) enum WindowedPlacementRestore {
-    LeavingFullScreen(Box<BindingAuthoring<WindowPlacementConfiguration>>),
-    AwaitingDriver,
-    Applying,
-    RestoringDirect { remaining_frames: u8 },
-}
-
-enum WindowedRestoreDispatch {
-    DirectWindow,
-    WindowDriver,
-}
-
 #[derive(Component, Clone)]
 pub(crate) struct WindowedPlacement {
     placement:  EstablishedWindowPlacement,
@@ -139,6 +125,103 @@ impl WindowedPlacement {
             window
                 .resolution
                 .set(self.resolution.width(), self.resolution.height());
+        }
+    }
+}
+
+/// The native mode change and driver placement that restore the windowed view.
+#[derive(Component)]
+pub(crate) enum WindowedPlacementRestore {
+    LeavingFullScreen(Box<BindingAuthoring<WindowPlacementConfiguration>>),
+    AwaitingDriver,
+    Applying,
+    RestoringDirect { remaining_frames: u8 },
+}
+
+enum WindowedRestoreDispatch {
+    DirectWindow,
+    WindowDriver,
+}
+
+/// Whether a direct windowed return can spend one more frame.
+enum DirectReturnBudget {
+    FrameSpent,
+    Exhausted,
+}
+
+impl WindowPlacementConfiguration {
+    /// Whether either the requested mode or native monitor readback is full screen.
+    #[must_use]
+    pub fn is_full_screen(world: &World, entity: Entity) -> bool {
+        world.get::<Window>(entity).is_some_and(|window| {
+            world
+                .get::<CurrentMonitor>(entity)
+                .map_or(window.mode != WindowMode::Windowed, |monitor| {
+                    is_full_screen(window, monitor)
+                })
+        })
+    }
+
+    /// Toggle an editor window on its current monitor, retaining its windowed placement.
+    ///
+    /// A window without current-monitor readback is left untouched. Output windows are ignored.
+    /// On a full-screen launch the persisted windowed placement supplies the return geometry.
+    pub fn toggle_full_screen(world: &mut World, entity: Entity) {
+        if world.get::<PrimaryWindow>(entity).is_none()
+            || world.get::<WindowedPlacementRestore>(entity).is_some()
+        {
+            return;
+        }
+        let Some(monitor) = world.get::<CurrentMonitor>(entity).copied() else {
+            return;
+        };
+        let Some(window) = world.get::<Window>(entity) else {
+            return;
+        };
+        if !is_full_screen(window, &monitor) {
+            let platform = *world.resource::<Platform>();
+            let placement = WindowedPlacement::read(window, &monitor, platform);
+            world.entity_mut(entity).insert(placement);
+            if let Some(mut window) = world.get_mut::<Window>(entity) {
+                window.mode = WindowMode::BorderlessFullscreen(monitor.index.selection());
+            }
+            return;
+        }
+        let retained = world.get::<WindowedPlacement>(entity).cloned().or_else(|| {
+            let role = super::primary_window_role().ok()?;
+            let saved = world
+                .get_resource::<PersistedWindowPlacements>()?
+                .states
+                .get(&role)?;
+            Some(WindowedPlacement::from_saved(
+                &saved.window_state,
+                window,
+                &monitor,
+            ))
+        });
+        if let Some(retained) = retained {
+            match request_windowed_restore(world, entity, &retained) {
+                Ok(WindowedRestoreDispatch::WindowDriver) => return,
+                Err(error) => {
+                    warn!("windowed placement could not be requested: {error}");
+                },
+                Ok(WindowedRestoreDispatch::DirectWindow) => {},
+            }
+            leave_native_full_screen(entity);
+            world.entity_mut(entity).insert((
+                retained.clone(),
+                WindowedPlacementRestore::RestoringDirect {
+                    remaining_frames: X11_WINDOWED_RETURN_MAX_FRAMES,
+                },
+            ));
+            if let Some(mut window) = world.get_mut::<Window>(entity) {
+                window.mode = WindowMode::Windowed;
+                retained.restore_resolution(&mut window);
+            }
+            finish_direct_windowed_placement_restore(world, entity);
+        } else if let Some(mut window) = world.get_mut::<Window>(entity) {
+            window.mode = WindowMode::Windowed;
+            leave_native_full_screen(entity);
         }
     }
 }
@@ -309,7 +392,10 @@ fn finish_direct_windowed_placement_restore(world: &mut World, entity: Entity) {
         drop_windowed_return(world, entity);
         return;
     };
-    if !direct_return_has_budget(world, entity) {
+    if matches!(
+        spend_direct_return_frame(world, entity),
+        DirectReturnBudget::Exhausted
+    ) {
         finish_uncompensated_windowed_return(world, entity, &placement);
         return;
     }
@@ -347,18 +433,18 @@ fn finish_direct_windowed_placement_restore(world: &mut World, entity: Entity) {
     drop_windowed_return(world, entity);
 }
 
-fn direct_return_has_budget(world: &mut World, entity: Entity) -> bool {
+fn spend_direct_return_frame(world: &mut World, entity: Entity) -> DirectReturnBudget {
     let Some(mut restore) = world.get_mut::<WindowedPlacementRestore>(entity) else {
-        return false;
+        return DirectReturnBudget::Exhausted;
     };
     let WindowedPlacementRestore::RestoringDirect { remaining_frames } = &mut *restore else {
-        return false;
+        return DirectReturnBudget::Exhausted;
     };
     if *remaining_frames == 0 {
-        return false;
+        return DirectReturnBudget::Exhausted;
     }
     *remaining_frames -= 1;
-    true
+    DirectReturnBudget::FrameSpent
 }
 
 fn finish_uncompensated_windowed_return(
@@ -436,83 +522,6 @@ pub(super) fn remember_windowed_placement(
 
 fn is_full_screen(window: &Window, monitor: &CurrentMonitor) -> bool {
     window.mode != WindowMode::Windowed || monitor.effective_window_mode != WindowMode::Windowed
-}
-
-impl WindowPlacementConfiguration {
-    /// Whether either the requested mode or native monitor readback is full screen.
-    #[must_use]
-    pub fn is_full_screen(world: &World, entity: Entity) -> bool {
-        world.get::<Window>(entity).is_some_and(|window| {
-            world
-                .get::<CurrentMonitor>(entity)
-                .map_or(window.mode != WindowMode::Windowed, |monitor| {
-                    is_full_screen(window, monitor)
-                })
-        })
-    }
-
-    /// Toggle an editor window on its current monitor, retaining its windowed placement.
-    ///
-    /// A window without current-monitor readback is left untouched. Output windows are ignored.
-    /// On a full-screen launch the persisted windowed placement supplies the return geometry.
-    pub fn toggle_full_screen(world: &mut World, entity: Entity) {
-        if world.get::<PrimaryWindow>(entity).is_none()
-            || world.get::<WindowedPlacementRestore>(entity).is_some()
-        {
-            return;
-        }
-        let Some(monitor) = world.get::<CurrentMonitor>(entity).copied() else {
-            return;
-        };
-        let Some(window) = world.get::<Window>(entity) else {
-            return;
-        };
-        if !is_full_screen(window, &monitor) {
-            let platform = *world.resource::<Platform>();
-            let placement = WindowedPlacement::read(window, &monitor, platform);
-            world.entity_mut(entity).insert(placement);
-            if let Some(mut window) = world.get_mut::<Window>(entity) {
-                window.mode = WindowMode::BorderlessFullscreen(monitor.index.selection());
-            }
-            return;
-        }
-        let retained = world.get::<WindowedPlacement>(entity).cloned().or_else(|| {
-            let role = super::primary_window_role().ok()?;
-            let saved = world
-                .get_resource::<PersistedWindowPlacements>()?
-                .states
-                .get(&role)?;
-            Some(WindowedPlacement::from_saved(
-                &saved.window_state,
-                window,
-                &monitor,
-            ))
-        });
-        if let Some(retained) = retained {
-            match request_windowed_restore(world, entity, &retained) {
-                Ok(WindowedRestoreDispatch::WindowDriver) => return,
-                Err(error) => {
-                    warn!("windowed placement could not be requested: {error}");
-                },
-                Ok(WindowedRestoreDispatch::DirectWindow) => {},
-            }
-            leave_native_full_screen(entity);
-            world.entity_mut(entity).insert((
-                retained.clone(),
-                WindowedPlacementRestore::RestoringDirect {
-                    remaining_frames: X11_WINDOWED_RETURN_MAX_FRAMES,
-                },
-            ));
-            if let Some(mut window) = world.get_mut::<Window>(entity) {
-                window.mode = WindowMode::Windowed;
-                retained.restore_resolution(&mut window);
-            }
-            finish_direct_windowed_placement_restore(world, entity);
-        } else if let Some(mut window) = world.get_mut::<Window>(entity) {
-            window.mode = WindowMode::Windowed;
-            leave_native_full_screen(entity);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -631,13 +640,15 @@ mod tests {
             })
         }
 
-        fn settle(&mut self) -> Result<bool, String> {
+        fn settle(&mut self) -> Result<PlacementDriverRun, String> {
             let role = super::super::primary_window_role().map_err(|error| error.to_string())?;
-            let mut attempted = false;
+            let mut run = PlacementDriverRun::NotAttempted;
             for _ in 0..120 {
                 self.app.update();
                 let world = self.app.world();
-                attempted |= world.get::<WindowRestoreAttempt>(self.editor).is_some();
+                if world.get::<WindowRestoreAttempt>(self.editor).is_some() {
+                    run = PlacementDriverRun::Attempted;
+                }
                 let established = world
                     .resource::<Bindings>()
                     .role_entity(&role)
@@ -650,7 +661,7 @@ mod tests {
                     && world.get::<WindowRestoreAttempt>(self.editor).is_none()
                     && world.get::<WindowedPlacementRestore>(self.editor).is_none()
                 {
-                    return Ok(attempted);
+                    return Ok(run);
                 }
             }
             Err("window placement did not finish".into())
@@ -678,14 +689,31 @@ mod tests {
         }
     }
 
-    fn display(published: bool) -> Result<DisplayTestDescriptor, String> {
+    /// Whether the placement driver made a restore attempt while a fixture settled.
+    #[derive(Clone, Copy)]
+    enum PlacementDriverRun {
+        Attempted,
+        NotAttempted,
+    }
+
+    /// Whether the test display publishes an identity. Only a published display gets a binding.
+    #[derive(Clone, Copy)]
+    enum DisplayIdentity {
+        Published,
+        Unpublished,
+    }
+
+    fn display(identity: DisplayIdentity) -> Result<DisplayTestDescriptor, String> {
         let handle = PlatformDeviceHandle::Reported(
             ReportedId::new("placement-display").map_err(|error| error.to_string())?,
         );
-        let display = if published {
-            DisplayTestDescriptor::new("placement", b"placement-display".to_vec(), handle)
-        } else {
-            DisplayTestDescriptor::without_published_identity("placement", handle)
+        let display = match identity {
+            DisplayIdentity::Published => {
+                DisplayTestDescriptor::new("placement", b"placement-display".to_vec(), handle)
+            },
+            DisplayIdentity::Unpublished => {
+                DisplayTestDescriptor::without_published_identity("placement", handle)
+            },
         };
         Ok(display.placed_at(IVec2::ZERO, UVec2::new(1920, 1080)))
     }
@@ -693,7 +721,7 @@ mod tests {
     #[test]
     fn full_screen_startup_retains_saved_geometry_before_the_first_driver_attempt()
     -> Result<(), String> {
-        let descriptor = display(true)?;
+        let descriptor = display(DisplayIdentity::Published)?;
         let adapter = DisplayTestAdapter::new();
         adapter.observe_displays(vec![descriptor.clone()]);
         let DisplayTestDeviceKey::Keyed(key) = adapter.display_device_key("placement") else {
@@ -764,7 +792,7 @@ mod tests {
                     ..default()
                 },
                 HashMap::new(),
-                display(false)?,
+                display(DisplayIdentity::Unpublished)?,
             )?;
             for _ in 0..4 {
                 fixture.app.update();
@@ -825,7 +853,7 @@ mod tests {
                 ..default()
             },
             HashMap::new(),
-            display(true)?,
+            display(DisplayIdentity::Published)?,
         )?;
         fixture.settle()?;
         let before_size = fixture.window()?.resolution.physical_size();
@@ -879,7 +907,8 @@ mod tests {
                 ..default()
             };
             window.resolution.set_scale_factor(scale);
-            let mut fixture = PlacementApp::new(window, HashMap::new(), display(true)?)?;
+            let mut fixture =
+                PlacementApp::new(window, HashMap::new(), display(DisplayIdentity::Published)?)?;
             fixture.settle()?;
             // Set native pixel values after startup, as a user resize and move would.
             {
@@ -898,7 +927,7 @@ mod tests {
             );
             assert_eq!(
                 fixture.window()?.mode,
-                WindowMode::BorderlessFullscreen(bevy::window::MonitorSelection::Index(0))
+                WindowMode::BorderlessFullscreen(MonitorSelection::Index(0))
             );
             {
                 let mut full = fixture
@@ -921,7 +950,7 @@ mod tests {
                     .is_some()
             );
             assert!(
-                fixture.settle()?,
+                matches!(fixture.settle()?, PlacementDriverRun::Attempted),
                 "the production placement driver must run"
             );
             let restored = fixture.window()?;
@@ -966,19 +995,22 @@ mod tests {
     }
 
     #[cfg(all(target_os = "linux", feature = "workaround-winit-4445"))]
-    fn x11_return_fixture(scale: f32, binding: bool) -> Result<PlacementApp, String> {
+    fn x11_return_fixture(scale: f32, identity: DisplayIdentity) -> Result<PlacementApp, String> {
         let mut window = Window {
             resolution: (454, 333).into(),
             ..default()
         };
         window.resolution.set_scale_factor(scale);
-        let mut fixture = PlacementApp::new(window, HashMap::new(), display(binding)?)?;
-        if binding {
-            fixture.settle()?;
-        } else {
-            for _ in 0..4 {
-                fixture.app.update();
-            }
+        let mut fixture = PlacementApp::new(window, HashMap::new(), display(identity)?)?;
+        match identity {
+            DisplayIdentity::Published => {
+                fixture.settle()?;
+            },
+            DisplayIdentity::Unpublished => {
+                for _ in 0..4 {
+                    fixture.app.update();
+                }
+            },
         }
         {
             let mut window = fixture
@@ -1057,13 +1089,13 @@ mod tests {
     fn full_screen_x11_driver_returns_to_exact_native_pixels_after_frame_compensation()
     -> Result<(), String> {
         for scale in [2.0, 1.75] {
-            let mut fixture = x11_return_fixture(scale, true)?;
+            let mut fixture = x11_return_fixture(scale, DisplayIdentity::Published)?;
             WindowPlacementConfiguration::toggle_full_screen(
                 fixture.app.world_mut(),
                 fixture.editor,
             );
             assert!(
-                fixture.settle()?,
+                matches!(fixture.settle()?, PlacementDriverRun::Attempted),
                 "the production placement driver must run"
             );
             assert_x11_native_return(&fixture)?;
@@ -1082,7 +1114,7 @@ mod tests {
     -> Result<(), String> {
         for scale in [2.0, 1.75] {
             for retained in [true, false] {
-                let mut fixture = x11_return_fixture(scale, false)?;
+                let mut fixture = x11_return_fixture(scale, DisplayIdentity::Unpublished)?;
                 let role =
                     super::super::primary_window_role().map_err(|error| error.to_string())?;
                 assert!(
@@ -1127,7 +1159,7 @@ mod tests {
     #[test]
     fn full_screen_x11_direct_return_waits_for_frame_extents_and_keeps_its_target()
     -> Result<(), String> {
-        let mut fixture = x11_return_fixture(2.0, false)?;
+        let mut fixture = x11_return_fixture(2.0, DisplayIdentity::Unpublished)?;
         WindowPlacementConfiguration::await_x11_frame_extents_for_test(
             fixture.app.world_mut(),
             fixture.editor,
@@ -1169,7 +1201,7 @@ mod tests {
     #[test]
     fn full_screen_x11_missing_frame_extents_releases_return_and_resumes_capture()
     -> Result<(), String> {
-        let mut fixture = x11_return_fixture(2.0, false)?;
+        let mut fixture = x11_return_fixture(2.0, DisplayIdentity::Unpublished)?;
         WindowPlacementConfiguration::await_x11_frame_extents_for_test(
             fixture.app.world_mut(),
             fixture.editor,
@@ -1217,7 +1249,7 @@ mod tests {
     #[cfg(all(target_os = "linux", feature = "workaround-winit-4445"))]
     #[test]
     fn full_screen_x11_failed_frame_query_applies_fallback_without_waiting() -> Result<(), String> {
-        let mut fixture = x11_return_fixture(1.75, false)?;
+        let mut fixture = x11_return_fixture(1.75, DisplayIdentity::Unpublished)?;
         WindowPlacementConfiguration::fail_x11_frame_query_for_test(
             fixture.app.world_mut(),
             fixture.editor,
@@ -1247,7 +1279,7 @@ mod tests {
     #[test]
     fn full_screen_x11_unconfirmed_position_releases_return_after_its_frame_limit()
     -> Result<(), String> {
-        let mut fixture = x11_return_fixture(2.0, false)?;
+        let mut fixture = x11_return_fixture(2.0, DisplayIdentity::Unpublished)?;
         fixture
             .app
             .world_mut()
@@ -1288,7 +1320,7 @@ mod tests {
                 ..default()
             },
             HashMap::new(),
-            display(true)?,
+            display(DisplayIdentity::Published)?,
         )?;
         fixture.settle()?;
         WindowPlacementConfiguration::toggle_full_screen(fixture.app.world_mut(), fixture.editor);
@@ -1342,7 +1374,10 @@ mod tests {
         .map_err(|error| error.to_string())?;
         crate::attach_window_to_binding_role(fixture.app.world_mut(), fixture.editor, &role)
             .map_err(|error| error.to_string())?;
-        assert!(fixture.settle()?, "the next placement must use the driver");
+        assert!(
+            matches!(fixture.settle()?, PlacementDriverRun::Attempted),
+            "the next placement must use the driver"
+        );
         assert_eq!(fixture.window()?.position, WindowPosition::At(new_position));
         Ok(())
     }

@@ -50,13 +50,17 @@ use hana_diegetic::LayoutTree;
 use hana_diegetic::Padding;
 use hana_diegetic::Px;
 use hana_diegetic::Sizing;
+use hana_diegetic::Text;
 use hana_diegetic::TextStyle;
+use hana_diegetic::render_shortcut_hint;
 use hana_rubric::CommandId;
 use hana_rubric::CommandKeystroke;
 use hana_rubric::KeymapBindingUnavailability;
 use hana_rubric::KeymapBindings;
 use hana_rubric::KeymapCommand;
+use hana_rubric::KeystrokeLabel;
 use hana_rubric::ReflectKeymapCommand;
+use hana_rubric::ShortcutHint;
 use hana_rubric::action;
 use hana_rubric::bind_action_system;
 use hana_rubric::command;
@@ -148,29 +152,20 @@ struct HelpShortcuts {
 
 /// Text shown only in Help; title-bar labels remain their own presentation.
 struct HelpPresentation {
-    keys:  String,
-    label: String,
+    keys:     String,
+    label:    String,
+    shortcut: ShortcutHint,
 }
 
 impl HelpPresentation {
     fn from_control(control: &super::TitleBarControl) -> Self {
         let (keys, label) = control.help_parts();
-        Self { keys, label }
+        Self {
+            keys,
+            label,
+            shortcut: control.shortcut_hint().clone(),
+        }
     }
-}
-
-fn display_keymap_chord(keys: &str) -> String {
-    keys.split(['-', ' '])
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let mut chars = part.chars();
-            match chars.next() {
-                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str().to_lowercase()),
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 pub(super) fn install(app: &mut App) {
@@ -466,7 +461,9 @@ fn build_shortcut_row(builder: &mut LayoutBuilder, row: HelpPresentation, label:
                     .width(Sizing::fixed(HELP_KEY_COLUMN_WIDTH))
                     .height(Sizing::FIT),
                 |builder| {
-                    builder.text((row.keys.as_str(), label.clone()));
+                    render_shortcut_hint(builder, &row.shortcut, &row.keys, label, |word| {
+                        Text::new(word, label.clone())
+                    });
                 },
             );
             builder.with(
@@ -488,18 +485,21 @@ fn shortcut_rows(
     let mut rows = Vec::new();
     if shortcuts.home_marker.is_present() {
         rows.push(HelpPresentation {
-            keys:  bound_keys::<ToggleHomeAabbGizmoEvent>(keymap_bindings),
-            label: HOME_AABB_LABEL.to_owned(),
+            keys:     bound_keys::<ToggleHomeAabbGizmoEvent>(keymap_bindings),
+            shortcut: bound_shortcut::<ToggleHomeAabbGizmoEvent>(keymap_bindings),
+            label:    HOME_AABB_LABEL.to_owned(),
         });
     }
     rows.push(HelpPresentation {
-        keys:  bound_keys::<ToggleScreenSpacePanelsEvent>(keymap_bindings),
-        label: SCREEN_PANEL_LABEL.to_owned(),
+        keys:     bound_keys::<ToggleScreenSpacePanelsEvent>(keymap_bindings),
+        shortcut: bound_shortcut::<ToggleScreenSpacePanelsEvent>(keymap_bindings),
+        label:    SCREEN_PANEL_LABEL.to_owned(),
     });
     if shortcuts.camera_preset.is_present() {
         rows.push(HelpPresentation {
-            keys:  bound_keys::<CyclePresetEvent>(keymap_bindings),
-            label: CAMERA_PRESET_LABEL.to_owned(),
+            keys:     bound_keys::<CyclePresetEvent>(keymap_bindings),
+            shortcut: bound_shortcut::<CyclePresetEvent>(keymap_bindings),
+            label:    CAMERA_PRESET_LABEL.to_owned(),
         });
     }
     rows
@@ -511,12 +511,21 @@ fn shortcut_rows(
 fn bound_keys<C: KeymapCommand>(keymap_bindings: &KeymapBindings) -> String {
     match keymap_bindings.keystroke(&CommandId::declared::<C>()) {
         CommandKeystroke::BoundTo(keystroke_sequence) => {
-            display_keymap_chord(&keystroke_sequence.to_string())
+            KeystrokeLabel::from_sequence(keystroke_sequence).words(" ")
         },
         CommandKeystroke::Unbound => UNBOUND_KEYS.to_owned(),
         CommandKeystroke::KeymapUnavailable(unavailability) => {
             keymap_unavailability_label(unavailability).to_owned()
         },
+    }
+}
+
+fn bound_shortcut<C: KeymapCommand>(keymap_bindings: &KeymapBindings) -> ShortcutHint {
+    match keymap_bindings.keystroke(&CommandId::declared::<C>()) {
+        CommandKeystroke::BoundTo(sequence) => {
+            ShortcutHint::Keys(KeystrokeLabel::from_sequence(sequence))
+        },
+        _ => ShortcutHint::NotAShortcut,
     }
 }
 
@@ -532,6 +541,12 @@ const fn keymap_unavailability_label(unavailability: KeymapBindingUnavailability
 
 #[cfg(test)]
 mod tests {
+    fn display_keymap_chord(keys: &str) -> String {
+        keys.parse::<KeystrokeSequence>().map_or_else(
+            |_| keys.to_owned(),
+            |sequence| KeystrokeLabel::from_sequence(&sequence).words(" "),
+        )
+    }
 
     #[test]
     fn command_palette_toggle_shortcuts_tracks_overlay_creation_and_removal() {
@@ -552,6 +567,7 @@ mod tests {
     use hana_diegetic::FontId;
     use hana_diegetic::HeadlessDiegeticUiPlugin;
     use hana_diegetic::Unit;
+    use hana_rubric::KeystrokeSequence;
 
     use super::*;
     use crate::screen_panels::HomeTitleBarFlash;
@@ -643,12 +659,14 @@ mod tests {
         let fonts = FontRegistry::new().map_err(|error| error.to_string())?;
         let rows = vec![
             HelpPresentation {
-                keys:  "A".to_owned(),
-                label: "Smoothing: Off, Anisotropic, Supersample, Both".to_owned(),
+                shortcut: ShortcutHint::NotAShortcut,
+                keys:     "A".to_owned(),
+                label:    "Smoothing: Off, Anisotropic, Supersample, Both".to_owned(),
             },
             HelpPresentation {
-                keys:  "Click".to_owned(),
-                label: "Zoom in".to_owned(),
+                shortcut: ShortcutHint::NotAShortcut,
+                keys:     "Click".to_owned(),
+                label:    "Zoom in".to_owned(),
             },
         ];
         let panel = DiegeticPanel::screen()

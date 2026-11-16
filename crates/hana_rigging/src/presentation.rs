@@ -124,6 +124,8 @@ pub enum ConnectedCause {
 pub enum RoleUnavailableCause {
     /// The operator cancelled or revoked consent; explicit recovery is required.
     Cancelled,
+    /// No person has given consent yet; an explicit request with consent starts the role.
+    ConsentRequired,
     /// Completed reporter evidence confirms neither presence nor absence of the key.
     IdentityUnconfirmed,
     /// Retained reporter evidence cannot establish that the device is reachable.
@@ -176,6 +178,7 @@ pub(crate) fn derive_role_presentation(
         RoleStatusView::Stopped(stopped) => RolePresentationView::Unavailable(match stopped {
             StoppedStatusView::RepeatedFailures { .. } => RoleUnavailableCause::RepeatedFailures,
             StoppedStatusView::Cancelled { .. } => RoleUnavailableCause::Cancelled,
+            StoppedStatusView::ConsentRequired { .. } => RoleUnavailableCause::ConsentRequired,
             StoppedStatusView::Unsupported { .. } => RoleUnavailableCause::Unsupported,
         }),
         RoleStatusView::Established { flow, .. } => established_presentation(*flow),
@@ -634,6 +637,13 @@ mod tests {
                     resumes_when: ResumeCondition::ExplicitRestart,
                 },
                 RoleUnavailableCause::Cancelled,
+            ),
+            (
+                StoppedStatusView::ConsentRequired {
+                    detail:       "Choose a monitor".to_owned(),
+                    resumes_when: ResumeCondition::ExplicitRestart,
+                },
+                RoleUnavailableCause::ConsentRequired,
             ),
             (
                 StoppedStatusView::RepeatedFailures {

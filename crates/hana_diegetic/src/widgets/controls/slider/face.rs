@@ -15,6 +15,7 @@ use crate::LayoutBuilder;
 use crate::PanelElementId;
 use crate::Sizing;
 use crate::SliderMetrics;
+use crate::Tooltip;
 use crate::WidgetBuilder;
 use crate::WidgetInteractivity;
 use crate::widgets::VisualSlotId;
@@ -37,66 +38,79 @@ impl LayoutBuilder {
         metrics: &ControlMetrics<L>,
         band: SliderReachableBand,
     ) {
+        self.slider_with_tooltip(id, slider, metrics, band, None);
+    }
+
+    /// Adds the shared slider face with a tooltip on its root.
+    pub fn slider_with_tooltip<L: ControlLength>(
+        &mut self,
+        id: impl Into<PanelElementId>,
+        slider: Slider,
+        metrics: &ControlMetrics<L>,
+        band: SliderReachableBand,
+        tooltip: Option<Tooltip>,
+    ) {
         let size = metrics.slider;
         let shadow_scale = crate::SliderMetrics::<L>::THUMB_SHADOW_SCALE;
         let palette = ControlPalette::system_dark();
-        self.with(
-            El::overlay()
-                .width(Sizing::fixed(size.width))
-                .height(Sizing::fixed(size.thumb_hit_height))
-                .alignment(AlignX::Center, AlignY::Center)
-                .widget(id, slider),
-            |builder| {
-                // The taller capsule stays behind the whole track; live fill
-                // and the knob draw over both signal surfaces.
-                if band == SliderReachableBand::Drawn {
-                    builder.with(
-                        El::new()
-                            .width(Sizing::fixed(size.width))
-                            .height(Sizing::fixed(size.reach_band_height()))
-                            .corner_radius(CornerRadius::all(size.reach_band_height().scaled(0.5)))
-                            .background(palette.slider_reachable_band)
-                            .widget_interactivity(WidgetInteractivity::Disabled)
-                            .visual_slot(VisualSlotId::SLIDER_BAND),
-                        |_| {},
-                    );
-                }
+        let mut root = El::overlay()
+            .width(Sizing::fixed(size.width))
+            .height(Sizing::fixed(size.thumb_hit_height))
+            .alignment(AlignX::Center, AlignY::Center)
+            .widget(id, slider);
+        if let Some(tooltip) = tooltip {
+            root = root.tooltip(tooltip);
+        }
+        self.with(root, |builder| {
+            // The taller capsule stays behind the whole track; live fill
+            // and the knob draw over both signal surfaces.
+            if band == SliderReachableBand::Drawn {
                 builder.with(
                     El::new()
                         .width(Sizing::fixed(size.width))
-                        .height(Sizing::fixed(size.track_height))
-                        .corner_radius(CornerRadius::all(size.track_radius()))
-                        .background(palette.track)
-                        .widget_interactivity(WidgetInteractivity::Disabled),
-                    |_| {},
-                );
-                if band == SliderReachableBand::Drawn {
-                    builder.with(
-                        El::new()
-                            .width(Sizing::fixed(size.thumb.width.scaled(shadow_scale)))
-                            .height(Sizing::fixed(size.thumb.height.scaled(shadow_scale)))
-                            .corner_radius(CornerRadius::all(
-                                size.thumb.corner_radius().scaled(shadow_scale),
-                            ))
-                            .background(Color::BLACK.with_alpha(0.35))
-                            .widget_interactivity(WidgetInteractivity::Disabled)
-                            .visual_slot(VisualSlotId::SLIDER_KNOB_SHADOW),
-                        |_| {},
-                    );
-                }
-                builder.with(
-                    El::new()
-                        .width(Sizing::fixed(size.width))
-                        .height(Sizing::fixed(size.track_height))
-                        .corner_radius(CornerRadius::all(size.track_radius()))
-                        .background(palette.accent)
+                        .height(Sizing::fixed(size.reach_band_height()))
+                        .corner_radius(CornerRadius::all(size.reach_band_height().scaled(0.5)))
+                        .background(palette.slider_reachable_band)
                         .widget_interactivity(WidgetInteractivity::Disabled)
-                        .slider_fill(),
+                        .visual_slot(VisualSlotId::SLIDER_BAND),
                     |_| {},
                 );
-                builder.slider_thumb(&size);
-            },
-        );
+            }
+            builder.with(
+                El::new()
+                    .width(Sizing::fixed(size.width))
+                    .height(Sizing::fixed(size.track_height))
+                    .corner_radius(CornerRadius::all(size.track_radius()))
+                    .background(palette.track)
+                    .widget_interactivity(WidgetInteractivity::Disabled),
+                |_| {},
+            );
+            if band == SliderReachableBand::Drawn {
+                builder.with(
+                    El::new()
+                        .width(Sizing::fixed(size.thumb.width.scaled(shadow_scale)))
+                        .height(Sizing::fixed(size.thumb.height.scaled(shadow_scale)))
+                        .corner_radius(CornerRadius::all(
+                            size.thumb.corner_radius().scaled(shadow_scale),
+                        ))
+                        .background(Color::BLACK.with_alpha(0.35))
+                        .widget_interactivity(WidgetInteractivity::Disabled)
+                        .visual_slot(VisualSlotId::SLIDER_KNOB_SHADOW),
+                    |_| {},
+                );
+            }
+            builder.with(
+                El::new()
+                    .width(Sizing::fixed(size.width))
+                    .height(Sizing::fixed(size.track_height))
+                    .corner_radius(CornerRadius::all(size.track_radius()))
+                    .background(palette.accent)
+                    .widget_interactivity(WidgetInteractivity::Disabled)
+                    .slider_fill(),
+                |_| {},
+            );
+            builder.slider_thumb(&size);
+        });
     }
 }
 

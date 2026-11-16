@@ -19,6 +19,7 @@ use hana_diegetic::Sizing;
 use hana_diegetic::Text;
 use hana_diegetic::TextStyle;
 use hana_diegetic::TextWrap;
+use hana_diegetic::render_shortcut_hint;
 use hana_rubric::ActiveKeymapContextState;
 use hana_rubric::CommandPaletteQueryResult;
 use hana_rubric::CommandPaletteRow;
@@ -30,7 +31,6 @@ use hana_rubric::PaletteSelectionOutcome;
 
 use super::constants::COMMAND_KEYSTROKE_COLOR;
 use super::constants::COMMAND_KEYSTROKE_COLUMN_WIDTH;
-use super::constants::COMMAND_KEYSTROKE_MAX_CHARS;
 use super::constants::COMMAND_ROW_HEIGHT;
 use super::constants::COMMAND_TEXT_SIZE;
 use super::constants::COMMAND_TITLE_COLOR;
@@ -476,29 +476,19 @@ fn build_command_row(
             |builder| {
                 if !matches!(command_row.binding(), PaletteBinding::Unbound) {
                     let presentation = palette_binding_presentation(command_row.binding());
-                    let binding_text =
-                        if matches!(command_row.binding(), PaletteBinding::BoundTo(_)) {
-                            clip(presentation.text(), COMMAND_KEYSTROKE_MAX_CHARS)
-                        } else {
-                            presentation.to_string()
-                        };
-                    build_binding_state(builder, &binding_text);
+                    let style =
+                        TextStyle::new(COMMAND_TEXT_SIZE).with_color(COMMAND_KEYSTROKE_COLOR);
+                    render_shortcut_hint(
+                        builder,
+                        presentation.shortcut(),
+                        presentation.text(),
+                        &style,
+                        |word| Text::new(word, style.clone()).wrap(TextWrap::None),
+                    );
                 }
             },
         );
     });
-}
-
-/// Renders a typed binding state instead of rendering it as an authored
-/// unbound command.
-fn build_binding_state(builder: &mut LayoutBuilder, state: &str) {
-    builder.text(
-        Text::new(
-            state,
-            TextStyle::new(COMMAND_TEXT_SIZE).with_color(COMMAND_KEYSTROKE_COLOR),
-        )
-        .wrap(TextWrap::None),
-    );
 }
 
 /// Formats Rubric's already-resolved context snapshot without consumer-side state lookup.
@@ -1108,13 +1098,19 @@ mod tests {
             )
         );
 
-        assert!(bound.contains("ctrl-shift-r"));
+        assert!(bound.contains("Icon { glyph: ChevronUp,"));
+        assert!(bound.contains("Icon { glyph: ArrowBigUp,"));
+        assert!(bound.contains("text: \" R\""));
         assert!(unbound.contains("Open command palette"));
         assert!(!unbound.contains("ctrl-shift-r"));
-        assert!(application_recovery.contains(&format!(
-            "protected {}",
-            crate::command_palette_recovery_keystroke()
-        )));
+        assert!(application_recovery.contains("text: \"protected \""));
+        let recovery_symbol = if cfg!(target_os = "macos") {
+            "Icon { glyph: Command,"
+        } else {
+            "Icon { glyph: ChevronUp,"
+        };
+        assert!(application_recovery.contains(recovery_symbol));
+        assert!(application_recovery.contains("text: \" P\""));
     }
 
     #[test]

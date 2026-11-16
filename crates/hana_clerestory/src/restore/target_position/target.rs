@@ -418,29 +418,22 @@ impl TargetPosition {
         &mut self,
         physical_frame_top: i32,
     ) {
-        match &mut self.placement_decision {
+        let physical_position = match &mut self.placement_decision {
             SavedWindowPlacementDecision::Restorable {
                 physical_position, ..
-            } => {
-                *physical_position =
-                    NativeWindowReadbackPosition::from_physical_pixels(*physical_position)
-                        .x11_frame_request(physical_frame_top)
-                        .physical_pixels();
-            },
+            } => physical_position,
             #[cfg(test)]
             SavedWindowPlacementDecision::PersistedOffset {
                 physical_position, ..
-            } => {
-                *physical_position =
-                    NativeWindowReadbackPosition::from_physical_pixels(*physical_position)
-                        .x11_frame_request(physical_frame_top)
-                        .physical_pixels();
-            },
-            SavedWindowPlacementDecision::CompositorControlled => {},
+            } => physical_position,
+            SavedWindowPlacementDecision::CompositorControlled => return,
             #[cfg(test)]
             SavedWindowPlacementDecision::NotSaved
-            | SavedWindowPlacementDecision::DiscardedLegacy => {},
-        }
+            | SavedWindowPlacementDecision::DiscardedLegacy => return,
+        };
+        *physical_position = NativeWindowReadbackPosition::from_physical_pixels(*physical_position)
+            .x11_frame_request(physical_frame_top)
+            .physical_pixels();
     }
 
     /// Size compensated for scale factor differences.

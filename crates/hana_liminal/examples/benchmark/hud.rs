@@ -15,10 +15,10 @@ use bevy::prelude::Timer;
 use bevy::prelude::With;
 use hana_kana::ToF64;
 
+use crate::benchmark_state;
 use crate::benchmark_state::BenchmarkMode;
 use crate::benchmark_state::BenchmarkPhase;
 use crate::benchmark_state::BenchmarkState;
-use crate::benchmark_state::outline_method_label;
 use crate::constants::AUTO_EXIT_DELAY_SECS;
 use crate::constants::AUTO_STARTUP_DELAY_SECS;
 use crate::constants::BENCHMARK_LABEL;
@@ -72,7 +72,7 @@ fn build_hud_text(state: &BenchmarkState, diagnostics: &DiagnosticsStore) -> Str
     let benchmark_phase_info = benchmark_phase_label(state);
     let progress = auto_progress_label(state);
     let col = results_label_width();
-    let outline_method_name = outline_method_label(state.outline_method);
+    let outline_method_name = benchmark_state::outline_method_label(state.outline_method);
     let live_metrics = live_metrics(diagnostics);
     let bench_stats = benchmark_stats_line(state.frame_times.as_slice(), col);
 

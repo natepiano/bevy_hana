@@ -27,6 +27,7 @@ use fairy_dust::OrbitCam;
 use fairy_dust::OrbitCamPose;
 use fairy_dust::SprinkleBuilder;
 use fairy_dust::TitleBar;
+use fairy_dust::TitleBarControl;
 use fairy_dust::command_palette_recovery_command_id;
 use fairy_dust::command_palette_recovery_keystroke;
 use fairy_dust::sprinkle_example;
@@ -312,8 +313,8 @@ fn title_bar() -> TitleBar {
 }
 
 /// The palette recovery chord remains application-owned and available outside authored routing.
-fn palette_control() -> String {
-    format!("{} Palette", command_palette_recovery_keystroke().label())
+fn palette_control() -> TitleBarControl {
+    TitleBarControl::shortcut(command_palette_recovery_keystroke(), "Palette")
 }
 
 fn configure_camera(orbit_cam: &mut OrbitCam) { CONTEXT_CAMERA_POSE.apply_to(orbit_cam); }

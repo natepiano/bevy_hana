@@ -27,6 +27,7 @@ use bevy::prelude::Commands;
 use bevy::prelude::Component;
 use bevy::prelude::ContainsEntity;
 use bevy::prelude::Despawn;
+use bevy::prelude::DetectChanges;
 use bevy::prelude::Entity;
 use bevy::prelude::EntityEvent;
 use bevy::prelude::GlobalTransform;
@@ -34,13 +35,13 @@ use bevy::prelude::Has;
 use bevy::prelude::Mut;
 use bevy::prelude::On;
 use bevy::prelude::Or;
-#[cfg(test)]
-use bevy::prelude::Pointer;
+use bevy::prelude::PointerButton;
 #[cfg(test)]
 use bevy::prelude::PostUpdate;
 #[cfg(test)]
 use bevy::prelude::Quat;
 use bevy::prelude::Query;
+use bevy::prelude::Ref;
 use bevy::prelude::Remove;
 use bevy::prelude::Res;
 use bevy::prelude::Resource;
@@ -72,6 +73,7 @@ use super::declaration::Tooltip;
 use super::declaration::TooltipDisabledPolicy;
 use super::declaration::TooltipExclusivity;
 use super::declaration::TooltipPhase;
+use super::declaration::TooltipPressBehavior;
 use super::materialization::MaterializedTooltip;
 use super::materialization::TooltipPresentationCamera;
 use super::materialization::TooltipReadiness;
@@ -113,13 +115,8 @@ pub struct TooltipHidden {
 }
 
 #[derive(Clone, Copy, Component)]
-pub(crate) struct TooltipPointerCamera {
+pub(super) struct TooltipPointerCamera {
     camera: Entity,
-}
-
-impl TooltipPointerCamera {
-    #[cfg(test)]
-    pub(crate) const fn new(camera: Entity) -> Self { Self { camera } }
 }
 
 // This belongs to the target: declarations and their controllers may be replaced
@@ -174,33 +171,43 @@ pub(super) fn remember_tooltip_camera_from_move(
 
 pub(super) fn remember_tooltip_camera_from_press(
     event: On<PointerPress>,
+    parents: Query<&ChildOf>,
     tooltips: Query<&Tooltips>,
-    mut controllers: Query<(&mut TooltipPhase, Option<&mut Visibility>)>,
+    mut controllers: Query<(&Tooltip, &mut TooltipPhase, Option<&mut Visibility>)>,
     mut commands: Commands,
 ) {
-    let target = event.event_target();
-    let Ok(tooltips) = tooltips.get(target) else {
+    if event.button != PointerButton::Primary {
         return;
-    };
-    commands.entity(target).insert((
-        TooltipPointerCamera {
-            camera: event.hit.camera,
-        },
-        TooltipPressSuppressed,
-    ));
-    // Interaction may already be Hovered after a same-update release. The
-    // press event itself owns suppression, before that transient state is lost.
-    for entity in tooltips.iter() {
-        let Ok((mut phase, visibility)) = controllers.get_mut(entity) else {
+    }
+    // Buttons and sliders consume their press. Resolve owners from the original
+    // hit path here instead of depending on the event reaching each ancestor.
+    for target in
+        std::iter::once(event.event_target()).chain(parents.iter_ancestors(event.event_target()))
+    {
+        let Ok(tooltips) = tooltips.get(target) else {
             continue;
         };
-        let was_visible = phase.is_visible();
-        *phase = TooltipPhase::HiddenUntilLeave;
-        if let Some(mut visibility) = visibility {
-            *visibility = Visibility::Hidden;
-        }
-        if was_visible {
-            commands.trigger(TooltipHidden { entity });
+        commands.entity(target).insert(TooltipPointerCamera {
+            camera: event.hit.camera,
+        });
+        // Interaction may already be Hovered after a same-update release.
+        // The press owns suppression until the pointer leaves this target.
+        for entity in tooltips.iter() {
+            let Ok((tooltip, mut phase, visibility)) = controllers.get_mut(entity) else {
+                continue;
+            };
+            if tooltip.press_behavior == TooltipPressBehavior::Preserve {
+                continue;
+            }
+            commands.entity(target).insert(TooltipPressSuppressed);
+            let was_visible = phase.is_visible();
+            *phase = TooltipPhase::HiddenUntilLeave;
+            if let Some(mut visibility) = visibility {
+                *visibility = Visibility::Hidden;
+            }
+            if was_visible {
+                commands.trigger(TooltipHidden { entity });
+            }
         }
     }
 }
@@ -278,6 +285,9 @@ fn advance_one_tooltip_phase(
     contact: TooltipPointerContact,
 ) -> bool {
     if contact == TooltipPointerContact::Pressed {
+        if tooltip.press_behavior == TooltipPressBehavior::Preserve {
+            return false;
+        }
         let emit_hidden = phase.is_visible();
         *phase = TooltipPhase::HiddenUntilLeave;
         return emit_hidden;
@@ -423,11 +433,22 @@ impl GeometryTooltipHover<'_, '_> {
     }
 }
 
+fn hide_tooltip_and_notify(
+    entity: Entity,
+    visibility: Option<&mut Visibility>,
+    commands: &mut Commands,
+) {
+    if let Some(visibility) = visibility {
+        *visibility = Visibility::Hidden;
+    }
+    commands.trigger(TooltipHidden { entity });
+}
+
 pub(super) fn advance_tooltip_visibility(
     time: Option<Res<Time>>,
     mut controllers: Query<(
         Entity,
-        &Tooltip,
+        Ref<Tooltip>,
         &TooltipFor,
         Option<&AuthoredTooltipTargetSpace>,
         Option<&MaterializedTooltip>,
@@ -494,7 +515,10 @@ pub(super) fn advance_tooltip_visibility(
             &controls,
             tooltip.show_over_descendant_controls,
         );
-        if press_suppressed && pointer.contact != TooltipPointerContact::Away {
+        if press_suppressed
+            && tooltip.press_behavior == TooltipPressBehavior::Dismiss
+            && pointer.contact != TooltipPointerContact::Away
+        {
             *phase = TooltipPhase::HiddenUntilLeave;
         }
         let suppressed = disabled && tooltip.disabled_policy == TooltipDisabledPolicy::Suppress;
@@ -506,16 +530,13 @@ pub(super) fn advance_tooltip_visibility(
         }
         if advance_one_tooltip_phase(
             &mut phase,
-            tooltip,
+            &tooltip,
             eligible,
             suppressed,
             delta,
             pointer.contact,
         ) {
-            if let Some(visibility) = visibility.as_deref_mut() {
-                *visibility = Visibility::Hidden;
-            }
-            commands.trigger(TooltipHidden { entity });
+            hide_tooltip_and_notify(entity, visibility.as_deref_mut(), &mut commands);
         }
 
         if !eligible && !focus_visible {
@@ -559,7 +580,11 @@ pub(super) fn advance_tooltip_visibility(
         {
             continue;
         }
-        if eligible && materialized.is_none() && !preparing {
+        // A replacement starts its own wait before allocating a fresh surface.
+        // Following frames prepare its layout during the delay, ready for reveal.
+        let ready_to_prepare = !tooltip.is_added()
+            || !matches!(&*phase, TooltipPhase::WaitingToShow(timer) if !timer.is_finished());
+        if eligible && ready_to_prepare && materialized.is_none() && !preparing {
             commands.entity(entity).insert(PrepareTooltip);
         }
     }
@@ -933,14 +958,19 @@ fn compatible_presentation_camera(
         return false;
     }
     let primary = primary_window.single().ok();
-    let Some(NormalizedRenderTarget::Window(window)) =
-        render_target.and_then(|target| target.normalize(primary))
-    else {
-        return false;
-    };
-    let window = window.entity();
-    if windows.get(window).is_err() || required_window.is_some_and(|required| required != window) {
-        return false;
+    match render_target.and_then(|target| target.normalize(primary)) {
+        Some(NormalizedRenderTarget::Window(window)) => {
+            let window = window.entity();
+            if windows.get(window).is_err()
+                || required_window.is_some_and(|required| required != window)
+            {
+                return false;
+            }
+        },
+        // A pointer hit already identifies its presentation camera. Image
+        // targets can show world help too; keyboard focus still needs its window.
+        Some(NormalizedRenderTarget::Image(_)) if required_window.is_none() => {},
+        _ => return false,
     }
     camera_layers
         .cloned()
@@ -988,22 +1018,13 @@ pub(super) fn emit_tooltip_shown(
 
 #[cfg(test)]
 mod tests {
-    use bevy::camera::PerspectiveProjection;
-    use bevy::camera::Projection;
-    use bevy::camera::RenderTargetInfo;
+    use bevy::asset::Assets;
     use bevy::ecs::system::RunSystemOnce;
-    use bevy::picking::InteractionPlugin;
+    use bevy::mesh::Mesh;
     use bevy::picking::backend::HitData;
-    use bevy::picking::backend::PointerHits;
-    use bevy::picking::pointer::Location;
-    use bevy::picking::pointer::PointerAction;
     use bevy::picking::pointer::PointerId;
-    use bevy::picking::pointer::PointerInput;
-    use bevy::picking::pointer::PointerLocation;
-    use bevy::picking::pointer::PointerMap;
     use bevy::prelude::IntoScheduleConfigs;
     use bevy::prelude::MinimalPlugins;
-    use bevy::prelude::PointerButton;
     use bevy::prelude::Vec3A;
     use bevy::prelude::World as BevyWorld;
     use bevy::time::TimeUpdateStrategy;
@@ -1020,6 +1041,8 @@ mod tests {
     use crate::PanelWidgetReader;
     use crate::layout::El;
     use crate::screen_space::ScreenSpacePlugin;
+    use crate::test_support::test_pointer as real_pointer;
+    use crate::test_support::tooltip_hover as real_hover;
     use crate::text::DiegeticTextMeasurer;
     use crate::widgets::WidgetFocusAuthority;
     use crate::widgets::WidgetsPlugin;
@@ -1047,6 +1070,7 @@ mod tests {
         app.add_plugins(MinimalPlugins)
             .insert_resource(DiegeticTextMeasurer::default())
             .add_plugins((HeadlessLayoutPlugin, WidgetsPlugin));
+        real_hover::install(&mut app);
         app
     }
 
@@ -1055,7 +1079,29 @@ mod tests {
         app.add_plugins((MinimalPlugins, TransformPlugin))
             .insert_resource(DiegeticTextMeasurer::default())
             .add_plugins((HeadlessLayoutPlugin, WidgetsPlugin, ScreenSpacePlugin));
+        real_hover::install(&mut app);
         app
+    }
+
+    #[test]
+    fn passive_tooltip_press_preserves_visible_and_hidden_phases() {
+        let tooltip = Tooltip::new(El::new()).preserve_on_press();
+        for mut phase in [TooltipPhase::Hidden, TooltipPhase::Visible] {
+            let visible = phase.is_visible();
+            assert!(!advance_one_tooltip_phase(
+                &mut phase,
+                &tooltip,
+                false,
+                false,
+                Duration::from_secs(1),
+                TooltipPointerContact::Pressed
+            ));
+            assert_eq!(phase.is_visible(), visible);
+            assert!(matches!(
+                phase,
+                TooltipPhase::Hidden | TooltipPhase::Visible
+            ));
+        }
     }
 
     #[test]
@@ -1123,16 +1169,23 @@ mod tests {
     }
 
     fn mesh_target(app: &mut App, half_extents: Vec3A) -> Entity {
+        let mesh =
+            app.world_mut()
+                .resource_mut::<Assets<Mesh>>()
+                .add(bevy::prelude::Cuboid::from_size(
+                    bevy::prelude::Vec3::from(half_extents) * 2.0,
+                ));
         let target = app
             .world_mut()
             .spawn((
-                Mesh3d::default(),
+                Mesh3d(mesh),
                 Aabb {
                     center: Vec3A::ZERO,
                     half_extents,
                 },
                 Transform::default(),
                 GlobalTransform::default(),
+                Visibility::Visible,
             ))
             .id();
         app.world_mut()
@@ -1157,7 +1210,11 @@ mod tests {
         let camera = spawn_presentation_camera(&mut app, window, RenderLayers::layer(0));
         let target = mesh_target(&mut app, Vec3A::splat(0.5));
         let child = mesh_target(&mut app, Vec3A::splat(0.25));
-        app.world_mut().entity_mut(child).insert(ChildOf(target));
+        app.world_mut().entity_mut(child).insert((
+            ChildOf(target),
+            Transform::from_xyz(0.0, 0.0, 0.6),
+            GlobalTransform::from_translation(bevy::prelude::Vec3::new(0.0, 0.0, 0.6)),
+        ));
         let parent_controller = standalone_world_tooltip(
             &mut app,
             target,
@@ -1170,11 +1227,7 @@ mod tests {
             child,
             fixed_size_tooltip(Vec2::new(60.0, 30.0)).show_after(Duration::ZERO),
         );
-        app.world_mut()
-            .resource_mut::<HoverMap>()
-            .entry(PointerId::Mouse)
-            .or_default()
-            .insert(child, HitData::new(camera, 0.0, None, None));
+        real_hover::hover_with(&mut app, camera, child);
         app.update();
         app.update();
 
@@ -1205,9 +1258,12 @@ mod tests {
         let camera = spawn_presentation_camera(&mut app, window, RenderLayers::layer(0));
         let target = mesh_target(&mut app, Vec3A::splat(0.5));
         let child = mesh_target(&mut app, Vec3A::splat(0.25));
-        app.world_mut()
-            .entity_mut(child)
-            .insert((ChildOf(target), Tooltips::default()));
+        app.world_mut().entity_mut(child).insert((
+            ChildOf(target),
+            Tooltips::default(),
+            Transform::from_xyz(0.0, 0.0, 0.6),
+            GlobalTransform::from_translation(bevy::prelude::Vec3::new(0.0, 0.0, 0.6)),
+        ));
         let parent_controller = standalone_world_tooltip(
             &mut app,
             target,
@@ -1215,17 +1271,71 @@ mod tests {
                 .show_after(Duration::ZERO)
                 .show_over_descendant_controls(),
         );
-        app.world_mut()
-            .resource_mut::<HoverMap>()
-            .entry(PointerId::Mouse)
-            .or_default()
-            .insert(child, HitData::new(camera, 0.0, None, None));
+        real_hover::hover_with(&mut app, camera, child);
         app.update();
         app.update();
         assert!(matches!(
             app.world().get::<TooltipPhase>(parent_controller),
             Some(TooltipPhase::WaitingToShow(_) | TooltipPhase::Visible)
         ));
+    }
+
+    #[test]
+    fn tooltip_primary_press_on_descendant_control_closes_in_that_update() {
+        let mut app = materialization_app();
+        app.init_resource::<HoverMap>();
+        let window = app
+            .world_mut()
+            .spawn((Window::default(), PrimaryWindow))
+            .id();
+        let camera = spawn_presentation_camera(&mut app, window, RenderLayers::layer(0));
+        let target = mesh_target(&mut app, Vec3A::splat(0.5));
+        let panel = spawn_panel(&mut app, tooltip_tree(None));
+        app.world_mut()
+            .entity_mut(panel)
+            .insert((ChildOf(target), Transform::from_xyz(0.0, 0.0, 0.6)));
+        update_materialization(&mut app);
+        let control = widget(&mut app, panel);
+        let controller = standalone_world_tooltip(
+            &mut app,
+            target,
+            fixed_size_tooltip(Vec2::new(0.03, 0.01))
+                .show_after(Duration::ZERO)
+                .show_over_descendant_controls(),
+        );
+        set_interaction(&mut app, control, PickingInteraction::Hovered);
+        real_hover::hover_with(&mut app, camera, control);
+        update_materialization(&mut app);
+        assert_eq!(
+            app.world().get::<Visibility>(controller),
+            Some(&Visibility::Inherited),
+            "positive control: ancestor help is open over its actual button"
+        );
+        real_pointer::press(&mut app, PointerButton::Primary);
+        app.update();
+        assert_eq!(
+            app.world().get::<Visibility>(controller),
+            Some(&Visibility::Hidden),
+            "the button consumes its press, but its ancestor's help must close in this update"
+        );
+        for _ in 0..3 {
+            app.update();
+            assert_eq!(
+                app.world().get::<Visibility>(controller),
+                Some(&Visibility::Hidden),
+                "remaining over the pressed control must not reopen help"
+            );
+        }
+        set_interaction(&mut app, control, PickingInteraction::None);
+        update_materialization(&mut app);
+        set_interaction(&mut app, control, PickingInteraction::Hovered);
+        real_hover::hover_with(&mut app, camera, control);
+        update_materialization(&mut app);
+        assert_eq!(
+            app.world().get::<Visibility>(controller),
+            Some(&Visibility::Inherited),
+            "a new hover after leaving may show help again"
+        );
     }
 
     fn prepare_tooltip(app: &mut App, controller: Entity) {
@@ -1269,11 +1379,40 @@ mod tests {
                 PostUpdate,
                 (reveal_ready_tooltips, ApplyDeferred, emit_tooltip_shown).chain(),
             );
+        real_pointer::install_mesh(&mut app);
+        app.add_observer(remember_tooltip_camera_from_press);
+        let window = app
+            .world_mut()
+            .spawn((
+                Window {
+                    resolution: TEST_VIEWPORT.as_uvec2().into(),
+                    ..Default::default()
+                },
+                PrimaryWindow,
+            ))
+            .id();
+        real_pointer::camera(
+            &mut app,
+            window,
+            Transform::from_xyz(0.0, 0.0, TEST_CAMERA_DISTANCE),
+        );
         app
     }
 
     fn visibility_controller(app: &mut App, tooltip: Tooltip) -> (Entity, Entity) {
-        let target = app.world_mut().spawn(PickingInteraction::None).id();
+        let mesh = app
+            .world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(bevy::prelude::Cuboid::from_size(bevy::prelude::Vec3::ONE));
+        let target = app
+            .world_mut()
+            .spawn((
+                Mesh3d(mesh),
+                Transform::default(),
+                GlobalTransform::default(),
+                Visibility::Visible,
+            ))
+            .id();
         let controller = app
             .world_mut()
             .spawn((
@@ -1286,11 +1425,14 @@ mod tests {
                 GlobalTransform::default(),
             ))
             .id();
+        // Build the mesh bounds before the first input frame. Timer assertions
+        // below measure hover time, not the fixture's geometry startup.
+        app.update();
         (target, controller)
     }
 
     fn set_interaction(app: &mut App, target: Entity, interaction: PickingInteraction) {
-        app.world_mut().entity_mut(target).insert(interaction);
+        real_hover::interaction(app, target, interaction);
     }
 
     fn descendant_hover_eligible(
@@ -1391,40 +1533,15 @@ mod tests {
         );
     }
 
-    fn add_synthetic_pointer(app: &mut App, pointer: PointerId, location: Location) {
-        app.world_mut()
-            .spawn((pointer, PointerLocation::new(location)));
-    }
-
-    fn seeded_perspective_camera() -> Camera { seeded_perspective_camera_for(TEST_VIEWPORT) }
-
-    fn seeded_perspective_camera_for(viewport: Vec2) -> Camera {
-        let mut camera = Camera::default();
-        camera.computed.target_info = Some(RenderTargetInfo {
-            physical_size: viewport.as_uvec2(),
-            scale_factor:  1.0,
-        });
-        let mut projection = Projection::Perspective(PerspectiveProjection::default());
-        projection.update(viewport.x, viewport.y);
-        camera.computed.clip_from_view = projection.get_clip_from_view();
-        camera
-    }
-
     fn spawn_presentation_camera(
         app: &mut App,
         window: Entity,
         render_layers: RenderLayers,
     ) -> Entity {
         let transform = Transform::from_xyz(0.0, 0.0, TEST_CAMERA_DISTANCE);
-        app.world_mut()
-            .spawn((
-                seeded_perspective_camera(),
-                RenderTarget::Window(WindowRef::Entity(window)),
-                render_layers,
-                transform,
-                GlobalTransform::from(transform),
-            ))
-            .id()
+        let camera = real_pointer::camera(app, window, transform);
+        app.world_mut().entity_mut(camera).insert(render_layers);
+        camera
     }
 
     fn fixed_size_tooltip(size: Vec2) -> Tooltip {
@@ -1435,7 +1552,10 @@ mod tests {
 
     fn tooltip_tree(tooltip: Option<Tooltip>) -> crate::LayoutTree {
         let mut builder = LayoutBuilder::new(100.0, 50.0);
-        let button = El::new().size(40.0, 20.0).button("action");
+        let button = El::new()
+            .size(40.0, 20.0)
+            .background(bevy::prelude::Color::WHITE)
+            .button("action");
         match tooltip {
             Some(tooltip) => {
                 builder.with(button.tooltip(tooltip), |_| {});
@@ -1457,6 +1577,8 @@ mod tests {
             app.world_mut().spawn(panel).id()
         });
         assert_ne!(panel, Entity::PLACEHOLDER);
+        // Picking needs the panel mesh's propagated transform and AABB.
+        app.update();
         panel
     }
 
@@ -1486,50 +1608,29 @@ mod tests {
     #[test]
     fn tooltip_short_click_hides_until_leave_with_real_pointer_input() {
         let mut app = visibility_app(Duration::from_millis(20));
-        app.add_plugins(InteractionPlugin)
-            .add_message::<PointerInput>()
-            .add_message::<PointerHits>()
-            .init_resource::<PointerMap>()
-            .add_observer(remember_tooltip_camera_from_press);
-        let window = app.world_mut().spawn(Window::default()).id();
+        assert!(
+            app.world()
+                .resource::<bevy::picking::pointer::PointerMap>()
+                .get_entity(PointerId::Mouse)
+                .is_some(),
+            "the pointer hook must register the mouse"
+        );
+        let window = real_pointer::current_window(app.world());
         let normalized = RenderTarget::Window(WindowRef::Entity(window)).normalize(Some(window));
         assert!(normalized.is_some());
-        let Some(normalized) = normalized else { return };
-        let location = Location {
-            target:   normalized,
-            position: Vec2::splat(50.0),
-        };
-        let pointer = PointerId::Touch(92);
-        add_synthetic_pointer(&mut app, pointer, location.clone());
         let tooltip = Tooltip::new(El::new()).show_after(Duration::ZERO);
         let (target, controller) = visibility_controller(&mut app, tooltip);
-        let hit = HitData::new(Entity::PLACEHOLDER, 0.0, None, None);
         for _ in 0..3 {
-            app.world_mut().write_message(PointerHits::new(
-                pointer,
-                vec![(target, hit.clone())],
-                0.0,
-            ));
-            app.world_mut().write_message(PointerInput::new(
-                pointer,
-                location.clone(),
-                PointerAction::Move { delta: Vec2::ZERO },
-            ));
+            real_hover::hover(&mut app, target);
             app.update();
         }
         assert_eq!(
             app.world().get::<Visibility>(controller),
             Some(&Visibility::Inherited)
         );
-        app.world_mut()
-            .write_message(PointerHits::new(pointer, vec![(target, hit.clone())], 0.0));
-        for action in [
-            PointerAction::Press(PointerButton::Primary),
-            PointerAction::Release(PointerButton::Primary),
-        ] {
-            app.world_mut()
-                .write_message(PointerInput::new(pointer, location.clone(), action));
-        }
+
+        real_pointer::press(&mut app, PointerButton::Primary);
+        real_pointer::release(&mut app, PointerButton::Primary);
         app.update();
         assert_eq!(
             app.world().get::<PickingInteraction>(target),
@@ -1541,26 +1642,17 @@ mod tests {
             "a press and release in one input batch must hide help"
         );
         for _ in 0..3 {
-            app.world_mut().write_message(PointerHits::new(
-                pointer,
-                vec![(target, hit.clone())],
-                0.0,
-            ));
+            real_hover::hover(&mut app, target);
             app.update();
             assert_eq!(
                 app.world().get::<Visibility>(controller),
                 Some(&Visibility::Hidden)
             );
         }
-        app.world_mut()
-            .write_message(PointerHits::new(pointer, Vec::new(), 0.0));
+        real_hover::leave(&mut app);
         app.update();
         for _ in 0..3 {
-            app.world_mut().write_message(PointerHits::new(
-                pointer,
-                vec![(target, hit.clone())],
-                0.0,
-            ));
+            real_hover::hover(&mut app, target);
             app.update();
         }
         assert_eq!(
@@ -1579,15 +1671,12 @@ mod tests {
             .world_mut()
             .spawn((Window::default(), PrimaryWindow))
             .id();
-        let camera = spawn_presentation_camera(&mut app, window, RenderLayers::layer(0));
+        spawn_presentation_camera(&mut app, window, RenderLayers::layer(0));
         let mut help = Tooltip::new(El::new()).show_after(Duration::from_millis(200));
         help.text("Arrange jacks");
         let panel = spawn_panel(&mut app, tooltip_tree(Some(help)));
         update_materialization(&mut app);
         let target = widget(&mut app, panel);
-        app.world_mut()
-            .entity_mut(target)
-            .insert(TooltipPointerCamera { camera });
         set_interaction(&mut app, target, PickingInteraction::Hovered);
         update_materialization(&mut app);
         let previous = controller(&app, target);
@@ -1600,23 +1689,8 @@ mod tests {
             app.world().get::<TooltipReadiness>(previous),
             app.world().get::<TooltipPlacementState>(previous),
         );
-        app.world_mut().trigger(PointerPress {
-            entity:  target,
-            pointer: Pointer::new(
-                PointerId::Mouse,
-                Location {
-                    target:   NormalizedRenderTarget::None {
-                        width:  800,
-                        height: 600,
-                    },
-                    position: Vec2::splat(50.0),
-                },
-            ),
-            button:  PointerButton::Primary,
-            hit:     HitData::new(camera, 0.0, None, None),
-            count:   1,
-        });
-        app.world_mut().flush();
+        real_pointer::press(&mut app, PointerButton::Primary);
+        app.update();
         let mut replacement = Tooltip::new(El::new()).show_after(Duration::from_millis(200));
         replacement.text("Put tools back");
         assert!(
@@ -1975,14 +2049,9 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_backend_hit_and_raw_pointer_input_start_tooltip_eligibility() {
-        let pointer = PointerId::Touch(91);
+    fn window_cursor_and_raw_pointer_input_start_tooltip_eligibility() {
         let mut app = materialization_app();
-        app.add_plugins(InteractionPlugin)
-            .add_message::<PointerInput>()
-            .add_message::<PointerHits>()
-            .init_resource::<PointerMap>()
-            .init_resource::<TooltipVisibilityLog>()
+        app.init_resource::<TooltipVisibilityLog>()
             .add_observer(record_tooltip_shown)
             .add_observer(record_tooltip_hidden);
         let window = app
@@ -1990,33 +2059,13 @@ mod tests {
             .spawn((Window::default(), PrimaryWindow))
             .id();
         let camera = spawn_presentation_camera(&mut app, window, RenderLayers::layer(0));
-        let Some(normalized_target) =
-            RenderTarget::Window(WindowRef::Entity(window)).normalize(Some(window))
-        else {
-            return;
-        };
-        let location = Location {
-            target:   normalized_target,
-            position: TEST_VIEWPORT * 0.5,
-        };
-        add_synthetic_pointer(&mut app, pointer, location.clone());
-
         let tooltip = fixed_size_tooltip(Vec2::new(30.0, 10.0)).show_after(Duration::ZERO);
         let panel = spawn_panel(&mut app, tooltip_tree(Some(tooltip)));
         app.update();
         let widget = widget(&mut app, panel);
         let controller = controller(&app, widget);
 
-        app.world_mut().write_message(PointerHits::new(
-            pointer,
-            vec![(widget, HitData::new(camera, 0.0, None, None))],
-            0.0,
-        ));
-        app.world_mut().write_message(PointerInput::new(
-            pointer,
-            location.clone(),
-            PointerAction::Move { delta: Vec2::ZERO },
-        ));
+        real_hover::hover_with(&mut app, camera, widget);
         app.update();
 
         assert_eq!(
@@ -2038,20 +2087,9 @@ mod tests {
                 || app.world().get::<MaterializedTooltip>(controller).is_some()
         );
 
-        // Backends emit current hits and pointer state every frame. Keep this
-        // synthetic backend active until the PostUpdate readiness pass can be
-        // observed by the following reveal pass.
+        // The real backend keeps the stationary cursor's hit current each frame.
         for _ in 0..=MATERIALIZATION_UPDATES {
-            app.world_mut().write_message(PointerHits::new(
-                pointer,
-                vec![(widget, HitData::new(camera, 0.0, None, None))],
-                0.0,
-            ));
-            app.world_mut().write_message(PointerInput::new(
-                pointer,
-                location.clone(),
-                PointerAction::Move { delta: Vec2::ZERO },
-            ));
+            real_hover::hover_with(&mut app, camera, widget);
             app.update();
         }
         assert!(
@@ -2094,9 +2132,7 @@ mod tests {
         );
         app.update();
 
-        app.world_mut()
-            .entity_mut(target)
-            .insert((PickingInteraction::Hovered, TooltipPointerCamera { camera }));
+        real_hover::hover_with(&mut app, camera, target);
         update_materialization(&mut app);
 
         assert!(
@@ -2119,9 +2155,7 @@ mod tests {
             [controller]
         );
 
-        app.world_mut()
-            .entity_mut(target)
-            .insert(PickingInteraction::None);
+        real_hover::leave(&mut app);
         app.update();
 
         assert!(matches!(
@@ -2135,7 +2169,69 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_focus_selects_and_then_reuses_the_interaction_camera() {
+    fn pointer_tooltip_materializes_on_its_image_camera() {
+        let mut app = materialization_app();
+        app.init_resource::<TooltipVisibilityLog>()
+            .add_observer(record_tooltip_shown)
+            .add_observer(record_tooltip_hidden);
+        let window = app
+            .world_mut()
+            .spawn((Window::default(), PrimaryWindow))
+            .id();
+        let camera = spawn_presentation_camera(&mut app, window, RenderLayers::layer(0));
+        app.world_mut()
+            .entity_mut(camera)
+            .insert(RenderTarget::Image(
+                bevy::asset::Handle::<bevy::image::Image>::default().into(),
+            ));
+        let target = mesh_target(&mut app, Vec3A::splat(0.5));
+        let controller = standalone_world_tooltip(
+            &mut app,
+            target,
+            fixed_size_tooltip(Vec2::new(0.03, 0.01))
+                .show_after(Duration::ZERO)
+                .hide_after(Duration::ZERO),
+        );
+        app.update();
+
+        real_hover::hover_with(&mut app, camera, target);
+        update_materialization(&mut app);
+
+        assert!(
+            matches!(
+                app.world().get::<TooltipPhase>(controller),
+                Some(TooltipPhase::Visible)
+            ),
+            "phase={:?}, readiness={:?}, placement={:?}",
+            app.world().get::<TooltipPhase>(controller),
+            app.world().get::<TooltipReadiness>(controller),
+            app.world()
+                .get::<crate::widgets::tooltip::placement::TooltipPlacementState>(controller),
+        );
+        assert_eq!(
+            app.world().get::<Visibility>(controller),
+            Some(&Visibility::Inherited)
+        );
+        assert_eq!(
+            app.world().resource::<TooltipVisibilityLog>().shown,
+            [controller]
+        );
+
+        real_hover::leave(&mut app);
+        app.update();
+
+        assert!(matches!(
+            app.world().get::<TooltipPhase>(controller),
+            Some(TooltipPhase::Hidden)
+        ));
+        assert_eq!(
+            app.world().resource::<TooltipVisibilityLog>().hidden,
+            [controller]
+        );
+    }
+
+    #[test]
+    fn keyboard_focus_selects_and_then_reuses_the_interaction_camera() -> Result<(), String> {
         let mut app = materialization_app();
         let window = app
             .world_mut()
@@ -2143,14 +2239,14 @@ mod tests {
             .id();
         let lower = spawn_presentation_camera(&mut app, window, RenderLayers::layer(0));
         let higher = spawn_presentation_camera(&mut app, window, RenderLayers::layer(0));
-        let Some(mut lower_camera) = app.world_mut().get_mut::<Camera>(lower) else {
-            return;
-        };
-        lower_camera.order = 1;
-        let Some(mut higher_camera) = app.world_mut().get_mut::<Camera>(higher) else {
-            return;
-        };
-        higher_camera.order = 5;
+        app.world_mut()
+            .get_mut::<Camera>(lower)
+            .ok_or("lower camera")?
+            .order = 1;
+        app.world_mut()
+            .get_mut::<Camera>(higher)
+            .ok_or("higher camera")?
+            .order = 5;
         let tooltip = Tooltip::new(El::new()).show_after(Duration::ZERO);
         let panel = spawn_panel(&mut app, tooltip_tree(Some(tooltip)));
         app.update();
@@ -2168,22 +2264,22 @@ mod tests {
             "initial keyboard-only focus chooses the highest-order compatible camera",
         );
 
-        let Some(normalized_target) =
-            RenderTarget::Window(WindowRef::Entity(window)).normalize(Some(window))
-        else {
-            return;
-        };
-        let location = Location {
-            target:   normalized_target,
-            position: TEST_VIEWPORT * 0.5,
-        };
-        app.world_mut().trigger(PointerPress {
-            entity:  widget,
-            pointer: Pointer::new(PointerId::Mouse, location.clone()),
-            button:  PointerButton::Primary,
-            hit:     HitData::new(lower, 0.0, None, None),
-            count:   1,
-        });
+        // The lower view must actually own this pointer interaction. Restore the
+        // higher view before the keyboard-only check to prove camera memory.
+        app.world_mut()
+            .get_mut::<Camera>(higher)
+            .ok_or("higher camera")?
+            .is_active = false;
+        real_hover::hover_with(&mut app, lower, widget);
+        app.update();
+        real_pointer::press(&mut app, PointerButton::Primary);
+        app.update();
+        real_hover::leave(&mut app);
+        app.update();
+        app.world_mut()
+            .get_mut::<Camera>(higher)
+            .ok_or("higher camera")?
+            .is_active = true;
         app.world_mut()
             .trigger(crate::RequestWidgetFocus { window, widget });
         app.update();
@@ -2195,13 +2291,12 @@ mod tests {
             "visible keyboard focus reuses the camera from the preceding interaction",
         );
 
-        app.world_mut().trigger(PointerPress {
-            entity:  widget,
-            pointer: Pointer::new(PointerId::Mouse, location),
-            button:  PointerButton::Primary,
-            hit:     HitData::new(higher, 0.0, None, None),
-            count:   1,
-        });
+        real_pointer::release(&mut app, PointerButton::Primary);
+        app.update();
+        real_hover::hover_with(&mut app, higher, widget);
+        app.update();
+        real_pointer::press(&mut app, PointerButton::Primary);
+        app.update();
         app.world_mut()
             .trigger(crate::RequestWidgetFocus { window, widget });
         app.update();
@@ -2212,6 +2307,7 @@ mod tests {
             Some(higher),
             "a later interaction replaces the remembered camera",
         );
+        Ok(())
     }
 
     #[test]
@@ -2219,6 +2315,17 @@ mod tests {
         let mut app = test_app();
         app.init_resource::<TooltipVisibilityLog>()
             .add_observer(record_tooltip_hidden);
+        let window = app
+            .world_mut()
+            .spawn((
+                Window {
+                    resolution: TEST_VIEWPORT.as_uvec2().into(),
+                    ..Default::default()
+                },
+                PrimaryWindow,
+            ))
+            .id();
+        let camera = spawn_presentation_camera(&mut app, window, RenderLayers::layer(0));
         let panel = spawn_panel(
             &mut app,
             tooltip_tree(Some(Tooltip::new(El::new()).show_after(Duration::ZERO))),
@@ -2226,9 +2333,8 @@ mod tests {
         app.update();
         let widget = widget(&mut app, panel);
         let original = controller(&app, widget);
-        app.world_mut()
-            .entity_mut(widget)
-            .insert(PickingInteraction::Hovered);
+        real_hover::hover_with(&mut app, camera, widget);
+        app.update();
         app.world_mut().entity_mut(original).insert((
             TooltipPhase::Visible,
             Visibility::Inherited,
@@ -2265,6 +2371,21 @@ mod tests {
             app.world()
                 .get::<MaterializedTooltip>(replacement_controller)
                 .is_none()
+        );
+        app.update();
+        assert!(
+            app.world()
+                .get::<MaterializedTooltip>(replacement_controller)
+                .is_some(),
+            "the fresh surface prepares during its delay, after replacement"
+        );
+        assert!(matches!(
+            app.world().get::<TooltipPhase>(replacement_controller),
+            Some(TooltipPhase::WaitingToShow(timer)) if !timer.is_finished()
+        ));
+        assert_eq!(
+            app.world().get::<Visibility>(replacement_controller),
+            Some(&Visibility::Hidden)
         );
     }
 

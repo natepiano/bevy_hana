@@ -32,6 +32,12 @@ pub enum DriverStopReason {
         /// Provider detail identifying the cancellation.
         detail: String,
     },
+    /// No person has given consent for this operation yet. This is a normal state, not a
+    /// fault: an explicit request that carries consent starts the operation.
+    ConsentRequired {
+        /// Provider detail naming the consent the operation waits for.
+        detail: String,
+    },
     /// The driver cannot perform this operation on the current platform.
     Unsupported {
         /// Provider-supplied text naming the unsupported platform contract.
@@ -53,6 +59,8 @@ pub enum DriverStopReason {
 pub enum DeviceAccessClass {
     /// The operator cancelled or revoked this operation.
     Cancelled,
+    /// No person has given consent for this operation yet.
+    ConsentRequired,
     /// Another owner holds exclusive access to the device.
     Contended,
     /// The operating system or device policy refuses access.
@@ -83,6 +91,12 @@ pub enum DeviceAccessError {
     /// The operator cancelled or revoked this operation; only explicit recovery may resume it.
     Cancelled {
         /// Provider detail identifying the cancelled consent or closed session.
+        detail: String,
+    },
+    /// No person has given consent for this operation yet, such as a screen capture that no
+    /// monitor choice and no saved grant permit. This is a normal state, not a fault.
+    ConsentRequired {
+        /// Provider detail naming the consent the operation waits for.
         detail: String,
     },
     /// Another owner holds exclusive access, such as a camera open by a video-conferencing
@@ -133,6 +147,7 @@ impl From<(DeviceAccessClass, String)> for DeviceAccessError {
     fn from((class, detail): (DeviceAccessClass, String)) -> Self {
         match class {
             DeviceAccessClass::Cancelled => Self::Cancelled { detail },
+            DeviceAccessClass::ConsentRequired => Self::ConsentRequired { detail },
             DeviceAccessClass::Contended => Self::Contended { detail },
             DeviceAccessClass::Blocked => Self::Blocked { detail },
             DeviceAccessClass::Absent => Self::Absent { detail },
@@ -153,6 +168,7 @@ impl DeviceAccessError {
     pub const fn access_class(&self) -> DeviceAccessClass {
         match self {
             Self::Cancelled { .. } => DeviceAccessClass::Cancelled,
+            Self::ConsentRequired { .. } => DeviceAccessClass::ConsentRequired,
             Self::Contended { .. } => DeviceAccessClass::Contended,
             Self::Blocked { .. } => DeviceAccessClass::Blocked,
             Self::Absent { .. } => DeviceAccessClass::Absent,
@@ -173,6 +189,7 @@ impl DeviceAccessError {
     pub fn detail(&self) -> &str {
         match self {
             Self::Cancelled { detail }
+            | Self::ConsentRequired { detail }
             | Self::Contended { detail }
             | Self::Blocked { detail }
             | Self::Absent { detail }
@@ -190,6 +207,11 @@ impl DeviceAccessError {
         match self {
             Self::Cancelled { detail } => {
                 ApplyFailureDisposition::Stop(DriverStopReason::Cancelled {
+                    detail: detail.clone(),
+                })
+            },
+            Self::ConsentRequired { detail } => {
+                ApplyFailureDisposition::Stop(DriverStopReason::ConsentRequired {
                     detail: detail.clone(),
                 })
             },
@@ -273,6 +295,19 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_consent_stops_apply_without_a_fault() {
+        assert_eq!(
+            DeviceAccessError::ConsentRequired {
+                detail: String::from("Choose a monitor"),
+            }
+            .apply_failure_disposition(),
+            ApplyFailureDisposition::Stop(DriverStopReason::ConsentRequired {
+                detail: String::from("Choose a monitor"),
+            })
+        );
+    }
+
+    #[test]
     fn a_device_this_process_is_still_releasing_awaits_clearance() {
         assert_eq!(
             DeviceAccessError::Releasing {
@@ -287,6 +322,7 @@ mod tests {
     fn every_class_round_trips_through_the_error_it_builds() {
         let classes = [
             DeviceAccessClass::Cancelled,
+            DeviceAccessClass::ConsentRequired,
             DeviceAccessClass::Contended,
             DeviceAccessClass::Blocked,
             DeviceAccessClass::Absent,
@@ -309,6 +345,7 @@ mod tests {
     fn every_error_reports_the_detail_its_failing_call_carried() {
         let classes = [
             DeviceAccessClass::Cancelled,
+            DeviceAccessClass::ConsentRequired,
             DeviceAccessClass::Contended,
             DeviceAccessClass::Blocked,
             DeviceAccessClass::Absent,

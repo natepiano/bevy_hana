@@ -55,6 +55,7 @@ const PIXELS_PER_POINT: f32 = 2.0;
 const BACKGROUND: u8 = 24;
 const COLOUR_TOLERANCE: u8 = 6;
 const POINTER: PointerId = PointerId::Mouse;
+const INDICATOR_FRAME_SECONDS: f32 = 1.0 / 120.0;
 
 struct IndicatorScene {
     app:    CaseApp,
@@ -90,7 +91,7 @@ impl IndicatorScene {
             ..default()
         });
         app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
-            1.0 / 120.0,
+            INDICATOR_FRAME_SECONDS,
         )));
         let region = CaptureRegion::new(UVec2::splat(SIZE), UVec2::ZERO, UVec2::splat(SIZE));
         let target = app.target(region);
@@ -253,17 +254,31 @@ impl IndicatorScene {
         Ok(())
     }
 
-    fn advance(&mut self, frames: usize) {
+    fn advance(&mut self, frames: usize) -> Result<(), String> {
         self.app
             .world_mut()
             .resource_mut::<Time<Virtual>>()
             .unpause();
-        for _ in 0..frames {
+        let original_step = self
+            .app
+            .world_mut()
+            .remove_resource::<TimeUpdateStrategy>()
+            .ok_or("indicator time strategy")?;
+        let frame_step = Duration::from_secs_f32(INDICATOR_FRAME_SECONDS);
+        let mut remaining = frame_step * frames.to_u32();
+        let maximum_step = self.app.world().resource::<Time<Virtual>>().max_delta();
+        while !remaining.is_zero() {
+            let step = remaining.min(maximum_step);
+            self.app
+                .insert_resource(TimeUpdateStrategy::ManualDuration(step));
             self.app.update();
+            remaining -= step;
         }
+        self.app.insert_resource(original_step);
         self.app.world_mut().resource_mut::<Time<Virtual>>().pause();
         // Clear the last nonzero delta before readback adds its own frames.
         self.app.update();
+        Ok(())
     }
 
     fn capture(&mut self) -> Result<Vec<u8>, String> {
@@ -347,7 +362,7 @@ fn fitting_ink() -> Result<(), String> {
     let mut scene = IndicatorScene::new(2, false)?;
     let before = scene.capture()?;
     scene.scroll(40.0)?;
-    scene.advance(140);
+    scene.advance(140)?;
     let after = scene.capture()?;
     assert_eq!(ink(&before, &after), Vec::<UVec2>::new());
     assert!(matches!(
@@ -438,13 +453,13 @@ fn fades_away() -> Result<(), String> {
     scene.dispatch_pixels(0.0, TouchPhase::Ended)?;
     let full = scene.capture()?;
     let expected = thumb_pixels(&scene.record()?)?;
-    scene.advance(84);
+    scene.advance(84)?;
     let held = scene.capture()?;
     assert_eq!(
         ink_bounds(&ink(&before, &full))?,
         ink_bounds(&ink(&before, &held))?
     );
-    scene.advance(27);
+    scene.advance(27)?;
     let fading = scene.capture()?;
     let core = UVec2::new(
         (expected.x + expected.width / 2.0).to_u32(),
@@ -458,7 +473,7 @@ fn fades_away() -> Result<(), String> {
         fading > baseline && fading < full,
         "baseline={baseline}, fading={fading}, full={full}"
     );
-    scene.advance(30);
+    scene.advance(30)?;
     assert!(matches!(
         scene.record()?.indicator,
         ScrollIndicatorState::Hidden

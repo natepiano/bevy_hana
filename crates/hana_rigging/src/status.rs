@@ -313,6 +313,13 @@ pub enum StoppedStatusView {
         /// Explicit recovery is required before another attempt.
         resumes_when: ResumeCondition,
     },
+    /// No person has given consent for this operation yet. This is a normal state, not a fault.
+    ConsentRequired {
+        /// Provider detail naming the consent the operation waits for.
+        detail:       String,
+        /// An explicit request that carries consent starts the operation.
+        resumes_when: ResumeCondition,
+    },
     /// Consecutive device-operation failures exhausted the automatic retry run.
     RepeatedFailures {
         /// Number of consecutive failed attempts.
@@ -478,6 +485,11 @@ pub enum DriverStopReasonView {
         /// Provider detail identifying the cancellation.
         detail: String,
     },
+    /// No person has given consent for this operation yet.
+    ConsentRequired {
+        /// Provider detail naming the consent the operation waits for.
+        detail: String,
+    },
     /// The current platform cannot perform this operation.
     Unsupported {
         /// Provider detail naming the unsupported contract.
@@ -490,6 +502,9 @@ impl Display for DriverStopReasonView {
         match self {
             Self::Cancelled { detail } => {
                 write!(formatter, "permission was cancelled or revoked: {detail}")
+            },
+            Self::ConsentRequired { detail } => {
+                write!(formatter, "waiting for consent: {detail}")
             },
             Self::Unsupported { detail } => write!(
                 formatter,
@@ -1103,6 +1118,9 @@ impl From<&DriverStopReason> for DriverStopReasonView {
     fn from(reason: &DriverStopReason) -> Self {
         match reason {
             DriverStopReason::Cancelled { detail } => Self::Cancelled {
+                detail: detail.clone(),
+            },
+            DriverStopReason::ConsentRequired { detail } => Self::ConsentRequired {
                 detail: detail.clone(),
             },
             DriverStopReason::Unsupported { detail } => Self::Unsupported {

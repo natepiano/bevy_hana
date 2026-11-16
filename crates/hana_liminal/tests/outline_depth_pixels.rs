@@ -20,12 +20,15 @@ use bevy::render::view::DebandDither;
 use bevy::render::view::Tonemapping;
 use bevy::window::ExitCondition;
 use bevy::winit::WinitPlugin;
+use hana_kana::ToF32;
+use hana_kana::ToUsize;
 use hana_liminal::LiminalPlugin;
 use hana_liminal::Outline;
 use hana_liminal::OutlineBarrier;
 use hana_liminal::OutlineCamera;
 use hana_liminal::OutlineDepthTest;
 use hana_liminal::OutlineDepthTexture;
+use hana_liminal::OverlapMode;
 
 const SIDE: u16 = 256;
 
@@ -326,6 +329,345 @@ fn outline_keeps_the_camera_border_beside_its_near_coplanar_presentation_plate()
     fixture.assert_occlusion()
 }
 
+impl Drop for OutlineDepthFixture {
+    fn drop(&mut self) {
+        // Compiler tasks borrow the GPU: finish them before dropping the App,
+        // then keep the device alive throughout render-world destruction.
+        while self
+            .app
+            .sub_app(RenderApp)
+            .world()
+            .resource::<PipelineCache>()
+            .waiting_pipelines()
+            .next()
+            .is_some()
+        {
+            self.app.update();
+        }
+        let device = self
+            .app
+            .sub_app(RenderApp)
+            .world()
+            .resource::<RenderDevice>()
+            .clone();
+        let _ = device.wgpu_device().poll(PollType::wait_indefinitely());
+        let app = std::mem::replace(&mut self.app, App::new());
+        drop(app);
+        drop(device);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DepthTestProjection {
+    Orthographic,
+    Perspective,
+}
+
+fn configure_tilted_plates(
+    fixture: &mut OutlineDepthFixture,
+    projection: DepthTestProjection,
+) -> Result<Transform, String> {
+    // Separate mesh buffers and transforms rasterize the same mathematical
+    // plane independently, as the Monitor's plate and neighboring panel do.
+    let plate = Transform::from_xyz(0.0137, -0.027, 0.0763).with_rotation(Quat::from_euler(
+        EulerRot::YXZ,
+        0.23,
+        -0.11,
+        0.0,
+    ));
+    let world = fixture.app.world_mut();
+    let mut bodies = world.query_filtered::<(Entity, &Transform), With<Mesh3d>>();
+    let poses: Vec<_> = bodies.iter(world).map(|(e, t)| (e, *t)).collect();
+    for (entity, transform) in poses {
+        world.entity_mut(entity).insert(Transform {
+            translation: plate.transform_point(transform.translation),
+            rotation: plate.rotation,
+            ..transform
+        });
+    }
+    let camera = world
+        .query_filtered::<Entity, With<Camera3d>>()
+        .single(world)
+        .map_err(|error| error.to_string())?;
+    if matches!(projection, DepthTestProjection::Perspective) {
+        world
+            .entity_mut(camera)
+            .insert(Projection::Perspective(PerspectiveProjection {
+                fov: 2.0 * 0.5_f32.atan(),
+                near: 0.004,
+                ..default()
+            }));
+    }
+    Ok(plate)
+}
+
+fn rendered_depth_pixels(fixture: &mut OutlineDepthFixture) -> Result<Vec<u8>, String> {
+    for _ in 0..120 {
+        fixture.app.update();
+        if fixture
+            .app
+            .sub_app(RenderApp)
+            .world()
+            .resource::<PipelineCache>()
+            .waiting_pipelines()
+            .next()
+            .is_some()
+        {
+            continue;
+        }
+        let pixels = fixture.pixels()?;
+        if pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|p| p[0] > 180 && p[1] < 120)
+            && pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
+                .any(is_blue_outline)
+        {
+            return Ok(pixels);
+        }
+    }
+    Err("depth scene never rendered its red face and blue outline".into())
+}
+
+const fn is_blue_outline(pixel: [u8; 4]) -> bool {
+    pixel[2] > 180
+        && pixel[2] > pixel[0].saturating_add(60)
+        && pixel[2] > pixel[1].saturating_add(40)
+}
+
+fn install_baseline_depth_shaders(
+    fixture: &mut OutlineDepthFixture,
+    directory: &std::path::Path,
+) -> Result<(), String> {
+    let mut shaders = fixture.app.world_mut().resource_mut::<Assets<Shader>>();
+    let originals: Vec<_> = shaders
+        .iter()
+        .filter(|(_, shader)| {
+            shader.path.starts_with("embedded://hana_liminal/")
+                && !shader.path.ends_with("/outline_occluded.wesl")
+        })
+        .map(|(id, shader)| (id, shader.path.clone()))
+        .collect();
+    assert_eq!(originals.len(), 5, "compare the complete outline WESL set");
+    for (id, path) in originals {
+        let name = std::path::Path::new(&path)
+            .file_name()
+            .ok_or("shader filename")?;
+        let source =
+            std::fs::read_to_string(directory.join(name)).map_err(|error| error.to_string())?;
+        shaders
+            .insert(id, Shader::from_wesl(source, path))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn coplanar_edge_gaps(
+    fixture: &mut OutlineDepthFixture,
+    plate: Transform,
+) -> Result<Vec<usize>, String> {
+    let pixels = rendered_depth_pixels(fixture)?;
+    let world = fixture.app.world_mut();
+    let (camera, camera_transform) = world
+        .query_filtered::<(&Camera, &GlobalTransform), With<Camera3d>>()
+        .single(world)
+        .map_err(|error| error.to_string())?;
+    let project = |point| {
+        camera
+            .world_to_viewport(camera_transform, plate.transform_point(point))
+            .map_err(|error| error.to_string())
+    };
+    let bottom = project(Vec3::new(1.0, -0.3, 0.02))?;
+    let top = project(Vec3::new(1.0, 0.3, 0.02))?;
+    let mut broken = Vec::new();
+    let rows = top.y.ceil().to_usize()..bottom.y.floor().to_usize();
+    assert!(
+        rows.len() > 20,
+        "projected contact edge must cover a visible run"
+    );
+    for row in rows {
+        let fraction = (row.to_f32() + 0.5 - top.y) / (bottom.y - top.y);
+        let edge_x = (bottom.x - top.x)
+            .mul_add(fraction, top.x)
+            .floor()
+            .to_usize();
+        // Sample outside the source silhouette, on the independently
+        // transformed red face. Each scanline must contain blue there.
+        let blue = (edge_x..edge_x + 8).any(|column| {
+            let index = row * usize::from(SIDE) + column;
+            is_blue_outline(pixels.as_chunks::<4>().0[index])
+        });
+        let red = pixels.as_chunks::<4>().0[row * usize::from(SIDE) + edge_x + 12];
+        assert!(
+            red[0] > 180 && red[1] < 120,
+            "contact probe left the adjacent face"
+        );
+        if !blue {
+            broken.push(row);
+        }
+    }
+    Ok(broken)
+}
+
+fn assert_coplanar_edge(outline: Outline) -> Result<(), String> {
+    for projection in [
+        DepthTestProjection::Orthographic,
+        DepthTestProjection::Perspective,
+    ] {
+        // Load the archived WESL into the same fixture when the directory is set.
+        // The normal gate asserts current pixels. Baseline gaps remain observations,
+        // including an explicit zero-gap result.
+        if let Some(directory) = std::env::var_os("RUST_TEST_OUTLINE_BASELINE_SHADER_DIR") {
+            let mut baseline = OutlineDepthFixture::new(0.0);
+            let plate = configure_tilted_plates(&mut baseline, projection)?;
+            install_baseline_depth_shaders(&mut baseline, std::path::Path::new(&directory))?;
+            baseline
+                .app
+                .world_mut()
+                .entity_mut(baseline.outlined_body)
+                .insert(outline.clone());
+            let broken = coplanar_edge_gaps(&mut baseline, plate)?;
+            let row = serde_json::json!({
+                "shader_source": "archived_before",
+                "projection": format!("{projection:?}"),
+                "method": format!("{:?}", outline.method),
+                "gap_rows": broken,
+            });
+            println!("{row}");
+            let report = std::env::var_os("RUST_TEST_OUTLINE_BASELINE_REPORT")
+                .ok_or("baseline shader comparison needs its report path")?;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(report)
+                .map_err(|error| error.to_string())?;
+            std::io::Write::write_all(&mut file, format!("{row}\n").as_bytes())
+                .map_err(|error| error.to_string())?;
+        }
+        let mut fixture = OutlineDepthFixture::new(0.0);
+        let plate = configure_tilted_plates(&mut fixture, projection)?;
+        fixture
+            .app
+            .world_mut()
+            .entity_mut(fixture.outlined_body)
+            .insert(outline.clone());
+        let broken = coplanar_edge_gaps(&mut fixture, plate)?;
+        assert!(
+            broken.is_empty(),
+            "{projection:?} {:?} outline over a coplanar face has gaps at rows {broken:?}",
+            outline.method
+        );
+    }
+    Ok(())
+}
+
+fn assert_hull_foreground_occlusion(outline: Outline) -> Result<(), String> {
+    for projection in [
+        DepthTestProjection::Orthographic,
+        DepthTestProjection::Perspective,
+    ] {
+        // Close faces catch an extruded front shell overtaking a real occluder.
+        for foreground_gap in [0.0005, 0.003, 0.4] {
+            let mut fixture = OutlineDepthFixture::new(foreground_gap);
+            configure_tilted_plates(&mut fixture, projection)?;
+            fixture
+                .app
+                .world_mut()
+                .entity_mut(fixture.outlined_body)
+                .insert(outline.clone());
+            let outlined = rendered_depth_pixels(&mut fixture)?;
+            // The red reference is a real foreground mesh with identical camera
+            // and geometry, rendered without an outline. It determines coverage
+            // under either projection without assuming an axis-aligned rectangle.
+            fixture
+                .app
+                .world_mut()
+                .entity_mut(fixture.outlined_body)
+                .remove::<Outline>();
+            for _ in 0..4 {
+                fixture.app.update();
+            }
+            let reference = fixture.pixels()?;
+            let red_coverage = reference
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| p[0] > 180 && p[1] < 120)
+                .count();
+            assert!(red_coverage > 500, "foreground reference must be visible");
+            let leaked = reference
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(outlined.as_chunks::<4>().0)
+                .filter(|(reference, actual)| {
+                    reference[0] > 180 && reference[1] < 120 && is_blue_outline(**actual)
+                })
+                .count();
+            assert_eq!(
+                leaked, 0,
+                "{projection:?} {:?} hull must not draw through a foreground face {foreground_gap} m closer",
+                outline.method
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn coplanar_face_keeps_jump_flood_outline_edge_unbroken() -> Result<(), String> {
+    assert_coplanar_edge(
+        Outline::jump_flood(5.0)
+            .with_overlap(OverlapMode::Grouped)
+            .with_color(Color::srgb(0.05, 0.2, 1.0))
+            .build(),
+    )
+}
+
+#[test]
+fn coplanar_face_keeps_screen_hull_outline_edge_unbroken() -> Result<(), String> {
+    assert_coplanar_edge(
+        Outline::screen_hull(5.0)
+            .with_overlap(OverlapMode::Grouped)
+            .with_color(Color::srgb(0.05, 0.2, 1.0))
+            .build(),
+    )
+}
+
+#[test]
+fn coplanar_face_keeps_world_hull_outline_edge_unbroken() -> Result<(), String> {
+    assert_coplanar_edge(
+        Outline::world_hull(0.08)
+            .with_overlap(OverlapMode::Grouped)
+            .with_color(Color::srgb(0.05, 0.2, 1.0))
+            .build(),
+    )
+}
+
+#[test]
+fn tilted_screen_hull_stays_behind_real_foreground_in_both_projections() -> Result<(), String> {
+    assert_hull_foreground_occlusion(
+        Outline::screen_hull(5.0)
+            .with_overlap(OverlapMode::Grouped)
+            .with_color(Color::srgb(0.05, 0.2, 1.0))
+            .build(),
+    )
+}
+
+#[test]
+fn tilted_world_hull_stays_behind_real_foreground_in_both_projections() -> Result<(), String> {
+    assert_hull_foreground_occlusion(
+        Outline::world_hull(0.08)
+            .with_overlap(OverlapMode::Grouped)
+            .with_color(Color::srgb(0.05, 0.2, 1.0))
+            .build(),
+    )
+}
 #[test]
 fn translucent_outlined_surface_hides_back_wire_but_keeps_front_and_exterior_wire()
 -> Result<(), String> {

@@ -29,6 +29,9 @@ use bevy_enhanced_input::prelude::InputAction;
 use bevy_enhanced_input::prelude::InputContextAppExt;
 use bevy_enhanced_input::prelude::Start;
 use hana_rubric::Keybindings;
+use hana_rubric::Keystroke;
+use hana_rubric::Modifiers;
+use hana_rubric::OrdinaryKey;
 use hana_valence::FoldCommands;
 use hana_valence::FoldPlugin;
 use hana_valence::FoldSequencePlayback;
@@ -44,11 +47,12 @@ use crate::constants::FOLD_CONTROL_RESERVE_LABEL;
 use crate::constants::FOLD_PLAY_CONTROL_ID;
 use crate::constants::FOLD_PLAY_CONTROL_LABEL;
 use crate::constants::FOLD_PLAY_RESERVE_LABEL;
+use crate::constants::UNFOLD_CONTROL_ACTION_LABEL;
 use crate::constants::UNFOLD_CONTROL_ID;
-use crate::constants::UNFOLD_CONTROL_LABEL;
 use crate::ensure_plugin;
 use crate::screen_panels;
 use crate::screen_panels::ControlActivation;
+use crate::screen_panels::TitleBarControl;
 use crate::screen_panels::TitleBarControlState;
 use crate::screen_panels::TitleBarOverflowSystems;
 use crate::screen_panels::TitleChip;
@@ -262,6 +266,8 @@ enum ReadySelection {
     },
 }
 
+const FOLD_STEP_KEY: OrdinaryKey = OrdinaryKey::SPACE;
+
 pub(crate) fn install(app: &mut App) {
     if app.world().contains_resource::<FoldControlsInstalled>() {
         return;
@@ -270,12 +276,20 @@ pub(crate) fn install(app: &mut App) {
     ensure_plugin(app, FoldPlugin);
     ensure_plugin(app, EnhancedInputPlugin);
     shortcuts::install(app);
-    shortcuts::reserve_key::<FoldControlContext>(app, KeyCode::Space, FOLD_CONTROL_RESERVE_LABEL);
+    shortcuts::reserve_key::<FoldControlContext>(
+        app,
+        FOLD_STEP_KEY.key_code(),
+        FOLD_CONTROL_RESERVE_LABEL,
+    );
     shortcuts::reserve_key::<FoldControlContext>(app, KeyCode::KeyP, FOLD_PLAY_RESERVE_LABEL);
     screen_panels::register_title_control(app, TitleChip::new(FOLD_CONTROL_ID, FOLD_CONTROL_LABEL));
     screen_panels::register_title_control(
         app,
-        TitleChip::new(UNFOLD_CONTROL_ID, UNFOLD_CONTROL_LABEL),
+        TitleBarControl::shortcut(
+            Keystroke::from_ordinary_key(Modifiers::none().with_shift(), FOLD_STEP_KEY),
+            UNFOLD_CONTROL_ACTION_LABEL,
+        )
+        .with_id(UNFOLD_CONTROL_ID),
     );
     screen_panels::register_title_control(
         app,
@@ -301,8 +315,8 @@ fn spawn_fold_control_actions(mut commands: Commands) {
         Actions::<FoldControlContext>::spawn(SpawnWith(
             |spawner: &mut ActionSpawner<FoldControlContext>| {
                 let keybindings = Keybindings::new::<FoldShift>(spawner, ActionSettings::default());
-                keybindings.spawn_key::<FoldStep>(spawner, KeyCode::Space);
-                keybindings.spawn_shift_key::<UnfoldStep>(spawner, KeyCode::Space);
+                keybindings.spawn_key::<FoldStep>(spawner, FOLD_STEP_KEY.key_code());
+                keybindings.spawn_shift_key::<UnfoldStep>(spawner, FOLD_STEP_KEY.key_code());
                 keybindings.spawn_key::<PlayFold>(spawner, KeyCode::KeyP);
             },
         )),

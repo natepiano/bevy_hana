@@ -2,7 +2,7 @@ use bevy::prelude::ChildSpawnerCommands;
 use bevy::prelude::TextFont;
 
 use super::super::values::CurrentValues;
-use super::span::add_span;
+use super::span;
 use crate::constants::DEFAULT_COLOR;
 use crate::constants::LABEL_WIDTH;
 use crate::constants::MISMATCH_COLOR;
@@ -21,13 +21,13 @@ pub(super) fn build_current_only_spans(
     current_values: &CurrentValues,
     text_font: &TextFont,
 ) {
-    add_span(
+    span::add_span(
         child_spawner,
         text_font,
         NO_RESTORE_DATA_TEXT,
         MISMATCH_COLOR,
     );
-    add_span(
+    span::add_span(
         child_spawner,
         text_font,
         &format!(
@@ -36,7 +36,7 @@ pub(super) fn build_current_only_spans(
         ),
         DEFAULT_COLOR,
     );
-    add_span(
+    span::add_span(
         child_spawner,
         text_font,
         &format!(
@@ -45,7 +45,7 @@ pub(super) fn build_current_only_spans(
         ),
         DEFAULT_COLOR,
     );
-    add_span(
+    span::add_span(
         child_spawner,
         text_font,
         &format!(
@@ -54,7 +54,7 @@ pub(super) fn build_current_only_spans(
         ),
         DEFAULT_COLOR,
     );
-    add_span(
+    span::add_span(
         child_spawner,
         text_font,
         &format!(
@@ -63,13 +63,13 @@ pub(super) fn build_current_only_spans(
         ),
         DEFAULT_COLOR,
     );
-    add_span(
+    span::add_span(
         child_spawner,
         text_font,
         &format!("{:<LABEL_WIDTH$}{}\n", SCALE_LABEL, current_values.scale),
         DEFAULT_COLOR,
     );
-    add_span(
+    span::add_span(
         child_spawner,
         text_font,
         &format!(
@@ -78,7 +78,7 @@ pub(super) fn build_current_only_spans(
         ),
         DEFAULT_COLOR,
     );
-    add_span(
+    span::add_span(
         child_spawner,
         text_font,
         &format!("{:<LABEL_WIDTH$}{}\n", MODE_LABEL, current_values.mode),

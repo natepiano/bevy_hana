@@ -24,7 +24,7 @@ use bevy::prelude::Vec2;
 use bevy::prelude::Vec3;
 use bevy::prelude::With;
 
-use super::size_gate::WidgetSizePicking;
+use super::size_gate::WidgetSizeEligibility;
 use crate::panel::ComputedDiegeticPanel;
 use crate::panel::DiegeticPanel;
 use crate::panel::PanelOwned;
@@ -154,10 +154,14 @@ pub(in crate::widgets) fn update_hits(
         Option<&PanelWidgets>,
         Option<&PanelPicking>,
     )>,
-    widgets: Query<(&PanelWidget, &WidgetOf, Option<&Pickable>)>,
+    widgets: Query<(
+        &PanelWidget,
+        &WidgetOf,
+        Option<&Pickable>,
+        Option<&WidgetSizeEligibility>,
+    )>,
     pickables: Query<&Pickable>,
     layers: Query<&RenderLayers>,
-    mut size_picking: WidgetSizePicking,
     mut ray_cast: MeshRayCast,
     mut pointer_hits: MessageWriter<PointerHits>,
 ) {
@@ -225,7 +229,6 @@ pub(in crate::widgets) fn update_hits(
                 pickable_markers,
                 &panels,
                 &widgets,
-                &mut size_picking,
             ) else {
                 continue;
             };
@@ -263,8 +266,12 @@ fn resolve_face_hit(
         Option<&PanelWidgets>,
         Option<&PanelPicking>,
     )>,
-    widgets: &Query<(&PanelWidget, &WidgetOf, Option<&Pickable>)>,
-    size_picking: &mut WidgetSizePicking,
+    widgets: &Query<(
+        &PanelWidget,
+        &WidgetOf,
+        Option<&Pickable>,
+        Option<&WidgetSizeEligibility>,
+    )>,
 ) -> Option<(FaceHit, Option<Vec<(usize, Entity)>>)> {
     let (panel, computed, panel_transform, panel_widgets, panel_picking) =
         panels.get(panel_entity).ok()?;
@@ -278,7 +285,13 @@ fn resolve_face_hit(
             panel_widgets,
             widgets,
             pickable_markers,
-            |_, rect| size_picking.accepts(panel_entity, rect, panel, panel_transform, camera),
+            |widget, _| {
+                widgets
+                    .get(widget)
+                    .ok()
+                    .and_then(|(_, _, _, decision)| decision)
+                    .is_some_and(|decision| decision.accepts(camera))
+            },
         )
     });
     Some((
@@ -375,7 +388,12 @@ fn matching_widgets(
     panel_local: Vec2,
     computed: &ComputedDiegeticPanel,
     panel_widgets: Option<&PanelWidgets>,
-    widgets: &Query<(&PanelWidget, &WidgetOf, Option<&Pickable>)>,
+    widgets: &Query<(
+        &PanelWidget,
+        &WidgetOf,
+        Option<&Pickable>,
+        Option<&WidgetSizeEligibility>,
+    )>,
     markers: PickableMarkers,
     mut accepts_size: impl FnMut(Entity, crate::BoundingBox) -> bool,
 ) -> Vec<(usize, Entity)> {
@@ -383,7 +401,7 @@ fn matching_widgets(
         panel_widgets
             .iter()
             .filter_map(|widget_entity| {
-                let (widget, widget_of, pickable) = widgets.get(widget_entity).ok()?;
+                let (widget, widget_of, pickable, _) = widgets.get(widget_entity).ok()?;
                 if widget_of.panel() != panel_entity
                     || pickable.is_some_and(|pickable| !pickable.is_hoverable)
                     || (matches!(markers, PickableMarkers::Required) && pickable.is_none())

@@ -40,11 +40,18 @@ pub(super) enum TooltipExclusivity {
     SoleHelp,
 }
 
+/// Whether pressing the target retires its help or leaves it unchanged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TooltipPressBehavior {
+    Dismiss,
+    Preserve,
+}
+
 /// Deferred visual and behavior declaration for a tooltip.
 ///
-/// Replace a standalone tooltip by despawning its controller and calling
-/// [`crate::TooltipCommandsExt::spawn_tooltip`] again. Replacing this component on a
-/// materialized controller is not an in-place content update.
+/// Use [`crate::TooltipCommandsExt::update_tooltip`] to update standalone content without
+/// restarting its reveal. Use [`crate::TooltipCommandsExt::resize_tooltip`] to resize materialized
+/// world help without restarting its reveal.
 #[derive(Component, Debug)]
 #[require(TooltipPhase)]
 pub struct Tooltip {
@@ -55,6 +62,7 @@ pub struct Tooltip {
     pub(super) ink_padding:                   TooltipInkPadding,
     pub(super) show_after:                    Duration,
     pub(super) hide_after:                    Duration,
+    pub(super) press_behavior:                TooltipPressBehavior,
     pub(super) disabled_policy:               TooltipDisabledPolicy,
     pub(super) exclusivity:                   TooltipExclusivity,
     pub(super) show_over_descendant_controls: bool,
@@ -135,6 +143,7 @@ impl Clone for Tooltip {
             ink_padding:                   self.ink_padding,
             show_after:                    self.show_after,
             hide_after:                    self.hide_after,
+            press_behavior:                self.press_behavior,
             disabled_policy:               self.disabled_policy,
             exclusivity:                   self.exclusivity,
             show_over_descendant_controls: self.show_over_descendant_controls,
@@ -150,6 +159,7 @@ impl PartialEq for Tooltip {
         Arc::ptr_eq(&self.blueprint, &other.blueprint)
             && self.show_after == other.show_after
             && self.hide_after == other.hide_after
+            && self.press_behavior == other.press_behavior
             && self.disabled_policy == other.disabled_policy
             && self.exclusivity == other.exclusivity
             && self.show_over_descendant_controls == other.show_over_descendant_controls
@@ -163,6 +173,16 @@ impl PartialEq for Tooltip {
 }
 
 impl Tooltip {
+    pub(super) fn resize_label_size(&mut self, size: Dimension, scale: f32) {
+        self.drawn_label_size = size;
+        Arc::make_mut(&mut self.blueprint).resize_tooltip_text(scale);
+        materialization::resolve_tooltip_look(
+            Arc::make_mut(&mut self.blueprint),
+            &self.authoring.unstyled_text,
+            size,
+        );
+    }
+
     /// Creates a deferred `Fit` by `Fit` tooltip with `root` as its visible root.
     ///
     /// A tooltip describes a widget; it does not contain one. Its root, its
@@ -219,6 +239,7 @@ impl Tooltip {
             ink_padding:                   TooltipInkPadding::WidgetFrame,
             show_after:                    DEFAULT_SHOW_DELAY,
             hide_after:                    Duration::ZERO,
+            press_behavior:                TooltipPressBehavior::Dismiss,
             disabled_policy:               TooltipDisabledPolicy::Suppress,
             exclusivity:                   TooltipExclusivity::Independent,
             show_over_descendant_controls: false,
@@ -232,6 +253,14 @@ impl Tooltip {
             tooltip.drawn_label_size,
         );
         tooltip
+    }
+
+    /// Leaves the current help state unchanged while its target is pressed.
+    /// For passive information targets, a press neither opens nor dismisses help.
+    #[must_use]
+    pub const fn preserve_on_press(mut self) -> Self {
+        self.press_behavior = TooltipPressBehavior::Preserve;
+        self
     }
 
     /// Sets the size at which the surrounding row labels are drawn.
@@ -464,6 +493,16 @@ mod tests {
     use crate::layout::Text;
     use crate::panel::PanelAnchorOffset;
     use crate::widgets::constants::DEFAULT_TOOLTIP_GAP;
+
+    #[test]
+    fn passive_tooltip_keeps_shared_delay_and_preserves_policy_when_cloned() {
+        let ordinary = Tooltip::new(El::new());
+        let passive = ordinary.clone().preserve_on_press();
+        assert_eq!(passive.show_after, DEFAULT_SHOW_DELAY);
+        assert_eq!(passive.press_behavior, TooltipPressBehavior::Preserve);
+        assert_eq!(passive, passive.clone());
+        assert_ne!(ordinary, passive);
+    }
 
     #[test]
     fn defaults_and_clone_identity_match_the_public_contract() {

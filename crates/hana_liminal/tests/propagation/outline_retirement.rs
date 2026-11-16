@@ -270,3 +270,105 @@ fn syncing_a_source_preserves_authored_descendant_outlines_in_its_group() {
     assert!(OUTLINE_WIDTH.mul_add(-2.0, authored.width).abs() < f32::EPSILON);
     assert!(world.get::<PropagatedOutlineOwnership>(copy).is_none());
 }
+
+#[test]
+fn late_panel_mesh_and_reparented_branch_receive_the_current_outline_owner() {
+    let mut world = world_with_observers();
+    let first = world.spawn(outline()).id();
+    let second = world
+        .spawn(Outline::jump_flood(OUTLINE_WIDTH * 2.0).build())
+        .id();
+    let branch = world.spawn(ChildOf(first)).id();
+    let leaf = world.spawn(ChildOf(branch)).id();
+    world.entity_mut(leaf).insert(Mesh3d(Handle::default()));
+    assert_eq!(
+        world.get::<Outline>(leaf).map(|o| o.group_source),
+        Some(Some(first))
+    );
+    world.entity_mut(leaf).insert(Mesh3d(Handle::default()));
+    assert_eq!(
+        world.get::<Outline>(leaf).map(|o| o.group_source),
+        Some(Some(first))
+    );
+    world.entity_mut(branch).insert(ChildOf(second));
+    world.flush();
+    let inherited = world
+        .get::<Outline>(leaf)
+        .expect("reparented panel mesh keeps an outline");
+    assert_eq!(inherited.group_source, Some(second));
+    assert!(OUTLINE_WIDTH.mul_add(-2.0, inherited.width).abs() < f32::EPSILON);
+}
+
+#[test]
+fn an_outlined_barrier_sources_late_children_but_prunes_nested_barriers() {
+    let mut world = world_with_observers();
+    let source = world.spawn((OutlineBarrier, outline())).id();
+    let late = world.spawn(ChildOf(source)).id();
+    world.entity_mut(late).insert(Mesh3d(Handle::default()));
+    assert_eq!(
+        world.get::<Outline>(late).map(|o| o.group_source),
+        Some(Some(source))
+    );
+    let barrier = world.spawn((OutlineBarrier, ChildOf(source))).id();
+    let protected = world
+        .spawn((Mesh3d(Handle::default()), ChildOf(barrier)))
+        .id();
+    assert!(
+        world.get::<Outline>(protected).is_none(),
+        "nested barriers block inheritance"
+    );
+    let second = world
+        .spawn((
+            OutlineBarrier,
+            Outline::jump_flood(OUTLINE_WIDTH * 2.0).build(),
+        ))
+        .id();
+    world.entity_mut(late).insert(ChildOf(second));
+    assert_eq!(
+        world.get::<Outline>(late).map(|o| o.group_source),
+        Some(Some(second)),
+        "a barrier carrying its own outline remains a source after reparenting"
+    );
+    world.entity_mut(protected).insert(ChildOf(second));
+    assert_eq!(
+        world.get::<Outline>(protected).map(|o| o.group_source),
+        Some(Some(second))
+    );
+}
+
+#[test]
+fn reparenting_a_branch_preserves_its_nested_outline_source_after_outer_retirement() {
+    let mut world = world_with_observers();
+    let outer = world.spawn(outline()).id();
+    let branch = world.spawn_empty().id();
+    let inner = world
+        .spawn((
+            Outline::jump_flood(OUTLINE_WIDTH * 2.0).build(),
+            ChildOf(branch),
+        ))
+        .id();
+    let leaf = world
+        .spawn((Mesh3d(Handle::default()), ChildOf(inner)))
+        .id();
+    assert_eq!(
+        world.get::<Outline>(leaf).map(|copy| copy.group_source),
+        Some(Some(inner))
+    );
+
+    world.entity_mut(branch).insert(ChildOf(outer));
+    world.flush();
+    world.entity_mut(outer).remove::<Outline>();
+    world.flush();
+
+    assert!(world.get::<Outline>(inner).is_some());
+    assert!(world.get::<PropagatedOutlineOwnership>(inner).is_none());
+    let inherited = world
+        .get::<Outline>(leaf)
+        .expect("the independently outlined inner source still outlines its mesh");
+    assert_eq!(inherited.group_source, Some(inner));
+    assert!(OUTLINE_WIDTH.mul_add(-2.0, inherited.width).abs() < f32::EPSILON);
+    assert!(matches!(
+        world.get::<PropagatedOutlineOwnership>(leaf),
+        Some(PropagatedOutlineOwnership::InheritedFrom(source)) if *source == inner
+    ));
+}

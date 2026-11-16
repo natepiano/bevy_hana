@@ -5,12 +5,22 @@ use bevy::prelude::Window;
 use bevy::prelude::With;
 use bevy::prelude::World;
 use bevy::window::PrimaryWindow;
+#[cfg(target_os = "macos")]
+use bevy::winit::WINIT_WINDOWS;
 use bevy_remote::BrpResult;
 use bevy_remote::RemotePlugin;
 use bevy_remote::http::RemoteHttpPlugin;
 use hana_clerestory::LiveDisplayDevices;
 use hana_clerestory::Monitors;
 use hana_rigging::prelude::DeviceKey;
+#[cfg(target_os = "macos")]
+use objc2_app_kit::NSView;
+#[cfg(target_os = "macos")]
+use objc2_app_kit::NSWindowStyleMask;
+#[cfg(target_os = "macos")]
+use raw_window_handle::HasWindowHandle;
+#[cfg(target_os = "macos")]
+use raw_window_handle::RawWindowHandle;
 use ron::Options;
 use ron::extensions::Extensions;
 use serde::Serialize;
@@ -223,12 +233,6 @@ fn shutdown(In(params): In<Option<Value>>, world: &mut World) -> BrpResult {
 
 #[cfg(target_os = "macos")]
 fn native_fullscreen(entity: Entity) -> NativeFullscreen {
-    use bevy::winit::WINIT_WINDOWS;
-    use objc2_app_kit::NSView;
-    use objc2_app_kit::NSWindowStyleMask;
-    use raw_window_handle::HasWindowHandle;
-    use raw_window_handle::RawWindowHandle;
-
     WINIT_WINDOWS.with_borrow(|winit_windows| {
         let Some(winit_window) = winit_windows.get_window(entity) else {
             return NativeFullscreen::Unavailable;

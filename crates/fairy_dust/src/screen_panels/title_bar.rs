@@ -27,6 +27,7 @@ use bevy::prelude::warn;
 use bevy::window::PrimaryWindow;
 use hana_diegetic::AlignY;
 use hana_diegetic::Anchor;
+use hana_diegetic::BoundingBox;
 use hana_diegetic::ChildLayoutState;
 use hana_diegetic::DiegeticPanel;
 use hana_diegetic::DiegeticPanelCommands;
@@ -37,12 +38,18 @@ use hana_diegetic::FontId;
 use hana_diegetic::FontRegistry;
 use hana_diegetic::GlyphShadowMode;
 use hana_diegetic::LayoutBuilder;
+use hana_diegetic::LayoutEngine;
+use hana_diegetic::LayoutResult;
 use hana_diegetic::LayoutTree;
 use hana_diegetic::Pt;
 use hana_diegetic::Px;
 use hana_diegetic::Sizing;
 use hana_diegetic::TextStyle;
 use hana_diegetic::Unit;
+use hana_diegetic::render_keystroke_label;
+use hana_diegetic::render_shortcut_hint;
+use hana_rubric::Keystroke;
+use hana_rubric::ShortcutHint;
 
 use super::PanelTextEdge;
 use super::constants::CONTROL_ACTIVE_COLOR;
@@ -120,6 +127,7 @@ pub struct TitleBarControl {
     segment_separator: SegmentSeparator,
     name:              ControlName,
     help_wording:      HelpWording,
+    shortcut:          ShortcutHint,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -163,6 +171,39 @@ enum HelpWording {
 }
 
 impl TitleBarControl {
+    /// Creates a shortcut control from its binding, preserving typed modifier symbols.
+    #[must_use]
+    pub fn shortcut(keystroke: Keystroke, action: impl Into<String>) -> Self {
+        let keys = keystroke.label();
+        let action = action.into();
+        let mut control = Self::from_label(format!("{} {action}", keys.words(" ")));
+        control.help_wording = HelpWording::Explicit {
+            keys: keys.words(" "),
+            action,
+        };
+        control.shortcut = ShortcutHint::Keys(keys);
+        control
+    }
+
+    /// Gives this control a stable identity independent of its displayed shortcut.
+    #[must_use]
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = id.into();
+        self
+    }
+
+    pub(super) const fn shortcut_hint(&self) -> &ShortcutHint { &self.shortcut }
+
+    fn display_shortcut(&self) -> ShortcutHint {
+        match &self.shortcut {
+            ShortcutHint::Keys(keys) => {
+                let (_, action) = self.help_parts();
+                ShortcutHint::Keys(keys.clone().then_words(action))
+            },
+            ShortcutHint::NotAShortcut => ShortcutHint::NotAShortcut,
+        }
+    }
+
     fn segmented_label(&self) -> String {
         match &self.name {
             ControlName::Unnamed => self.label.clone(),
@@ -248,6 +289,7 @@ impl TitleBarControl {
             segment_separator: SegmentSeparator::Spacing,
             name:              ControlName::Unnamed,
             help_wording:      HelpWording::Inherit,
+            shortcut:          ShortcutHint::NotAShortcut,
         }
     }
 
@@ -261,6 +303,7 @@ impl TitleBarControl {
             segment_separator: SegmentSeparator::Spacing,
             name: ControlName::Unnamed,
             help_wording: HelpWording::Inherit,
+            shortcut: ShortcutHint::NotAShortcut,
         }
     }
 
@@ -298,6 +341,7 @@ impl TitleBarControl {
             segment_separator: SegmentSeparator::Spacing,
             name:              ControlName::Unnamed,
             help_wording:      HelpWording::Inherit,
+            shortcut:          ShortcutHint::NotAShortcut,
         }
     }
 }
@@ -819,18 +863,7 @@ fn title_bar_size(
     let title_size = super::integral_advance_size(fonts, TITLE_SIZE);
     let control_size = super::integral_advance_size(fonts, LABEL_SIZE);
     let text_size = |text: &str, size: Pt, edge: PanelTextEdge| {
-        let bounds = (measurer.measure_fn)(text, &TextStyle::new(size).as_measure());
-        let (top, bottom) = super::screen_panel_text_edge_trim(fonts, size);
-        let trim = match edge {
-            PanelTextEdge::Interior => 0.0,
-            PanelTextEdge::First => top.0,
-            PanelTextEdge::Last => bottom.0,
-            PanelTextEdge::Both => top.0 + bottom.0,
-        };
-        Vec2::new(
-            bounds.width / Unit::Pixels.to_points(),
-            bounds.height / Unit::Pixels.to_points() - trim,
-        )
+        title_bar_text_size(text, size, edge, fonts, measurer)
     };
     let horizontal = title_bar.orientation == TitleBarOrientation::Horizontal;
     let text_edge = if horizontal {
@@ -862,29 +895,14 @@ fn title_bar_size(
     }
     for control in &title_bar.controls {
         cells.push(separator);
-        let label = if state.activation(&control.id) == ControlActivation::Disabled {
-            match &control.disabled_note {
-                DisabledNote::None => control.label.clone(),
-                DisabledNote::Explain(note) => format!("{} {note}", control.label),
-            }
-        } else {
-            control.label.clone()
-        };
-        let drawn_label = if control.segments.is_empty() {
-            label
-        } else {
-            control.segmented_label()
-        };
-        let mut cell = text_size(&drawn_label, control_size, text_edge);
-        for (index, segment) in control.segments.iter().enumerate() {
-            let segment_size = text_size(&segment.label, control_size, text_edge);
-            cell.x += TITLE_BAR_SEGMENT_GAP.0 + segment_size.x;
-            cell.y = cell.y.max(segment_size.y);
-            if index + 1 < control.segments.len() {
-                cell.x += text_size(control.segment_separator.text(), control_size, text_edge).x;
-            }
-        }
-        cells.push(cell);
+        cells.push(title_bar_control_size(
+            control,
+            state,
+            fonts,
+            measurer,
+            control_size,
+            text_edge,
+        ));
     }
     if !title_bar.title.is_empty() || !title_bar.controls.is_empty() {
         cells.push(separator);
@@ -915,6 +933,100 @@ fn title_bar_size(
             cells.iter().map(|cell| cell.y).sum::<f32>() + gap + padding,
         )
     }
+}
+
+/// The bounds of a solved layout's root, which is always element 0.
+fn root_bounds(result: &LayoutResult) -> BoundingBox { result.computed[0].bounds }
+
+fn title_bar_control_size(
+    control: &TitleBarControl,
+    state: &TitleBarControlState,
+    fonts: &FontRegistry,
+    measurer: &DiegeticTextMeasurer,
+    size: Pt,
+    edge: PanelTextEdge,
+) -> Vec2 {
+    let unsegmented = control.segments.is_empty();
+    let shortcut = if unsegmented {
+        control.display_shortcut()
+    } else {
+        control.shortcut.clone()
+    };
+    // Only an unsegmented, disabled control shows its disabled note.
+    let shown_note = match &control.disabled_note {
+        DisabledNote::Explain(note)
+            if unsegmented && state.activation(&control.id) == ControlActivation::Disabled =>
+        {
+            Some(note)
+        },
+        _ => None,
+    };
+    let text_size = |text: &str| title_bar_text_size(text, size, edge, fonts, measurer);
+    let mut cell = match shortcut {
+        ShortcutHint::NotAShortcut => {
+            let mut label = if unsegmented {
+                control.label.clone()
+            } else {
+                control.segmented_label()
+            };
+            if let Some(note) = shown_note {
+                label = format!("{label} {note}");
+            }
+            text_size(&label)
+        },
+        ShortcutHint::Keys(mut keys) => {
+            if let Some(note) = shown_note {
+                keys = keys.then_words(note.clone());
+            }
+            let mut builder =
+                LayoutBuilder::with_root(El::row().width(Sizing::FIT).height(Sizing::FIT));
+            let style = TextStyle::new(size);
+            render_keystroke_label(&mut builder, &keys, &style, |word| {
+                super::screen_panel_ink_text(word, style.clone(), fonts, size, edge)
+            });
+            let tree = builder
+                .build()
+                .scaled(Unit::Pixels.to_points(), Unit::Points.to_points());
+            let result = LayoutEngine::new(measurer.measure_fn.clone()).compute(
+                &tree,
+                f32::MAX,
+                f32::MAX,
+                1.0,
+            );
+            let root = root_bounds(&result);
+            Vec2::new(root.width, root.height) / Unit::Pixels.to_points()
+        },
+    };
+    for (index, segment) in control.segments.iter().enumerate() {
+        let segment_size = text_size(&segment.label);
+        cell.x += TITLE_BAR_SEGMENT_GAP.0 + segment_size.x;
+        cell.y = cell.y.max(segment_size.y);
+        if index + 1 < control.segments.len() {
+            cell.x += text_size(control.segment_separator.text()).x;
+        }
+    }
+    cell
+}
+
+fn title_bar_text_size(
+    text: &str,
+    size: Pt,
+    edge: PanelTextEdge,
+    fonts: &FontRegistry,
+    measurer: &DiegeticTextMeasurer,
+) -> Vec2 {
+    let bounds = (measurer.measure_fn)(text, &TextStyle::new(size).as_measure());
+    let (top, bottom) = super::screen_panel_text_edge_trim(fonts, size);
+    let trim = match edge {
+        PanelTextEdge::Interior => 0.0,
+        PanelTextEdge::First => top.0,
+        PanelTextEdge::Last => bottom.0,
+        PanelTextEdge::Both => top.0 + bottom.0,
+    };
+    Vec2::new(
+        bounds.width / Unit::Pixels.to_points(),
+        bounds.height / Unit::Pixels.to_points() - trim,
+    )
 }
 
 fn build_title_bar_tree(
@@ -1056,18 +1168,22 @@ fn plain_control_cell(
     match (activation, &control.disabled_note) {
         (ControlActivation::Disabled, DisabledNote::Explain(note)) => {
             let label = format!("{} {note}", control.label);
-            builder.text(super::screen_panel_ink_text(
-                label, style, fonts, size, edge,
-            ));
+            let shortcut = match control.display_shortcut() {
+                ShortcutHint::Keys(keys) => ShortcutHint::Keys(keys.then_words(note.clone())),
+                ShortcutHint::NotAShortcut => ShortcutHint::NotAShortcut,
+            };
+            render_shortcut_hint(builder, &shortcut, &label, &style, |word| {
+                super::screen_panel_ink_text(word, style.clone(), fonts, size, edge)
+            });
         },
         _ => {
-            builder.text(super::screen_panel_ink_text(
+            render_shortcut_hint(
+                builder,
+                &control.display_shortcut(),
                 &control.label,
-                style,
-                fonts,
-                size,
-                edge,
-            ));
+                &style,
+                |word| super::screen_panel_ink_text(word, style.clone(), fonts, size, edge),
+            );
         },
     }
 }
@@ -1090,13 +1206,13 @@ fn segmented_control_cell(
     };
     let row = El::row().gap(TITLE_BAR_SEGMENT_GAP).align_y(AlignY::Center);
     builder.with(row, |builder| {
-        builder.text(super::screen_panel_ink_text(
-            control.segmented_label(),
-            controls.inactive.clone(),
-            fonts,
-            size,
-            edge,
-        ));
+        render_shortcut_hint(
+            builder,
+            &control.shortcut,
+            &control.segmented_label(),
+            &controls.inactive,
+            |word| super::screen_panel_ink_text(word, controls.inactive.clone(), fonts, size, edge),
+        );
         for (index, segment) in control.segments.iter().enumerate() {
             let style = controls.for_activation(state.activation(&segment.id));
             builder.with(El::row().align_y(AlignY::Center), |builder| {
@@ -1154,6 +1270,37 @@ mod tests {
     use hana_diegetic::Unit;
 
     use super::*;
+
+    #[test]
+    fn title_bar_shortcut_fit_measures_icons_and_disabled_notes() -> Result<(), String> {
+        let fonts = FontRegistry::new().map_err(|error| error.to_string())?;
+        let measurer = DiegeticTextMeasurer::default();
+        let key = "ctrl-alt-shift-home"
+            .parse::<Keystroke>()
+            .map_err(|error| error.to_string())?;
+        for orientation in [
+            TitleBarOrientation::Horizontal,
+            TitleBarOrientation::Vertical,
+        ] {
+            let control =
+                TitleBarControl::shortcut(key, "Home").with_disabled_note("(unavailable)");
+            let bar = TitleBar::new()
+                .with_orientation(orientation)
+                .control(control);
+            let mut state = TitleBarControlState::from_title_bar(&bar);
+            for activation in [ControlActivation::Inactive, ControlActivation::Disabled] {
+                state.set_active(&bar.controls[0].id, activation);
+                let expected =
+                    solved_rung_sizes(std::slice::from_ref(&bar), &state, &fonts, orientation)?[0];
+                let fitted = title_bar_size(&bar, &state, &fonts, &measurer);
+                assert!(
+                    (expected - fitted).abs().max_element() <= 0.5,
+                    "{orientation:?}, {activation:?}: measured {fitted:?}, solved {expected:?}"
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn explicit_home_control_is_spawned_once() -> Result<(), String> {
@@ -1335,7 +1482,7 @@ mod tests {
                 .get::<ComputedDiegeticPanel>(entity)
                 .and_then(|panel| panel.layout().solved())
                 .ok_or("title bar rung did not solve")?;
-            let root = solved.computed[0].bounds;
+            let root = super::root_bounds(solved);
             sizes.push(Vec2::new(root.width, root.height) / Unit::Pixels.to_points());
             for command in &solved.commands {
                 let debug = format!("{:?}", command.kind);
@@ -1456,8 +1603,8 @@ mod tests {
                 .and_then(|panel| panel.layout().solved())
                 .ok_or("title bar did not solve")?;
             let extent = match orientation {
-                TitleBarOrientation::Horizontal => solved.computed[0].bounds.width,
-                TitleBarOrientation::Vertical => solved.computed[0].bounds.height,
+                TitleBarOrientation::Horizontal => super::root_bounds(solved).width,
+                TitleBarOrientation::Vertical => super::root_bounds(solved).height,
             } / Unit::Pixels.to_points();
             if *visibility == Visibility::Hidden {
                 assert!(size < threshold, "{orientation:?} hidden at {size}");
@@ -1597,7 +1744,7 @@ mod tests {
             .get::<ComputedDiegeticPanel>(entity)
             .and_then(|panel| panel.layout().solved())
             .ok_or("title bar did not solve")?;
-        let root = solved.computed[0].bounds;
+        let root = super::root_bounds(solved);
         let pixels_per_point = 1.0 / Unit::Pixels.to_points();
         let drawn = app
             .world()
@@ -1740,7 +1887,7 @@ mod tests {
                 drawn.contains(&format!("text: {expected_title:?}")),
                 "at {width}, expected {expected_title:?} in {drawn}"
             );
-            let drawn_width = solved.computed[0].bounds.width / Unit::Pixels.to_points();
+            let drawn_width = super::root_bounds(solved).width / Unit::Pixels.to_points();
             assert!(
                 2.0_f32.mul_add(SCREEN_PANEL_WINDOW_INSET, drawn_width) <= f32::from(width) + 0.5,
                 "bar width {drawn_width} exceeds window width {width}"
@@ -1787,7 +1934,7 @@ mod tests {
                 .get::<ComputedDiegeticPanel>(entity)
                 .and_then(|panel| panel.layout().solved())
                 .ok_or("title bar did not solve")?;
-            let root = solved.computed[0].bounds;
+            let root = super::root_bounds(solved);
             let point_per_pixel = Unit::Pixels.to_points();
             let font = fonts
                 .font(FontId::MONOSPACE)
@@ -1879,7 +2026,7 @@ mod tests {
             .get::<ComputedDiegeticPanel>(entity)
             .and_then(|panel| panel.layout().solved())
             .ok_or("narrow bar did not solve")?;
-        let width = solved.computed[0].bounds.width / Unit::Pixels.to_points();
+        let width = super::root_bounds(solved).width / Unit::Pixels.to_points();
         let left = super::super::separation::inset_anchor_top_left(
             bevy::prelude::Vec2::new(400.0, 500.0),
             bevy::prelude::Vec2::new(width, 50.0),
@@ -1945,7 +2092,7 @@ mod tests {
                 .get::<ComputedDiegeticPanel>(entity)
                 .and_then(|panel| panel.layout().solved())
                 .ok_or("title bar did not solve")?;
-            let drawn_width = solved.computed[0].bounds.width / Unit::Pixels.to_points();
+            let drawn_width = super::root_bounds(solved).width / Unit::Pixels.to_points();
             assert!(
                 (drawn_width - predicted_width).abs() <= 0.5,
                 "{title:?} at {width}: predicted {predicted_width}, drawn {drawn_width}"

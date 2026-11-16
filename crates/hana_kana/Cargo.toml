@@ -16,16 +16,20 @@ version           = "0.6.0-dev"
 workspace = true
 
 [features]
-default = ["math"]
-math    = []
-tween   = ["dep:bevy_tween"]
+bevy    = ["dep:bevy", "dep:bevy_lookup_curve"]
+default = ["bevy", "math"]
+math    = ["bevy"]
+tween   = ["bevy", "dep:bevy_tween"]
 
 [dependencies]
-bevy              = { workspace = true, features = ["bevy_asset", "bevy_log"] }
-bevy_lookup_curve = { workspace = true }
-bevy_tween        = { workspace = true, optional = true }
-serde             = { workspace = true }
-thiserror         = { workspace = true }
+bevy = { workspace = true, features = [
+  "bevy_asset",
+  "bevy_log",
+], optional = true }
+bevy_lookup_curve = { workspace = true, optional = true }
+bevy_tween = { workspace = true, optional = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 bevy          = { workspace = true, features = ["3d"] }

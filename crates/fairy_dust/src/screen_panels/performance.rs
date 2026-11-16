@@ -60,15 +60,24 @@ impl DerefMut for GpuMeterPanel {
     fn deref_mut(&mut self) -> &mut Self::Target { &mut self.panel }
 }
 
+use hana_diegetic::Text;
+use hana_diegetic::render_shortcut_hint;
+use hana_rubric::KeystrokeLabel;
+use hana_rubric::ShortcutHint;
+
 /// One label/value group in a reusable instrumentation stats panel.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StatsPanelRow {
     /// Left-side row label.
-    pub label:   String,
+    pub label:          String,
     /// Right-side current value.
-    pub value:   String,
+    pub value:          String,
     /// Optional explanatory detail lines below the label/value row.
-    pub details: Vec<String>,
+    pub details:        Vec<String>,
+    /// Typed shortcut used as the row label, when present.
+    pub label_shortcut: ShortcutHint,
+    /// Typed shortcut used as the row value, when present.
+    pub value_shortcut: ShortcutHint,
 }
 
 /// One named group of related [`StatsPanelRow`] values.
@@ -85,10 +94,28 @@ impl StatsPanelRow {
     #[must_use]
     pub fn new(label: impl Into<String>, value: impl Into<String>) -> Self {
         Self {
-            label:   label.into(),
-            value:   value.into(),
-            details: Vec::new(),
+            label:          label.into(),
+            value:          value.into(),
+            details:        Vec::new(),
+            label_shortcut: ShortcutHint::NotAShortcut,
+            value_shortcut: ShortcutHint::NotAShortcut,
         }
+    }
+
+    /// Replaces the label with a shortcut built from the actual binding.
+    #[must_use]
+    pub fn with_label_shortcut(mut self, label: KeystrokeLabel) -> Self {
+        self.label = label.words(" ");
+        self.label_shortcut = ShortcutHint::Keys(label);
+        self
+    }
+
+    /// Replaces the value with a shortcut built from the actual binding.
+    #[must_use]
+    pub fn with_value_shortcut(mut self, label: KeystrokeLabel) -> Self {
+        self.value = label.words(" ");
+        self.value_shortcut = ShortcutHint::Keys(label);
+        self
     }
 
     /// Adds one detail line below the label/value row.
@@ -430,7 +457,14 @@ fn stats_group(builder: &mut LayoutBuilder, row: &StatsPanelRow, text_sizes: Sta
                             .height(Sizing::FIT)
                             .alignment(AlignX::Left, AlignY::Center),
                         |builder| {
-                            builder.text((&row.label, stats_header_label_style(text_sizes)));
+                            let style = stats_header_label_style(text_sizes);
+                            render_shortcut_hint(
+                                builder,
+                                &row.label_shortcut,
+                                &row.label,
+                                &style,
+                                |words| Text::new(words, style.clone()),
+                            );
                         },
                     );
                     builder.with(
@@ -439,7 +473,14 @@ fn stats_group(builder: &mut LayoutBuilder, row: &StatsPanelRow, text_sizes: Sta
                             .height(Sizing::FIT)
                             .alignment(AlignX::Right, AlignY::Center),
                         |builder| {
-                            builder.text((&row.value, stats_header_value_style(text_sizes)));
+                            let style = stats_header_value_style(text_sizes);
+                            render_shortcut_hint(
+                                builder,
+                                &row.value_shortcut,
+                                &row.value,
+                                &style,
+                                |words| Text::new(words, style.clone()),
+                            );
                         },
                     );
                 },

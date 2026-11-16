@@ -3,7 +3,7 @@ use bevy::prelude::TextFont;
 
 use super::super::values::CurrentValues;
 use super::super::values::RestoredValues;
-use super::span::add_span;
+use super::span;
 use crate::constants::ACTUAL_COLUMN_TITLE;
 use crate::constants::CURRENT_COLUMN_TITLE;
 use crate::constants::DEFAULT_COLOR;
@@ -123,7 +123,7 @@ fn add_restored_header(
             "", RESTORED_COLUMN_TITLE, CURRENT_COLUMN_TITLE
         )
     };
-    add_span(child_spawner, text_font, &header, DEFAULT_COLOR);
+    span::add_span(child_spawner, text_font, &header, DEFAULT_COLOR);
 }
 
 fn add_position_rows(
@@ -250,7 +250,7 @@ fn add_scale_row(
     column_width: usize,
 ) {
     if cached_mismatch_state.is_none() {
-        add_span(
+        span::add_span(
             child_spawner,
             text_font,
             &format!(
@@ -368,7 +368,7 @@ fn add_standard_comparison_row(
     };
 
     // `comparison_row.label` and `comparison_row.restored` use `DEFAULT_COLOR`.
-    add_span(
+    span::add_span(
         child_spawner,
         text_font,
         &format!(
@@ -380,7 +380,7 @@ fn add_standard_comparison_row(
     );
     // `comparison_row.current` uses `MISMATCH_COLOR` when it differs from
     // `comparison_row.restored`.
-    add_span(
+    span::add_span(
         child_spawner,
         text_font,
         &format!("{}\n", comparison_row.current),
@@ -409,7 +409,7 @@ fn add_extended_comparison_row(
     };
 
     // `comparison_row.label` and `comparison_row.restored` use `DEFAULT_COLOR`.
-    add_span(
+    span::add_span(
         child_spawner,
         text_font,
         &format!(
@@ -421,14 +421,14 @@ fn add_extended_comparison_row(
     );
     // `comparison_row.current` uses `MISMATCH_COLOR` when it differs from
     // `comparison_row.restored`.
-    add_span(
+    span::add_span(
         child_spawner,
         text_font,
         &format!("{current:<column_width$}", current = comparison_row.current),
         current_color,
     );
     // `comparison_mismatch.expected` uses `DEFAULT_COLOR`.
-    add_span(
+    span::add_span(
         child_spawner,
         text_font,
         &format!(
@@ -438,7 +438,7 @@ fn add_extended_comparison_row(
         DEFAULT_COLOR,
     );
     // `comparison_mismatch.actual` uses `MISMATCH_WARN_COLOR` on mismatch.
-    add_span(
+    span::add_span(
         child_spawner,
         text_font,
         &format!("{}\n", comparison_mismatch.actual),

@@ -227,6 +227,9 @@ impl OrdinaryKey {
     /// non-`const`, so a `const` site cannot use it without unwrapping.
     pub const KEY_P: Self = Self(KeyCode::KeyP);
 
+    /// The Space key, for shared binding and shortcut-label declarations.
+    pub const SPACE: Self = Self(KeyCode::Space);
+
     /// Returns the validated physical key code.
     #[must_use]
     pub const fn key_code(self) -> KeyCode { self.0 }
@@ -366,16 +369,19 @@ impl Keystroke {
     #[must_use]
     pub const fn primary_trigger(self) -> PrimaryTrigger { self.primary_trigger }
 
-    /// Returns this keystroke as on-screen hint text: each part of its `Display` form capitalized
-    /// and joined by `+`, so `secondary-p` reads `Cmd+P` on macOS and `Ctrl+P` elsewhere.
+    /// Returns the platform-ordered modifier symbols and ordinary key words for a UI hint.
     #[must_use]
-    pub fn label(self) -> String {
-        // No modifier or key name contains `-`, so it only separates the parts `Display` writes.
-        self.to_string()
-            .split('-')
-            .map(capitalized)
-            .collect::<Vec<_>>()
-            .join("+")
+    pub fn label(self) -> KeystrokeLabel {
+        let mut label = KeystrokeLabel::from_modifiers(self.modifiers);
+        match self.primary_trigger {
+            PrimaryTrigger::OrdinaryKey(key) => {
+                label
+                    .parts
+                    .push(KeystrokeLabelPart::Word(capitalized(&key.to_string())));
+            },
+            PrimaryTrigger::ModifierFamily(family) => label.push_modifier(family),
+        }
+        label
     }
 
     /// Compares keystrokes by their platform-independent binding representation.
@@ -391,6 +397,172 @@ impl Keystroke {
                     .structural_order()
                     .cmp(&other.primary_trigger.structural_order())
             })
+    }
+}
+
+/// A modifier symbol selected by the shortcut label source, independent of a UI toolkit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModifierSymbol {
+    /// Lucide `ChevronUp`.
+    Control,
+    /// Lucide `Option`.
+    Alt,
+    /// Lucide `ArrowBigUp`.
+    Shift,
+    /// Lucide `Command`, used only for the macOS platform modifier.
+    Command,
+}
+
+impl ModifierSymbol {
+    const fn word(self) -> &'static str {
+        match self {
+            Self::Control => "Ctrl",
+            Self::Alt => "Alt",
+            Self::Shift => "Shift",
+            Self::Command => "Cmd",
+        }
+    }
+}
+
+/// One visible element of a shortcut: a modifier symbol or unchanged key/action words.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KeystrokeLabelPart {
+    /// Draw through the UI's bundled Lucide icon path.
+    Symbol(ModifierSymbol),
+    /// Draw as ordinary text; this includes Home, Super and Win.
+    Word(String),
+    /// A gap between successive keystrokes rather than within one chord.
+    SequenceSeparator,
+}
+
+/// Whether display text is accompanied by an authoritative typed shortcut.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum ShortcutHint {
+    /// Plain status or descriptive text with no shortcut to render.
+    #[default]
+    NotAShortcut,
+    /// A label constructed from the actual keystroke or binding.
+    Keys(KeystrokeLabel),
+}
+
+/// The single presentation source for shortcut modifiers and their platform order.
+///
+/// UI consumers render the typed parts. `Display` is the textual alternative for logs and
+/// accessibility, retaining the familiar `Ctrl+Home` spelling without selecting an icon font.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct KeystrokeLabel {
+    parts: Vec<KeystrokeLabelPart>,
+}
+
+impl KeystrokeLabel {
+    /// Returns the ordered elements a shortcut renderer draws.
+    #[must_use]
+    pub fn parts(&self) -> &[KeystrokeLabelPart] { &self.parts }
+
+    /// Labels a modifier set, including modifier gates on pointer and gamepad controls.
+    #[must_use]
+    pub fn from_modifiers(modifiers: Modifiers) -> Self {
+        let mut label = Self::default();
+        for (enabled, family) in [
+            (modifiers.has_control(), ModifierFamily::Control),
+            (modifiers.has_alt(), ModifierFamily::Alt),
+            (modifiers.has_shift(), ModifierFamily::Shift),
+            (modifiers.has_platform(), ModifierFamily::Platform),
+        ] {
+            if enabled {
+                label.push_modifier(family);
+            }
+        }
+        label
+    }
+
+    /// Labels a sequence without turning its canonical spelling into display input.
+    #[must_use]
+    pub fn from_sequence(sequence: &KeystrokeSequence) -> Self {
+        let mut label = Self::default();
+        for (index, keystroke) in sequence.iter().enumerate() {
+            if index != 0 {
+                label.parts.push(KeystrokeLabelPart::SequenceSeparator);
+            }
+            label.parts.extend(keystroke.label().parts);
+        }
+        label
+    }
+
+    /// Adds plain words beside a shortcut, preserving its typed modifier symbols.
+    #[must_use]
+    pub fn then_words(mut self, words: impl Into<String>) -> Self {
+        self.parts.push(KeystrokeLabelPart::Word(words.into()));
+        self
+    }
+
+    /// Adds another typed hint, for compound controls with separate gates or directions.
+    #[must_use]
+    pub fn then(mut self, other: Self) -> Self {
+        self.parts.extend(other.parts);
+        self
+    }
+
+    /// Plain words in a compound hint, with no modifier interpretation.
+    #[must_use]
+    pub fn plain(words: impl Into<String>) -> Self {
+        Self {
+            parts: vec![KeystrokeLabelPart::Word(words.into())],
+        }
+    }
+
+    /// Returns a text-only alternative with the caller's word separator.
+    #[must_use]
+    pub fn words(&self, separator: &str) -> String {
+        let mut text = String::new();
+        let mut between_parts = false;
+        for part in &self.parts {
+            let word = match part {
+                KeystrokeLabelPart::Symbol(symbol) => symbol.word(),
+                KeystrokeLabelPart::Word(word) => word,
+                KeystrokeLabelPart::SequenceSeparator => {
+                    text.push(' ');
+                    between_parts = false;
+                    continue;
+                },
+            };
+            if between_parts {
+                text.push_str(separator);
+            }
+            text.push_str(word);
+            between_parts = true;
+        }
+        text
+    }
+
+    fn push_modifier(&mut self, family: ModifierFamily) {
+        let symbol = match family {
+            ModifierFamily::Control => ModifierSymbol::Control,
+            ModifierFamily::Alt => ModifierSymbol::Alt,
+            ModifierFamily::Shift => ModifierSymbol::Shift,
+            ModifierFamily::Platform => {
+                if cfg!(target_os = "macos") {
+                    ModifierSymbol::Command
+                } else {
+                    self.parts.push(KeystrokeLabelPart::Word(
+                        if cfg!(target_os = "windows") {
+                            "Win"
+                        } else {
+                            "Super"
+                        }
+                        .to_owned(),
+                    ));
+                    return;
+                }
+            },
+        };
+        self.parts.push(KeystrokeLabelPart::Symbol(symbol));
+    }
+}
+
+impl Display for KeystrokeLabel {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.words("+"))
     }
 }
 
@@ -757,10 +929,10 @@ mod tests {
 
     #[test]
     fn label_capitalizes_each_part_and_joins_them_with_plus() -> Result<(), KeystrokeParseError> {
-        assert_eq!(parsed("shift-ctrl-r")?.label(), "Ctrl+Shift+R");
-        assert_eq!(parsed("alt-minus")?.label(), "Alt+Minus");
-        assert_eq!(parsed("f12")?.label(), "F12");
-        assert_eq!(parsed("shift")?.label(), "Shift");
+        assert_eq!(parsed("shift-ctrl-r")?.label().to_string(), "Ctrl+Shift+R");
+        assert_eq!(parsed("alt-minus")?.label().to_string(), "Alt+Minus");
+        assert_eq!(parsed("f12")?.label().to_string(), "F12");
+        assert_eq!(parsed("shift")?.label().to_string(), "Shift");
 
         Ok(())
     }

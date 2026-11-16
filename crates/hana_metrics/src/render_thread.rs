@@ -113,13 +113,17 @@ pub(super) fn install(app: &mut App, shared: SharedTiming) {
             mark_after_graph
                 .after(RenderSystems::Render)
                 .before(RenderSystems::Cleanup),
-            publish_render.after(RenderSystems::PostCleanup),
+            publish_render
+                .after(RenderSystems::Cleanup)
+                .after(RenderSystems::PostCleanup),
         ),
     );
     render_app.add_systems(
         RenderGraph,
         (
-            mark_graph_start.in_set(RenderGraphSystems::Begin),
+            mark_graph_start
+                .in_set(RenderGraphSystems::Begin)
+                .before(RenderGraphSystems::Render),
             mark_graph_after_render
                 .after(RenderGraphSystems::Render)
                 .before(RenderGraphSystems::Submit),

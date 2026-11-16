@@ -8,11 +8,14 @@ use bevy::ecs::system::SystemParam;
 #[cfg(test)]
 use bevy::prelude::App;
 use bevy::prelude::Camera;
+use bevy::prelude::Children;
 use bevy::prelude::Component;
 use bevy::prelude::Entity;
 use bevy::prelude::GlobalTransform;
+use bevy::prelude::InheritedVisibility;
 use bevy::prelude::Query;
 use bevy::prelude::Rect;
+use bevy::prelude::Res;
 #[cfg(test)]
 use bevy::prelude::Transform;
 use bevy::prelude::Vec2;
@@ -20,6 +23,7 @@ use bevy::prelude::Vec3;
 #[cfg(test)]
 use bevy::prelude::Window;
 use bevy::prelude::With;
+use bevy::prelude::Without;
 use bevy::transform::helper::TransformHelper;
 #[cfg(test)]
 use bevy::window::PrimaryWindow;
@@ -39,8 +43,11 @@ use super::viewport;
 use super::viewport::HostBorder;
 use super::viewport::OrientedScreenRect;
 use super::viewport::TooltipSlideBounds;
+use super::world::WorldTooltipHelpGaps;
 use crate::layout::Anchor;
 use crate::layout::BoundingBox;
+use crate::layout::RenderCommandKind;
+use crate::layout::TextInkMeasurement;
 use crate::layout::Unit;
 use crate::panel::ComputedDiegeticPanel;
 use crate::panel::DiegeticPanel;
@@ -56,6 +63,7 @@ use crate::panel::PanelSpace;
 use crate::panel::WidgetEntity;
 #[cfg(test)]
 use crate::panel::World;
+use crate::text::FontRegistry;
 use crate::widgets::PanelWidget;
 use crate::widgets::TooltipBoundary;
 use crate::widgets::WidgetAnchorRect;
@@ -88,6 +96,8 @@ pub(super) enum CardTooltipPlacement {
     #[default]
     InsideOrOutside,
     InsideOnly,
+    /// Clear the authored obstacles beside the target, independent of the card edge.
+    TargetAdjacent,
 }
 
 impl TooltipCardOccupiedRegions {
@@ -119,6 +129,21 @@ pub(super) enum TargetControlRow<Bounds> {
 }
 
 impl TooltipCardOccupiedRegions {
+    /// Place beside the target using the ordinary control-tooltip gap and viewport
+    /// search. The host's margin reserves may be crossed; content remains occupied.
+    #[must_use]
+    pub fn beside_target(mut self, crossable_margins: &[Rect]) -> Self {
+        self.occupied = self
+            .occupied
+            .iter()
+            .filter(|region| !crossable_margins.contains(region))
+            .copied()
+            .collect();
+        self.placement = CardTooltipPlacement::TargetAdjacent;
+        self.target_row = TargetControlRow::TargetOnly;
+        self
+    }
+
     /// Keeps the complete help box on the card, even if it must overlap controls.
     #[must_use]
     pub const fn inside_only(mut self) -> Self {
@@ -132,10 +157,23 @@ impl TooltipCardOccupiedRegions {
 /// tooltip boundary.
 #[derive(SystemParam)]
 pub(in crate::widgets::tooltip) struct WorldTooltipCardSources<'w, 's> {
+    fonts:              Option<Res<'w, FontRegistry>>,
     card_regions:       Query<'w, 's, &'static TooltipCardOccupiedRegions>,
     transforms:         Query<'w, 's, &'static GlobalTransform>,
     tooltip_boundaries: Query<'w, 's, &'static TooltipBoundary>,
     panel_layouts:      Query<'w, 's, &'static ComputedDiegeticPanel>,
+    children:           Query<'w, 's, &'static Children>,
+    text_panels: Query<
+        'w,
+        's,
+        (
+            &'static DiegeticPanel,
+            &'static ComputedDiegeticPanel,
+            &'static GlobalTransform,
+            &'static InheritedVisibility,
+        ),
+        Without<MaterializedTooltip>,
+    >,
 }
 
 /// Where a world tooltip may go.
@@ -144,6 +182,8 @@ pub(super) enum WorldTooltipPlacementArea {
     /// The placement area, keeping clear of the border of the panel holding a
     /// target inside a marked element.
     Viewport(TooltipSlideBounds),
+    /// A card target using viewport space while clearing its neighbouring content.
+    AdjacentCard(TooltipSlideBounds),
     /// A card whose occupied regions the help must clear.
     Card {
         bounds:         PanelScreenBounds,
@@ -160,10 +200,122 @@ impl WorldTooltipPlacementArea {
     /// keeps its card's own rule.
     pub(super) fn clears_border(&self, painted: PanelScreenBounds) -> bool {
         match self {
-            Self::Viewport(bounds) => bounds.clears_host_border(painted),
+            Self::Viewport(bounds) | Self::AdjacentCard(bounds) => {
+                bounds.clears_host_border(painted)
+            },
             Self::Card { .. } => true,
         }
     }
+}
+
+impl WorldTooltipCardSources<'_, '_> {
+    /// Content obstacles for a mesh target using the same placement path as a control.
+    pub(super) fn target_obstacles(
+        &self,
+        target: Entity,
+        camera: &TooltipCameraView<'_>,
+        target_bounds: PanelScreenBounds,
+    ) -> Option<Vec<PanelScreenBounds>> {
+        let Ok(regions) = self.card_regions.get(target) else {
+            return Some(Vec::new());
+        };
+        if regions.placement != CardTooltipPlacement::TargetAdjacent {
+            return Some(Vec::new());
+        }
+        let transform = self.transforms.get(regions.card).ok()?;
+        let occupied = regions
+            .occupied
+            .iter()
+            .map(|rect| {
+                projected_points_bounds(
+                    [
+                        rect.min,
+                        Vec2::new(rect.max.x, rect.min.y),
+                        rect.max,
+                        Vec2::new(rect.min.x, rect.max.y),
+                    ]
+                    .map(|point| transform.transform_point(point.extend(0.0))),
+                    camera,
+                )
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let centre = target_bounds.top_left() + target_bounds.size() * 0.5;
+        // A region enclosing the source is its backing, not a neighbouring
+        // control. The source's resolved anchors already protect its own ink.
+        let mut obstacles = occupied
+            .into_iter()
+            .filter(|region| {
+                let min = region.top_left();
+                let max = min + region.size();
+                !(centre.cmpge(min).all() && centre.cmple(max).all())
+            })
+            .collect::<Vec<_>>();
+        obstacles.extend(self.card_text_obstacles(regions.card, camera));
+        Some(obstacles)
+    }
+
+    fn card_text_obstacles(
+        &self,
+        card: Entity,
+        camera: &TooltipCameraView<'_>,
+    ) -> Vec<PanelScreenBounds> {
+        let mut obstacles = Vec::new();
+        for descendant in self.children.iter_descendants(card) {
+            let Ok((panel, computed, transform, visible)) = self.text_panels.get(descendant) else {
+                continue;
+            };
+            if !visible.get() {
+                continue;
+            }
+            let (Ok(plane), Some(layout)) = (
+                PanelPlane::from_panel(panel, transform),
+                computed.layout().solved(),
+            ) else {
+                continue;
+            };
+            let scale = plane.size()
+                / (Vec2::new(panel.width(), panel.height()) * panel.layout_unit().to_points());
+            let origin = plane.point(Anchor::TopLeft);
+            for command in &layout.commands {
+                let RenderCommandKind::Text { text, config } = &command.kind else {
+                    continue;
+                };
+                let bounds = command.bounds;
+                // Line boxes include blank leading. Protect the glyphs without
+                // rejecting an adjacent tooltip that uses that empty space.
+                let ink = self
+                    .fonts
+                    .as_ref()
+                    .and_then(|fonts| fonts.measure_ink(text, &config.as_measure()).ok());
+                let (min, max) = match ink {
+                    Some(TextInkMeasurement::Visible(ink)) => (
+                        Vec2::new(bounds.x + ink.left, bounds.y + ink.top),
+                        Vec2::new(bounds.x + ink.right, bounds.y + ink.bottom),
+                    ),
+                    Some(TextInkMeasurement::NoVisibleInk) => continue,
+                    None => (
+                        Vec2::new(bounds.x, bounds.y),
+                        Vec2::new(bounds.x + bounds.width, bounds.y + bounds.height),
+                    ),
+                };
+                let min = min * scale;
+                let max = max * scale;
+                let points = [min, Vec2::new(max.x, min.y), max, Vec2::new(min.x, max.y)]
+                    .map(|point| origin + plane.right() * point.x - plane.up() * point.y);
+                if let Some(bounds) = projected_points_bounds(points, camera) {
+                    obstacles.push(bounds);
+                }
+            }
+        }
+        obstacles
+    }
+}
+
+/// The attachment's gap, or the shared gap for a geometry target without a card.
+#[derive(Clone, Copy)]
+pub(super) enum WorldTooltipGap {
+    Authored,
+    DrawnLabel(f32),
 }
 
 #[derive(Clone)]
@@ -174,6 +326,7 @@ pub(super) struct WorldTooltipTarget {
     pub(super) world_per_layout_unit:   Vec2,
     pub(super) world_per_layout_unit_z: f32,
     pub(super) placement_area:          WorldTooltipPlacementArea,
+    pub(super) gap:                     WorldTooltipGap,
 }
 
 impl WorldTooltipTarget {
@@ -226,8 +379,9 @@ pub(super) enum WorldTargetChange {
 pub(super) struct TooltipCameraView<'a> {
     pub(super) camera:           &'a Camera,
     pub(super) global_transform: &'a GlobalTransform,
-    pub(super) window:           Entity,
+    pub(super) window:           Option<Entity>,
     pub(super) viewport:         Rect,
+    pub(super) inputs_changed:   bool,
 }
 
 pub(super) fn panel_local_anchor(panel: &DiegeticPanel, anchor: Anchor) -> Vec3 {
@@ -261,9 +415,53 @@ pub(super) fn projected_points_bounds<const N: usize>(
     PanelScreenBounds::new(minimum, maximum - minimum).ok()
 }
 
+fn card_placement_area(
+    regions: &TooltipCardOccupiedRegions,
+    transform: &GlobalTransform,
+    gap_meters: f32,
+    front_clearance_meters: f32,
+    camera: &TooltipCameraView<'_>,
+) -> Option<WorldTooltipPlacementArea> {
+    let card_normal = transform.affine().transform_vector3(Vec3::Z).normalize();
+    let project = |rect: Rect, depth: f32| {
+        projected_points_bounds(
+            [
+                Vec3::new(rect.min.x, rect.min.y, 0.0),
+                Vec3::new(rect.max.x, rect.min.y, 0.0),
+                Vec3::new(rect.max.x, rect.max.y, 0.0),
+                Vec3::new(rect.min.x, rect.max.y, 0.0),
+            ]
+            .map(|point| transform.transform_point(point) + card_normal * depth),
+            camera,
+        )
+    };
+    let bounds = project(regions.card_rect, 0.0)?;
+    let outside_bounds = project(regions.card_rect, front_clearance_meters)?;
+    let occupied = regions
+        .occupied
+        .iter()
+        .copied()
+        .map(|rect| project(rect, 0.0))
+        .collect::<Option<Vec<_>>>()?;
+    let target_row = match regions.target_row {
+        TargetControlRow::TargetOnly => TargetControlRow::TargetOnly,
+        TargetControlRow::CompleteRow(row) => TargetControlRow::CompleteRow(project(row, 0.0)?),
+    };
+    let card_scale = transform.affine().transform_vector3(Vec3::X).length();
+    let gap_pixels = gap_meters / card_scale * outside_bounds.size().x / regions.card_rect.width();
+    Some(WorldTooltipPlacementArea::Card {
+        bounds,
+        outside_bounds,
+        occupied,
+        target_row,
+        gap_pixels,
+        placement: regions.placement,
+    })
+}
+
 pub(super) fn world_tooltip_target(
     materialized: &MaterializedTooltip,
-    gap_meters: f32,
+    help_gaps: WorldTooltipHelpGaps,
     front_clearance_meters: f32,
     camera: &TooltipCameraView<'_>,
     panels: &Query<(&DiegeticPanel, &GlobalTransform)>,
@@ -272,47 +470,23 @@ pub(super) fn world_tooltip_target(
     card_sources: &WorldTooltipCardSources<'_, '_>,
 ) -> Option<WorldTooltipTarget> {
     let placement_area = match card_sources.card_regions.get(materialized.target) {
-        Ok(regions) => {
+        Ok(regions) if regions.placement != CardTooltipPlacement::TargetAdjacent => {
             let transform = card_sources.transforms.get(regions.card).ok()?;
-            let card_normal = transform.affine().transform_vector3(Vec3::Z).normalize();
-            let project = |rect: Rect, depth: f32| {
-                projected_points_bounds(
-                    [
-                        Vec3::new(rect.min.x, rect.min.y, 0.0),
-                        Vec3::new(rect.max.x, rect.min.y, 0.0),
-                        Vec3::new(rect.max.x, rect.max.y, 0.0),
-                        Vec3::new(rect.min.x, rect.max.y, 0.0),
-                    ]
-                    .map(|point| transform.transform_point(point) + card_normal * depth),
-                    camera,
-                )
-            };
-            let bounds = project(regions.card_rect, 0.0)?;
-            let outside_bounds = project(regions.card_rect, front_clearance_meters)?;
-            let occupied = regions
-                .occupied
-                .iter()
-                .copied()
-                .map(|rect| project(rect, 0.0))
-                .collect::<Option<Vec<_>>>()?;
-            let target_row = match regions.target_row {
-                TargetControlRow::TargetOnly => TargetControlRow::TargetOnly,
-                TargetControlRow::CompleteRow(row) => {
-                    TargetControlRow::CompleteRow(project(row, 0.0)?)
-                },
-            };
-            let card_scale = transform.affine().transform_vector3(Vec3::X).length();
-            let gap_pixels =
-                gap_meters / card_scale * outside_bounds.size().x / regions.card_rect.width();
-            WorldTooltipPlacementArea::Card {
-                bounds,
-                outside_bounds,
-                occupied,
-                target_row,
-                gap_pixels,
-                placement: regions.placement,
-            }
+            card_placement_area(
+                regions,
+                transform,
+                help_gaps.card_meters,
+                front_clearance_meters,
+                camera,
+            )?
         },
+        Ok(_) => WorldTooltipPlacementArea::AdjacentCard(world_slide_bounds(
+            materialized.target,
+            camera,
+            panels,
+            widgets,
+            card_sources,
+        )),
         Err(_) => WorldTooltipPlacementArea::Viewport(world_slide_bounds(
             materialized.target,
             camera,
@@ -335,6 +509,7 @@ pub(super) fn world_tooltip_target(
             world_per_layout_unit,
             world_per_layout_unit_z: world_per_layout_unit.x,
             placement_area,
+            gap: WorldTooltipGap::Authored,
         });
     }
     let (geometry, global_transform) = anchor_geometry.get(materialized.target).ok()?;
@@ -351,6 +526,15 @@ pub(super) fn world_tooltip_target(
             ))
         })
         .unwrap_or_else(|| Vec2::splat(materialized.layout_unit.meters_per_unit()));
+    let attachment = materialized.authored_attachment;
+    let default_offset =
+        viewport::default_gap_offset(attachment.source_anchor(), attachment.target_anchor());
+    let gap = match (&placement_area, attachment.offset() == default_offset) {
+        (WorldTooltipPlacementArea::Viewport(_), true) => {
+            WorldTooltipGap::DrawnLabel(help_gaps.geometry_meters)
+        },
+        _ => WorldTooltipGap::Authored,
+    };
     viewport::valid_screen_scale(world_per_layout_unit).then_some(WorldTooltipTarget {
         bounds: projected_world_anchors(&anchors, camera)?,
         anchors,
@@ -358,6 +542,7 @@ pub(super) fn world_tooltip_target(
         world_per_layout_unit,
         world_per_layout_unit_z: world_per_layout_unit.x,
         placement_area,
+        gap,
     })
 }
 
@@ -620,6 +805,44 @@ mod tests {
         widget
     }
 
+    fn assert_materialized_world_target(app: &App, controller: Entity, target: Entity) {
+        assert_eq!(
+            app.world()
+                .get::<MaterializedTooltip>(controller)
+                .map(MaterializedTooltip::layout_unit),
+            Some(Unit::Points)
+        );
+        assert_eq!(
+            app.world()
+                .get::<AnchoredTo>(controller)
+                .map(AnchoredTo::target),
+            Some(target)
+        );
+        let diagnostics = app
+            .world()
+            .resource::<AnchorResolveDiagnostics>()
+            .current()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            app.world().get::<TooltipReadiness>(controller),
+            Some(&TooltipReadiness::Ready),
+            "controller {controller:?}: placement={:?}, diagnostics={diagnostics:?}",
+            app.world().get::<TooltipPlacementState>(controller),
+        );
+        let local = app.world().get::<Transform>(controller);
+        let global = app.world().get::<GlobalTransform>(controller);
+        assert!(local.is_some());
+        assert!(global.is_some());
+        if let (Some(local), Some(global)) = (local, global) {
+            assert!(
+                global
+                    .translation()
+                    .abs_diff_eq(local.translation, GEOMETRY_EPSILON)
+            );
+        }
+    }
+
     #[test]
     fn world_panel_and_widget_targets_inherit_layout_unit_and_apply_widget_offset() {
         let mut app = materialization_app();
@@ -669,41 +892,7 @@ mod tests {
             (panel_controller, target_panel),
             (widget_controller, target_widget),
         ] {
-            assert_eq!(
-                app.world()
-                    .get::<MaterializedTooltip>(controller)
-                    .map(MaterializedTooltip::layout_unit),
-                Some(Unit::Points)
-            );
-            assert_eq!(
-                app.world()
-                    .get::<AnchoredTo>(controller)
-                    .map(AnchoredTo::target),
-                Some(target)
-            );
-            let diagnostics = app
-                .world()
-                .resource::<AnchorResolveDiagnostics>()
-                .current()
-                .copied()
-                .collect::<Vec<_>>();
-            assert_eq!(
-                app.world().get::<TooltipReadiness>(controller),
-                Some(&TooltipReadiness::Ready),
-                "controller {controller:?}: placement={:?}, diagnostics={diagnostics:?}",
-                app.world().get::<TooltipPlacementState>(controller),
-            );
-            let local = app.world().get::<Transform>(controller);
-            let global = app.world().get::<GlobalTransform>(controller);
-            assert!(local.is_some());
-            assert!(global.is_some());
-            if let (Some(local), Some(global)) = (local, global) {
-                assert!(
-                    global
-                        .translation()
-                        .abs_diff_eq(local.translation, GEOMETRY_EPSILON)
-                );
-            }
+            assert_materialized_world_target(&app, controller, target);
         }
 
         let target_panel_data = app.world().get::<DiegeticPanel>(target_panel);
@@ -711,9 +900,26 @@ mod tests {
         let Some(target_panel_data) = target_panel_data else {
             return;
         };
-        let expected_y = -widget_offset
-            * target_panel_data.layout_unit().to_points()
-            * target_panel_data.points_to_world();
+        // Every tooltip clears its source by its shadow extent plus 2 px.
+        let front = super::super::world::WORLD_TOOLTIP_FRONT_CLEARANCE_METERS;
+        let world_per_pixel = 2.0
+            * (TEST_CAMERA_DISTANCE - front)
+            * (PerspectiveProjection::default().fov * 0.5).tan()
+            / TEST_VIEWPORT.y;
+        let shadow = crate::widgets::TOOLTIP_SHADOW_EXTENT
+            .painted_reach(target_panel_data.points_to_world())
+            .above;
+        let frames = app
+            .world()
+            .get::<ResolvedAnchorGeometry>(target_widget)
+            .zip(app.world().get::<GlobalTransform>(target_widget))
+            .and_then(|(geometry, transform)| world_geometry_anchor_frames(geometry, transform));
+        assert!(frames.is_some());
+        let Some(frames) = frames else {
+            return;
+        };
+        let expected_y = -(2.0_f32.mul_add(world_per_pixel, shadow)
+            + frames[anchor_index(Anchor::BottomCenter)].position.y * front / TEST_CAMERA_DISTANCE);
         assert!(
             app.world()
                 .get::<ResolvedAnchorOffset>(widget_controller)

@@ -44,6 +44,7 @@ pub(super) const CUSTOM_BINDINGS_MODE_VALUE: &str = "Custom controls";
 pub(super) const MANUAL_MODE_VALUE: &str = "Manual input";
 
 // setting row labels
+#[cfg(test)]
 pub(super) const INVERT_Y_BINDING_LABEL: &str = "Alt I";
 pub(super) const INVERT_Y_STATUS_LABEL: &str = "Invert Y";
 

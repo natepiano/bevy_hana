@@ -10,6 +10,8 @@ use bevy::prelude::World;
 use bevy::prelude::error;
 use bevy::window::OnMonitor;
 use bevy::window::WindowPosition;
+#[cfg(target_os = "macos")]
+use bevy::winit::WINIT_WINDOWS;
 use hana_clerestory::CurrentMonitor;
 use hana_clerestory::LiveDisplayContradictionCount;
 use hana_clerestory::LiveDisplayEndpoint;
@@ -23,6 +25,14 @@ use hana_rigging::prelude::RecoveryPolicy;
 use hana_rigging::prelude::RoleKeyError;
 use hana_rigging::prelude::RoleStatus;
 use hana_rigging::prelude::RoleStatusView;
+#[cfg(target_os = "macos")]
+use objc2_app_kit::NSView;
+#[cfg(target_os = "macos")]
+use objc2_app_kit::NSWindowStyleMask;
+#[cfg(target_os = "macos")]
+use raw_window_handle::HasWindowHandle;
+#[cfg(target_os = "macos")]
+use raw_window_handle::RawWindowHandle;
 use serde::Serialize;
 use serde::Serializer;
 
@@ -748,12 +758,6 @@ fn window_snapshot(
 
 #[cfg(target_os = "macos")]
 fn native_fullscreen(entity: Entity) -> NativeFullscreen {
-    use bevy::winit::WINIT_WINDOWS;
-    use objc2_app_kit::NSView;
-    use objc2_app_kit::NSWindowStyleMask;
-    use raw_window_handle::HasWindowHandle;
-    use raw_window_handle::RawWindowHandle;
-
     WINIT_WINDOWS
         .with_borrow(|winit_windows| {
             let winit_window = winit_windows.get_window(entity)?;
