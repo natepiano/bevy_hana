@@ -66,6 +66,18 @@ impl PanelPrecomposeCache {
         &mut self.entries
     }
 
+    /// Reads `retired_images` without advancing their lifetimes.
+    pub(crate) fn retired_images(&self) -> impl Iterator<Item = &Handle<Image>> {
+        self.retired_images.iter().map(|retired| &retired.handle)
+    }
+
+    /// Reads `pending_activations` without advancing their lifetimes.
+    pub(crate) fn pending_camera_activations(&self) -> impl Iterator<Item = Entity> + '_ {
+        self.pending_activations
+            .iter()
+            .map(|pending| pending.entity)
+    }
+
     /// Holds an old render target handle so it outlives the camera's switch to the
     /// replacement image. [`Self::drain_ready_retired_images`] releases it on the second
     /// frame after retirement.

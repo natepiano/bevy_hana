@@ -167,6 +167,9 @@ pub(super) fn cleanup_retired_precompose_images(
     mut images: ResMut<Assets<Image>>,
 ) {
     for mut cache in &mut caches {
+        if cache.retired_images().next().is_none() {
+            continue;
+        }
         for handle in cache.drain_ready_retired_images() {
             images.remove(handle.id());
         }
@@ -180,6 +183,9 @@ pub(super) fn activate_pending_precompose_cameras(
     mut cameras: Query<&mut Camera>,
 ) {
     for mut cache in &mut caches {
+        if cache.pending_camera_activations().next().is_none() {
+            continue;
+        }
         for camera_entity in cache.drain_ready_camera_activations() {
             if let Ok(mut camera) = cameras.get_mut(camera_entity) {
                 camera.is_active = true;

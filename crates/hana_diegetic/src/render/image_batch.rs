@@ -22,6 +22,8 @@ use bevy::picking::Pickable;
 use bevy::prelude::App;
 use bevy::prelude::Assets;
 use bevy::prelude::Changed;
+use bevy::prelude::ChildOf;
+use bevy::prelude::Children;
 use bevy::prelude::Color;
 use bevy::prelude::Commands;
 use bevy::prelude::Component;
@@ -571,6 +573,8 @@ type ChangedImageRouteInput = Or<(
     Changed<Resolved<ShadowCasting>>,
 )>;
 
+type ChangedImageAncestryInput = Or<(Changed<Visibility>, Changed<ChildOf>)>;
+
 #[cfg(test)]
 #[derive(Debug, Default, Eq, PartialEq, Resource)]
 struct ImageBatchRouteCounts {
@@ -585,7 +589,7 @@ fn reset_image_batch_route_counts(mut counts: ResMut<ImageBatchRouteCounts>) {
 
 fn image_batch_route_inputs_changed(
     changed_panels: Query<(), ChangedImageRouteInput>,
-    changed_visibility: Query<(), Changed<Visibility>>,
+    changed_ancestry: Query<(), ChangedImageAncestryInput>,
     visual_overrides: Res<VisualOverrideIndex>,
     mut removed_panels: RemovedComponents<DiegeticPanel>,
     mut removed_computed: RemovedComponents<ComputedDiegeticPanel>,
@@ -593,9 +597,10 @@ fn image_batch_route_inputs_changed(
     mut removed_layers: RemovedComponents<RenderLayers>,
     mut removed_shadow: RemovedComponents<Resolved<ShadowCasting>>,
     mut removed_visibility: RemovedComponents<Visibility>,
+    mut removed_parent_links: RemovedComponents<ChildOf>,
 ) -> bool {
     !changed_panels.is_empty()
-        || !changed_visibility.is_empty()
+        || !changed_ancestry.is_empty()
         || visual_overrides.is_changed()
         || removed_panels.read().next().is_some()
         || removed_computed.read().next().is_some()
@@ -603,6 +608,7 @@ fn image_batch_route_inputs_changed(
         || removed_layers.read().next().is_some()
         || removed_shadow.read().next().is_some()
         || removed_visibility.read().next().is_some()
+        || removed_parent_links.read().next().is_some()
 }
 
 /// Plugin that routes computed image commands into [`ImageBatchStore`].
@@ -679,7 +685,8 @@ fn route_image_batch_records(
         Option<&Resolved<ShadowCasting>>,
     )>,
     changed_panels: Query<Entity, ChangedImageRouteInput>,
-    changed_visibility: Query<(), Changed<Visibility>>,
+    changed_ancestry: Query<Entity, ChangedImageAncestryInput>,
+    children: Query<&Children>,
     mut ancestor_visibility: AncestorVisibility,
     visual_overrides: Res<VisualOverrideIndex>,
     mut removed_panels: RemovedComponents<DiegeticPanel>,
@@ -688,6 +695,7 @@ fn route_image_batch_records(
     mut removed_layers: RemovedComponents<RenderLayers>,
     mut removed_shadow: RemovedComponents<Resolved<ShadowCasting>>,
     mut removed_visibility: RemovedComponents<Visibility>,
+    mut removed_parent_links: RemovedComponents<ChildOf>,
     mut store: ResMut<ImageBatchStore>,
     #[cfg(test)] mut counts: Option<ResMut<ImageBatchRouteCounts>>,
 ) {
@@ -695,16 +703,24 @@ fn route_image_batch_records(
     if let Some(counts) = counts.as_deref_mut() {
         counts.runs += 1;
     }
-    let full_pass = visual_overrides.is_changed()
-        || !changed_visibility.is_empty()
-        || removed_visibility.read().next().is_some();
     let mut dirty_panels: HashSet<_> = changed_panels.iter().collect();
     dirty_panels.extend(removed_panels.read());
     dirty_panels.extend(removed_computed.read());
     dirty_panels.extend(removed_precompose.read());
     dirty_panels.extend(removed_layers.read());
     dirty_panels.extend(removed_shadow.read());
-    if full_pass {
+    for root in changed_ancestry
+        .iter()
+        .chain(removed_visibility.read())
+        .chain(removed_parent_links.read())
+    {
+        dirty_panels.extend(
+            std::iter::once(root)
+                .chain(children.iter_descendants(root))
+                .filter(|&entity| panels.contains(entity)),
+        );
+    }
+    if visual_overrides.is_changed() {
         dirty_panels.extend(panels.iter().map(|(entity, ..)| entity));
     }
     for panel_entity in dirty_panels {
@@ -1856,7 +1872,94 @@ mod tests {
             &ImageBatchRouteCounts::default()
         );
 
-        let changed_panel = panels[0];
+        check_single_panel_route_changes(&mut app, panels[0]);
+
+        let parent = app
+            .world_mut()
+            .spawn((Transform::default(), Visibility::Inherited))
+            .id();
+        let nested_parent = app
+            .world_mut()
+            .spawn((Transform::default(), Visibility::Inherited, ChildOf(parent)))
+            .id();
+        let hidden_parent = app
+            .world_mut()
+            .spawn((Transform::default(), Visibility::Hidden))
+            .id();
+        let reparented_panel = panels[1];
+        app.world_mut()
+            .entity_mut(reparented_panel)
+            .insert(Visibility::Inherited);
+        let mut images = Assets::<Image>::default();
+        let texture = images.add(Image::default());
+        let precomposed_panel =
+            spawn_panel(&mut app, vec![precompose_command(FIRST_COMMAND_INDEX)]);
+        insert_precompose_entry(&mut app, precomposed_panel, FIRST_COMMAND_INDEX, texture);
+        app.world_mut()
+            .entity_mut(precomposed_panel)
+            .insert((Visibility::Inherited, ChildOf(parent)));
+        let nested_panel = spawn_panel(&mut app, Vec::new());
+        app.world_mut()
+            .entity_mut(nested_panel)
+            .insert((Visibility::Inherited, ChildOf(nested_parent)));
+        app.insert_resource(images);
+        app.update();
+        app.update();
+
+        app.world_mut()
+            .entity_mut(parent)
+            .insert(Visibility::Hidden);
+        app.update();
+        let counts = app.world().resource::<ImageBatchRouteCounts>();
+        let changed_parent = (counts.runs, counts.visits);
+
+        // `reconcile_image_batch_entities` retires the hidden batch before the next visibility
+        // case.
+        app.update();
+        app.world_mut().entity_mut(parent).remove::<Visibility>();
+        app.update();
+        let counts = app.world().resource::<ImageBatchRouteCounts>();
+        let removed_parent_visibility = (counts.runs, counts.visits);
+
+        app.add_systems(
+            PostUpdate,
+            (
+                precompose::activate_pending_precompose_cameras,
+                precompose::cleanup_retired_precompose_images,
+            )
+                .chain()
+                .before(route_image_batch_records),
+        );
+        app.update();
+        app.update();
+        let counts = app.world().resource::<ImageBatchRouteCounts>();
+        let idle_precompose = (counts.runs, counts.visits);
+
+        app.world_mut()
+            .entity_mut(reparented_panel)
+            .insert(ChildOf(hidden_parent));
+        app.update();
+        let counts = app.world().resource::<ImageBatchRouteCounts>();
+        let changed_parent_link = (counts.runs, counts.visits);
+
+        assert_eq!(
+            [
+                ("changed parent visibility", changed_parent),
+                ("removed parent visibility", removed_parent_visibility),
+                ("idle precompose maintenance", idle_precompose),
+                ("reparented panel under hidden parent", changed_parent_link),
+            ],
+            [
+                ("changed parent visibility", (1, 2)),
+                ("removed parent visibility", (1, 2)),
+                ("idle precompose maintenance", (0, 0)),
+                ("reparented panel under hidden parent", (1, 1)),
+            ],
+            "visibility routing stays inside its subtree and idle caches do not wake routing",
+        );
+    }
+
+    fn check_single_panel_route_changes(app: &mut App, changed_panel: Entity) {
         assert!(
             app.world_mut()
                 .commands()
