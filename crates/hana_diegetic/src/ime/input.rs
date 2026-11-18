@@ -7,6 +7,7 @@ use bevy::input::ButtonState;
 use bevy::input::keyboard::KeyboardInput;
 use bevy::prelude::ButtonInput;
 use bevy::prelude::Commands;
+use bevy::prelude::DetectChangesMut;
 use bevy::prelude::Entity;
 use bevy::prelude::KeyCode;
 use bevy::prelude::MessageReader;
@@ -147,15 +148,19 @@ pub(super) fn update_window_ime(
     let active_window = active_session.active_window();
     if let Some(previous) = window_state.active_window
         && Some(previous) != active_window
-        && let Ok(mut window) = windows.get_mut(previous)
+        && let Ok(window) = windows.get_mut(previous)
     {
-        window.ime_enabled = false;
+        window
+            .map_unchanged(|window| &mut window.ime_enabled)
+            .set_if_neq(false);
     }
 
     if let Some(entity) = active_window
-        && let Ok(mut window) = windows.get_mut(entity)
+        && let Ok(window) = windows.get_mut(entity)
     {
-        window.ime_enabled = true;
+        window
+            .map_unchanged(|window| &mut window.ime_enabled)
+            .set_if_neq(true);
     }
 
     window_state.active_window = active_window;
@@ -793,6 +798,7 @@ mod tests {
     use bevy::prelude::App;
     use bevy::prelude::ButtonInput;
     use bevy::prelude::Commands;
+    use bevy::prelude::DetectChanges;
     use bevy::prelude::Entity;
     use bevy::prelude::KeyCode;
     use bevy::prelude::MessageReader;
@@ -800,6 +806,8 @@ mod tests {
     use bevy::prelude::On;
     use bevy::prelude::Res;
     use bevy::prelude::ResMut;
+    use bevy::prelude::Update;
+    use bevy::prelude::Window;
     use bevy::prelude::World;
 
     use super::KeyboardEditDecision;
@@ -810,6 +818,7 @@ mod tests {
     use super::vertical_arrows;
     use crate::ime::ActiveImeSession;
     use crate::ime::ImeAppOwnedFieldSpec;
+    use crate::ime::ImeCommitAuthority;
     use crate::ime::ImeCursorState;
     use crate::ime::ImeEditableFieldSpec;
     use crate::ime::ImeOpenSession;
@@ -820,6 +829,7 @@ mod tests {
     use crate::ime::buffer::ImeMovementDirection;
     use crate::ime::buffer::ImeMovementUnit;
     use crate::ime::buffer::ImeSelectionMode;
+    use crate::ime::editor::PendingImePanelAnchor;
 
     fn keys(pressed: &[KeyCode]) -> ButtonInput<KeyCode> {
         let mut keys = ButtonInput::default();
@@ -838,6 +848,106 @@ mod tests {
             repeat,
             window: Entity::PLACEHOLDER,
         }
+    }
+
+    fn window_ime_app() -> (App, Entity) {
+        let mut app = App::new();
+        app.init_resource::<ActiveImeSession>()
+            .init_resource::<crate::ime::ImeInputBlocker>()
+            .init_resource::<ImeCommitAuthority>()
+            .init_resource::<PendingImePanelAnchor>()
+            .init_resource::<super::ImeWindowState>()
+            .add_observer(crate::ime::session::open_session)
+            .add_systems(Update, super::update_window_ime);
+        let window = app.world_mut().spawn(Window::default()).id();
+        (app, window)
+    }
+
+    fn open_window_ime(app: &mut App, window: Entity) {
+        app.world_mut().trigger(ImeOpenSession {
+            target: ImeTarget::AppOwned {
+                owner:    window,
+                field_id: "query".into(),
+            },
+            window,
+            initial_text: String::new(),
+            field_spec: ImeEditableFieldSpec::AppOwned(ImeAppOwnedFieldSpec::new("query")),
+            anchor: None,
+        });
+        app.world_mut().flush();
+    }
+
+    #[test]
+    fn update_window_ime_keeps_the_window_unchanged_for_a_stable_session() -> Result<(), String> {
+        let (mut app, window) = window_ime_app();
+        open_window_ime(&mut app, window);
+        app.update();
+        let enabled = app
+            .world()
+            .entity(window)
+            .get_ref::<Window>()
+            .ok_or_else(|| String::from("the session window must exist"))?;
+        assert!(enabled.ime_enabled);
+        let enabled_tick = enabled.last_changed();
+
+        for _ in 0..3 {
+            app.update();
+            let enabled = app
+                .world()
+                .entity(window)
+                .get_ref::<Window>()
+                .ok_or_else(|| String::from("the session window must exist"))?;
+            assert!(enabled.ime_enabled);
+            assert_eq!(
+                enabled.last_changed(),
+                enabled_tick,
+                "a stable IME session must not mark Window changed"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn update_window_ime_switches_windows_only_when_the_values_differ() -> Result<(), String> {
+        for previous_enabled in [false, true] {
+            for next_enabled in [false, true] {
+                let (mut app, previous) = window_ime_app();
+                let next = app
+                    .world_mut()
+                    .spawn(Window {
+                        ime_enabled: next_enabled,
+                        ..Window::default()
+                    })
+                    .id();
+                open_window_ime(&mut app, previous);
+                app.update();
+                app.world_mut()
+                    .get_mut::<Window>(previous)
+                    .ok_or_else(|| String::from("the previous window must exist"))?
+                    .ime_enabled = previous_enabled;
+                open_window_ime(&mut app, next);
+                app.world_mut().clear_trackers();
+                app.world_mut()
+                    .run_system_once(super::update_window_ime)
+                    .map_err(|error| error.to_string())?;
+
+                let previous = app
+                    .world()
+                    .entity(previous)
+                    .get_ref::<Window>()
+                    .ok_or_else(|| String::from("the previous window must exist"))?;
+                let next = app
+                    .world()
+                    .entity(next)
+                    .get_ref::<Window>()
+                    .ok_or_else(|| String::from("the next window must exist"))?;
+                assert!(!previous.ime_enabled);
+                assert!(next.ime_enabled);
+                assert_eq!(previous.is_changed(), previous_enabled);
+                assert_eq!(next.is_changed(), !next_enabled);
+            }
+        }
+        Ok(())
     }
 
     #[test]

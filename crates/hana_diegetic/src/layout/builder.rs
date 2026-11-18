@@ -62,6 +62,7 @@ use super::element::ElementContent;
 use super::element::LayoutTree;
 use super::element::PrecomposeMode;
 use super::element::ScrollAnchor;
+use super::element::ScrollClip;
 use super::element::ScrollDrive;
 use super::element::ScrollLine;
 use super::element::ScrollRestEdge;
@@ -690,6 +691,7 @@ pub(super) struct CommonEl {
     scroll_anchor_x:            ScrollAnchor,
     scroll_anchor_y:            ScrollAnchor,
     scroll_line:                ScrollLine,
+    scroll_clip:                ScrollClip,
     caret_follow:               bool,
     caret_marker:               bool,
     material:                   Cascade<Handle<StandardMaterial>>,
@@ -910,6 +912,7 @@ impl Default for CommonEl {
             scroll_anchor_x:            ScrollAnchor::Start,
             scroll_anchor_y:            ScrollAnchor::Start,
             scroll_line:                ScrollLine::PanelDefaultFont,
+            scroll_clip:                ScrollClip::ContentBox,
             caret_follow:               false,
             caret_marker:               false,
             material:                   Cascade::Inherit,
@@ -959,6 +962,7 @@ fn text_leaf_element(mut common: CommonEl, content: ElementContent) -> Element {
         scroll_anchor_x: common.scroll_anchor_x,
         scroll_anchor_y: common.scroll_anchor_y,
         scroll_line: common.scroll_line,
+        scroll_clip: common.scroll_clip,
         caret_follow: common.caret_follow,
         caret_marker: common.caret_marker,
         material: common.material,
@@ -1417,6 +1421,16 @@ impl<L, Role> El<L, Role> {
     /// reads it.
     pub fn scroll_line(mut self, style: TextStyle) -> Self {
         self.common.scroll_line = ScrollLine::Declared(Box::new(style));
+        self
+    }
+
+    /// Sets what this element's clip shows at its top and bottom edges.
+    ///
+    /// The default, [`ScrollClip::ContentBox`], clips to the full content box.
+    /// Only a scrolling element (`scroll_x`, `scroll_y`, `scroll_y_from_end`)
+    /// reads it.
+    pub const fn scroll_clip(mut self, clip: ScrollClip) -> Self {
+        self.common.scroll_clip = clip;
         self
     }
 
@@ -2252,6 +2266,7 @@ impl<L, Role> El<L, Role> {
             scroll_anchor_x: common.scroll_anchor_x,
             scroll_anchor_y: common.scroll_anchor_y,
             scroll_line: common.scroll_line,
+            scroll_clip: common.scroll_clip,
             caret_follow: common.caret_follow,
             caret_marker: common.caret_marker,
             material: common.material,

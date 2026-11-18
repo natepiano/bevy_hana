@@ -199,6 +199,7 @@ pub(crate) type MeasureRichTextFn =
 
 use std::sync::Arc;
 
+pub use element::ScrollClip;
 pub(crate) use element::ScrollDrive;
 pub use element::ScrollRestEdge;
 pub(crate) use shape_cache::RichGlyphCluster;

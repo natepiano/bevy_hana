@@ -4,9 +4,11 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
+use bevy::ecs::entity::EntityAllocator;
 use bevy::prelude::AlphaMode;
 use bevy::prelude::Bundle;
 use bevy::prelude::Changed;
+use bevy::prelude::ChildOf;
 use bevy::prelude::Commands;
 use bevy::prelude::Component;
 use bevy::prelude::DetectChangesMut;
@@ -17,6 +19,7 @@ use bevy::prelude::Query;
 use bevy::prelude::Res;
 use bevy::prelude::ResMut;
 use bevy::prelude::StandardMaterial;
+use bevy::prelude::World;
 use hana_kana::ToF32;
 
 use super::PanelTextLayout;
@@ -27,6 +30,7 @@ use super::glyph_cascade::InheritedTextCascades;
 use super::glyph_cascade::PanelTextCascadeSources;
 use super::layout::PanelTextDrawZIndex;
 use super::layout::PanelTextDrawZIndexRank;
+use crate::AntiAlias;
 use crate::PanelElementId;
 use crate::TextAlign;
 use crate::cascade;
@@ -34,6 +38,7 @@ use crate::cascade::Cascade;
 use crate::cascade::CascadeAttribute;
 use crate::cascade::CascadeFrom;
 use crate::cascade::HdrTextCoverageBias;
+use crate::cascade::Resolved;
 use crate::cascade::TextAlpha;
 use crate::cascade::TextMaterial;
 use crate::constants::MILLISECONDS_PER_SECOND;
@@ -393,6 +398,7 @@ pub(super) fn reify_text_entities(
         Option<&RichRunGlyphs>,
     )>,
     mut commands: Commands,
+    allocator: &EntityAllocator,
     mut perf: ResMut<DiegeticPerfStats>,
     lucide_font: Option<Res<LucideFont>>,
     rich_shaper: RichParagraphShaper,
@@ -403,6 +409,7 @@ pub(super) fn reify_text_entities(
         .as_deref()
         .map_or(LucideFontReadiness::Loading, LucideFont::readiness);
     for (panel_entity, mut panel, computed, panel_runs) in &mut changed_panels {
+        let mut new_children = Vec::new();
         let PanelLayout::Solved(result) = computed.layout() else {
             continue;
         };
@@ -424,11 +431,7 @@ pub(super) fn reify_text_entities(
             lucide_readiness,
             rich_shaper.availability(),
         );
-        if let (Some(font), Some(registry)) =
-            (lucide_font.as_deref(), rich_shaper.registry.as_deref())
-        {
-            centre_icon_ink(&mut text_commands, font, registry);
-        }
+        centre_ready_icon_ink(&mut text_commands, lucide_font.as_deref(), &rich_shaper);
 
         // Source the panel's existing runs from `PanelTextRuns` (the typed
         // text-run index) rather than scanning every `TextContent` child and
@@ -492,7 +495,8 @@ pub(super) fn reify_text_entities(
             } else {
                 spawn_panel_text_child(SpawnPanelTextChild {
                     inherited: &inherited,
-                    commands: &mut commands,
+                    allocator,
+                    pending: &mut new_children,
                     panel_entity,
                     identity: identity.clone(),
                     text,
@@ -521,8 +525,19 @@ pub(super) fn reify_text_entities(
         // `Changed<DiegeticPanel>`, or this `&mut DiegeticPanel` write would
         // re-dirty the panel and loop layout → reification every frame.
         panel.bypass_change_detection().text_index = text_index;
+        queue_panel_text_children(&mut commands, new_children);
     }
     perf.reify_ms = reify_start.elapsed().as_secs_f32() * MILLISECONDS_PER_SECOND;
+}
+
+fn centre_ready_icon_ink(
+    commands: &mut [TextRunReification<'_>],
+    font: Option<&LucideFont>,
+    shaper: &RichParagraphShaper<'_>,
+) {
+    if let (Some(font), Some(registry)) = (font, shaper.registry.as_deref()) {
+        centre_icon_ink(commands, font, registry);
+    }
 }
 
 /// Inputs to [`spawn_panel_text_child`]. Grouped into a struct because reification
@@ -530,7 +545,8 @@ pub(super) fn reify_text_entities(
 /// freshly spawned child.
 struct SpawnPanelTextChild<'a, 'w, 's> {
     inherited:      &'a InheritedTextCascades,
-    commands:       &'a mut Commands<'w, 's>,
+    allocator:      &'w EntityAllocator,
+    pending:        &'s mut Vec<PendingPanelTextChild>,
     panel_entity:   Entity,
     identity:       PanelTextRunIdentity,
     text:           &'a str,
@@ -548,7 +564,8 @@ struct SpawnPanelTextChild<'a, 'w, 's> {
 fn spawn_panel_text_child(request: SpawnPanelTextChild<'_, '_, '_>) -> Entity {
     let SpawnPanelTextChild {
         inherited,
-        commands,
+        allocator,
+        pending,
         panel_entity,
         identity,
         text,
@@ -559,31 +576,91 @@ fn spawn_panel_text_child(request: SpawnPanelTextChild<'_, '_, '_>) -> Entity {
         label_cascades,
         glyph_source,
     } = request;
-    let mut spawned = Entity::PLACEHOLDER;
-    commands.entity(panel_entity).with_children(|children| {
-        // `TextRunOf` is inserted only here, on a newly spawned run; the reuse
-        // branch must never re-insert it (a reused run already carries it, and
-        // re-inserting would fire the relationship hook and mutate
-        // `PanelTextRuns` on a no-op). `with_children` already adds `ChildOf`.
-        let bundle = (
-            TextContent::new(text.to_owned()),
+    let entity = allocator.alloc();
+    pending.push(PendingPanelTextChild {
+        entity,
+        bundle: PanelTextChildBundle {
+            parent: ChildOf(panel_entity),
+            text: TextContent::new(text.to_owned()),
             style,
             layout,
             identity,
             z_index,
             z_index_rank,
-            TextRunOf(panel_entity),
-            PanelOwned::from(panel_entity),
-            CascadeFrom::new(panel_entity),
-            label_cascades.spawn_bundle(inherited),
-        );
-        let child = match glyph_source {
-            PanelGlyphSource::Plain => children.spawn(bundle),
-            PanelGlyphSource::Rich(glyphs) => children.spawn((bundle, glyphs.clone())),
-        };
-        spawned = child.id();
+            run_of: TextRunOf(panel_entity),
+            owned: PanelOwned::from(panel_entity),
+            cascade_from: CascadeFrom::new(panel_entity),
+            cascades: label_cascades.spawn_bundle(inherited),
+        },
+        glyph_source: glyph_source.clone(),
     });
-    spawned
+    entity
+}
+
+#[derive(Bundle)]
+struct PanelTextChildBundle {
+    parent:       ChildOf,
+    text:         TextContent,
+    style:        TextStyle,
+    layout:       PanelTextLayout,
+    identity:     PanelTextRunIdentity,
+    z_index:      PanelTextDrawZIndex,
+    z_index_rank: PanelTextDrawZIndexRank,
+    run_of:       TextRunOf,
+    owned:        PanelOwned,
+    cascade_from: CascadeFrom,
+    cascades:     SeededTextCascades,
+}
+
+struct PendingPanelTextChild {
+    entity:       Entity,
+    bundle:       PanelTextChildBundle,
+    glyph_source: PanelGlyphSource<RichRunGlyphs>,
+}
+
+impl PendingPanelTextChild {
+    fn apply(self, world: &mut World) {
+        let result = match self.glyph_source {
+            PanelGlyphSource::Plain => world.spawn_at(self.entity, self.bundle),
+            PanelGlyphSource::Rich(glyphs) => world.spawn_at(self.entity, (self.bundle, glyphs)),
+        };
+        if let Err(error) = result {
+            bevy::log::error!(?error, "Cannot spawn a panel text child");
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Default, bevy::prelude::Resource)]
+struct TextSpawnCommandWork(usize);
+
+fn queue_panel_text_children(commands: &mut Commands, children: Vec<PendingPanelTextChild>) {
+    if children.is_empty() {
+        return;
+    }
+    // One dispatch applies the complete panel. Every child keeps its full spawn bundle.
+    commands.queue(move |world: &mut World| {
+        #[cfg(test)]
+        {
+            world.init_resource::<TextSpawnCommandWork>();
+            world.resource_mut::<TextSpawnCommandWork>().0 += 1;
+        }
+        for child in children {
+            child.apply(world);
+        }
+    });
+}
+
+#[derive(Bundle)]
+struct SeededTextCascades {
+    alpha:                  (Cascade<TextAlpha>, Resolved<TextAlpha>),
+    material:               (Cascade<TextMaterial>, Resolved<TextMaterial>),
+    lighting:               (Cascade<Lighting>, Resolved<Lighting>),
+    sidedness:              (Cascade<Sidedness>, Resolved<Sidedness>),
+    shadow_casting:         (Cascade<ShadowCasting>, Resolved<ShadowCasting>),
+    glyph_shadow_mode:      (Cascade<GlyphShadowMode>, Resolved<GlyphShadowMode>),
+    anti_alias:             (Cascade<AntiAlias>, Resolved<AntiAlias>),
+    hdr_text_coverage_bias: (Cascade<HdrTextCoverageBias>, Resolved<HdrTextCoverageBias>),
 }
 
 /// Inputs to [`update_reused_panel_text_child`]. Grouped into a struct because
@@ -614,26 +691,41 @@ struct TextLabelCascadeOverrides {
 }
 
 impl TextLabelCascadeOverrides {
-    fn spawn_bundle(self, inherited: &InheritedTextCascades) -> impl Bundle {
-        (
-            glyph_cascade::seeded_text_cascade(self.alpha.map(TextAlpha), &inherited.alpha),
-            glyph_cascade::seeded_text_cascade(
+    fn spawn_bundle(self, inherited: &InheritedTextCascades) -> SeededTextCascades {
+        SeededTextCascades {
+            alpha:                  glyph_cascade::seeded_text_cascade(
+                self.alpha.map(TextAlpha),
+                &inherited.alpha,
+            ),
+            material:               glyph_cascade::seeded_text_cascade(
                 self.material.map(TextMaterial),
                 &inherited.material,
             ),
-            glyph_cascade::seeded_text_cascade(self.lighting, &inherited.lighting),
-            glyph_cascade::seeded_text_cascade(self.sidedness, &inherited.sidedness),
-            glyph_cascade::seeded_text_cascade(self.shadow_casting, &inherited.shadow_casting),
-            glyph_cascade::seeded_text_cascade(
+            lighting:               glyph_cascade::seeded_text_cascade(
+                self.lighting,
+                &inherited.lighting,
+            ),
+            sidedness:              glyph_cascade::seeded_text_cascade(
+                self.sidedness,
+                &inherited.sidedness,
+            ),
+            shadow_casting:         glyph_cascade::seeded_text_cascade(
+                self.shadow_casting,
+                &inherited.shadow_casting,
+            ),
+            glyph_shadow_mode:      glyph_cascade::seeded_text_cascade(
                 self.glyph_shadow_mode,
                 &inherited.glyph_shadow_mode,
             ),
-            glyph_cascade::seeded_text_cascade(Cascade::Inherit, &inherited.anti_alias),
-            glyph_cascade::seeded_text_cascade(
+            anti_alias:             glyph_cascade::seeded_text_cascade(
+                Cascade::Inherit,
+                &inherited.anti_alias,
+            ),
+            hdr_text_coverage_bias: glyph_cascade::seeded_text_cascade(
                 self.hdr_text_coverage_bias.map(HdrTextCoverageBias),
                 &inherited.hdr_text_coverage_bias,
             ),
-        )
+        }
     }
 
     fn from_style(style: &TextStyle) -> Self {
@@ -1314,6 +1406,11 @@ mod tests {
         spawn_panel(&mut app, builder.build());
         app.update();
         assert_eq!(observed.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            app.world().resource::<super::TextSpawnCommandWork>().0,
+            1,
+            "plain and rich labels share one complete spawn command per panel"
+        );
         assert_eq!(
             incomplete.load(Ordering::Relaxed),
             0,

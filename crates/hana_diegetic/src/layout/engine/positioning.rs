@@ -1288,6 +1288,9 @@ fn position_tree<const VIEWS: bool>(
             }
         }
     }
+    if tree.contains_whole_row_scrolls() {
+        snap_whole_row_clips(tree, &mut commands);
+    }
     commands
 }
 
@@ -1364,7 +1367,144 @@ pub(super) fn render_commands_from_geometry<const VIEWS: bool>(
         }
     }
 
+    if tree.contains_whole_row_scrolls() {
+        snap_whole_row_clips(tree, &mut commands);
+    }
     commands
+}
+
+/// Distance in tree units within which a row edge counts as on a clip edge,
+/// so rounding in the layout never hides a row that fits.
+const WHOLE_ROW_EDGE_TOLERANCE: f32 = 0.01;
+
+/// Vertical extent of one drawn row inside a whole-row clip.
+#[derive(Clone, Copy)]
+struct RowSpan {
+    top:    f32,
+    bottom: f32,
+}
+
+impl RowSpan {
+    const fn of(bounds: BoundingBox) -> Self {
+        Self {
+            top:    bounds.y,
+            bottom: bounds.y + bounds.height,
+        }
+    }
+
+    /// Whether this row crosses the edge at `y`, so a clip there cuts it.
+    fn crosses(self, y: f32) -> bool {
+        self.top < y - WHOLE_ROW_EDGE_TOLERANCE && self.bottom > y + WHOLE_ROW_EDGE_TOLERANCE
+    }
+}
+
+/// Shrinks the clip of each scrolling element with a declared scroll line so
+/// it shows only whole rows.
+///
+/// A row is one drawn piece of the clipped content: a text line, a filled or
+/// bordered box, an image, an icon, a line shape or a nested clip. The top
+/// edge moves down past each row it cuts, and the bottom edge moves up above
+/// each row it cuts. A row taller than the clip can never show whole, so it
+/// does not move an edge. Content with no clean edge keeps the full clip.
+fn snap_whole_row_clips(tree: &LayoutTree, commands: &mut [RenderCommand]) {
+    let mut rows = Vec::new();
+    for start in 0..commands.len() {
+        if !matches!(commands[start].kind, RenderCommandKind::ScissorStart)
+            || !tree.elements[commands[start].element_idx].shows_whole_rows()
+        {
+            continue;
+        }
+        let clip = commands[start].bounds;
+        rows.clear();
+        collect_clip_rows(&commands[start + 1..], clip.height, &mut rows);
+        if let Some(snapped) = whole_row_clip(clip, &rows) {
+            commands[start].bounds = snapped;
+        }
+    }
+}
+
+/// Collects the rows drawn inside one clip, up to its matching scissor end.
+fn collect_clip_rows(commands: &[RenderCommand], clip_height: f32, rows: &mut Vec<RowSpan>) {
+    let mut nested_depth = 0_usize;
+    let push = |rows: &mut Vec<RowSpan>, span: RowSpan| {
+        if span.bottom - span.top <= clip_height + WHOLE_ROW_EDGE_TOLERANCE {
+            rows.push(span);
+        }
+    };
+    for command in commands {
+        match &command.kind {
+            RenderCommandKind::ScissorStart => {
+                if nested_depth == 0 {
+                    push(rows, RowSpan::of(command.bounds));
+                }
+                nested_depth += 1;
+            },
+            RenderCommandKind::ScissorEnd => {
+                if nested_depth == 0 {
+                    return;
+                }
+                nested_depth -= 1;
+            },
+            _ if nested_depth > 0 => {},
+            RenderCommandKind::Rectangle {
+                source: RectangleSource::ScrollIndicator,
+                ..
+            } => {},
+            RenderCommandKind::Text { text, .. } => {
+                // Text without wrapping draws its hard lines in one command.
+                let line_count = text.split('\n').count().max(1);
+                let line_height = command.bounds.height / line_count.to_f32();
+                for line in 0..line_count {
+                    let top = line_height.mul_add(line.to_f32(), command.bounds.y);
+                    push(
+                        rows,
+                        RowSpan {
+                            top,
+                            bottom: top + line_height,
+                        },
+                    );
+                }
+            },
+            RenderCommandKind::Rectangle { .. }
+            | RenderCommandKind::Border { .. }
+            | RenderCommandKind::Image { .. }
+            | RenderCommandKind::Icon(_)
+            | RenderCommandKind::PrecomposeLdr
+            | RenderCommandKind::PanelShapes { .. }
+            | RenderCommandKind::RichText { .. } => push(rows, RowSpan::of(command.bounds)),
+        }
+    }
+}
+
+/// The clip with its top and bottom moved so no row crosses either edge, or
+/// `None` when the clip needs no change or no whole row fits.
+fn whole_row_clip(clip: BoundingBox, rows: &[RowSpan]) -> Option<BoundingBox> {
+    let mut top = clip.y;
+    while let Some(row_bottom) = rows
+        .iter()
+        .filter(|row| row.crosses(top))
+        .map(|row| row.bottom)
+        .reduce(f32::max)
+    {
+        top = row_bottom;
+    }
+    let mut bottom = clip.y + clip.height;
+    while let Some(row_top) = rows
+        .iter()
+        .filter(|row| row.crosses(bottom))
+        .map(|row| row.top)
+        .reduce(f32::min)
+    {
+        bottom = row_top;
+    }
+    let unchanged =
+        top.to_bits() == clip.y.to_bits() && bottom.to_bits() == (clip.y + clip.height).to_bits();
+    (!unchanged && bottom > top).then_some(BoundingBox {
+        x:      clip.x,
+        y:      top,
+        width:  clip.width,
+        height: bottom - top,
+    })
 }
 
 /// Emits child-divider rectangles.

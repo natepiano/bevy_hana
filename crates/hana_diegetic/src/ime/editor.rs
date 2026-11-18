@@ -7,6 +7,7 @@ use bevy::prelude::Camera;
 use bevy::prelude::Color;
 use bevy::prelude::Commands;
 use bevy::prelude::Component;
+use bevy::prelude::DetectChangesMut;
 use bevy::prelude::Entity;
 use bevy::prelude::EntityEvent;
 use bevy::prelude::Event;
@@ -819,10 +820,12 @@ pub(super) fn update_window_ime_position(
     let Some(anchor) = editor.anchor else {
         return;
     };
-    let Ok(mut window) = windows.get_mut(editor.window) else {
+    let Ok(window) = windows.get_mut(editor.window) else {
         return;
     };
-    window.ime_position = anchor.caret_pos;
+    window
+        .map_unchanged(|window| &mut window.ime_position)
+        .set_if_neq(anchor.caret_pos);
 }
 
 pub(crate) fn handle_blur_intent(
@@ -1748,6 +1751,7 @@ mod tests {
     use bevy::prelude::App;
     use bevy::prelude::Color;
     use bevy::prelude::Commands;
+    use bevy::prelude::DetectChanges;
     use bevy::prelude::Entity;
     use bevy::prelude::GlobalTransform;
     use bevy::prelude::MinimalPlugins;
@@ -1757,6 +1761,7 @@ mod tests {
     use bevy::prelude::PointerClick;
     use bevy::prelude::ResMut;
     use bevy::prelude::Resource;
+    use bevy::prelude::Update;
     use bevy::prelude::Window;
     use bevy::prelude::With;
     use bevy::prelude::default;
@@ -1768,6 +1773,7 @@ mod tests {
     use super::EDITOR_SELECTION;
     use super::ImeBlurIntent;
     use super::ImeEditor;
+    use super::ImeEditorAnchor;
     use super::ImeEditorPanel;
     use super::ImeEditorState;
     use super::ImeEditorSurface;
@@ -2216,6 +2222,66 @@ mod tests {
                 presentation: None,
             }),
         }
+    }
+
+    #[test]
+    fn update_window_ime_position_changes_the_window_only_when_the_caret_moves()
+    -> Result<(), String> {
+        let mut app = App::new();
+        let window = app.world_mut().spawn(Window::default()).id();
+        let mut state = editor_state(ImeTarget::AppOwned {
+            owner:    window,
+            field_id: "query".into(),
+        });
+        let initial_caret = Vec2::new(20.0, 30.0);
+        let editor = state
+            .active_mut()
+            .ok_or_else(|| String::from("the editor must be active"))?;
+        editor.window = window;
+        editor.anchor = Some(ImeEditorAnchor {
+            screen_rect: Rect::from_corners(Vec2::ZERO, Vec2::splat(200.0)),
+            editor_pos:  Vec2::ZERO,
+            editor_size: Vec2::splat(200.0),
+            caret_pos:   initial_caret,
+        });
+        app.insert_resource(state)
+            .add_systems(Update, super::update_window_ime_position);
+        app.update();
+        let positioned = app
+            .world()
+            .entity(window)
+            .get_ref::<Window>()
+            .ok_or_else(|| String::from("the editor window must exist"))?;
+        assert_eq!(positioned.ime_position, initial_caret);
+        let mut position_tick = positioned.last_changed();
+
+        for caret_pos in [initial_caret, Vec2::new(40.0, 50.0), Vec2::new(40.0, 50.0)] {
+            let old_position = app
+                .world()
+                .get::<Window>(window)
+                .ok_or_else(|| String::from("the editor window must exist"))?
+                .ime_position;
+            app.world_mut()
+                .resource_mut::<ImeEditorState>()
+                .active_mut()
+                .and_then(|editor| editor.anchor.as_mut())
+                .ok_or_else(|| String::from("the editor must have a caret anchor"))?
+                .caret_pos = caret_pos;
+            app.update();
+            let positioned = app
+                .world()
+                .entity(window)
+                .get_ref::<Window>()
+                .ok_or_else(|| String::from("the editor window must exist"))?;
+            assert_eq!(positioned.ime_position, caret_pos);
+            assert_eq!(
+                positioned.last_changed() != position_tick,
+                caret_pos != old_position,
+                "only a new caret position must mark Window changed"
+            );
+            position_tick = positioned.last_changed();
+        }
+        Ok(())
     }
 
     #[test]

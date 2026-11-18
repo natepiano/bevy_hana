@@ -109,6 +109,17 @@ pub enum ScrollRestEdge {
     End,
 }
 
+/// What a scrolling element's clip shows at its top and bottom edges.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScrollClip {
+    /// The clip is the element's full content box, so an edge row can show in part.
+    #[default]
+    ContentBox,
+    /// The clip shrinks so no text line, filled box, image or icon is cut at
+    /// the top or bottom edge.
+    WholeRows,
+}
+
 impl ChildOverflow {
     /// Whether children are clipped to the element's content box.
     pub(super) const fn clips(self) -> bool { matches!(self, Self::Clipped | Self::Scrolled) }
@@ -249,6 +260,8 @@ pub(super) struct Element {
     pub(super) scroll_anchor_y:         ScrollAnchor,
     /// Text line this element moves by when it scrolls.
     pub(super) scroll_line:             ScrollLine,
+    /// What the clip shows at its edges; see [`El::scroll_clip`](crate::El::scroll_clip).
+    pub(super) scroll_clip:             ScrollClip,
     /// Follow the marked editor caret using the previous solved horizontal offset.
     pub(super) caret_follow:            bool,
     /// This editor element locates the caret for its enclosing field.
@@ -385,6 +398,7 @@ impl Default for Element {
             scroll_anchor_x:         ScrollAnchor::Start,
             scroll_anchor_y:         ScrollAnchor::Start,
             scroll_line:             ScrollLine::PanelDefaultFont,
+            scroll_clip:             ScrollClip::ContentBox,
             caret_follow:            false,
             caret_marker:            false,
             material:                Cascade::Inherit,
@@ -422,6 +436,12 @@ impl Element {
         } else {
             inherited_clip
         }
+    }
+
+    /// Whether this element scrolls and its clip shows only whole rows.
+    pub(super) const fn shows_whole_rows(&self) -> bool {
+        matches!(self.overflow, ChildOverflow::Scrolled)
+            && matches!(self.scroll_clip, ScrollClip::WholeRows)
     }
 
     pub(super) fn child_clip_bounds(&self, bounds: BoundingBox) -> BoundingBox {
@@ -471,6 +491,8 @@ pub struct LayoutTree {
     has_rich_text:                         bool,
     /// Cached on insertion; shares the tree's existing alignment padding.
     has_scroll_views:                      bool,
+    /// Cached on insertion: a scrolling element asks for whole rows.
+    has_whole_row_scrolls:                 bool,
 }
 
 impl LayoutTree {
@@ -525,6 +547,7 @@ impl LayoutTree {
             tooltip_body_style_origins: TooltipBodyStyleOrigins::default(),
             has_rich_text:              false,
             has_scroll_views:           false,
+            has_whole_row_scrolls:      false,
         }
     }
 
@@ -532,6 +555,7 @@ impl LayoutTree {
     pub(super) fn add(&mut self, element: Element) -> usize {
         let index = self.elements.len();
         self.has_scroll_views |= matches!(element.scroll_drive, ScrollDrive::Library(_));
+        self.has_whole_row_scrolls |= element.shows_whole_rows();
         self.elements.push(element);
         index
     }
@@ -541,6 +565,8 @@ impl LayoutTree {
     pub(crate) const fn contains_rich_text(&self) -> bool { self.has_rich_text }
 
     pub(super) const fn contains_scroll_views(&self) -> bool { self.has_scroll_views }
+
+    pub(super) const fn contains_whole_row_scrolls(&self) -> bool { self.has_whole_row_scrolls }
 
     /// Adds an element as a child of the given parent.
     ///
@@ -1954,6 +1980,7 @@ fn classify_element_change(element: &Element, next: &Element) -> LayoutTreeChang
         || element.scroll_anchor_x != next.scroll_anchor_x
         || element.scroll_anchor_y != next.scroll_anchor_y
         || element.scroll_line != next.scroll_line
+        || element.scroll_clip != next.scroll_clip
         || element.caret_follow != next.caret_follow
         || element.caret_marker != next.caret_marker
         || element.editable != next.editable

@@ -68,6 +68,37 @@ pub struct DiegeticTextMeasurer {
     pub measure_fn: MeasureTextFn,
 }
 
+impl DiegeticTextMeasurer {
+    /// `memoized` caches each text and full [`TextMeasure`] pair.
+    /// The cache lasts until the returned measurer and its measurement function are dropped.
+    /// Create one measurer per fit to exclude dimensions from earlier font or text states.
+    #[must_use]
+    pub fn memoized(&self) -> Self {
+        let measure = Arc::clone(&self.measure_fn);
+        let entries = Mutex::new(HashMap::<String, Vec<(TextMeasure, TextDimensions)>>::new());
+        Self {
+            measure_fn: Arc::new(move |text, style| {
+                let Ok(mut cache) = entries.lock() else {
+                    return measure(text, style);
+                };
+                if let Some(dimensions) = cache.get(text).and_then(|values| {
+                    values
+                        .iter()
+                        .find_map(|(prior, dimensions)| (prior == style).then_some(*dimensions))
+                }) {
+                    return dimensions;
+                }
+                let dimensions = measure(text, style);
+                cache
+                    .entry(text.to_owned())
+                    .or_default()
+                    .push((*style, dimensions));
+                dimensions
+            }),
+        }
+    }
+}
+
 impl Default for DiegeticTextMeasurer {
     fn default() -> Self {
         Self {
@@ -513,7 +544,12 @@ pub(super) fn build_layout(
 )]
 #[allow(clippy::panic, reason = "tests should panic on unexpected values")]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
     use super::CapHeightMeasurement;
+    use super::DiegeticTextMeasurer;
     use super::FontLayoutMeasurements;
     use super::MAX_FONT_MEASUREMENTS;
     use super::create_cap_height_measurer;
@@ -534,6 +570,35 @@ mod tests {
     fn measurer() -> MeasureTextFn {
         let font_registry = FontRegistry::new().unwrap();
         create_parley_measurer(font_registry.font_context(), font_registry.family_names())
+    }
+
+    #[test]
+    fn memoized_measurer_measures_each_distinct_request_once_per_fit() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&count);
+        let source = DiegeticTextMeasurer::default();
+        let source = DiegeticTextMeasurer {
+            measure_fn: Arc::new(move |text, style| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                (source.measure_fn)(text, style)
+            }),
+        };
+        let fitted = source.memoized();
+        let first = TextStyle::new(12.0).as_measure();
+        let second = TextStyle::new(14.0).as_measure();
+        for _ in 0..4 {
+            for (text, style) in [("one", first), ("two", first), ("one", second)] {
+                (fitted.measure_fn)(text, &style);
+            }
+        }
+        assert_eq!(count.load(Ordering::Relaxed), 3);
+        let next_fit = source.memoized();
+        (next_fit.measure_fn)("one", &first);
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            4,
+            "a new fit has a new cache"
+        );
     }
 
     #[test]

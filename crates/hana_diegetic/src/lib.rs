@@ -273,6 +273,7 @@ pub use layout::RenderCommandKind;
 pub use layout::ResolvedPanelShape;
 pub use layout::ResolvedPanelShapePrimitive;
 pub use layout::Row;
+pub use layout::ScrollClip;
 pub use layout::ScrollRestEdge;
 pub use layout::ShadowCasting;
 #[doc(hidden)]

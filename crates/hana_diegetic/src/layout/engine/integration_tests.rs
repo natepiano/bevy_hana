@@ -54,6 +54,7 @@ use crate::layout::RectangleSource;
 use crate::layout::RenderCommand;
 use crate::layout::RenderCommandKind;
 use crate::layout::ResolvedPanelShape;
+use crate::layout::ScrollClip;
 use crate::layout::Sizing;
 use crate::layout::Text;
 use crate::layout::TextDimensions;
@@ -2232,6 +2233,76 @@ fn clip_emits_scissor_commands() {
 
     assert_eq!(scissor_starts.len(), 1);
     assert_eq!(scissor_ends.len(), 1);
+}
+
+/// A 35-unit scroll window, moved down 5 units, over two text columns of
+/// ten 10-unit lines: one drawn as a single block, one drawn line by line.
+fn scrolled_text_columns(whole_rows: bool) -> Vec<RenderCommand> {
+    let lines = (0..10)
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut b = LayoutBuilder::new(VIEWPORT, VIEWPORT);
+    let mut window = El::column()
+        .width(Sizing::GROW)
+        .height(Sizing::fixed(35.0))
+        .scroll_y(5.0);
+    if whole_rows {
+        window = window.scroll_clip(ScrollClip::WholeRows);
+    }
+    b.with(window, |b| {
+        b.with(El::row().width(Sizing::GROW), |b| {
+            b.text(Text::new(&lines, TextStyle::new(10.0)));
+            b.text(Text::new(&lines, TextStyle::new(10.0)).wrap(TextWrap::Newlines));
+        });
+    });
+    let tree = b.build();
+    LayoutEngine::new(monospace_measure())
+        .compute(&tree, VIEWPORT, VIEWPORT, 1.0)
+        .commands
+}
+
+fn scroll_clip(commands: &[RenderCommand]) -> BoundingBox {
+    commands
+        .iter()
+        .find(|command| matches!(command.kind, RenderCommandKind::ScissorStart))
+        .map(|command| command.bounds)
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_whole_row_scroll_draws_no_half_row() {
+    let commands = scrolled_text_columns(true);
+    let clip = scroll_clip(&commands);
+    assert!(approx_eq(clip.y, 5.0), "clip top {}", clip.y);
+    assert!(approx_eq(clip.height, 30.0), "clip height {}", clip.height);
+    let mut rows = 0;
+    for command in &commands {
+        let RenderCommandKind::Text { text, .. } = &command.kind else {
+            continue;
+        };
+        let line_count = text.split('\n').count();
+        let line_height = command.bounds.height / line_count.to_f32();
+        for line in 0..line_count {
+            let top = line_height.mul_add(line.to_f32(), command.bounds.y);
+            let bottom = top + line_height;
+            let inside = top >= clip.y - 0.01 && bottom <= clip.y + clip.height + 0.01;
+            let outside = bottom <= clip.y + 0.01 || top >= clip.y + clip.height - 0.01;
+            assert!(
+                inside || outside,
+                "row {top}..{bottom} is cut by clip {clip:?}"
+            );
+            rows += usize::from(inside);
+        }
+    }
+    assert_eq!(rows, 6, "each column shows its three whole rows");
+}
+
+#[test]
+fn a_scroll_without_whole_rows_keeps_the_full_clip() {
+    let clip = scroll_clip(&scrolled_text_columns(false));
+    assert!(approx_eq(clip.y, 0.0), "clip top {}", clip.y);
+    assert!(approx_eq(clip.height, 35.0), "clip height {}", clip.height);
 }
 
 // ── Empty tree ───────────────────────────────────────────────────────────────
