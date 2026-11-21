@@ -3,8 +3,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::mpsc;
-#[cfg(test)]
-use std::sync::mpsc::SyncSender;
 use std::time::Instant;
 
 use notify::Event;
@@ -21,12 +19,6 @@ use crate::disk::paths::KeymapPaths;
 pub(super) struct WatchNotifications {
     pub(super) dirty:          bool,
     pub(super) health_message: Option<String>,
-}
-
-#[cfg(test)]
-pub(super) struct TestWatcher {
-    pub(super) watcher_notifications: Arc<Mutex<WatchNotifications>>,
-    pub(super) watcher_sender:        SyncSender<()>,
 }
 
 #[derive(Clone, Copy)]
@@ -86,7 +78,7 @@ impl DiskWorker {
         if let Some(health_message) = health_message {
             self.handle_watcher_failure(paths, health_message);
         } else if dirty {
-            self.dirty_at = Some(Instant::now() + self.worker_timings.debounce);
+            self.dirty_at = Some(self.clock.now() + self.worker_timings.debounce);
             #[cfg(test)]
             self.status.record_dirty_notification();
         }
@@ -101,7 +93,7 @@ impl DiskWorker {
             self.reported_watch_error = Some(message);
         }
 
-        self.read_user_keymap(paths, Instant::now());
+        self.read_user_keymap(paths, self.clock.now());
         self.recreate_watcher(paths);
     }
 
@@ -409,11 +401,8 @@ fn resolve_user_keymap_watch(paths: &KeymapPaths) -> UserKeymapWatch {
 mod tests {
     use std::fs;
     use std::path::Path;
-    use std::sync::OnceLock;
     use std::sync::mpsc;
-    use std::sync::mpsc::RecvTimeoutError;
     use std::time::Duration;
-    use std::time::Instant;
 
     use notify::Event;
     use notify::RecursiveMode;
@@ -426,23 +415,15 @@ mod tests {
     use crate::disk::paths::TestDirectory;
     use crate::disk::paths::XdgConfigHome;
     use crate::disk::worker::channels;
-    use crate::disk::worker::channels::DiskDelivery;
     use crate::disk::worker::channels::DiskWorkerChannels;
     use crate::disk::worker::runtime;
+    use crate::disk::worker::runtime::WorkerClock;
     use crate::disk::worker::runtime::WorkerTimings;
 
     const DEFAULT_KEYMAP: &[u8] = b"{\"bindings\": []}";
     const DEBOUNCE_INTERVAL: Duration = Duration::from_millis(100);
     const POLL_AUDIT_INTERVAL: Duration = Duration::from_millis(20);
     const RETRY_INTERVAL: Duration = Duration::from_millis(30);
-    /// How long the probe below asks the operating system's notification service for an answer.
-    ///
-    /// The one wall clock left in these tests, and it bounds the external service rather than
-    /// the disk worker: a machine that denies filesystem notifications reports nothing at all,
-    /// so the only way to learn that is to ask and stop asking. What it decides is whether the
-    /// two native-watch tests can run here, never whether the worker is correct.
-    const NOTIFICATION_PROBE_DEADLINE: Duration = Duration::from_secs(2);
-    const NOTIFICATION_PROBE_INTERVAL: Duration = Duration::from_millis(50);
     const TEST_APP_NAME: &str = "hana-rubric-watch-test";
 
     fn isolated_paths(temporary_directory: &TestDirectory) -> Result<KeymapPaths, String> {
@@ -464,7 +445,11 @@ mod tests {
         Ok(paths)
     }
 
-    fn start_worker(worker_timings: WorkerTimings, watch_mode: WatchMode) -> DiskWorkerChannels {
+    fn start_worker(
+        worker_timings: WorkerTimings,
+        watch_mode: WatchMode,
+        clock: WorkerClock,
+    ) -> DiskWorkerChannels {
         let paths = KeymapPathAvailability::for_app_name(TEST_APP_NAME)
             .into_resolved()
             .expect("test keymap paths resolve");
@@ -474,6 +459,7 @@ mod tests {
             Some(b"{}".to_vec()),
             worker_timings,
             watch_mode,
+            clock,
         )
     }
 
@@ -488,12 +474,8 @@ mod tests {
         path: &Path,
         expected_contents: Option<&[u8]>,
     ) {
-        while !matches!(
-            &worker.await_message().delivery,
-            DiskDelivery::Snapshot(snapshot)
-                if snapshot.source_path == path
-                    && channels::contents_match(&snapshot.contents, expected_contents)
-        ) {}
+        while channels::assert_snapshot(&worker.await_message(), path, expected_contents).is_err() {
+        }
     }
 
     fn wait_for_watcher(worker: &DiskWorkerChannels, expected: bool) {
@@ -518,7 +500,7 @@ mod tests {
             poll:     None,
             retry:    RETRY_INTERVAL,
         };
-        let mut worker = start_worker(worker_timings, WatchMode::Injected);
+        let mut worker = start_worker(worker_timings, WatchMode::Injected, WorkerClock::manual());
 
         assert!(
             paths
@@ -536,14 +518,16 @@ mod tests {
             .map_err(|error| format!("configuration directory recreation failed: {error}"))?;
         worker.inject_watcher_failure()?;
         wait_for_watcher(&worker, true);
-        wait_for_snapshot(&worker, paths.user_keymap(), None);
+        worker.advance_clock(worker_timings.retry)?;
+        worker.expect_snapshot(paths.user_keymap(), None)?;
         let read_attempts_before_write = worker.activity(|activity| activity.read_attempts);
         fs::write(paths.user_keymap(), b"{\"bindings\": []}")
             .map_err(|error| format!("recreated user keymap write failed: {error}"))?;
         worker.inject_watcher_dirty()?;
         wait_for_dirty_notifications(&worker, 1);
+        worker.advance_clock(worker_timings.debounce)?;
 
-        wait_for_snapshot(&worker, paths.user_keymap(), Some(b"{\"bindings\": []}"));
+        worker.expect_snapshot(paths.user_keymap(), Some(b"{\"bindings\": []}"))?;
         if worker.activity(|activity| activity.read_attempts) != read_attempts_before_write + 1 {
             return Err(String::from(
                 "the recreated watcher snapshot did not come from its injected watcher edge",
@@ -556,112 +540,32 @@ mod tests {
         Ok(())
     }
 
-    /// Whether this machine's filesystem-notification service actually delivers events.
-    ///
-    /// [`WatchMode::Native`] is the production path and the only mode that depends on that
-    /// service. Some execution environments deny it without denying the filesystem, so every
-    /// native watch silently never fires while ordinary reads and writes keep working. The
-    /// difference is measured rather than assumed: a platform or environment-variable check would
-    /// give up this coverage on the machine that needs it most.
-    enum NativeNotificationDelivery {
-        /// A watcher armed on a directory reported a file written inside it.
-        Delivering,
-        /// Nothing was reported, so a native watch cannot be observed here.
-        Silent { reason: String },
-    }
-
-    fn native_notification_delivery() -> &'static NativeNotificationDelivery {
-        static DELIVERY: OnceLock<NativeNotificationDelivery> = OnceLock::new();
-
-        DELIVERY.get_or_init(probe_native_notification_delivery)
-    }
-
-    fn probe_native_notification_delivery() -> NativeNotificationDelivery {
-        let directory = match TestDirectory::new("notification-probe") {
-            Ok(directory) => directory,
-            Err(error) => {
-                return NativeNotificationDelivery::Silent {
-                    reason: format!("a directory to watch could not be created: {error}"),
-                };
-            },
-        };
+    /// Wait for the operating system to deliver an event for a write to the watched directory.
+    fn wait_for_native_notification() -> Result<(), String> {
+        let directory = TestDirectory::new("notification-probe").map_err(|error| {
+            format!("native notification probe directory creation failed: {error}")
+        })?;
         let (sender, receiver) = mpsc::channel();
-        let mut watcher = match notify::recommended_watcher(move |event: notify::Result<Event>| {
+        let mut watcher = notify::recommended_watcher(move |event: notify::Result<Event>| {
             let _ = sender.send(event);
-        }) {
-            Ok(watcher) => watcher,
-            Err(error) => {
-                return NativeNotificationDelivery::Silent {
-                    reason: format!("the notification service refused a watcher: {error}"),
-                };
-            },
-        };
-        if let Err(error) = watcher.watch(directory.path(), RecursiveMode::NonRecursive) {
-            return NativeNotificationDelivery::Silent {
-                reason: format!("the notification service refused to watch a directory: {error}"),
-            };
-        }
+        })
+        .map_err(|error| format!("native notification probe watcher creation failed: {error}"))?;
+        watcher
+            .watch(directory.path(), RecursiveMode::NonRecursive)
+            .map_err(|error| format!("native notification probe watch failed: {error}"))?;
 
-        // The write repeats because arming a watch is not instantaneous on every backend: a single
-        // write can land before the service is listening and be reported by nobody.
-        let probe_file = directory.path().join("probe.jsonc");
-        let deadline = Instant::now() + NOTIFICATION_PROBE_DEADLINE;
-        let mut writes = 0_u32;
-        while Instant::now() < deadline {
-            writes += 1;
-            if let Err(error) = fs::write(&probe_file, writes.to_string()) {
-                return NativeNotificationDelivery::Silent {
-                    reason: format!("the watched file could not be written: {error}"),
-                };
-            }
-            match receiver.recv_timeout(NOTIFICATION_PROBE_INTERVAL) {
-                Ok(Ok(_)) => return NativeNotificationDelivery::Delivering,
-                Ok(Err(error)) => {
-                    return NativeNotificationDelivery::Silent {
-                        reason: format!("the notification service reported an error: {error}"),
-                    };
-                },
-                Err(RecvTimeoutError::Timeout) => {},
-                Err(RecvTimeoutError::Disconnected) => {
-                    return NativeNotificationDelivery::Silent {
-                        reason: String::from("the notification service closed its event channel"),
-                    };
-                },
-            }
-        }
-
-        NativeNotificationDelivery::Silent {
-            reason: format!(
-                "the notification service accepted a watch and then reported nothing for a file written {writes} times inside the directory it was watching",
-            ),
-        }
-    }
-
-    /// Reports whether `test` can observe a native watch on this machine, naming the environment
-    /// when it cannot so the skip is never read as a disk-worker defect.
-    ///
-    /// The reason is printed rather than swallowed, and `.config/nextest.toml` shows these two
-    /// tests' output even when they pass, because a silent pass would be indistinguishable from
-    /// real coverage.
-    fn native_watch_is_observable(test: &str) -> bool {
-        match native_notification_delivery() {
-            NativeNotificationDelivery::Delivering => true,
-            NativeNotificationDelivery::Silent { reason } => {
-                eprintln!(
-                    "SKIPPED {test}: this environment denies the filesystem-notification service, \
-                     so a native watch cannot be observed. The disk worker was never exercised and \
-                     is not implicated: {reason}",
-                );
-                false
-            },
-        }
+        fs::write(directory.path().join("probe.jsonc"), b"{}")
+            .map_err(|error| format!("native notification probe write failed: {error}"))?;
+        receiver
+            .recv()
+            .map_err(|error| format!("native notification probe channel closed: {error}"))?
+            .map_err(|error| format!("native notification probe reported an error: {error}"))?;
+        Ok(())
     }
 
     #[test]
     fn a_native_watch_carries_an_edit_without_a_poll_audit() -> Result<(), String> {
-        if !native_watch_is_observable("a_native_watch_carries_an_edit_without_a_poll_audit") {
-            return Ok(());
-        }
+        wait_for_native_notification()?;
 
         let environment_lock = ENVIRONMENT_LOCK
             .lock()
@@ -678,7 +582,7 @@ mod tests {
             poll:     None,
             retry:    RETRY_INTERVAL,
         };
-        let mut worker = start_worker(worker_timings, WatchMode::Native);
+        let mut worker = start_worker(worker_timings, WatchMode::Native, WorkerClock::System);
 
         assert!(
             paths
@@ -694,11 +598,8 @@ mod tests {
         );
         wait_for_watcher(&worker, true);
 
-        // Delivery is the whole assertion. There is no latency bound: the notification
-        // service is the operating system's, this test already skips where that service is
-        // unavailable, and a millisecond figure measured against it says more about how loaded
-        // the machine is than about the worker. A watch that never delivers parks here for
-        // nextest's `slow-timeout` to end.
+        // The native watch must deliver the edit. If the edit never arrives, nextest's
+        // `slow-timeout` ends the test.
         let edited_contents = b"{\"bindings\": [{\"bindings\": {}}]}";
         fs::write(paths.user_keymap(), edited_contents)
             .map_err(|error| format!("native watch keymap write failed: {error}"))?;
@@ -724,7 +625,7 @@ mod tests {
             poll:     Some(POLL_AUDIT_INTERVAL),
             retry:    RETRY_INTERVAL,
         };
-        let mut worker = start_worker(worker_timings, WatchMode::PollOnly);
+        let mut worker = start_worker(worker_timings, WatchMode::PollOnly, WorkerClock::manual());
 
         assert!(
             paths
@@ -734,12 +635,12 @@ mod tests {
         wait_for_message(&worker);
         fs::write(paths.user_keymap(), b"{\"bindings\": [{\"bindings\": {}}]}")
             .map_err(|error| format!("polled user keymap write failed: {error}"))?;
+        worker.advance_clock(POLL_AUDIT_INTERVAL)?;
 
-        wait_for_snapshot(
-            &worker,
+        worker.expect_snapshot(
             paths.user_keymap(),
             Some(b"{\"bindings\": [{\"bindings\": {}}]}"),
-        );
+        )?;
 
         worker.shutdown();
         drop(xdg_config_home);
@@ -758,12 +659,13 @@ mod tests {
         use super::RETRY_INTERVAL;
         use super::TestDirectory;
         use super::WatchMode;
+        use super::WorkerClock;
         use super::WorkerTimings;
         use super::XdgConfigHome;
         use super::isolated_paths;
-        use super::native_watch_is_observable;
         use super::runtime;
         use super::start_worker;
+        use super::wait_for_native_notification;
         use super::wait_for_snapshot;
         use super::wait_for_watcher;
 
@@ -815,11 +717,7 @@ mod tests {
         /// the file a file-only watch was placed on.
         #[test]
         fn a_native_watch_carries_edits_to_a_symlinked_keymap_file() -> Result<(), String> {
-            if !native_watch_is_observable(
-                "a_native_watch_carries_edits_to_a_symlinked_keymap_file",
-            ) {
-                return Ok(());
-            }
+            wait_for_native_notification()?;
 
             let environment_lock = ENVIRONMENT_LOCK
                 .lock()
@@ -845,7 +743,7 @@ mod tests {
                 poll:     None,
                 retry:    RETRY_INTERVAL,
             };
-            let mut worker = start_worker(worker_timings, WatchMode::Native);
+            let mut worker = start_worker(worker_timings, WatchMode::Native, WorkerClock::System);
 
             wait_for_snapshot(
                 &worker,

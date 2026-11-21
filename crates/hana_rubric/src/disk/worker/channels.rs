@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+#[cfg(test)]
+use std::sync::mpsc;
 use std::sync::mpsc::Sender;
 #[cfg(test)]
 use std::sync::mpsc::SyncSender;
@@ -13,7 +15,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 #[cfg(test)]
-use super::watch::TestWatcher;
+use super::watch::WatchNotifications;
 use crate::Diagnostic;
 use crate::DiagnosticKind;
 use crate::DiagnosticOrigin;
@@ -55,16 +57,16 @@ pub(crate) struct DiskWorkerMessage {
     )
 )]
 pub(crate) struct DiskWorkerChannels {
-    pub(super) slot:               CoalescingSlot,
-    pub(super) control_sender:     Sender<WorkerControl>,
-    pub(super) join_handle:        Option<JoinHandle<()>>,
-    pub(super) status:             Arc<WorkerStatus>,
+    pub(super) slot:                   CoalescingSlot,
+    pub(super) control_sender:         Sender<WorkerControl>,
+    pub(super) join_handle:            Option<JoinHandle<()>>,
+    pub(super) status:                 Arc<WorkerStatus>,
     #[cfg(test)]
-    pub(super) test_watcher:       Option<TestWatcher>,
+    pub(super) injected_notifications: Option<Arc<Mutex<WatchNotifications>>>,
     /// Releases a worker started with `WatchMode::InjectedHoldingFirstRead` from the window
     /// between arming its watcher and its first read.
     #[cfg(test)]
-    pub(super) first_read_release: SyncSender<()>,
+    pub(super) first_read_release:     SyncSender<()>,
 }
 
 impl DiskWorkerChannels {
@@ -75,10 +77,32 @@ impl DiskWorkerChannels {
     #[cfg(test)]
     pub(super) fn await_message(&self) -> DiskWorkerMessage { self.slot.take_blocking() }
 
-    /// Take a delivery published within `quiet`, reporting `None` when the worker stayed silent.
+    /// Check the snapshot in the slot after the worker processes the due work.
     #[cfg(test)]
-    pub(super) fn take_message_within(&self, quiet: Duration) -> Option<DiskWorkerMessage> {
-        self.slot.take_within(quiet)
+    pub(super) fn expect_snapshot(
+        &self,
+        path: &Path,
+        expected_contents: Option<&[u8]>,
+    ) -> Result<(), String> {
+        let message = self.take_message().ok_or_else(|| {
+            format!(
+                "disk worker did not publish a snapshot for `{}`",
+                path.display()
+            )
+        })?;
+        assert_snapshot(&message, path, expected_contents)
+    }
+
+    /// Advance the manual clock and block until the worker processes the due work.
+    #[cfg(test)]
+    pub(super) fn advance_clock(&self, elapsed: Duration) -> Result<(), String> {
+        let (processed, completion) = mpsc::sync_channel(0);
+        self.control_sender
+            .send(WorkerControl::AdvanceClock { elapsed, processed })
+            .map_err(|error| format!("could not advance the disk worker clock: {error}"))?;
+        completion
+            .recv()
+            .map_err(|error| format!("the disk worker did not process the clock advance: {error}"))
     }
 
     /// Block until the worker's own activity satisfies `reached`.
@@ -118,12 +142,11 @@ impl DiskWorkerChannels {
         health_message: Option<String>,
         dirty: bool,
     ) -> Result<(), String> {
-        let test_watcher = self
-            .test_watcher
+        let injected_notifications = self
+            .injected_notifications
             .as_ref()
             .ok_or_else(|| String::from("worker was not started with an injected watcher"))?;
-        let mut watcher_notifications = test_watcher
-            .watcher_notifications
+        let mut watcher_notifications = injected_notifications
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
@@ -131,8 +154,9 @@ impl DiskWorkerChannels {
         watcher_notifications.dirty |= dirty;
         drop(watcher_notifications);
 
-        let _ = test_watcher.watcher_sender.try_send(());
-        Ok(())
+        self.control_sender
+            .send(WorkerControl::WatcherNotification)
+            .map_err(|error| format!("could not notify the disk worker: {error}"))
     }
 
     #[cfg(test)]
@@ -233,25 +257,6 @@ impl CoalescingSlot {
                 .wait(message_slot)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
-    }
-
-    /// Block until the worker publishes, or report that `quiet` passed without one.
-    ///
-    /// The only negative assertion in the worker's tests, and the one place a duration decides
-    /// an outcome: absence over an interval cannot be established any other way. It is safe
-    /// where a deadline is not, because a slow machine makes this wait quieter rather than
-    /// louder -- the failure it reports is a delivery that happened, never one that was late.
-    #[cfg(test)]
-    pub(super) fn take_within(&self, quiet: Duration) -> Option<DiskWorkerMessage> {
-        let (mut message_slot, _) = self
-            .slot
-            .published
-            .wait_timeout_while(self.message_slot(), quiet, |message_slot| {
-                message_slot.is_none()
-            })
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        Some(Self::retained(message_slot.take()?))
     }
 
     /// Append the count of diagnostics the slot dropped while coalescing, when it dropped any.
@@ -357,6 +362,13 @@ impl WorkerStatus {
 
 pub(super) enum WorkerControl {
     Stop,
+    #[cfg(test)]
+    WatcherNotification,
+    #[cfg(test)]
+    AdvanceClock {
+        elapsed:   Duration,
+        processed: SyncSender<()>,
+    },
 }
 
 pub(super) fn disk_error_diagnostic(path: &Path, action: &str, error: &Error) -> Diagnostic {
@@ -390,13 +402,37 @@ fn discarded_diagnostics_diagnostic(discarded_diagnostics: usize) -> Diagnostic 
     )
 }
 
+#[cfg(test)]
+pub(super) fn assert_snapshot(
+    message: &DiskWorkerMessage,
+    path: &Path,
+    expected_contents: Option<&[u8]>,
+) -> Result<(), String> {
+    let DiskDelivery::Snapshot(snapshot) = &message.delivery else {
+        return Err(String::from("disk worker message has no snapshot"));
+    };
+
+    if snapshot.source_path != path {
+        return Err(format!(
+            "disk worker used `{}` instead of `{}`",
+            snapshot.source_path.display(),
+            path.display()
+        ));
+    }
+
+    if !contents_match(&snapshot.contents, expected_contents) {
+        return Err(String::from(
+            "disk worker snapshot contents differed from the file",
+        ));
+    }
+
+    Ok(())
+}
+
 /// Whether a delivered snapshot carries `expected_contents`, where `None` stands for the
 /// confirmed absence of the user keymap file.
 #[cfg(test)]
-pub(super) fn contents_match(
-    contents: &UserKeymapContents,
-    expected_contents: Option<&[u8]>,
-) -> bool {
+fn contents_match(contents: &UserKeymapContents, expected_contents: Option<&[u8]>) -> bool {
     match (contents, expected_contents) {
         (UserKeymapContents::Read(contents), Some(expected)) => contents.as_ref() == expected,
         (UserKeymapContents::Absent, None) => true,
