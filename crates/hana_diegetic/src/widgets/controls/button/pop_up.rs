@@ -1,14 +1,11 @@
-use bevy::prelude::Color;
-
 use super::Button;
 use super::ButtonPaintBounds;
+use super::face;
+use super::face::TEXT as POP_UP_TEXT;
 use crate::AlignX;
 use crate::AlignY;
-use crate::Appearance;
-use crate::Border;
 use crate::ControlLength;
 use crate::ControlMetrics;
-use crate::CornerRadius;
 use crate::El;
 use crate::Padding;
 use crate::PanelCoord;
@@ -21,17 +18,6 @@ use crate::Text;
 use crate::TextStyle;
 use crate::WidgetElement;
 
-const POP_UP_BORDER_FOCUSED: Color = Color::srgb(0.41, 0.68, 1.0);
-const POP_UP_BORDER_HOVERED: Color = Color::srgb(0.75, 0.78, 0.83);
-const POP_UP_BORDER_PRESSED: Color = Color::srgb(0.60, 0.62, 0.66);
-const POP_UP_BORDER_DISABLED: Color = Color::srgb(0.26, 0.28, 0.31);
-const POP_UP_BORDER: Color = Color::srgb(0.66, 0.69, 0.74);
-const POP_UP_FILL: Color = Color::srgb(0.20, 0.22, 0.26);
-const POP_UP_FILL_DISABLED: Color = Color::srgb(0.11, 0.12, 0.14);
-const POP_UP_FILL_HOVERED: Color = Color::srgb(0.27, 0.30, 0.35);
-const POP_UP_FILL_PRESSED: Color = Color::srgb(0.16, 0.18, 0.21);
-const POP_UP_TEXT: Color = Color::srgb(0.94, 0.95, 0.97);
-const POP_UP_TEXT_DISABLED: Color = Color::srgb(0.52, 0.54, 0.57);
 /// Heights of the chevron ends, as fractions of the button height from its top.
 const POP_UP_UPPER_CHEVRON_BASE: f32 = 0.45;
 const POP_UP_UPPER_CHEVRON_TIP: f32 = 0.34;
@@ -76,7 +62,7 @@ impl Button {
         let value_style = TextStyle::new(metrics.label_size).with_color(POP_UP_TEXT);
         Text::new(current_value, value_style)
             .measure_as(widest_choice)
-            .layout(
+            .layout(face::button_face(
                 El::new()
                     .height(Sizing::fixed(metrics.button.height))
                     .padding(Padding::new(
@@ -86,8 +72,6 @@ impl Button {
                         metrics.border_width,
                     ))
                     .alignment(AlignX::Left, AlignY::Center)
-                    .background(POP_UP_FILL)
-                    .border(Border::all(metrics.border_width, POP_UP_BORDER))
                     .draw(PanelDraw::lines([
                         chevron(
                             (left(), y(POP_UP_UPPER_CHEVRON_BASE)),
@@ -106,31 +90,9 @@ impl Button {
                             (right(), y(POP_UP_LOWER_CHEVRON_BASE)),
                         ),
                     ]))
-                    .corner_radius(CornerRadius::all(metrics.button.corner_radius))
-                    .widget(id, self)
-                    .hovered(
-                        Appearance::new()
-                            .background(POP_UP_FILL_HOVERED)
-                            .border_color(POP_UP_BORDER_HOVERED),
-                    )
-                    .pressed(
-                        Appearance::new()
-                            .background(POP_UP_FILL_PRESSED)
-                            .border_color(POP_UP_BORDER_PRESSED),
-                    )
-                    .focused(
-                        Appearance::new()
-                            .border_color(POP_UP_BORDER_FOCUSED)
-                            .border_width(metrics.focus_border_width),
-                    )
-                    .disabled(
-                        Appearance::new()
-                            .background(POP_UP_FILL_DISABLED)
-                            .border_color(POP_UP_BORDER_DISABLED)
-                            .text_color(POP_UP_TEXT_DISABLED)
-                            .path_color(POP_UP_TEXT_DISABLED),
-                    ),
-            )
+                    .widget(id, self),
+                metrics,
+            ))
     }
 }
 
@@ -138,15 +100,10 @@ impl Button {
 mod tests {
     use std::sync::Arc;
 
+    use bevy::prelude::Color;
     use hana_kana::ToF32;
 
     use super::Button;
-    use super::Color;
-    use super::POP_UP_BORDER;
-    use super::POP_UP_BORDER_FOCUSED;
-    use super::POP_UP_BORDER_HOVERED;
-    use super::POP_UP_BORDER_PRESSED;
-    use super::POP_UP_FILL;
     use super::POP_UP_TEXT;
     use crate::ControlMetrics;
     use crate::LayoutBuilder;
@@ -154,6 +111,11 @@ mod tests {
     use crate::layout::RectangleSource;
     use crate::layout::RenderCommandKind;
     use crate::layout::TextDimensions;
+    use crate::widgets::controls::button::face::BORDER as POP_UP_BORDER;
+    use crate::widgets::controls::button::face::BORDER_FOCUSED as POP_UP_BORDER_FOCUSED;
+    use crate::widgets::controls::button::face::BORDER_HOVERED as POP_UP_BORDER_HOVERED;
+    use crate::widgets::controls::button::face::BORDER_PRESSED as POP_UP_BORDER_PRESSED;
+    use crate::widgets::controls::button::face::FILL as POP_UP_FILL;
 
     fn contrast(foreground: Color, background: Color) -> f32 {
         let luminance = |color: Color| {

@@ -59,6 +59,10 @@ pub(in crate::widgets) struct SliderPresentation {
     dragging:            Has<SliderDrag>,
 }
 
+impl SliderPresentation {
+    const REACH_RIM_HEIGHT_RATIO: f32 = 1.0 / 24.0;
+}
+
 /// Why the signal marker is hidden rather than placed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MarkerHidden {
@@ -152,28 +156,14 @@ fn present_reach_band_knob_edge(
     state: &SliderState,
     points_to_world: f32,
 ) {
-    if has_visible_reach_band(slots, state) {
-        // The dark inset rim separates a knob from the near-white reach band.
-        // An absent or hidden band keeps the face's original bright rim.
+    if has_visible_reach_band(slots, state)
+        && let Some(border) = slots.border_box(VisualSlotId::SLIDER_THUMB)
+    {
+        // Expand the dark rim outside the white face without changing the pointer geometry.
+        let rim = border.height * points_to_world * SliderPresentation::REACH_RIM_HEIGHT_RATIO;
         thumb.border_color = Some(crate::ControlPalette::system_dark().field_fill);
-        if let (Some(border), Some(content)) = (
-            slots.border_box(VisualSlotId::SLIDER_THUMB),
-            slots.content_box(VisualSlotId::SLIDER_THUMB),
-        ) {
-            // The shared capsule has no border. Add an inset rim only when
-            // the reach band needs separation from the capsule fill.
-            let minimum_rim = border.height / 12.0;
-            let scale = 1.25 * points_to_world;
-            thumb.border_widths = Some(
-                [
-                    content.y - border.y,
-                    border.x + border.width - content.x - content.width,
-                    border.y + border.height - content.y - content.height,
-                    content.x - border.x,
-                ]
-                .map(|width| width.max(minimum_rim) * scale),
-            );
-        }
+        thumb.border_widths = Some([rim; 4]);
+        thumb.border_outset = Some(rim);
     }
 }
 

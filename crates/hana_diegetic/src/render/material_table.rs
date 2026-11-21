@@ -196,12 +196,14 @@ impl TryFrom<u32> for MaterialSlotId {
     }
 }
 
-/// Failure reason for converting a raw GPU row value back to a CPU row id.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Error when converting a GPU row value to a CPU row id.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum MaterialSlotIdError {
     /// The raw value is `INVALID_GPU_MATERIAL_SLOT`, reserved for `NotAuthored`.
+    #[error("material slot id is reserved")]
     ReservedSentinel,
     /// The raw value is not present in the current frame table.
+    #[error("material slot id {raw} is outside the table of {row_count} rows")]
     OutOfRange {
         /// Raw row value supplied by a GPU-facing record.
         raw:       u32,

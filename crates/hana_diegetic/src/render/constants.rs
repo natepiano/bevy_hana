@@ -72,3 +72,9 @@ pub(super) const TEXT_Z_OFFSET: f32 = 0.0;
 /// Default clip rect for unclipped text: effectively infinite panel-local
 /// bounds so the shader clip test becomes a no-op.
 pub(super) const UNCLIPPED_TEXT_CLIP_RECT: Vec4 = Vec4::new(-1e6, -1e6, 1e6, 1e6);
+
+// transparency
+/// A 64 MiB node pool holds twelve full-window layers at 640 by 400 pixels.
+/// This floor adds no pool memory at 1280 by 720 pixels or larger.
+/// Device binding limits can reduce the floor.
+pub(super) const OIT_FRAGMENT_POOL_FLOOR_BYTES: usize = 64 * 1024 * 1024;

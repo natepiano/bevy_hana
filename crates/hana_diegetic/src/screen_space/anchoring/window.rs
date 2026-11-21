@@ -1,5 +1,6 @@
 //! Concrete window lookup for screen-space attachment resolution.
 
+use bevy::ecs::query::QuerySingleError;
 use bevy::platform::collections::HashMap;
 use bevy::prelude::Entity;
 use bevy::prelude::Query;
@@ -9,28 +10,30 @@ use bevy::prelude::With;
 use bevy::window::PrimaryWindow;
 use bevy::window::WindowRef;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum WindowResolveFailure {
-    Missing,
-    ZeroSized,
+#[derive(Debug, thiserror::Error)]
+pub(super) enum WindowResolveError {
+    #[error("could not resolve the primary window")]
+    PrimaryWindow(#[from] QuerySingleError),
+    #[error("window {0} is missing")]
+    Missing(Entity),
+    #[error("window {0} has a nonpositive dimension")]
+    ZeroSized(Entity),
 }
 
 pub(super) fn resolve_window(
     window_ref: WindowRef,
     primary: &Query<Entity, With<PrimaryWindow>>,
     window_sizes: &HashMap<Entity, Vec2>,
-) -> Result<(Entity, Vec2), WindowResolveFailure> {
+) -> Result<(Entity, Vec2), WindowResolveError> {
     let window = match window_ref {
-        WindowRef::Primary => primary
-            .single()
-            .map_err(|_| WindowResolveFailure::Missing)?,
+        WindowRef::Primary => primary.single()?,
         WindowRef::Entity(entity) => entity,
     };
     let Some(size) = window_sizes.get(&window).copied() else {
-        return Err(WindowResolveFailure::Missing);
+        return Err(WindowResolveError::Missing(window));
     };
     if size.x <= 0.0 || size.y <= 0.0 {
-        return Err(WindowResolveFailure::ZeroSized);
+        return Err(WindowResolveError::ZeroSized(window));
     }
     Ok((window, size))
 }

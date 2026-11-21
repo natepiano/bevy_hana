@@ -69,8 +69,8 @@ pub(crate) struct DirectedFillInterval {
 /// `border_color` recolor only the slot's SDF fill or border role.
 /// `border_widths`
 /// replaces the slot's authored SDF border widths, which grow inward from the
-/// authored outer bounds and so change no geometry layout solved. `offset`
-/// translates
+/// authored outer bounds. `border_outset` expands the rendered bounds and corner radii.
+/// Both options keep the solved layout boxes unchanged. `offset` translates
 /// the slot's SDF, image, text, and panel-line records in the panel-local
 /// render frame — panel world units with Y increasing upward — while
 /// preserving authored draw depth. `material`
@@ -94,6 +94,8 @@ pub(crate) struct VisualSlotOverride {
     /// panel-local world units, the same frame and order
     /// `ResolvedSdfSurface::border_widths` carries.
     pub border_widths: Option<[f32; 4]>,
+    /// Expands the SDF bounds and corner radii without changing the solved layout.
+    pub border_outset: Option<f32>,
     /// Panel-local render-frame XY translation added to retained record
     /// transforms: panel world units with Y increasing upward, distinct from
     /// the layout-point frame (Y increasing downward) the widget slot boxes
@@ -114,7 +116,7 @@ pub(crate) struct VisualSlotOverride {
     pub texture:       Option<Handle<Image>>,
 }
 
-const _: () = assert!(size_of::<VisualSlotOverride>() == 200);
+const _: () = assert!(size_of::<VisualSlotOverride>() == 208);
 
 impl VisualSlotOverride {
     /// Sets the visible slider fill length from its leading edge.
@@ -171,6 +173,7 @@ impl VisualSlotOverride {
         self.fill_color = overlay.fill_color.or(self.fill_color);
         self.border_color = overlay.border_color.or(self.border_color);
         self.border_widths = overlay.border_widths.or(self.border_widths);
+        self.border_outset = overlay.border_outset.or(self.border_outset);
         self.offset = overlay.offset.or(self.offset);
         self.dim_fill |= overlay.dim_fill;
         self.dim_border |= overlay.dim_border;
@@ -206,6 +209,7 @@ impl VisualSlotOverride {
         if !capabilities.contains(VisualElementCapabilities::SDF_BORDER) {
             self.border_color = None;
             self.border_widths = None;
+            self.border_outset = None;
             self.dim_border = false;
         }
         if !capabilities.contains(VisualElementCapabilities::TEXT) {

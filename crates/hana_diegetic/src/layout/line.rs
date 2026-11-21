@@ -264,15 +264,22 @@ enum PanelCoordKind {
 
 /// Error returned when a panel-line scalar is not finite.
 #[derive(thiserror::Error, Clone, Copy, Debug, PartialEq)]
-#[error("panel-line scalar must be finite, got {value}")]
-pub struct InvalidPanelScalar {
-    value: f32,
+pub enum PanelScalarError {
+    /// The scalar is NaN or infinite.
+    #[error("panel-line scalar must be finite, got {value}")]
+    NonFinite {
+        /// The scalar supplied by the caller.
+        value: f32,
+    },
 }
 
-impl InvalidPanelScalar {
+impl PanelScalarError {
     /// Returns the invalid scalar value.
     #[must_use]
-    pub const fn value(self) -> f32 { self.value }
+    pub const fn value(self) -> f32 {
+        let Self::NonFinite { value } = self;
+        value
+    }
 }
 
 impl PanelLine {
@@ -1357,14 +1364,14 @@ impl PanelCoord {
     ///
     /// # Errors
     ///
-    /// Returns [`InvalidPanelScalar`] when `value` is NaN or infinite.
-    pub const fn try_percent(value: f32) -> Result<Self, InvalidPanelScalar> {
+    /// Returns [`PanelScalarError`] when `value` is NaN or infinite.
+    pub const fn try_percent(value: f32) -> Result<Self, PanelScalarError> {
         if value.is_finite() {
             Ok(Self {
                 kind: PanelCoordKind::Percent(value),
             })
         } else {
-            Err(InvalidPanelScalar { value })
+            Err(PanelScalarError::NonFinite { value })
         }
     }
 
@@ -1455,12 +1462,12 @@ mod tests {
 
     use super::DEFAULT_CAP_SIZE;
     use super::DEFAULT_LINE_WIDTH;
-    use super::InvalidPanelScalar;
     use super::LineStyle;
     use super::PanelCircle;
     use super::PanelCoord;
     use super::PanelLine;
     use super::PanelPoint;
+    use super::PanelScalarError;
     use super::PanelShapeClipPolicy;
     use super::PanelShapePrimitiveKind;
     use super::PanelShapeResolveContext;
@@ -1473,7 +1480,7 @@ mod tests {
 
     #[test]
     fn invalid_panel_scalar_message_is_stable() {
-        let error = InvalidPanelScalar {
+        let error = PanelScalarError::NonFinite {
             value: f32::INFINITY,
         };
 

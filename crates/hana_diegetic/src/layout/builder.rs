@@ -521,6 +521,20 @@ impl<Role> Text<Role> {
         }
     }
 
+    /// Changes the text layout while preserving its widget role and content.
+    pub(crate) fn map_layout(
+        mut self,
+        update: impl FnOnce(El<Row, Role>) -> El<Row, Role>,
+    ) -> Self {
+        let layout = El {
+            common:       self.layout,
+            child_layout: Row::default(),
+            role:         PhantomData,
+        };
+        self.layout = update(layout).common;
+        self
+    }
+
     /// Sets the complete sizing policy for this text leaf.
     pub fn sizing(mut self, sizing: TextSizing) -> Self {
         self.sizing = sizing;

@@ -171,8 +171,7 @@ fn resolved_icon_uses_its_solved_square_size() -> Result<(), String> {
     report_default_icon_ink_moves(&fonts, font_id)
 }
 
-/// Lists changed icon origins for the repair review. This reads the shipped
-/// outlines through the same font registry used to measure the reified run.
+/// Measures shipped icon outlines through the renderer's font registry.
 fn report_default_icon_ink_moves(
     fonts: &crate::FontRegistry,
     font_id: FontId,

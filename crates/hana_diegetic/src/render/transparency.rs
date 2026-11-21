@@ -71,6 +71,7 @@ use hana_kana::ToF32;
 use hana_kana::ToF64;
 use hana_kana::ToUsize;
 
+use super::constants::OIT_FRAGMENT_POOL_FLOOR_BYTES;
 use crate::screen_space::ScreenSpaceCamera;
 
 /// Sizing factor for Bevy's shared OIT fragment pool, in twelve-byte allocation
@@ -278,9 +279,12 @@ pub(super) fn on_screen_space_camera_added(
 /// error before the first frame. Bevy sizes the pool from active cameras only;
 /// this counts every OIT camera, so a camera that turns active never grows the
 /// pool past the limit. When the window grows past the limit, every camera's
-/// average drops to the most the device holds; when it fits again, every camera
-/// returns to [`OIT_FRAGMENTS_PER_PIXEL_AVERAGE`]. Between those changes an
-/// average set by hand stays, unless it passes the limit.
+/// average drops to the most the device holds. Small windows receive at least
+/// [`OIT_FRAGMENT_POOL_FLOOR_BYTES`] when the device permits that allocation.
+/// The floor holds twelve full-window layers at 640 by 400 pixels.
+/// Larger windows retain [`OIT_FRAGMENTS_PER_PIXEL_AVERAGE`].
+/// Between target changes, a manual average stays within the device limit.
+/// Bevy exposes no overflow signal, so higher fragment demand can still exceed this pool.
 ///
 /// This caps the node pool only. Bevy also binds a heads buffer of 4 bytes per
 /// pixel, 150.4 MB at 6880 × 5464, and no average can shrink it.
@@ -297,13 +301,11 @@ pub(super) fn fit_oit_fragment_pool_to_device(
         .iter()
         .filter_map(|(camera, _)| camera.physical_target_size())
         .fold(UVec2::ZERO, UVec2::max);
-    let ceiling = oit_fragment_ceiling(
-        largest,
-        limits
-            .max_storage_buffer_binding_size
-            .min(limits.max_buffer_size),
-    );
-    let fit = OIT_FRAGMENTS_PER_PIXEL_AVERAGE.min(ceiling);
+    let binding_limit = limits
+        .max_storage_buffer_binding_size
+        .min(limits.max_buffer_size);
+    let ceiling = oit_fragment_ceiling(largest, binding_limit);
+    let fit = oit_fragment_target(largest).min(ceiling);
     let fit_changed = last_fit.differs_from(fit);
     *last_fit = LastComputedPoolTarget::Computed(fit);
     for (_, settings) in &mut cameras {
@@ -317,6 +319,23 @@ pub(super) fn fit_oit_fragment_pool_to_device(
             .map_unchanged(|settings| &mut settings.fragments_per_pixel_average)
             .set_if_neq(next);
     }
+}
+
+/// Returns the allocation average for the window budget and the small-window floor.
+fn oit_fragment_target(size: UVec2) -> f32 {
+    let pixels = size.x.saturating_mul(size.y);
+    if pixels == 0 {
+        return OIT_FRAGMENTS_PER_PIXEL_AVERAGE;
+    }
+    let nodes = OIT_FRAGMENT_POOL_FLOOR_BYTES.div_ceil(size_of::<OitFragmentNode>());
+    let mut target = (nodes.to_f64() / pixels.to_f64())
+        .to_f32()
+        .max(OIT_FRAGMENTS_PER_PIXEL_AVERAGE);
+    // Bevy truncates its f32 product to a node count. Round upward to preserve the floor.
+    while oit_pool_nodes(pixels, target) < nodes {
+        target = target.next_up();
+    }
+    target
 }
 
 /// The pool target [`fit_oit_fragment_pool_to_device`] last computed. A changed
@@ -386,6 +405,11 @@ mod tests {
     use crate::DiegeticPanel;
     use crate::Px;
     use crate::screen_space::ScreenSpacePlugin;
+
+    /// One byte below the floor checks that the device limit takes priority.
+    const BELOW_FLOOR_BINDING_BYTES: usize = OIT_FRAGMENT_POOL_FLOOR_BYTES - 1;
+    /// The Preferences reproduction uses a 640 by 400 physical window.
+    const SMALL_WINDOW_SIZE: UVec2 = UVec2::new(640, 400);
 
     #[test]
     fn partial_app_without_shader_asset_messages_can_update() {
@@ -525,9 +549,8 @@ mod tests {
         // for their largest viewport, at 96 B/pixel.
         for size in [UVec2::new(1280, 720), UVec2::new(1440, 900)] {
             let pixels = size.x * size.y;
-            let settings = stable_transparency_oit_settings();
-            let bytes = oit_pool_nodes(pixels, settings.fragments_per_pixel_average)
-                * size_of::<OitFragmentNode>();
+            let bytes =
+                oit_pool_nodes(pixels, oit_fragment_target(size)) * size_of::<OitFragmentNode>();
             let budget = pixels.to_usize() * 96;
             assert!(
                 bytes <= budget,
@@ -536,6 +559,30 @@ mod tests {
             // The observed panel demand is four to six 16-byte nodes/pixel.
             assert!(bytes / 16 >= pixels.to_usize() * 6);
         }
+    }
+
+    #[test]
+    fn fragment_target_keeps_the_small_window_floor_after_f32_rounding() {
+        for size in [UVec2::ONE, SMALL_WINDOW_SIZE] {
+            let pixels = size.x * size.y;
+            let bytes =
+                oit_pool_nodes(pixels, oit_fragment_target(size)) * size_of::<OitFragmentNode>();
+            assert!(bytes >= OIT_FRAGMENT_POOL_FLOOR_BYTES, "{size:?}: {bytes}");
+        }
+        assert_eq!(
+            oit_fragment_target(UVec2::ZERO),
+            OIT_FRAGMENTS_PER_PIXEL_AVERAGE
+        );
+    }
+
+    #[test]
+    fn fragment_target_keeps_the_device_limit_when_the_floor_does_not_fit() {
+        let pixels = SMALL_WINDOW_SIZE.x * SMALL_WINDOW_SIZE.y;
+        let limit = u64::try_from(BELOW_FLOOR_BINDING_BYTES).expect("binding limit fits in u64");
+        let target = oit_fragment_target(SMALL_WINDOW_SIZE)
+            .min(oit_fragment_ceiling(SMALL_WINDOW_SIZE, limit));
+        let bytes = oit_pool_nodes(pixels, target) * size_of::<OitFragmentNode>();
+        assert!(bytes <= BELOW_FLOOR_BINDING_BYTES);
     }
 
     #[test]

@@ -83,7 +83,6 @@ use crate::constants::DIAGNOSTIC_LOG_TARGET;
 use crate::layout::Anchor;
 use crate::layout::BoundingBox;
 use crate::layout::Dimension;
-use crate::layout::InvalidSize;
 use crate::layout::LayoutResult;
 use crate::layout::LayoutTree;
 use crate::layout::LayoutTreeChange;
@@ -92,6 +91,7 @@ use crate::layout::MeasureTextFn;
 use crate::layout::PanelSize;
 use crate::layout::ShadowCasting;
 use crate::layout::Sidedness;
+use crate::layout::SizeError;
 use crate::layout::Sizing;
 use crate::layout::TextStyle;
 use crate::layout::Unit;
@@ -519,11 +519,11 @@ impl DiegeticPanel {
     ///
     /// # Errors
     ///
-    /// Returns [`InvalidSize`] if either dimension is zero or negative.
-    pub fn set_size(&mut self, size: impl PanelSize) -> Result<(), InvalidSize> {
+    /// Returns [`SizeError`] if either dimension is zero or negative.
+    pub fn set_size(&mut self, size: impl PanelSize) -> Result<(), SizeError> {
         let (w, h, unit) = size.dimensions();
         if w <= 0.0 || h <= 0.0 {
-            return Err(InvalidSize {
+            return Err(SizeError::NonPositive {
                 width:  w,
                 height: h,
             });

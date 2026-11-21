@@ -8,6 +8,8 @@ pub struct ControlPalette {
     pub accent:                Color,
     /// Deeper accent for a fill that carries a white label, such as a default button.
     pub accent_behind_text:    Color,
+    /// Warning fill behind the label of a destructive default button.
+    pub warning_behind_text:   Color,
     /// Non-default button face.
     pub control_fill:          Color,
     /// Inset text field face.
@@ -16,6 +18,8 @@ pub struct ControlPalette {
     pub field_border:          Color,
     /// Text inside an inset value field.
     pub field_text:            Color,
+    /// Secondary hint ink on a neutral confirmation button in every state.
+    pub confirm_hint:          Color,
     /// Tooltip outline against a dark surface.
     pub tooltip_border:        Color,
     /// Unfilled slider track.
@@ -45,10 +49,12 @@ impl ControlPalette {
         Self {
             accent:                Color::srgb(0.039, 0.518, 1.0),
             accent_behind_text:    Color::srgb(37.0 / 255.0, 99.0 / 255.0, 235.0 / 255.0),
+            warning_behind_text:   Color::srgb(0.65, 0.14, 0.10),
             control_fill:          Color::srgb(0.36, 0.36, 0.37),
             field_fill:            Color::srgb(0.11, 0.11, 0.12),
             field_border:          Color::srgb(0.62, 0.62, 0.62),
             field_text:            Color::srgb(0.78, 0.82, 0.88),
+            confirm_hint:          Color::srgb(0.73, 0.76, 0.80),
             tooltip_border:        Color::srgba(0.58, 0.59, 0.61, 0.95),
             track:                 Color::srgba(1.0, 1.0, 1.0, 0.27),
             slider_cabled_fill:    Color::srgb(0.0, 0.22, 0.58),

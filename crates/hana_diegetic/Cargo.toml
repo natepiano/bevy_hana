@@ -36,7 +36,7 @@ bevy = { workspace = true, features = [
 ] }
 bevy_enhanced_input = { workspace = true }
 bitflags = { workspace = true }
-bytemuck = { workspace = true, features = ["derive"] }
+bytemuck = { workspace = true, features = ["derive", "impl_core_error"] }
 hana_kana = { workspace = true }
 hana_rubric = { workspace = true }
 hana_valence = { workspace = true }

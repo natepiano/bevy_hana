@@ -1,8 +1,10 @@
 mod callback;
 mod events;
+mod face;
 mod pop_up;
 mod presentation;
 mod press;
+mod push;
 
 use bevy::prelude::In;
 use bevy::prelude::IntoSystem;
@@ -17,6 +19,8 @@ pub use events::ButtonClicked;
 pub use events::ButtonPressSource;
 pub use events::ButtonPressed;
 pub use events::ButtonReleased;
+pub(super) use face::default_button_face;
+pub(super) use face::tinted_button_face;
 pub(in crate::widgets) use presentation::present_button_state;
 pub(crate) use press::ButtonCaptures;
 pub use press::ButtonLatch;

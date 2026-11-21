@@ -30,7 +30,6 @@ use crate::cascade::Cascade;
 use crate::layout;
 use crate::layout::Anchor;
 use crate::layout::Dimension;
-use crate::layout::InvalidSize;
 use crate::layout::LayoutBuilder;
 use crate::layout::LayoutTree;
 use crate::layout::PanelSize;
@@ -38,6 +37,7 @@ use crate::layout::PaperSize;
 use crate::layout::Pt;
 use crate::layout::Px;
 use crate::layout::ShadowCasting;
+use crate::layout::SizeError;
 use crate::layout::Sizing;
 use crate::layout::Unit;
 use crate::widgets;
@@ -55,7 +55,7 @@ use crate::widgets::WidgetPressedAppearance;
 pub enum PanelBuildError {
     /// A fixed-size axis was zero or negative.
     #[error("{0}")]
-    InvalidSize(#[from] InvalidSize),
+    InvalidSize(#[from] SizeError),
     /// Two elements share the same author-assigned [`PanelElementId`]. Element
     /// ids and editable-field ids share one panel-local namespace, so a name
     /// reused across either kind is a build error.
@@ -261,16 +261,12 @@ pub(super) struct BuilderData {
 /// | Physical-unit cross-axis match | N/A (pixel-only) | enforced via [`CompatibleUnits`](super::sizing::CompatibleUnits) | unit mixing in 3D is always a bug |
 /// | `.world_width(m)` / `.world_height(m)` | — | ✅ | world-space scaling |
 ///
-/// # Zero / negative size is a runtime check
+/// # Runtime size check
 ///
-/// `Px(0.0)` is valid at compile time — the type system alone can't
-/// reject zero or negative sizes without reaching for `NonZeroDimension`
-/// wrappers that would break `Px(0.0)` as a legitimate `GrowRange` floor
-/// or `FitMax` sentinel. So `.build()` returns
-/// [`InvalidSize`](crate::layout::InvalidSize) when both axes are fixed
-/// and either is zero or negative. Dynamic axes
-/// (`Fit` / `Percent` / `Grow`) start at `0.0` and resolve later — they
-/// do *not* trip this check.
+/// `Px(0.0)` is valid at compile time because sizing constraints can use zero.
+/// When both axes are fixed, `build()` returns [`PanelBuildError::InvalidSize`]
+/// with a [`SizeError`] if either dimension is zero or negative.
+/// Dynamic axes (`Fit`, `Percent`, and `Grow`) start at zero and resolve during layout.
 ///
 /// # The `Sizing` escape hatch bypasses the world-panel guard
 ///
@@ -829,7 +825,7 @@ impl<S: sealed::CanBuild> DiegeticPanelBuilder<World, S> {
         let (w_sizing, h_sizing) = match self.data.coordinate_space {
             CoordinateSpace::World { width, height } => (width, height),
             CoordinateSpace::Screen { .. } => {
-                return Err(InvalidSize {
+                return Err(SizeError::NonPositive {
                     width:  self.data.width,
                     height: self.data.height,
                 }
@@ -854,7 +850,7 @@ impl<S: sealed::CanBuild> DiegeticPanelBuilder<World, S> {
         let h_dynamic = !matches!(h_sizing, Sizing::Fixed(_));
 
         if !w_dynamic && !h_dynamic && (self.data.width <= 0.0 || self.data.height <= 0.0) {
-            return Err(InvalidSize {
+            return Err(SizeError::NonPositive {
                 width:  self.data.width,
                 height: self.data.height,
             }
@@ -912,7 +908,7 @@ impl<S: sealed::CanBuild> DiegeticPanelBuilder<Screen, S> {
             ..
         } = self.data.coordinate_space
         else {
-            return Err(InvalidSize {
+            return Err(SizeError::NonPositive {
                 width:  self.data.width,
                 height: self.data.height,
             }
@@ -925,7 +921,7 @@ impl<S: sealed::CanBuild> DiegeticPanelBuilder<Screen, S> {
             && !has_dynamic_height
             && (self.data.width <= 0.0 || self.data.height <= 0.0)
         {
-            return Err(InvalidSize {
+            return Err(SizeError::NonPositive {
                 width:  self.data.width,
                 height: self.data.height,
             }
@@ -1050,9 +1046,9 @@ mod tests {
     use crate::ImeBuiltInFieldKind;
     use crate::ImeBuiltInFieldSpec;
     use crate::ImeEditableFieldSpec;
-    use crate::InvalidSize;
     use crate::Mm;
     use crate::PanelElementId;
+    use crate::SizeError;
     use crate::SliderConfigError;
     use crate::Text;
     use crate::TextStyle;
@@ -1067,7 +1063,7 @@ mod tests {
     fn panel_build_error_messages_are_stable() {
         let cases = [
             (
-                PanelBuildError::from(InvalidSize {
+                PanelBuildError::from(SizeError::NonPositive {
                     width:  0.0,
                     height: 12.0,
                 }),
@@ -1121,7 +1117,7 @@ mod tests {
 
     #[test]
     fn invalid_size_conversion_preserves_source() {
-        let error = PanelBuildError::from(InvalidSize {
+        let error = PanelBuildError::from(SizeError::NonPositive {
             width:  -2.0,
             height: 4.0,
         });
@@ -1129,7 +1125,7 @@ mod tests {
         assert!(matches!(
             error.source(),
             Some(source)
-                if source.is::<InvalidSize>()
+                if source.is::<SizeError>()
                     && source.to_string()
                         == "panel dimensions must be positive, got -2×4"
         ));

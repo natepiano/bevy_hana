@@ -106,12 +106,12 @@ pub use geometry::Border;
 pub use geometry::BoundingBox;
 pub use geometry::ChildDivider;
 pub use geometry::CornerRadius;
-pub use line::InvalidPanelScalar;
 pub use line::LineStyle;
 pub use line::PanelCircle;
 pub use line::PanelCoord;
 pub use line::PanelLine;
 pub use line::PanelPoint;
+pub use line::PanelScalarError;
 pub use line::PanelShape;
 pub use line::PanelShapePrimitiveGeometry;
 pub use line::PanelShapePrimitiveKey;
@@ -155,12 +155,12 @@ pub use units::Dimension;
 pub use units::DimensionMatch;
 pub use units::HasUnit;
 pub use units::In;
-pub use units::InvalidSize;
 pub use units::Mm;
 pub use units::PanelSize;
 pub use units::PaperSize;
 pub use units::Pt;
 pub use units::Px;
+pub use units::SizeError;
 pub use units::Unit;
 
 /// Sets the root element's width sizing to `Grow { min, max }`.

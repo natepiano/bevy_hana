@@ -11,7 +11,7 @@ use hana_valence::AnchoredTo as ValenceAnchoredTo;
 use hana_valence::AttachmentResolveCandidate;
 
 use super::window;
-use super::window::WindowResolveFailure;
+use super::window::WindowResolveError;
 use crate::panel::CoordinateSpace;
 use crate::panel::DiegeticPanel;
 use crate::panel::PanelAnchorOffset;
@@ -241,9 +241,11 @@ fn resolve_source_window(
 ) -> Result<Entity, ScreenAttachmentResolveSkip> {
     window::resolve_window(window_ref, &queries.primary, window_sizes)
         .map(|(entity, _)| entity)
-        .map_err(|failure| match failure {
-            WindowResolveFailure::Missing => ScreenAttachmentResolveSkip::SourceWindowMissing,
-            WindowResolveFailure::ZeroSized => ScreenAttachmentResolveSkip::SourceWindowZeroSized,
+        .map_err(|error| match error {
+            WindowResolveError::PrimaryWindow(_) | WindowResolveError::Missing(_) => {
+                ScreenAttachmentResolveSkip::SourceWindowMissing
+            },
+            WindowResolveError::ZeroSized(_) => ScreenAttachmentResolveSkip::SourceWindowZeroSized,
         })
 }
 
@@ -254,9 +256,11 @@ fn resolve_target_window(
 ) -> Result<Entity, ScreenAttachmentResolveSkip> {
     window::resolve_window(window_ref, &queries.primary, window_sizes)
         .map(|(entity, _)| entity)
-        .map_err(|failure| match failure {
-            WindowResolveFailure::Missing => ScreenAttachmentResolveSkip::TargetWindowMissing,
-            WindowResolveFailure::ZeroSized => ScreenAttachmentResolveSkip::TargetWindowZeroSized,
+        .map_err(|error| match error {
+            WindowResolveError::PrimaryWindow(_) | WindowResolveError::Missing(_) => {
+                ScreenAttachmentResolveSkip::TargetWindowMissing
+            },
+            WindowResolveError::ZeroSized(_) => ScreenAttachmentResolveSkip::TargetWindowZeroSized,
         })
 }
 

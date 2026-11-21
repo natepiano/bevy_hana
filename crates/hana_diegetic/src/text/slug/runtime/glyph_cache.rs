@@ -316,7 +316,7 @@ fn published_table<'a, T: bytemuck::Pod>(
         .cast_slice::<u8>()
         .ok_or(AtlasPublicationError::InvalidTable { table })?;
     let records = bytemuck::try_cast_slice::<u8, T>(bytes)
-        .map_err(|_| AtlasPublicationError::InvalidTable { table })?;
+        .map_err(|source| AtlasPublicationError::InvalidTableCast { table, source })?;
     let valid_extent = match extent {
         PublishedTableExtent::Complete => records.len() == total_records,
         PublishedTableExtent::Prefix => records.len() <= total_records,
@@ -610,12 +610,16 @@ mod tests {
         buffers
             .insert(handles.path_records.id(), ShaderBuffer::from(vec![1_u32]))
             .expect("inject malformed paths");
-        assert_eq!(
+        assert!(matches!(
             backend
                 .commit_glyph_atlas(&mut buffers, &mut materials)
                 .expect_err("invalid record stride"),
-            AtlasPublicationError::InvalidTable { table: "paths" }
-        );
+            AtlasPublicationError::InvalidTableCast {
+                table:  "paths",
+                source: bytemuck::PodCastError::OutputSliceWouldHaveSlop
+                    | bytemuck::PodCastError::TargetAlignmentGreaterAndInputNotAligned,
+            }
+        ));
         assert_eq!(buffers.len(), 3, "no partial replacement on failure");
         assert_material_atlas(&materials, &material, &handles);
         buffers

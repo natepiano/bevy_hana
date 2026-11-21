@@ -2288,8 +2288,8 @@ fn route_sdf_visual_override<'a>(
 /// frame material rows, `SdfBatchKey` selection, and `SdfBatchStore` upsert
 /// as authored data: `fill_color` and `border_color` patch their authored
 /// material rows in place. Replacement border widths restate the record's
-/// inward inset without moving its outer bounds, an
-/// offset translates only its `local_transform`, and a replacement material
+/// inward inset. An optional border outset expands its bounds and corner radii.
+/// An offset translates only its `local_transform`, and a replacement material
 /// that changes `PipelineCompatibility`/`ResourceCompatibility` re-keys the
 /// record to its compatible destination batch. Authored registry surfaces
 /// stay untouched, and every branch checks `SdfRoleAuthorship` first:
@@ -2317,6 +2317,16 @@ fn apply_sdf_visual_override<'a>(
         && border_authored
     {
         surface.border_widths = border_widths;
+    }
+    if let Some(outset) = slot_override.border_outset
+        && border_authored
+    {
+        if !surface.clip_rect_limits_mesh() {
+            surface.clip_rect += Vec4::new(-outset, -outset, outset, outset);
+        }
+        surface.sdf_half_size += Vec2::splat(outset);
+        surface.mesh_half_size += Vec2::splat(outset);
+        surface.corner_radii = surface.corner_radii.map(|radius| radius + outset);
     }
     if let Some(material) = &slot_override.material {
         if fill_authored {
@@ -9220,5 +9230,69 @@ mod tests {
             material.extension.hardware_depth_bias,
             test_batch_key().sort_depth_bias().to_i32(),
         );
+    }
+    #[test]
+    fn border_outset_preserves_the_fill_center_and_solved_widget_bounds() {
+        let mut app = widget_sdf_pipeline_app();
+        spawn_sdf_panel(
+            &mut app,
+            slotted_widget_bordered_fill_tree(),
+            StandardMaterial::default(),
+        );
+        settle_sdf_pipeline(&mut app);
+        let authored = sdf_records(&app).remove(0);
+        let widget = styled_widget(&mut app);
+        let slots = app
+            .world()
+            .get::<WidgetVisualSlots>(widget)
+            .expect("solved slots")
+            .clone();
+        set_slot_override(&mut app, widget, VisualSlotOverride::default());
+        app.update();
+        let unchanged = sdf_records(&app).remove(0);
+        assert_eq!(unchanged.half_size.value, authored.half_size.value);
+        assert_eq!(
+            unchanged.mesh_half_size.value,
+            authored.mesh_half_size.value
+        );
+        assert_eq!(unchanged.local_transform, authored.local_transform);
+        let outset = authored.border_widths.value.min_element();
+        set_slot_override(
+            &mut app,
+            widget,
+            VisualSlotOverride {
+                border_outset: Some(outset),
+                border_widths: Some(
+                    (authored.border_widths.value + Vec4::splat(outset)).to_array(),
+                ),
+                ..VisualSlotOverride::default()
+            },
+        );
+        app.update();
+        let expanded = sdf_records(&app).remove(0);
+        assert_eq!(
+            expanded.half_size.value,
+            authored.half_size.value + Vec2::splat(outset)
+        );
+        assert_eq!(
+            expanded.mesh_half_size.value,
+            authored.mesh_half_size.value + Vec2::splat(outset)
+        );
+        assert_eq!(expanded.local_transform, authored.local_transform);
+        assert_eq!(
+            expanded.corner_radii.value,
+            authored.corner_radii.value + Vec4::splat(outset)
+        );
+        assert_eq!(
+            expanded.border_widths.value,
+            authored.border_widths.value + Vec4::splat(outset)
+        );
+        assert_eq!(app.world().get::<WidgetVisualSlots>(widget), Some(&slots));
+        clear_slot_override(&mut app, widget);
+        app.update();
+        let restored = sdf_records(&app).remove(0);
+        assert_eq!(restored.half_size.value, authored.half_size.value);
+        assert_eq!(restored.mesh_half_size.value, authored.mesh_half_size.value);
+        assert_eq!(restored.border_widths.value, authored.border_widths.value);
     }
 }

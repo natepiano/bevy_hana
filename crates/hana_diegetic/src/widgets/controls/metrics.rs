@@ -14,6 +14,7 @@ const ROW_GAP_RATIO: f32 = 0.5;
 const ROW_LABEL_WIDTH_RATIO: f32 = 82.0 / 13.0;
 const BUTTON_HEIGHT_RATIO: f32 = 22.0 / 13.0;
 const BUTTON_SIDE_PADDING_RATIO: f32 = 10.0 / 13.0;
+const BUTTON_HINT_GAP_RATIO: f32 = 1.5;
 const BUTTON_CORNER_RADIUS_RATIO: f32 = 11.0 / 26.0;
 const POP_UP_CHEVRON_LEFT_INSET_RATIO: f32 = 16.0 / 13.0;
 const POP_UP_CHEVRON_MIDDLE_INSET_RATIO: f32 = 1.0;
@@ -116,22 +117,26 @@ impl<L: ControlLength> ControlMetrics<L> {
             focus_border_width: label_size.scaled(FOCUS_BORDER_WIDTH_RATIO),
             group_inset: label_size.scaled(GROUP_INSET_RATIO),
             spacing: SpacingMetrics {
-                panel_padding: label_size.scaled(1.5),
-                panel_bottom:  label_size.scaled(2.0),
-                title_gap:     label_size,
-                card_gap:      label_size,
-                card_padding:  label_size,
-                row_gap:       label_size.scaled(0.5),
+                panel_padding:         label_size.scaled(1.5),
+                panel_bottom:          label_size.scaled(2.0),
+                title_gap:             label_size,
+                confirm_title_gap:     label_size.scaled(0.75),
+                confirm_outer_padding: label_size.scaled(ROW_GAP_RATIO * 3.0),
+                card_gap:              label_size,
+                card_padding:          label_size,
+                row_gap:               label_size.scaled(0.5),
             },
             row: RowMetrics {
-                height:      label_size.scaled(ROW_HEIGHT_RATIO),
-                gap:         label_size.scaled(ROW_GAP_RATIO),
-                label_width: label_size.scaled(ROW_LABEL_WIDTH_RATIO),
+                height:       label_size.scaled(ROW_HEIGHT_RATIO),
+                gap:          label_size.scaled(ROW_GAP_RATIO),
+                label_width:  label_size.scaled(ROW_LABEL_WIDTH_RATIO),
+                value_gutter: label_size.scaled(BUTTON_HINT_GAP_RATIO),
             },
             button: ButtonMetrics {
                 height:        label_size.scaled(BUTTON_HEIGHT_RATIO),
                 side_padding:  label_size.scaled(BUTTON_SIDE_PADDING_RATIO),
                 corner_radius: label_size.scaled(BUTTON_CORNER_RADIUS_RATIO),
+                hint_gap:      label_size.scaled(BUTTON_HINT_GAP_RATIO),
             },
             pop_up: PopUpMetrics {
                 chevron_left_inset:    label_size.scaled(POP_UP_CHEVRON_LEFT_INSET_RATIO),
@@ -185,8 +190,10 @@ impl ControlMetrics<f32> {
         self.spacing = words.spacing;
         self.group_inset = words.group_inset;
         self.button.side_padding = words.button.side_padding;
+        self.button.hint_gap = words.button.hint_gap;
         self.row.height = words.row.height;
         self.row.gap = words.row.gap;
+        self.row.value_gutter = words.row.value_gutter;
         self.button.height = words.button.height;
         self.field = words.field;
         self.slider.value_width = words.slider.value_width;
@@ -220,17 +227,21 @@ impl ControlMetrics<f32> {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SpacingMetrics<L: ControlLength> {
     /// Inset from the panel's left, right, and top edges.
-    pub panel_padding: L,
+    pub panel_padding:         L,
     /// Inset from the panel's bottom edge.
-    pub panel_bottom:  L,
+    pub panel_bottom:          L,
     /// Gap between a title and its first card.
-    pub title_gap:     L,
+    pub title_gap:             L,
+    /// Gap between a confirmation title and its first content row.
+    pub confirm_title_gap:     L,
+    /// Inset from a confirmation plate edge to its content, six spacing units.
+    pub confirm_outer_padding: L,
     /// Gap between cards.
-    pub card_gap:      L,
+    pub card_gap:              L,
     /// Inset on every side of a card.
-    pub card_padding:  L,
+    pub card_padding:          L,
     /// Gap between related rows within a card.
-    pub row_gap:       L,
+    pub row_gap:               L,
 }
 
 impl<L: ControlLength> SpacingMetrics<L> {
@@ -244,17 +255,21 @@ impl<L: ControlLength> SpacingMetrics<L> {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RowMetrics<L: ControlLength> {
     /// Height of a control row.
-    pub height:      L,
+    pub height:       L,
     /// Gap between adjacent controls or rows.
-    pub gap:         L,
+    pub gap:          L,
     /// Width reserved for a control's label.
-    pub label_width: L,
+    pub label_width:  L,
+    /// Gutter between a form's label column and value column.
+    pub value_gutter: L,
 }
 
 /// Dimensions of a button.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ButtonMetrics<L: ControlLength> {
+    /// Gap between a button label and its separate key hint.
+    pub hint_gap:      L,
     /// Height of a button.
     pub height:        L,
     /// Padding on each side of a button's label.

@@ -1,13 +1,11 @@
 //! Generic atlas for non-text analytic paths.
 
 use std::collections::HashMap;
-use std::error::Error;
-use std::fmt::Display;
-use std::fmt::Formatter;
 use std::hash::Hash;
 
 use bevy::prelude::Assets;
 use bevy::render::storage::ShaderBuffer;
+use bytemuck::PodCastError;
 use hana_kana::ToU32;
 
 use super::BandRecord;
@@ -172,25 +170,20 @@ pub(crate) enum AtlasState {
     },
 }
 
-/// Published table failures that prevent an atomic glyph-atlas replacement.
-#[derive(Debug, PartialEq, Eq)]
+/// Errors that prevent replacement of the published glyph atlas.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum AtlasPublicationError {
+    #[error("published {table} buffer is missing")]
     MissingBuffer { table: &'static str },
+    #[error("published {table} buffer has invalid layout or length")]
     InvalidTable { table: &'static str },
+    #[error("published {table} buffer has invalid layout or length")]
+    InvalidTableCast {
+        table:  &'static str,
+        #[source]
+        source: PodCastError,
+    },
 }
-
-impl Display for AtlasPublicationError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::MissingBuffer { table } => write!(f, "published {table} buffer is missing"),
-            Self::InvalidTable { table } => {
-                write!(f, "published {table} buffer has invalid layout or length")
-            },
-        }
-    }
-}
-
-impl Error for AtlasPublicationError {}
 
 #[cfg(test)]
 mod tests {

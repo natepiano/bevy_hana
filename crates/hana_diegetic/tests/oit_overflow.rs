@@ -13,6 +13,7 @@ use bevy::window::WindowRef;
 use drawn_support::CaptureRegion;
 use drawn_support::CaseApp;
 use drawn_support::DrawnCase;
+use hana_diegetic::StableTransparency;
 use hana_kana::ToF32;
 use hana_kana::ToU8;
 use hana_kana::ToUsize;
@@ -36,6 +37,14 @@ const QUAD_SIDE: f32 = 4.0;
 const CHANNEL_TOLERANCE: u8 = 3;
 const SAMPLE_REGION: CaptureRegion =
     CaptureRegion::new(UVec2::splat(SIZE), UVec2::splat(60), UVec2::splat(8));
+/// A 640 by 400 physical window reproduces the small Preferences window.
+const SMALL_WINDOW_SIZE: UVec2 = UVec2::new(640, 400);
+
+#[derive(Clone, Copy)]
+enum FragmentPool {
+    Explicit,
+    Stable,
+}
 
 #[derive(Clone, Copy, Debug)]
 enum FragmentTraversal {
@@ -43,44 +52,23 @@ enum FragmentTraversal {
     FarToNear,
 }
 
-fn check_composite(fragments: u32, traversal: FragmentTraversal) -> Result<(), String> {
+fn check_composite(
+    fragments: u32,
+    traversal: FragmentTraversal,
+    pool: FragmentPool,
+) -> Result<(), String> {
     let mut app = CaseApp::new();
-    let region = CaptureRegion::new(UVec2::splat(SIZE), UVec2::ZERO, UVec2::splat(SIZE));
-    let target = app.target(region);
-    // The window camera's `Tonemapping::None` lets display compensation reach
-    // `DisplayCompensationReadiness::Identity`, which `CaseApp::settle` waits for.
-    app.world_mut().spawn((
-        Camera3d::default(),
-        RenderTarget::Window(WindowRef::Primary),
-        Hdr,
-        Tonemapping::None,
-    ));
-    let mut camera = Camera {
-        clear_color: ClearColorConfig::Custom(Color::BLACK),
-        ..default()
+    let size = match pool {
+        FragmentPool::Explicit => UVec2::splat(SIZE),
+        FragmentPool::Stable => SMALL_WINDOW_SIZE,
     };
-    region.apply_to_camera(&mut camera);
-    app.world_mut().spawn((
-        Camera3d::default(),
-        camera,
-        RenderTarget::Image(target.clone().into()),
-        Hdr,
-        Tonemapping::None,
-        DebandDither::Disabled,
-        Msaa::Off,
-        OrderIndependentTransparencySettings {
-            sorted_fragment_max_count: SORTED_FRAGMENTS,
-            fragments_per_pixel_average: FRAGMENT_UNITS_PER_PIXEL,
-            ..default()
-        },
-        Projection::Orthographic(OrthographicProjection {
-            scaling_mode: ScalingMode::FixedVertical {
-                viewport_height: VIEWPORT_HEIGHT,
-            },
-            ..OrthographicProjection::default_3d()
-        }),
-        Transform::IDENTITY,
-    ));
+    let region = CaptureRegion::new(size, UVec2::ZERO, size);
+    let sample = match pool {
+        FragmentPool::Explicit => SAMPLE_REGION,
+        FragmentPool::Stable => region,
+    };
+    let target = app.target(region);
+    spawn_composite_cameras(&mut app, region, &target, pool);
     let mesh = app
         .world_mut()
         .resource_mut::<Assets<Mesh>>()
@@ -122,14 +110,75 @@ fn check_composite(fragments: u32, traversal: FragmentTraversal) -> Result<(), S
         "",
         &format!("fragments={fragments} traversal={traversal:?}"),
         region,
-        SAMPLE_REGION,
+        sample,
         &pixels,
     )?;
-    assert_straight_composite(&pixels, fragments, traversal);
+    assert_straight_composite(&pixels, fragments, traversal, sample);
     Ok(())
 }
 
-fn assert_straight_composite(pixels: &[u8], fragments: u32, traversal: FragmentTraversal) {
+fn spawn_composite_cameras(
+    app: &mut CaseApp,
+    region: CaptureRegion,
+    target: &Handle<Image>,
+    pool: FragmentPool,
+) {
+    // The window camera's `Tonemapping::None` lets display compensation reach
+    // `DisplayCompensationReadiness::Identity`, which `CaseApp::settle` waits for.
+    app.world_mut().spawn((
+        Camera3d::default(),
+        RenderTarget::Window(WindowRef::Primary),
+        Hdr,
+        Tonemapping::None,
+    ));
+    let mut camera = Camera {
+        clear_color: ClearColorConfig::Custom(Color::BLACK),
+        ..default()
+    };
+    region.apply_to_camera(&mut camera);
+    let camera_entity = app
+        .world_mut()
+        .spawn((
+            Camera3d::default(),
+            camera,
+            RenderTarget::Image(target.clone().into()),
+            Hdr,
+            Tonemapping::None,
+            DebandDither::Disabled,
+            Msaa::Off,
+            Projection::Orthographic(OrthographicProjection {
+                scaling_mode: ScalingMode::FixedVertical {
+                    viewport_height: VIEWPORT_HEIGHT,
+                },
+                ..OrthographicProjection::default_3d()
+            }),
+            Transform::IDENTITY,
+        ))
+        .id();
+    match pool {
+        FragmentPool::Explicit => {
+            app.world_mut().entity_mut(camera_entity).insert(
+                OrderIndependentTransparencySettings {
+                    sorted_fragment_max_count: SORTED_FRAGMENTS,
+                    fragments_per_pixel_average: FRAGMENT_UNITS_PER_PIXEL,
+                    ..default()
+                },
+            );
+        },
+        FragmentPool::Stable => {
+            app.world_mut()
+                .entity_mut(camera_entity)
+                .insert(StableTransparency);
+        },
+    }
+}
+
+fn assert_straight_composite(
+    pixels: &[u8],
+    fragments: u32,
+    traversal: FragmentTraversal,
+    sample: CaptureRegion,
+) {
     // Independent straight-alpha OVER on black. All fragments have the same
     // colour, so the resolver's approximate ordering cannot affect this oracle.
     // Alpha is exactly representable in the resolver's eight-bit alpha field.
@@ -142,9 +191,9 @@ fn assert_straight_composite(pixels: &[u8], fragments: u32, traversal: FragmentT
     ))
     .to_f32_array()
     .map(|channel| (channel * 255.0).round().to_u8());
-    for y in SAMPLE_REGION.origin.y..SAMPLE_REGION.origin.y + SAMPLE_REGION.size.y {
-        for x in SAMPLE_REGION.origin.x..SAMPLE_REGION.origin.x + SAMPLE_REGION.size.x {
-            let index = (y.to_usize() * SIZE.to_usize() + x.to_usize()) * 4;
+    for y in sample.origin.y..sample.origin.y + sample.size.y {
+        for x in sample.origin.x..sample.origin.x + sample.size.x {
+            let index = (y.to_usize() * sample.full_size.x.to_usize() + x.to_usize()) * 4;
             let actual = &pixels[index..index + 4];
             assert!(
                 actual[..3]
@@ -161,15 +210,36 @@ fn assert_straight_composite(pixels: &[u8], fragments: u32, traversal: FragmentT
 }
 
 fn sorted_control() -> Result<(), String> {
-    check_composite(SORTED_FRAGMENTS, FragmentTraversal::NearToFar)
+    check_composite(
+        SORTED_FRAGMENTS,
+        FragmentTraversal::NearToFar,
+        FragmentPool::Explicit,
+    )
 }
 
 fn evict_nearest() -> Result<(), String> {
-    check_composite(OVERFLOW_FRAGMENTS, FragmentTraversal::NearToFar)
+    check_composite(
+        OVERFLOW_FRAGMENTS,
+        FragmentTraversal::NearToFar,
+        FragmentPool::Explicit,
+    )
 }
 
 fn blend_incoming_nearest() -> Result<(), String> {
-    check_composite(OVERFLOW_FRAGMENTS, FragmentTraversal::FarToNear)
+    check_composite(
+        OVERFLOW_FRAGMENTS,
+        FragmentTraversal::FarToNear,
+        FragmentPool::Explicit,
+    )
+}
+
+#[test]
+fn small_window_composites_twelve_full_window_layers_without_pool_loss() -> Result<(), String> {
+    check_composite(
+        OVERFLOW_FRAGMENTS,
+        FragmentTraversal::NearToFar,
+        FragmentPool::Stable,
+    )
 }
 
 #[test]

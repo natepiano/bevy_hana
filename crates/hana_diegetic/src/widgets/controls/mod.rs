@@ -1,4 +1,5 @@
 mod button;
+mod confirm;
 mod editable;
 mod metrics;
 mod palette;
@@ -40,6 +41,9 @@ pub(super) use button::present_button_state;
 pub(super) use button::press_from_pointer;
 pub use button::release_button;
 pub(super) use button::release_from_pointer;
+pub use confirm::ConfirmChoice;
+pub use confirm::ConfirmDialog;
+pub use confirm::ConfirmTone;
 pub(super) use editable::present_editable_state;
 pub use metrics::ButtonMetrics;
 pub use metrics::CapsuleThumb;

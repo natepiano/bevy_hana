@@ -1,15 +1,15 @@
 //! Layout units, dimensions, anchors, and typed dimensional wrappers.
 
 mod anchor;
-mod invalid_size;
 mod panel_size;
 mod paper_size;
+mod size_error;
 mod unit;
 
 pub use anchor::Anchor;
-pub use invalid_size::InvalidSize;
 pub use panel_size::PanelSize;
 pub use paper_size::PaperSize;
+pub use size_error::SizeError;
 pub use unit::Dimension;
 pub use unit::DimensionMatch;
 pub use unit::HasUnit;

@@ -7,6 +7,8 @@
 //! the path renderer draws a crisp stroked line, and a reference to compare
 //! the panel-line ruler route against.
 
+use std::num::TryFromIntError;
+
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::NoFrustumCulling;
 use bevy::light::NotShadowCaster;
@@ -226,6 +228,12 @@ struct BuiltLine {
     material: Handle<PathExtendedMaterial>,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum AnalyticLineBuildError {
+    #[error("analytic line band count exceeds u32: {0}")]
+    BandCountOverflow(#[from] TryFromIntError),
+}
+
 fn build_line(
     line: &AnalyticLine,
     place: Mat4,
@@ -234,7 +242,7 @@ fn build_line(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<PathExtendedMaterial>,
     storage_buffers: &mut Assets<ShaderBuffer>,
-) -> Result<Option<BuiltLine>, String> {
+) -> Result<Option<BuiltLine>, AnalyticLineBuildError> {
     let delta = line.end - line.start;
     let length = delta.length();
     if length <= MIN_EXTENT || line.width <= MIN_EXTENT {
@@ -254,8 +262,7 @@ fn build_line(
     // default 96 bands starve the distance scan (see
     // PANEL_LINE_BAND_TARGET_DESIGN_UNITS).
     let packed = super::build_packed_path(rectangle_outline(design), 1);
-    let band_count = u32::try_from(packed.bands().len() / 2)
-        .map_err(|error| format!("analytic line band count exceeds u32: {error}"))?;
+    let band_count = u32::try_from(packed.bands().len() / 2)?;
     let path_record = PackedPathRecord::new(
         packed.bounds(),
         0,
