@@ -216,8 +216,11 @@ pub(crate) struct WindowDriverId(
 
 /// The window manager has not installed its endpoint driver in this world.
 #[derive(Debug, thiserror::Error)]
-#[error("the Clerestory window placement driver is not installed")]
-pub struct WindowPlacementDriverUnavailable;
+pub enum WindowPlacementDriverError {
+    /// The world has no [`WindowDriverId` resource](window_placement_driver#errors).
+    #[error("the Clerestory window placement driver is not installed")]
+    NotInstalled,
+}
 
 /// Returns the existing window manager's typed endpoint-driver registration.
 ///
@@ -226,17 +229,15 @@ pub struct WindowPlacementDriverUnavailable;
 ///
 /// # Errors
 ///
-/// Returns [`WindowPlacementDriverUnavailable`] before [`crate::WindowManagerPlugin`] is installed.
+/// Returns [`WindowPlacementDriverError`] if the world has no `WindowDriverId` resource.
+/// [`crate::WindowManagerPlugin`] installs the resource.
 pub fn window_placement_driver(
     world: &World,
-) -> Result<
-    EndpointDriverRegistration<WindowPlacementConfiguration>,
-    WindowPlacementDriverUnavailable,
-> {
+) -> Result<EndpointDriverRegistration<WindowPlacementConfiguration>, WindowPlacementDriverError> {
     world
         .get_resource::<WindowDriverId>()
         .map(|driver| driver.0)
-        .ok_or(WindowPlacementDriverUnavailable)
+        .ok_or(WindowPlacementDriverError::NotInstalled)
 }
 
 impl WindowRoleDriverState {

@@ -12,7 +12,7 @@ use bevy::reflect::TypePath;
 use bevy::reflect::TypeRegistry;
 use thiserror::Error;
 
-use crate::CapabilityProjectionFailure;
+use crate::CapabilityProjectionError;
 use crate::ReporterId;
 
 type CapabilityEquality = fn(&dyn Reflect, &dyn Reflect) -> bool;
@@ -74,11 +74,13 @@ pub(crate) struct CapabilityProjectionDeclaration<'a> {
     reporter:    ReporterId,
 }
 
-/// A projection failure attributed to the reporter outcome that supplied the declaration.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ReporterCapabilityProjectionFailure {
+/// A projection error with the reporter that supplied the declaration.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("reporter {reporter:?} supplied a capability that could not be projected: {failure}")]
+pub(crate) struct ReporterCapabilityProjectionError {
     reporter: ReporterId,
-    failure:  CapabilityProjectionFailure,
+    #[source]
+    failure:  CapabilityProjectionError,
 }
 
 /// One projected component type and the reporters whose current declarations contribute it.
@@ -130,18 +132,18 @@ impl<'a> CapabilityProjectionDeclaration<'a> {
     const fn reporter(self) -> ReporterId { self.reporter }
 }
 
-impl ReporterCapabilityProjectionFailure {
-    const fn new(reporter: ReporterId, failure: CapabilityProjectionFailure) -> Self {
+impl ReporterCapabilityProjectionError {
+    const fn new(reporter: ReporterId, failure: CapabilityProjectionError) -> Self {
         Self { reporter, failure }
     }
 
-    pub(crate) fn into_parts(self) -> (ReporterId, CapabilityProjectionFailure) {
+    pub(crate) fn into_parts(self) -> (ReporterId, CapabilityProjectionError) {
         (self.reporter, self.failure)
     }
 
     pub(crate) const fn reporter(&self) -> ReporterId { self.reporter }
 
-    pub(crate) const fn failure(&self) -> &CapabilityProjectionFailure { &self.failure }
+    pub(crate) const fn failure(&self) -> &CapabilityProjectionError { &self.failure }
 }
 
 /// Erased capability components a provider reports for one [`DeviceRecord`](crate::DeviceRecord).
@@ -245,14 +247,14 @@ impl Capabilities {
         &mut self,
         source: CapabilitySource,
         type_registry: &TypeRegistry,
-    ) -> Vec<CapabilityProjectionFailure> {
+    ) -> Vec<CapabilityProjectionError> {
         self.source = CapabilitySourceState::Retained(source);
         let mut failures = Vec::new();
         self.declarations.retain(|declaration| {
             match reflect_component_for(declaration.value().as_partial_reflect(), type_registry) {
                 Ok(_) => true,
                 Err(error) => {
-                    failures.push(CapabilityProjectionFailure::ReflectComponentNotRegistered {
+                    failures.push(CapabilityProjectionError::ReflectComponentNotRegistered {
                         type_path: error.into_type_path(),
                     });
                     false
@@ -266,12 +268,12 @@ impl Capabilities {
     pub(crate) fn retain_without_type_registry(
         &mut self,
         source: CapabilitySource,
-    ) -> Vec<CapabilityProjectionFailure> {
+    ) -> Vec<CapabilityProjectionError> {
         self.source = CapabilitySourceState::Retained(source);
         self.declarations
             .drain(..)
             .map(
-                |declaration| CapabilityProjectionFailure::ApplicationTypeRegistryUnavailable {
+                |declaration| CapabilityProjectionError::ApplicationTypeRegistryUnavailable {
                     affected_type_path: declaration.value().reflect_type_path().to_owned(),
                 },
             )
@@ -346,14 +348,14 @@ fn attach_declarations<'a>(
 ///
 /// # Errors
 ///
-/// Returns reporter-attributed [`CapabilityProjectionFailure`] values when any incoming or
-/// previously projected type no longer has reflected-component metadata in `type_registry`.
+/// Returns an error for each reporter and capability type that has no reflected-component
+/// registration in `type_registry`.
 pub(crate) fn project_declarations(
     entity: &mut EntityWorldMut,
     type_registry: &TypeRegistry,
     agreed: &[CapabilityProjectionDeclaration<'_>],
     disputed: &[CapabilityProjectionDeclaration<'_>],
-) -> Result<(), Vec<ReporterCapabilityProjectionFailure>> {
+) -> Result<(), Vec<ReporterCapabilityProjectionError>> {
     let (agreed_components, mut failures) = resolve_declarations(agreed, type_registry);
     let (disputed_components, disputed_failures) = resolve_declarations(disputed, type_registry);
     failures.extend(disputed_failures);
@@ -422,7 +424,7 @@ fn resolve_declarations<'declaration, 'registry>(
         CapabilityProjectionDeclaration<'declaration>,
         &'registry ReflectComponent,
     )>,
-    Vec<ReporterCapabilityProjectionFailure>,
+    Vec<ReporterCapabilityProjectionError>,
 ) {
     let mut resolved = Vec::with_capacity(declarations.len());
     let mut failures = Vec::new();
@@ -432,7 +434,7 @@ fn resolve_declarations<'declaration, 'registry>(
             type_registry,
         ) {
             Ok(reflect_component) => resolved.push((*contribution, reflect_component)),
-            Err(error) => failures.push(ReporterCapabilityProjectionFailure::new(
+            Err(error) => failures.push(ReporterCapabilityProjectionError::new(
                 contribution.reporter(),
                 error.into_projection_failure(),
             )),
@@ -446,7 +448,7 @@ fn resolve_omitted_types<'registry>(
     type_registry: &'registry TypeRegistry,
 ) -> (
     Vec<(TypeId, &'registry ReflectComponent)>,
-    Vec<ReporterCapabilityProjectionFailure>,
+    Vec<ReporterCapabilityProjectionError>,
 ) {
     let mut resolved = Vec::with_capacity(omitted_types.len());
     let mut failures = Vec::new();
@@ -456,7 +458,7 @@ fn resolve_omitted_types<'registry>(
             Err(error) => {
                 let failure = error.into_projection_failure();
                 failures.extend(projected_type.reporters.iter().map(|reporter| {
-                    ReporterCapabilityProjectionFailure::new(*reporter, failure.clone())
+                    ReporterCapabilityProjectionError::new(*reporter, failure.clone())
                 }));
             },
         }
@@ -563,8 +565,8 @@ impl CapabilityAttachError {
         }
     }
 
-    fn into_projection_failure(self) -> CapabilityProjectionFailure {
-        CapabilityProjectionFailure::ReflectComponentNotRegistered {
+    fn into_projection_failure(self) -> CapabilityProjectionError {
+        CapabilityProjectionError::ReflectComponentNotRegistered {
             type_path: self.into_type_path(),
         }
     }

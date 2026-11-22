@@ -57,36 +57,47 @@ const TEST_QUAD_HEIGHT: f32 = 1.0;
 const TEST_QUAD_WIDTH: f32 = 2.0;
 
 /// Reason an anchor relationship did not resolve this frame.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, thiserror::Error)]
 #[non_exhaustive]
-pub enum AnchorResolveSkip {
+pub enum AnchorResolveError {
     /// The source entity lacks [`ResolvedAnchorGeometry`].
+    #[error("source anchor geometry is missing")]
     MissingSourceGeometry,
     /// The target entity lacks [`ResolvedAnchorGeometry`].
+    #[error("target anchor geometry is missing")]
     MissingTargetGeometry,
     /// The source entity lacks either [`Transform`] or [`GlobalTransform`].
+    #[error("source transform is missing")]
     MissingSourceTransform,
     /// The target entity lacks [`GlobalTransform`].
+    #[error("target transform is missing")]
     MissingTargetTransform,
     /// The source or target geometry does not contain this anchor id.
+    #[error("anchor {0:?} is missing from the geometry")]
     MissingAnchor(AnchorSite),
     /// The target entity no longer exists.
+    #[error("target entity no longer exists")]
     DespawnedTarget,
     /// The source's transform parent is missing or degenerate (non-finite or
     /// non-invertible), or the wanted pose cannot be expressed under it without skew.
+    #[error("parent transform cannot support the requested anchor pose")]
     UnsupportedParentTransform,
     /// The source entity's current global scale is non-finite.
+    #[error("source scale is not finite")]
     NonFiniteScale,
     /// The source depends on a target that already skipped this frame.
+    #[error("target attachment did not resolve")]
     BlockedBySkippedDependency,
     /// The source participates in an anchor relationship cycle.
+    #[error("source attachment forms a cycle")]
     Cycle,
     /// The source depends on a cycle in the anchor relationship graph.
+    #[error("source attachment depends on a cycle")]
     BlockedByCycle,
 }
 
 /// Resolver diagnostics for [`resolve_anchors`].
-pub type AnchorResolveDiagnostics = AttachmentResolveDiagnostics<AnchorResolveSkip>;
+pub type AnchorResolveDiagnostics = AttachmentResolveDiagnostics<AnchorResolveError>;
 
 /// Reusable temporary storage used exclusively by [`resolve_anchors`].
 ///
@@ -98,7 +109,7 @@ pub type AnchorResolveDiagnostics = AttachmentResolveDiagnostics<AnchorResolveSk
 /// pass, so equal-value transform ticks can be ignored.
 #[derive(Default)]
 pub struct AnchorResolverScratch {
-    candidates:          Vec<AttachmentResolveCandidate<AnchorResolveSkip>>,
+    candidates:          Vec<AttachmentResolveCandidate<AnchorResolveError>>,
     resolution_order:    Vec<AttachmentResolveAction>,
     cached_placements:   Vec<CachedAnchorPlacement>,
     cached_indices:      HashMap<Entity, usize>,
@@ -289,7 +300,7 @@ fn observed_global(
 /// Sources keep their hierarchy and compensate parent stretch when an exact
 /// local translation, rotation and scale can represent the rigid world pose.
 /// Degenerate parents and poses requiring local shear skip with
-/// [`AnchorResolveSkip::UnsupportedParentTransform`].
+/// [`AnchorResolveError::UnsupportedParentTransform`].
 ///
 /// [`ResolvedAnchorWorld`] is recomputed whenever a resolver input changes for
 /// entities carrying the cache. Entities resolved in the current pass use the newly computed
@@ -437,8 +448,8 @@ pub fn resolve_anchors(
 fn cache_resolved_placement(
     cached_placements: &mut Vec<CachedAnchorPlacement>,
     cached_indices: &mut HashMap<Entity, usize>,
-    result: Result<Option<CachedAnchorPlacement>, AnchorResolveSkip>,
-) -> Result<(), AnchorResolveSkip> {
+    result: Result<Option<CachedAnchorPlacement>, AnchorResolveError>,
+) -> Result<(), AnchorResolveError> {
     if let Some(mut placement) = result? {
         placement.target_placement = cached_indices.get(&placement.target).copied();
         if let AnchorPlacementParent::Entity(parent) = placement.source_parent {
@@ -571,7 +582,7 @@ fn resolve_cached_pose_changes(
             diagnostics.record(
                 source,
                 target,
-                AnchorResolveSkip::BlockedBySkippedDependency,
+                AnchorResolveError::BlockedBySkippedDependency,
             );
             continue;
         }
@@ -579,7 +590,7 @@ fn resolve_cached_pose_changes(
             Ok(placement) => {
                 let Ok(mut transform) = transforms.get_mut(source) else {
                     skipped_placements[index] = true;
-                    diagnostics.record(source, target, AnchorResolveSkip::MissingSourceTransform);
+                    diagnostics.record(source, target, AnchorResolveError::MissingSourceTransform);
                     continue;
                 };
                 transform.set_if_neq(placement.local_transform);
@@ -596,7 +607,7 @@ fn resolve_cached_pose_changes(
 }
 
 fn classify_candidates(
-    candidates: &mut Vec<AttachmentResolveCandidate<AnchorResolveSkip>>,
+    candidates: &mut Vec<AttachmentResolveCandidate<AnchorResolveError>>,
     entities: &Entities,
     attachments: &Query<(Entity, &AnchoredTo)>,
     geometry: &Query<&ResolvedAnchorGeometry>,
@@ -629,31 +640,31 @@ fn validate_candidate(
     transforms: &Query<&mut Transform, With<AnchoredTo>>,
     source: Entity,
     attachment: AnchoredTo,
-) -> Result<(), AnchorResolveSkip> {
+) -> Result<(), AnchorResolveError> {
     let target = attachment.target();
     if !entities.contains_spawned(target) {
-        return Err(AnchorResolveSkip::DespawnedTarget);
+        return Err(AnchorResolveError::DespawnedTarget);
     }
     if !geometry.contains(source) {
-        return Err(AnchorResolveSkip::MissingSourceGeometry);
+        return Err(AnchorResolveError::MissingSourceGeometry);
     }
     if !geometry.contains(target) {
-        return Err(AnchorResolveSkip::MissingTargetGeometry);
+        return Err(AnchorResolveError::MissingTargetGeometry);
     }
     if !transforms.contains(source) || !globals.contains(source) {
-        return Err(AnchorResolveSkip::MissingSourceTransform);
+        return Err(AnchorResolveError::MissingSourceTransform);
     }
     if !globals.contains(target) {
-        return Err(AnchorResolveSkip::MissingTargetTransform);
+        return Err(AnchorResolveError::MissingTargetTransform);
     }
     Ok(())
 }
 
-const fn resolve_reasons() -> AttachmentResolveReasons<AnchorResolveSkip> {
+const fn resolve_reasons() -> AttachmentResolveReasons<AnchorResolveError> {
     AttachmentResolveReasons {
-        blocked_by_skipped_dependency: AnchorResolveSkip::BlockedBySkippedDependency,
-        cycle:                         AnchorResolveSkip::Cycle,
-        blocked_by_cycle:              AnchorResolveSkip::BlockedByCycle,
+        blocked_by_skipped_dependency: AnchorResolveError::BlockedBySkippedDependency,
+        cycle:                         AnchorResolveError::Cycle,
+        blocked_by_cycle:              AnchorResolveError::BlockedByCycle,
     }
 }
 
@@ -666,7 +677,7 @@ fn handle_action(
     transforms: &mut Query<&mut Transform, With<AnchoredTo>>,
     resolved_globals: &mut HashMap<Entity, GlobalTransform>,
     action: AttachmentResolveAction,
-) -> Result<Option<CachedAnchorPlacement>, AnchorResolveSkip> {
+) -> Result<Option<CachedAnchorPlacement>, AnchorResolveError> {
     match action {
         AttachmentResolveAction::Place {
             source,
@@ -699,7 +710,7 @@ fn place_anchor(
     source: Entity,
     target: Entity,
     attachment: AnchoredTo,
-) -> Result<Option<CachedAnchorPlacement>, AnchorResolveSkip> {
+) -> Result<Option<CachedAnchorPlacement>, AnchorResolveError> {
     let mut placement_inputs = anchor_placement_inputs(
         geometry,
         globals,
@@ -712,7 +723,7 @@ fn place_anchor(
     )?;
     let placement = anchor_placement(globals, poses, resolved_globals, placement_inputs)?;
     let Ok(mut transform) = transforms.get_mut(source) else {
-        return Err(AnchorResolveSkip::MissingSourceTransform);
+        return Err(AnchorResolveError::MissingSourceTransform);
     };
     transform.set_if_neq(placement.local_transform);
     resolved_globals.insert(source, placement.global_transform);
@@ -725,14 +736,14 @@ fn cached_anchor_placement(
     index: usize,
     globals: &Query<&GlobalTransform>,
     poses: &Query<&AnchorPose>,
-) -> Result<AnchorPlacement, AnchorResolveSkip> {
+) -> Result<AnchorPlacement, AnchorResolveError> {
     let inputs = cached_placements[index];
     let target_global = match inputs.target_placement {
         Some(target_index) => cached_placements[target_index].last_global,
         None => globals
             .get(inputs.target)
             .copied()
-            .map_err(|_| AnchorResolveSkip::MissingTargetTransform)?,
+            .map_err(|_| AnchorResolveError::MissingTargetTransform)?,
     };
     let parent_global = match inputs.source_parent {
         AnchorPlacementParent::World => None,
@@ -741,7 +752,7 @@ fn cached_anchor_placement(
             None => globals
                 .get(parent)
                 .copied()
-                .map_err(|_| AnchorResolveSkip::UnsupportedParentTransform)?,
+                .map_err(|_| AnchorResolveError::UnsupportedParentTransform)?,
         }),
     };
     anchor_placement_from_globals(poses, inputs, target_global, parent_global)
@@ -762,9 +773,9 @@ fn anchor_placement_inputs(
     source: Entity,
     target: Entity,
     attachment: AnchoredTo,
-) -> Result<CachedAnchorPlacement, AnchorResolveSkip> {
+) -> Result<CachedAnchorPlacement, AnchorResolveError> {
     let source_global = entity_global(globals, resolved_globals, source)
-        .ok_or(AnchorResolveSkip::MissingSourceTransform)?;
+        .ok_or(AnchorResolveError::MissingSourceTransform)?;
     let parent = parents.get(source).ok().map(ChildOf::parent);
     // The source's x axis is the size reference. Parent stretch must not turn
     // anchored content into a stretched or sheared world frame.
@@ -772,10 +783,10 @@ fn anchor_placement_inputs(
     if !source_scale.is_finite() || !source_global.affine().matrix3.is_finite() {
         if let Some(parent) = parent {
             let parent_global = entity_global(globals, resolved_globals, parent)
-                .ok_or(AnchorResolveSkip::UnsupportedParentTransform)?;
+                .ok_or(AnchorResolveError::UnsupportedParentTransform)?;
             validate_supported_parent_transform(&parent_global)?;
         }
-        return Err(AnchorResolveSkip::NonFiniteScale);
+        return Err(AnchorResolveError::NonFiniteScale);
     }
 
     let target_frame = anchor_frame(geometry, target, attachment.target_anchor())?;
@@ -806,14 +817,14 @@ fn anchor_placement(
     poses: &Query<&AnchorPose>,
     resolved_globals: &HashMap<Entity, GlobalTransform>,
     inputs: CachedAnchorPlacement,
-) -> Result<AnchorPlacement, AnchorResolveSkip> {
+) -> Result<AnchorPlacement, AnchorResolveError> {
     let target_global = entity_global(globals, resolved_globals, inputs.target)
-        .ok_or(AnchorResolveSkip::MissingTargetTransform)?;
+        .ok_or(AnchorResolveError::MissingTargetTransform)?;
     let parent_global = match inputs.source_parent {
         AnchorPlacementParent::World => None,
         AnchorPlacementParent::Entity(parent) => Some(
             entity_global(globals, resolved_globals, parent)
-                .ok_or(AnchorResolveSkip::UnsupportedParentTransform)?,
+                .ok_or(AnchorResolveError::UnsupportedParentTransform)?,
         ),
     };
     anchor_placement_from_globals(poses, inputs, target_global, parent_global)
@@ -824,7 +835,7 @@ fn anchor_placement_from_globals(
     inputs: CachedAnchorPlacement,
     target_global: GlobalTransform,
     parent_global: Option<GlobalTransform>,
-) -> Result<AnchorPlacement, AnchorResolveSkip> {
+) -> Result<AnchorPlacement, AnchorResolveError> {
     let pose = poses.get(inputs.source).copied().unwrap_or_default();
 
     let target_world = target_global.transform_point(inputs.target_frame.position().into_inner());
@@ -864,24 +875,24 @@ fn anchor_frame(
     geometry: &Query<&ResolvedAnchorGeometry>,
     entity: Entity,
     anchor_site: AnchorSite,
-) -> Result<AnchorFrame, AnchorResolveSkip> {
+) -> Result<AnchorFrame, AnchorResolveError> {
     geometry
         .get(entity)
-        .map_err(|_| AnchorResolveSkip::MissingSourceGeometry)?
+        .map_err(|_| AnchorResolveError::MissingSourceGeometry)?
         .frame(anchor_site)
         .copied()
-        .map_err(|_| AnchorResolveSkip::MissingAnchor(anchor_site))
+        .map_err(|_| AnchorResolveError::MissingAnchor(anchor_site))
 }
 
 fn local_transform_for(
     parent: AnchorPlacementParent,
     parent_global: Option<GlobalTransform>,
     global_transform: GlobalTransform,
-) -> Result<Transform, AnchorResolveSkip> {
+) -> Result<Transform, AnchorResolveError> {
     let AnchorPlacementParent::Entity(_) = parent else {
         return Ok(global_transform.compute_transform());
     };
-    let parent_global = parent_global.ok_or(AnchorResolveSkip::UnsupportedParentTransform)?;
+    let parent_global = parent_global.ok_or(AnchorResolveError::UnsupportedParentTransform)?;
     local_transform_for_parent(&parent_global, &global_transform)
 }
 
@@ -891,12 +902,12 @@ fn local_transform_for(
 /// TRS exists. Degenerate parents and poses requiring local shear are refused.
 ///
 /// # Errors
-/// Returns [`AnchorResolveSkip::UnsupportedParentTransform`] when the local
+/// Returns [`AnchorResolveError::UnsupportedParentTransform`] when the local
 /// transform cannot reproduce the requested world pose without shear.
 pub fn local_transform_for_parent(
     parent_global: &GlobalTransform,
     global_transform: &GlobalTransform,
-) -> Result<Transform, AnchorResolveSkip> {
+) -> Result<Transform, AnchorResolveError> {
     let parent_inverse = validate_supported_parent_transform(parent_global)?;
     let relative = parent_inverse * global_transform.affine();
     let (scale, rotation, translation) = relative.to_scale_rotation_translation();
@@ -923,16 +934,16 @@ pub fn local_transform_for_parent(
     {
         return Ok(local);
     }
-    Err(AnchorResolveSkip::UnsupportedParentTransform)
+    Err(AnchorResolveError::UnsupportedParentTransform)
 }
 
 fn validate_supported_parent_transform(
     parent: &GlobalTransform,
-) -> Result<Affine3A, AnchorResolveSkip> {
+) -> Result<Affine3A, AnchorResolveError> {
     let affine = parent.affine();
     let inverse = affine.inverse();
     if !affine.is_finite() || !inverse.is_finite() {
-        return Err(AnchorResolveSkip::UnsupportedParentTransform);
+        return Err(AnchorResolveError::UnsupportedParentTransform);
     }
     Ok(inverse)
 }
@@ -1036,7 +1047,7 @@ mod tests {
     use bevy_transform::prelude::Transform;
 
     use super::AnchorResolveDiagnostics;
-    use super::AnchorResolveSkip;
+    use super::AnchorResolveError;
     use super::quad_geometry;
     use super::resolve_anchors;
     use super::run_resolve;
@@ -1118,7 +1129,7 @@ mod tests {
             &world,
             source,
             target,
-            AnchorResolveSkip::MissingTargetGeometry,
+            AnchorResolveError::MissingTargetGeometry,
         );
 
         world.entity_mut(target).insert(quad_geometry());
@@ -1143,7 +1154,7 @@ mod tests {
             &world,
             source,
             missing_target,
-            AnchorResolveSkip::MissingTargetGeometry,
+            AnchorResolveError::MissingTargetGeometry,
         );
     }
 
@@ -1403,7 +1414,7 @@ mod tests {
             &world,
             source,
             target,
-            AnchorResolveSkip::UnsupportedParentTransform,
+            AnchorResolveError::UnsupportedParentTransform,
         );
     }
 
@@ -1472,14 +1483,14 @@ mod tests {
         world: &World,
         source: Entity,
         target: Entity,
-        reason: AnchorResolveSkip,
+        reason: AnchorResolveError,
     ) {
         assert!(diagnostics(world).current().any(|entry| {
             entry.source == source && entry.target == target && entry.reason == reason
         }));
     }
 
-    fn diagnostics(world: &World) -> &AttachmentResolveDiagnostics<AnchorResolveSkip> {
+    fn diagnostics(world: &World) -> &AttachmentResolveDiagnostics<AnchorResolveError> {
         world.resource::<AnchorResolveDiagnostics>()
     }
 

@@ -1,4 +1,7 @@
 use bevy::prelude::Reflect;
+use thiserror::Error;
+
+use crate::DeviceAccessErrorView;
 
 /// What the kernel does about a device failure during apply, decided by its class alone.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,7 +88,8 @@ pub enum DeviceAccessClass {
 ///
 /// New hardware can bring failure classifications this crate cannot enumerate in advance, so
 /// downstream matches must carry a wildcard arm and adding a variant must not be a breaking change.
-#[derive(Clone, PartialEq, Eq, Debug, Reflect)]
+#[derive(Clone, Debug, Eq, Error, PartialEq, Reflect)]
+#[error("{}", DeviceAccessErrorView::from(self))]
 #[non_exhaustive]
 pub enum DeviceAccessError {
     /// The operator cancelled or revoked this operation; only explicit recovery may resume it.

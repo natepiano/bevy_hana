@@ -54,7 +54,7 @@ use hana_rigging::prelude::BindingAuthoring;
 use hana_rigging::prelude::BindingPolicy;
 use hana_rigging::prelude::Bindings;
 use hana_rigging::prelude::Capabilities;
-use hana_rigging::prelude::CapabilityProjectionFailure;
+use hana_rigging::prelude::CapabilityProjectionError;
 use hana_rigging::prelude::CapabilityProjectionStatus;
 use hana_rigging::prelude::Claim;
 use hana_rigging::prelude::ClaimHolder;
@@ -4676,7 +4676,7 @@ fn a_retraction_with_missing_registration_reaches_reporter_health() -> Result<()
     };
     assert_eq!(
         failures.entries(),
-        [CapabilityProjectionFailure::ReflectComponentNotRegistered {
+        [CapabilityProjectionError::ReflectComponentNotRegistered {
             type_path: ScanRateCapability::type_path().to_owned(),
         }]
     );
@@ -4811,10 +4811,10 @@ fn projection_failures_are_named_sorted_deduplicated_and_stable() -> Result<(), 
 
     advance_reporter(&mut app, reporter)?;
     let expected = vec![
-        CapabilityProjectionFailure::ReflectComponentNotRegistered {
+        CapabilityProjectionError::ReflectComponentNotRegistered {
             type_path: AlphaRegistrationMissing::type_path().to_owned(),
         },
-        CapabilityProjectionFailure::ReflectComponentNotRegistered {
+        CapabilityProjectionError::ReflectComponentNotRegistered {
             type_path: ZetaRegistrationMissing::type_path().to_owned(),
         },
     ];
@@ -4866,7 +4866,7 @@ fn missing_capability_component_registration_reaches_the_kernel_status()
     advance_reporter(&mut app, reporter)?;
     app.update();
 
-    let expected = CapabilityProjectionFailure::ReflectComponentNotRegistered {
+    let expected = CapabilityProjectionError::ReflectComponentNotRegistered {
         type_path: AlphaRegistrationMissing::type_path().to_owned(),
     };
     assert!(matches!(
@@ -4901,7 +4901,7 @@ fn custom_capability_type_path_still_correlates_its_registration_failure()
     advance_reporter(&mut app, reporter)?;
     app.update();
 
-    let expected = CapabilityProjectionFailure::ReflectComponentNotRegistered {
+    let expected = CapabilityProjectionError::ReflectComponentNotRegistered {
         type_path: CustomPathRegistrationMissing::type_path().to_owned(),
     };
     assert!(matches!(
@@ -5061,7 +5061,7 @@ fn a_projection_failure_refuses_a_stale_capability_component() -> Result<(), Box
     app.update();
     app.update();
 
-    let expected = CapabilityProjectionFailure::ReflectComponentNotRegistered {
+    let expected = CapabilityProjectionError::ReflectComponentNotRegistered {
         type_path: ScanRateCapability::type_path().to_owned(),
     };
     assert!(matches!(
@@ -5097,7 +5097,7 @@ fn a_missing_application_type_registry_is_named_by_reporter_and_role() -> Result
     advance_reporter(&mut app, reporter)?;
     app.update();
 
-    let expected = CapabilityProjectionFailure::ApplicationTypeRegistryUnavailable {
+    let expected = CapabilityProjectionError::ApplicationTypeRegistryUnavailable {
         affected_type_path: ScanRateCapability::type_path().to_owned(),
     };
     let ReporterOutcomeHealth::Succeeded {

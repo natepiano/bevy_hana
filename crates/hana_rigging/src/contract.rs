@@ -20,7 +20,7 @@ use thiserror::Error;
 
 use crate::AttemptInvalidation;
 use crate::AttemptRef;
-use crate::CapabilityProjectionFailure;
+use crate::CapabilityProjectionError;
 use crate::CapabilityProjectionStatus;
 use crate::CapabilityRequirement;
 use crate::DeviceAccessError;
@@ -903,7 +903,7 @@ pub enum TargetWait {
     /// Application code must restore reflected-component registration.
     ApplicationCapabilityRegistrationRequired {
         /// Correlated reporter projection failure naming the required type.
-        failure: CapabilityProjectionFailure,
+        failure: CapabilityProjectionError,
     },
 }
 
@@ -988,13 +988,12 @@ impl<'a> TargetResolutionContext<'a> {
     ///
     /// # Errors
     ///
-    /// Returns the requirement when the reporter's accepted projection does not currently include
-    /// the requested capability.
+    /// Returns [`RequiredCapabilityError`] when the required capability projection is unavailable.
     pub fn required_capability<'world, C>(
         &self,
         world: &'world World,
         reporter: ReporterId,
-    ) -> Result<&'world C, RequiredCapabilityUnavailable>
+    ) -> Result<&'world C, RequiredCapabilityError>
     where
         C: Component + Reflect + TypePath,
     {
@@ -1006,53 +1005,57 @@ impl<'a> TargetResolutionContext<'a> {
             .is_some_and(|projection| {
                 matches!(projection, CapabilityProjectionStatus::AllProjected)
             });
-        if projected && reporter_supports_projection {
-            return world
-                .get::<C>(self.device.entity)
-                .ok_or(RequiredCapabilityUnavailable {
-                    reporter,
-                    requirement,
-                });
-        }
-        Err(RequiredCapabilityUnavailable {
+        let error = RequiredCapabilityError::NotProjected {
             reporter,
-            requirement,
-        })
+            required_type_path: requirement.type_path(),
+        };
+        if projected && reporter_supports_projection {
+            return world.get::<C>(self.device.entity).ok_or(error);
+        }
+        Err(error)
     }
 }
 
-/// Kernel-owned signal that one reporter did not project a required capability.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RequiredCapabilityUnavailable {
-    reporter:    ReporterId,
-    requirement: CapabilityRequirement,
+/// The reporter did not project a required capability.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum RequiredCapabilityError {
+    /// The required component projection is unavailable.
+    #[error("reporter {reporter:?} did not project the required capability {required_type_path}")]
+    #[non_exhaustive]
+    NotProjected {
+        /// Reporter that must project the capability.
+        reporter:           ReporterId,
+        /// Reflected type path of the required capability component.
+        required_type_path: &'static str,
+    },
 }
 
-impl RequiredCapabilityUnavailable {
+impl RequiredCapabilityError {
     /// Correlate this requirement with the reporter's latest projection result.
     #[must_use]
     pub fn target_wait(&self, world: &World) -> TargetWait {
-        let failure = reporter_capability_projection(world, self.reporter).and_then(|projection| {
+        let Self::NotProjected {
+            reporter,
+            required_type_path,
+        } = *self;
+        let failure = reporter_capability_projection(world, reporter).and_then(|projection| {
             let CapabilityProjectionStatus::Failed(failures) = projection else {
                 return None;
             };
             failures.entries().iter().find(|failure| match failure {
-                CapabilityProjectionFailure::ApplicationTypeRegistryUnavailable {
+                CapabilityProjectionError::ApplicationTypeRegistryUnavailable {
                     affected_type_path,
-                } => affected_type_path == self.requirement.type_path(),
-                CapabilityProjectionFailure::ReflectComponentNotRegistered { type_path } => {
-                    type_path == self.requirement.type_path()
+                } => affected_type_path == required_type_path,
+                CapabilityProjectionError::ReflectComponentNotRegistered { type_path } => {
+                    type_path == required_type_path
                 },
             })
         });
         failure.cloned().map_or_else(
             || TargetWait::Reporter {
-                reporter: self.reporter,
-                error:    DeviceAccessError::Absent {
-                    detail: format!(
-                        "required capability `{}` is not projected",
-                        self.requirement.type_path()
-                    ),
+                reporter,
+                error: DeviceAccessError::Absent {
+                    detail: format!("required capability `{required_type_path}` is not projected"),
                 },
             },
             |failure| TargetWait::ApplicationCapabilityRegistrationRequired { failure },

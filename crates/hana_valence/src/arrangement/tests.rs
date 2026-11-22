@@ -1,7 +1,4 @@
 use core::convert::Infallible;
-use core::error::Error;
-use core::fmt::Display;
-use core::fmt::Formatter;
 
 use bevy_ecs::entity::Entity;
 use bevy_ecs::world::World;
@@ -41,16 +38,9 @@ enum LogicalMember {
 
 struct NoFoldProvider;
 
-#[derive(Debug)]
-struct ProviderFailure;
-
-impl Display for ProviderFailure {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> core::fmt::Result {
-        formatter.write_str("provider authoring failed")
-    }
-}
-
-impl Error for ProviderFailure {}
+#[derive(Debug, thiserror::Error)]
+#[error("provider authoring failed")]
+struct ProviderError;
 
 impl ArrangementProvider for NoFoldProvider {
     type Member = LogicalMember;
@@ -471,7 +461,7 @@ fn provider_plan_retains_its_typed_selection_and_received_association() {
 
 #[test]
 fn provider_errors_preserve_the_downstream_error_source() {
-    let error = ArrangementError::provider(ProviderFailure);
+    let error = ArrangementError::provider(ProviderError);
 
     assert_eq!(
         core::error::Error::source(&error).map(std::string::ToString::to_string),

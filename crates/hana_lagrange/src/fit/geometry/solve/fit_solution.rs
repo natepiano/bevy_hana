@@ -1,8 +1,5 @@
-use core::fmt;
-use core::fmt::Display;
-use core::fmt::Formatter;
-
 use hana_kana::Position;
+use thiserror::Error;
 
 /// Successful fit output: camera orbit radius and centered focus point.
 #[derive(Debug, Clone, Copy)]
@@ -14,24 +11,15 @@ pub struct FitSolution {
 }
 
 /// Explicit fit calculation failures.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum FitError {
     /// Camera viewport size/aspect ratio is unavailable.
+    #[error("camera viewport size is unavailable")]
     NoViewport,
     /// All candidate fits projected points behind the camera.
+    #[error("all candidate fits project points behind camera")]
     PointsBehindCamera,
     /// Projection variant is not supported (e.g. `Projection::Custom`).
+    #[error("projection variant is not supported")]
     UnsupportedProjection,
-}
-
-impl Display for FitError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NoViewport => write!(f, "camera viewport size is unavailable"),
-            Self::PointsBehindCamera => {
-                write!(f, "all candidate fits project points behind camera")
-            },
-            Self::UnsupportedProjection => write!(f, "projection variant is not supported"),
-        }
-    }
 }

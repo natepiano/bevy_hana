@@ -101,7 +101,7 @@ pub use display_test_adapter::DisplayTestEnumeration;
 pub use display_test_adapter::DisplayTestReporterLookup;
 use driver::WindowDriverId;
 use driver::WindowEndpointDriver;
-pub use driver::WindowPlacementDriverUnavailable;
+pub use driver::WindowPlacementDriverError;
 use driver::WindowRoleDriverState;
 pub use driver::window_placement_driver;
 pub use events::ExpectedLogicalPosition;
@@ -152,13 +152,13 @@ use monitors::MonitorPlugin;
 pub use monitors::MonitorTopologyRevision;
 pub use monitors::Monitors;
 pub use persistence::EstablishedWindowPlacement;
-pub use persistence::InvalidWindowDisplay;
 use persistence::PersistencePlugin;
 pub use persistence::ReadbackWindowPosition;
 pub use persistence::RequestedWindowPlacement;
 pub use persistence::SavedFullscreenVideoMode;
 pub use persistence::SavedVideoMode;
 pub use persistence::SavedWindowMode;
+pub use persistence::WindowDisplayError;
 pub use persistence::WindowPlacementConfiguration;
 pub use persistence::managed_window_role;
 pub use persistence::primary_window_role;
@@ -608,7 +608,7 @@ pub(crate) mod tests {
     use hana_rigging::prelude::BindingAuthoring;
     use hana_rigging::prelude::BindingPolicy;
     use hana_rigging::prelude::Bindings;
-    use hana_rigging::prelude::CapabilityProjectionFailure;
+    use hana_rigging::prelude::CapabilityProjectionError;
     use hana_rigging::prelude::DeviceEndpoint;
     use hana_rigging::prelude::DeviceIdSource;
     use hana_rigging::prelude::DeviceKey;
@@ -3057,7 +3057,7 @@ pub(crate) mod tests {
                         RoleStatusView::Waiting(
                             WaitingStatusView::ApplicationCapabilityRegistrationRequired {
                                 failure:
-                                    CapabilityProjectionFailure::ReflectComponentNotRegistered {
+                                    CapabilityProjectionError::ReflectComponentNotRegistered {
                                         type_path,
                                     },
                                 ..

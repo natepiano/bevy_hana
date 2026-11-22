@@ -40,6 +40,9 @@ use hana_kana::ToU32;
 use hana_kana::ToUsize;
 use raw_window_handle::HasWindowHandle;
 use raw_window_handle::RawWindowHandle;
+use x11rb::errors::ConnectError;
+use x11rb::errors::ConnectionError;
+use x11rb::errors::ReplyError;
 use x11rb::protocol::xproto::AtomEnum;
 use x11rb::protocol::xproto::ConnectionExt;
 use x11rb::xcb_ffi::XCBConnection;
@@ -369,33 +372,34 @@ fn query_frame_top_for_entity(entity: Entity) -> X11FrameReadback {
 }
 
 fn query_frame_top(window_id: u32) -> X11FrameReadback {
-    match read_frame_top(window_id) {
-        Ok(readback) => readback,
-        Err(X11FrameQueryFailure) => X11FrameReadback::QueryFailed,
-    }
+    read_frame_top(window_id).unwrap_or(X11FrameReadback::QueryFailed)
 }
 
-struct X11FrameQueryFailure;
+#[derive(Debug, thiserror::Error)]
+enum X11FrameQueryError {
+    #[error("could not connect to X11")]
+    Connect(#[from] ConnectError),
+    #[error("could not send the X11 frame query")]
+    Request(#[from] ConnectionError),
+    #[error("could not read the X11 frame query reply")]
+    Reply(#[from] ReplyError),
+}
 
-fn read_frame_top(window_id: u32) -> Result<X11FrameReadback, X11FrameQueryFailure> {
-    let (connection, _) = XCBConnection::connect(None).map_err(|_| X11FrameQueryFailure)?;
+fn read_frame_top(window_id: u32) -> Result<X11FrameReadback, X11FrameQueryError> {
+    let (connection, _) = XCBConnection::connect(None)?;
 
-    let atom_cookie = connection
-        .intern_atom(false, FRAME_EXTENTS_ATOM_NAME)
-        .map_err(|_| X11FrameQueryFailure)?;
-    let atom = atom_cookie.reply().map_err(|_| X11FrameQueryFailure)?.atom;
+    let atom_cookie = connection.intern_atom(false, FRAME_EXTENTS_ATOM_NAME)?;
+    let atom = atom_cookie.reply()?.atom;
 
-    let property_cookie = connection
-        .get_property(
-            false,
-            window_id,
-            atom,
-            AtomEnum::CARDINAL,
-            FRAME_EXTENT_PROPERTY_OFFSET,
-            FRAME_EXTENT_COUNT,
-        )
-        .map_err(|_| X11FrameQueryFailure)?;
-    let property = property_cookie.reply().map_err(|_| X11FrameQueryFailure)?;
+    let property_cookie = connection.get_property(
+        false,
+        window_id,
+        atom,
+        AtomEnum::CARDINAL,
+        FRAME_EXTENT_PROPERTY_OFFSET,
+        FRAME_EXTENT_COUNT,
+    )?;
+    let property = property_cookie.reply()?;
 
     let Some(values) = property.value32() else {
         return Ok(X11FrameReadback::AwaitingFrameExtents);

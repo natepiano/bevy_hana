@@ -46,6 +46,7 @@ use hana_rigging::prelude::RoleKeyError;
 use hana_rigging::prelude::UnregisteredSchemeError;
 use ron::Error;
 use ron::Options;
+use ron::error::SpannedError;
 use ron::extensions::Extensions;
 use ron::from_str;
 use ron::ser::PrettyConfig;
@@ -299,12 +300,12 @@ pub(crate) enum PersistedWindowIdentityMigrationOutcome {
     /// No unique compatible live report exists yet, so preserve the v4 evidence for a later scan.
     AwaitingLiveEvidence,
     /// Fresh evidence named an invalid persistence key and this entry cannot be retained safely.
-    Rejected(PersistedWindowIdentityMigrationFailure),
+    Rejected(PersistedWindowIdentityMigrationError),
 }
 
 /// Why fresh evidence cannot become a v5 classified display target.
 #[derive(Debug, ThisError)]
-pub(crate) enum PersistedWindowIdentityMigrationFailure {
+pub(crate) enum PersistedWindowIdentityMigrationError {
     /// A reporter association named a non-display device for a persisted window target.
     #[error("fresh monitor association named non-monitor device kind {found:?}")]
     NonDisplayKey {
@@ -392,8 +393,7 @@ fn decode_v5(
 ) -> PersistedWindowStateDecodeOutcome {
     decode_entries(entries, |entry| {
         let entry = decode_v5_entry::<PersistedEntryV5>(entry)?;
-        validate_window_target(&entry.window_state.target, registered_schemes)
-            .map_err(|error| error.to_string())?;
+        validate_window_target(&entry.window_state.target, registered_schemes)?;
         Ok((entry.persisted_role, entry.window_state.into()))
     })
 }
@@ -404,8 +404,7 @@ fn decode_v6(
 ) -> PersistedWindowStateDecodeOutcome {
     decode_entries(entries, |entry| {
         let entry = decode_v5_entry::<PersistedEntryV6>(entry)?;
-        validate_window_target(&entry.window_state.target, registered_schemes)
-            .map_err(|error| error.to_string())?;
+        validate_window_target(&entry.window_state.target, registered_schemes)?;
         Ok((
             entry.persisted_role,
             PersistedWindowPlacement::new(entry.window_state, entry.binding_policy.into()),
@@ -413,13 +412,21 @@ fn decode_v6(
     })
 }
 
-fn decode_v5_entry<T>(entry: &RawValue) -> Result<T, String>
+#[derive(Debug, ThisError)]
+enum PersistedWindowEntryError {
+    #[error("{0}")]
+    Decode(#[from] SpannedError),
+    #[error("{0}")]
+    Target(#[from] PersistedWindowIdentityMigrationError),
+}
+
+fn decode_v5_entry<T>(entry: &RawValue) -> Result<T, PersistedWindowEntryError>
 where
     T: DeserializeOwned,
 {
     persistence_ron_options()
         .from_str(entry.get_ron())
-        .map_err(|error| error.to_string())
+        .map_err(PersistedWindowEntryError::from)
 }
 
 fn persistence_ron_options() -> Options {
@@ -438,7 +445,10 @@ fn decode_entries(
     entries: Vec<Box<RawValue>>,
     mut decode_entry: impl FnMut(
         &RawValue,
-    ) -> Result<(PersistedWindowRole, PersistedWindowPlacement), String>,
+    ) -> Result<
+        (PersistedWindowRole, PersistedWindowPlacement),
+        PersistedWindowEntryError,
+    >,
 ) -> PersistedWindowStateDecodeOutcome {
     let mut states = HashMap::with_capacity(entries.len());
     for entry in entries {
@@ -491,7 +501,7 @@ pub(super) fn resolve_legacy_target(
 fn validate_window_target(
     target: &PersistedWindowTargetV5,
     registered_schemes: &RegisteredSchemes,
-) -> Result<(), PersistedWindowIdentityMigrationFailure> {
+) -> Result<(), PersistedWindowIdentityMigrationError> {
     match target {
         PersistedWindowTargetV5::Classified(device_key) => {
             validate_classified_key(device_key, registered_schemes)
@@ -503,15 +513,15 @@ fn validate_window_target(
 fn validate_classified_key(
     device_key: &DeviceKey,
     registered_schemes: &RegisteredSchemes,
-) -> Result<(), PersistedWindowIdentityMigrationFailure> {
+) -> Result<(), PersistedWindowIdentityMigrationError> {
     if device_key.kind != DeviceKind::Display {
-        return Err(PersistedWindowIdentityMigrationFailure::NonDisplayKey {
+        return Err(PersistedWindowIdentityMigrationError::NonDisplayKey {
             found: device_key.kind,
         });
     }
     registered_schemes
         .validate(device_key)
-        .map_err(PersistedWindowIdentityMigrationFailure::from)
+        .map_err(PersistedWindowIdentityMigrationError::from)
 }
 
 /// Encode live v6 state for a normal save.

@@ -179,7 +179,7 @@ fn shader_variants_link_morph_targets_and_distinct_uniform_arrays() -> Result<()
         app.add_plugins(crate::LiminalPlugin);
         app.finish();
         app.cleanup();
-        hana_shader_testing::wait_for_shaders(&mut app)?;
+        hana_shader_testing::wait_for_shaders(&mut app).map_err(|error| error.to_string())?;
         let mut descriptors = captured_descriptors(&app);
         descriptors.extend(outline_descriptors(
             app.sub_app(RenderApp).world(),

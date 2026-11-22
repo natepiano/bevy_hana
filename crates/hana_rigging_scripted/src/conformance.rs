@@ -160,7 +160,7 @@ const UNMONITORED_FRAME_STEP: Duration = Duration::from_millis(1);
 /// stall a driver that is crediting every frame. Dividing the tightest declared bound by this keeps
 /// the walk inside it while still letting the flow step cross it deliberately, and requiring the
 /// division to have actually happened is what
-/// [`ConformanceRefusal::FramePacingCrossesTheFlowBound`] checks.
+/// [`ConformanceRefusalError::FramePacingCrossesTheFlowBound`] checks.
 const FRAME_STEPS_PER_FLOW_BOUND: u32 = 32;
 
 /// Extra frames the flow step spends past a continuous subject's first-datum bound.
@@ -175,7 +175,7 @@ const FLOW_OVERRUN_FRAMES: usize = 8;
 /// datum gap, and both are free: a subject declaring a 33ms gap and a 5s startup allowance needs
 /// thousands of updates, and legal bounds a few nanoseconds apart need hundreds of millions. A walk
 /// that spends those is a hang rather than a result, so the walk refuses the subject up front
-/// instead — see [`ConformanceRefusal::FlowBoundsExceedTheWalksFrameBudget`].
+/// instead — see [`ConformanceRefusalError::FlowBoundsExceedTheWalksFrameBudget`].
 const FLOW_FRAME_CEILING: usize = STEP_FRAME_CEILING * 8;
 
 /// A driver put through the conformance walk, and the facts only its author can supply.
@@ -212,7 +212,7 @@ const FLOW_FRAME_CEILING: usize = STEP_FRAME_CEILING * 8;
 ///
 /// The two bounds may not be arbitrarily far apart: the walk drives the frame clock by hand and
 /// refuses a pair it cannot cross inside its own frame budget. See
-/// [`ConformanceRefusal::FlowBoundsExceedTheWalksFrameBudget`].
+/// [`ConformanceRefusalError::FlowBoundsExceedTheWalksFrameBudget`].
 ///
 /// A subject is `'static` because its capability declaration outlives the call that built it: the
 /// scripted reporter holds the declaration for the life of the app and rebuilds it on every replay.
@@ -577,7 +577,7 @@ impl ConformanceReport {
 /// Separate from the stop it happened at so a caller can tell "this driver never established" from
 /// "this scan could not start a walk at all" without parsing a message.
 #[derive(Debug, Error)]
-pub enum ConformanceRefusal {
+pub enum ConformanceRefusalError {
     /// The supplied scan names no device the walk could bind to.
     #[error("the supplied scan names no keyed, present device to bind")]
     ScanNamesNoPresentedDevice,
@@ -705,30 +705,45 @@ pub enum ConformanceRefusal {
     },
 }
 
-/// One conformance walk that stopped before the driver had been proven.
+/// A conformance walk that stops before it proves the driver.
 #[derive(Debug, Error)]
-#[error("conformance stopped at {stop}: {refusal}")]
-pub struct ConformanceFailure {
-    reached: ConformanceReport,
-    stop:    ConformanceStop,
-    #[source]
-    refusal: Box<ConformanceRefusal>,
+pub enum ConformanceError {
+    /// The walk stopped with a refusal.
+    #[error("conformance stopped at {stop}: {refusal}")]
+    Stopped {
+        /// The steps the walk reached before it stopped.
+        reached: ConformanceReport,
+        /// The point where the walk stopped.
+        stop:    ConformanceStop,
+        /// The reason the walk stopped.
+        #[source]
+        refusal: Box<ConformanceRefusalError>,
+    },
 }
 
-impl ConformanceFailure {
+impl ConformanceError {
     /// Every step the walk reached before it stopped.
     #[must_use]
-    pub const fn reached(&self) -> &ConformanceReport { &self.reached }
+    pub const fn reached(&self) -> &ConformanceReport {
+        let Self::Stopped { reached, .. } = self;
+        reached
+    }
 
     /// Where the walk stopped, which may be before it began.
     #[must_use]
-    pub const fn stop(&self) -> ConformanceStop { self.stop }
+    pub const fn stop(&self) -> ConformanceStop {
+        let Self::Stopped { stop, .. } = self;
+        *stop
+    }
 
     /// Why it could go no further.
     ///
     /// Boxed inside the failure so the walk's own `Result`s stay small: every step returns one.
     #[must_use]
-    pub fn refusal(&self) -> &ConformanceRefusal { &self.refusal }
+    pub fn refusal(&self) -> &ConformanceRefusalError {
+        let Self::Stopped { refusal, .. } = self;
+        refusal
+    }
 }
 
 /// Walk one endpoint driver through the kernel's whole lifecycle and report what it reached.
@@ -741,14 +756,12 @@ impl ConformanceFailure {
 ///
 /// # Errors
 ///
-/// Returns [`ConformanceFailure`] naming where the walk stopped and why. A failure carries every
-/// step reached before it, so a driver that establishes but never survives a replug is
-/// distinguishable from one that never establishes at all, and a walk that refused before its first
-/// step reports [`ConformanceStop::BeforeTheWalkBegan`] rather than borrowing a step's name.
+/// Returns [`ConformanceError`] with the steps the walk reached and the reason it stopped.
+/// If the walk stops before the first step, it reports [`ConformanceStop::BeforeTheWalkBegan`].
 pub fn run<Subject>(
     subject: Subject,
     scan: ScriptedScan,
-) -> Result<ConformanceReport, ConformanceFailure>
+) -> Result<ConformanceReport, ConformanceError>
 where
     Subject: ConformanceSubject,
 {
@@ -785,9 +798,9 @@ where
                   refused and a public refusal variant for it would be surface no caller could \
                   produce"
     )]
-    fn open(mut subject: Subject, scan: ScriptedScan) -> Result<Self, ConformanceFailure> {
+    fn open(mut subject: Subject, scan: ScriptedScan) -> Result<Self, ConformanceError> {
         let report = ConformanceReport::default();
-        let refuse = |refusal: ConformanceRefusal| ConformanceFailure {
+        let refuse = |refusal: ConformanceRefusalError| ConformanceError::Stopped {
             reached: ConformanceReport::default(),
             stop:    ConformanceStop::BeforeTheWalkBegan,
             refusal: Box::new(refusal),
@@ -795,7 +808,9 @@ where
 
         let device = presented_device(&scan).map_err(refuse)?;
         let DeviceIdSource::Reported { scheme, .. } = &device.id else {
-            return Err(refuse(ConformanceRefusal::PresentedDeviceIsNotReported));
+            return Err(refuse(
+                ConformanceRefusalError::PresentedDeviceIsNotReported,
+            ));
         };
         let scheme = scheme.clone();
         let kind = device.kind;
@@ -850,7 +865,7 @@ where
     }
 
     /// The whole lifecycle, in the order the kernel hands it out.
-    fn walk(&mut self) -> Result<(), ConformanceFailure> {
+    fn walk(&mut self) -> Result<(), ConformanceError> {
         self.device_reported()?;
         self.binding_authored()?;
         self.attempt_issued(ConformanceStep::AttemptIssued)?;
@@ -875,7 +890,7 @@ where
     // ---- steps ----
 
     /// Admit scans until the kernel resolves the presented key to a device it retains.
-    fn device_reported(&mut self) -> Result<(), ConformanceFailure> {
+    fn device_reported(&mut self) -> Result<(), ConformanceError> {
         let device = self.endpoint.device.clone();
         self.admit_scans_until(
             ConformanceStep::DeviceReported,
@@ -887,14 +902,14 @@ where
     }
 
     /// Author the walk's binding and hand the subject its role entity.
-    fn binding_authored(&mut self) -> Result<(), ConformanceFailure> {
+    fn binding_authored(&mut self) -> Result<(), ConformanceError> {
         self.author_binding(ConformanceStep::BindingAuthored)?;
         self.report.record(ConformanceStep::BindingAuthored);
         Ok(())
     }
 
     /// Advance until the role is applying, which is the only frame a mid-flight step can act on.
-    fn attempt_issued(&mut self, step: ConformanceStep) -> Result<(), ConformanceFailure> {
+    fn attempt_issued(&mut self, step: ConformanceStep) -> Result<(), ConformanceError> {
         self.advance_until(step, "RoleStatusView::Applying", |walk| {
             matches!(walk.role_status(), Some(RoleStatusView::Applying { .. }))
         })?;
@@ -905,7 +920,7 @@ where
     }
 
     /// Advance until the kernel publishes a session, then check the driver actually kept it.
-    fn session_established(&mut self) -> Result<SessionRef, ConformanceFailure> {
+    fn session_established(&mut self) -> Result<SessionRef, ConformanceError> {
         let session = self.wait_for_session(ConformanceStep::SessionEstablished)?;
         self.require_held_session(ConformanceStep::SessionEstablished, session)?;
         self.report.record(ConformanceStep::SessionEstablished);
@@ -913,7 +928,7 @@ where
     }
 
     /// Assert the presentation this subject's declared flow promises, and no other.
-    fn flow_read(&mut self) -> Result<(), ConformanceFailure> {
+    fn flow_read(&mut self) -> Result<(), ConformanceError> {
         let step = ConformanceStep::FlowRead;
         match Subject::FLOW {
             FlowExpectation::NotMonitored => {
@@ -937,7 +952,7 @@ where
     fn session_ended_on_departure(
         &mut self,
         established: SessionRef,
-    ) -> Result<(), ConformanceFailure> {
+    ) -> Result<(), ConformanceError> {
         let step = ConformanceStep::SessionEndedOnDeparture;
         let cursor = self.cleanup_cursor();
         self.admit_scans_until(step, "a role with no established session", |walk| {
@@ -955,7 +970,7 @@ where
     }
 
     /// The departed role must say so to an operator, not merely stop being established.
-    fn disconnected_during_grace(&mut self) -> Result<(), ConformanceFailure> {
+    fn disconnected_during_grace(&mut self) -> Result<(), ConformanceError> {
         let step = ConformanceStep::DisconnectedDuringGrace;
         self.advance_until(step, "Disconnected", |walk| {
             matches!(
@@ -971,7 +986,7 @@ where
     fn reestablished_on_return(
         &mut self,
         departed: SessionRef,
-    ) -> Result<SessionRef, ConformanceFailure> {
+    ) -> Result<SessionRef, ConformanceError> {
         let step = ConformanceStep::ReestablishedOnReturn;
         self.admit_scans_until(step, "a re-established session", |walk| {
             matches!(walk.role_status(), Some(RoleStatusView::Established { .. }))
@@ -980,7 +995,7 @@ where
         if session == departed {
             return Err(self.refuse(
                 step,
-                ConformanceRefusal::ReturnedSessionReusesTheDepartedReference { session },
+                ConformanceRefusalError::ReturnedSessionReusesTheDepartedReference { session },
             ));
         }
         self.require_held_session(step, session)?;
@@ -992,7 +1007,7 @@ where
     fn retirement_ended_the_session(
         &mut self,
         established: SessionRef,
-    ) -> Result<(), ConformanceFailure> {
+    ) -> Result<(), ConformanceError> {
         let step = ConformanceStep::RetirementEndedTheSession;
         let cursor = self.cleanup_cursor();
         self.retire();
@@ -1016,7 +1031,7 @@ where
     /// that is still there and the walk can carry on into the removal steps. It also reuses the
     /// displaced role entity, which is why this cancellation reaches the driver with a live one:
     /// the attempt is what a replacement displaces, never the entity.
-    fn replacement_cancelled_the_attempt(&mut self) -> Result<(), ConformanceFailure> {
+    fn replacement_cancelled_the_attempt(&mut self) -> Result<(), ConformanceError> {
         let step = ConformanceStep::ReplacementCancelledTheAttempt;
         self.author_binding(step)?;
         self.attempt_issued(step)?;
@@ -1025,7 +1040,7 @@ where
         let endings = self.ending_cursor();
         let authoring = self.authoring();
         let successor = hana_rigging::replace_binding(self.app.world_mut(), authoring)
-            .map_err(|error| self.refuse(step, ConformanceRefusal::BindingRefused(error)))?;
+            .map_err(|error| self.refuse(step, ConformanceRefusalError::BindingRefused(error)))?;
         self.attach_role(successor);
         self.app.update();
         self.advance_until(
@@ -1060,7 +1075,7 @@ where
     /// This is how an application takes a role entity away for good, and the only way the cleanup
     /// reaches a driver with no live entity to read: a plain despawn of a still-registered role is
     /// re-spawned by recovery and arrives live.
-    fn removed_role_entity_ended_the_session(&mut self) -> Result<(), ConformanceFailure> {
+    fn removed_role_entity_ended_the_session(&mut self) -> Result<(), ConformanceError> {
         let step = ConformanceStep::RemovedRoleEntityEndedTheSession;
         let session = self.wait_for_session(step)?;
         self.require_held_session(step, session)?;
@@ -1083,7 +1098,7 @@ where
     }
 
     /// The same removal against a role that is still applying rather than established.
-    fn removed_role_entity_cancelled_the_attempt(&mut self) -> Result<(), ConformanceFailure> {
+    fn removed_role_entity_cancelled_the_attempt(&mut self) -> Result<(), ConformanceError> {
         let step = ConformanceStep::RemovedRoleEntityCancelledTheAttempt;
         self.author_binding(step)?;
         self.attempt_issued(step)?;
@@ -1121,7 +1136,7 @@ where
     /// has to ask the world rather than trust the record, and this is the step that proves it — the
     /// release arrives with [`DriverCleanupRoleEntity::Removed`] for an id [`Bindings`] still
     /// answers with.
-    fn stranded_role_entity_ended_the_session(&mut self) -> Result<(), ConformanceFailure> {
+    fn stranded_role_entity_ended_the_session(&mut self) -> Result<(), ConformanceError> {
         let step = ConformanceStep::StrandedRoleEntityEndedTheSession;
         self.author_binding(step)?;
         let session = self.wait_for_session(step)?;
@@ -1156,10 +1171,10 @@ where
     // ---- shared machinery ----
 
     /// Author one binding for the walk's role and hand the subject the entity it reserved.
-    fn author_binding(&mut self, step: ConformanceStep) -> Result<(), ConformanceFailure> {
+    fn author_binding(&mut self, step: ConformanceStep) -> Result<(), ConformanceError> {
         let authoring = self.authoring();
         let role_entity = hana_rigging::register_binding(self.app.world_mut(), authoring)
-            .map_err(|error| self.refuse(step, ConformanceRefusal::BindingRefused(error)))?;
+            .map_err(|error| self.refuse(step, ConformanceRefusalError::BindingRefused(error)))?;
         self.attach_role(role_entity);
         Ok(())
     }
@@ -1186,10 +1201,7 @@ where
     }
 
     /// Advance until the kernel publishes a session, and return its reference.
-    fn wait_for_session(
-        &mut self,
-        step: ConformanceStep,
-    ) -> Result<SessionRef, ConformanceFailure> {
+    fn wait_for_session(&mut self, step: ConformanceStep) -> Result<SessionRef, ConformanceError> {
         self.advance_until(step, "RoleStatusView::Established", |walk| {
             matches!(walk.role_status(), Some(RoleStatusView::Established { .. }))
         })?;
@@ -1197,7 +1209,7 @@ where
             Some(RoleStatusView::Established { session, .. }) => Ok(*session),
             _ => Err(self.refuse(
                 step,
-                ConformanceRefusal::ObservableNeverReached {
+                ConformanceRefusalError::ObservableNeverReached {
                     expected: "RoleStatusView::Established",
                     observed: self.observed_status(),
                 },
@@ -1211,10 +1223,7 @@ where
     /// frame zero either, so a step that only ran out of frames would pass with
     /// `judge_continuous_flow` deleted from the kernel. The stall reading is what makes the flow
     /// step a reading of the bound rather than of the walk's own patience.
-    fn advance_until_presenting(
-        &mut self,
-        step: ConformanceStep,
-    ) -> Result<(), ConformanceFailure> {
+    fn advance_until_presenting(&mut self, step: ConformanceStep) -> Result<(), ConformanceError> {
         for _ in 0..flow_frames::<Subject>() {
             match self.presentation() {
                 Some(RolePresentationView::Presenting) => return Ok(()),
@@ -1222,7 +1231,7 @@ where
                     let cause = *cause;
                     return Err(self.refuse(
                         step,
-                        ConformanceRefusal::FlowStalledBeforeItPresented { cause },
+                        ConformanceRefusalError::FlowStalledBeforeItPresented { cause },
                     ));
                 },
                 _ => {},
@@ -1234,7 +1243,7 @@ where
         }
         Err(self.refuse(
             step,
-            ConformanceRefusal::ObservableNeverReached {
+            ConformanceRefusalError::ObservableNeverReached {
                 expected: "Presenting",
                 observed: self.observed(),
             },
@@ -1246,12 +1255,12 @@ where
         &self,
         step: ConformanceStep,
         session: SessionRef,
-    ) -> Result<(), ConformanceFailure> {
+    ) -> Result<(), ConformanceError> {
         match self.subject.session(self.app.world(), &self.role) {
             SessionLookup::Holding(held) if held == session => Ok(()),
             other => Err(self.refuse(
                 step,
-                ConformanceRefusal::SubjectRecordContradictsTheKernel {
+                ConformanceRefusalError::SubjectRecordContradictsTheKernel {
                     expected: "SessionLookup::Holding, matching the published session",
                     observed: format!("{other:?}"),
                 },
@@ -1260,12 +1269,12 @@ where
     }
 
     /// The driver's record must be over once the kernel has ended the role.
-    fn require_ended_record(&self, step: ConformanceStep) -> Result<(), ConformanceFailure> {
+    fn require_ended_record(&self, step: ConformanceStep) -> Result<(), ConformanceError> {
         match self.subject.session(self.app.world(), &self.role) {
             SessionLookup::NotEstablished => Ok(()),
             other => Err(self.refuse(
                 step,
-                ConformanceRefusal::SubjectRecordContradictsTheKernel {
+                ConformanceRefusalError::SubjectRecordContradictsTheKernel {
                     expected: "SessionLookup::NotEstablished",
                     observed: format!("{other:?}"),
                 },
@@ -1274,7 +1283,7 @@ where
     }
 
     /// The kernel must keep no role entity for a role it has retired.
-    fn require_retired_role(&self, step: ConformanceStep) -> Result<(), ConformanceFailure> {
+    fn require_retired_role(&self, step: ConformanceStep) -> Result<(), ConformanceError> {
         if self
             .app
             .world()
@@ -1286,7 +1295,7 @@ where
         }
         Err(self.refuse(
             step,
-            ConformanceRefusal::ObservableNeverReached {
+            ConformanceRefusalError::ObservableNeverReached {
                 expected: "a role the kernel no longer retains",
                 observed: String::from("a role the kernel still retains"),
             },
@@ -1314,7 +1323,7 @@ where
         session: SessionRef,
         cause: RequiredReleaseCause,
         role_entity: RoleEntityAtCleanup,
-    ) -> Result<(), ConformanceFailure> {
+    ) -> Result<(), ConformanceError> {
         let recorded = self.subject.cleanups(self.app.world(), &self.role);
         let matched = recorded.since(cursor).iter().any(|call| match call {
             RecordedCleanup::SessionReleased {
@@ -1333,7 +1342,7 @@ where
         }
         Err(self.refuse(
             step,
-            ConformanceRefusal::CleanupNeverReachedTheSubject {
+            ConformanceRefusalError::CleanupNeverReachedTheSubject {
                 expected: cause.described(),
                 observed: format!("{:?}", recorded.since(cursor)),
             },
@@ -1348,7 +1357,7 @@ where
         attempt: AttemptRef,
         invalidation: AttemptInvalidation,
         role_entity: RoleEntityAtCleanup,
-    ) -> Result<(), ConformanceFailure> {
+    ) -> Result<(), ConformanceError> {
         let recorded = self.subject.cleanups(self.app.world(), &self.role);
         let matched = recorded.since(cursor).iter().any(|call| match call {
             RecordedCleanup::AttemptCancelled {
@@ -1367,7 +1376,7 @@ where
         }
         Err(self.refuse(
             step,
-            ConformanceRefusal::CleanupNeverReachedTheSubject {
+            ConformanceRefusalError::CleanupNeverReachedTheSubject {
                 expected: match invalidation {
                     AttemptInvalidation::BindingReplaced => "cancel_apply(BindingReplaced)",
                     _ => "cancel_apply(RoleRetired)",
@@ -1387,7 +1396,7 @@ where
         cursor: usize,
         attempt: AttemptRef,
         invalidation: AttemptInvalidationView,
-    ) -> Result<(), ConformanceFailure> {
+    ) -> Result<(), ConformanceError> {
         let endings = self.app.world().resource::<PublishedAttemptEndings>();
         let published = endings.0.get(cursor..).unwrap_or_default();
         let matched = published.iter().any(|ending| {
@@ -1403,7 +1412,7 @@ where
         }
         Err(self.refuse(
             step,
-            ConformanceRefusal::ObservableNeverReached {
+            ConformanceRefusalError::ObservableNeverReached {
                 expected: "AttemptEndingView::Invalidated naming this step's cause",
                 observed: format!("{published:?}"),
             },
@@ -1411,12 +1420,12 @@ where
     }
 
     /// The attempt the role is currently running, for the step that must see it displaced.
-    fn applying_attempt(&self, step: ConformanceStep) -> Result<AttemptRef, ConformanceFailure> {
+    fn applying_attempt(&self, step: ConformanceStep) -> Result<AttemptRef, ConformanceError> {
         match self.role_status() {
             Some(RoleStatusView::Applying { attempt, .. }) => Ok(*attempt),
             _ => Err(self.refuse(
                 step,
-                ConformanceRefusal::ObservableNeverReached {
+                ConformanceRefusalError::ObservableNeverReached {
                     expected: "RoleStatusView::Applying",
                     observed: self.observed(),
                 },
@@ -1424,12 +1433,12 @@ where
         }
     }
 
-    fn role_entity(&self, step: ConformanceStep) -> Result<Entity, ConformanceFailure> {
+    fn role_entity(&self, step: ConformanceStep) -> Result<Entity, ConformanceError> {
         self.app
             .world()
             .resource::<Bindings>()
             .role_entity(&self.role)
-            .map_err(|error| self.refuse(step, ConformanceRefusal::BindingRefused(error)))
+            .map_err(|error| self.refuse(step, ConformanceRefusalError::BindingRefused(error)))
     }
 
     fn resolves(&self, device: &DeviceKey) -> bool {
@@ -1489,7 +1498,7 @@ where
         step: ConformanceStep,
         expected: &'static str,
         reached: impl Fn(&Self) -> bool,
-    ) -> Result<(), ConformanceFailure> {
+    ) -> Result<(), ConformanceError> {
         for _ in 0..STEP_FRAME_CEILING {
             if reached(self) {
                 return Ok(());
@@ -1501,7 +1510,7 @@ where
         }
         Err(self.refuse(
             step,
-            ConformanceRefusal::ObservableNeverReached {
+            ConformanceRefusalError::ObservableNeverReached {
                 expected,
                 observed: self.observed(),
             },
@@ -1521,14 +1530,16 @@ where
         step: ConformanceStep,
         expected: &'static str,
         reached: impl Fn(&Self) -> bool,
-    ) -> Result<(), ConformanceFailure> {
+    ) -> Result<(), ConformanceError> {
         for _ in 0..SCAN_RELEASE_CEILING {
             self.require_unspent_script(step)?;
-            advance_until_running(&mut self.app, self.reporter)
-                .map_err(|error| self.refuse(step, ConformanceRefusal::ReporterStalled(error)))?;
+            advance_until_running(&mut self.app, self.reporter).map_err(|error| {
+                self.refuse(step, ConformanceRefusalError::ReporterStalled(error))
+            })?;
             self.gate.release();
-            advance_until_accepted(&mut self.app, self.reporter)
-                .map_err(|error| self.refuse(step, ConformanceRefusal::ReporterStalled(error)))?;
+            advance_until_accepted(&mut self.app, self.reporter).map_err(|error| {
+                self.refuse(step, ConformanceRefusalError::ReporterStalled(error))
+            })?;
             for _ in 0..STEP_FRAME_CEILING {
                 if reached(self) {
                     return Ok(());
@@ -1538,7 +1549,7 @@ where
         }
         Err(self.refuse(
             step,
-            ConformanceRefusal::ObservableNeverReached {
+            ConformanceRefusalError::ObservableNeverReached {
                 expected,
                 observed: self.observed(),
             },
@@ -1546,23 +1557,23 @@ where
     }
 
     /// The script must still hold a scan the walk has not replayed.
-    fn require_unspent_script(&self, step: ConformanceStep) -> Result<(), ConformanceFailure> {
+    fn require_unspent_script(&self, step: ConformanceStep) -> Result<(), ConformanceError> {
         let accepted = crate::completed_batches(&self.app, self.reporter)
-            .map_err(|error| self.refuse(step, ConformanceRefusal::ReporterStalled(error)))?;
+            .map_err(|error| self.refuse(step, ConformanceRefusalError::ReporterStalled(error)))?;
         if usize::try_from(accepted).unwrap_or(usize::MAX) < self.scripted_scans {
             return Ok(());
         }
         Err(self.refuse(
             step,
-            ConformanceRefusal::ScriptedScansExhausted {
+            ConformanceRefusalError::ScriptedScansExhausted {
                 accepted,
                 scripted: self.scripted_scans,
             },
         ))
     }
 
-    fn refuse(&self, step: ConformanceStep, refusal: ConformanceRefusal) -> ConformanceFailure {
-        ConformanceFailure {
+    fn refuse(&self, step: ConformanceStep, refusal: ConformanceRefusalError) -> ConformanceError {
+        ConformanceError::Stopped {
             reached: self.report.clone(),
             stop:    ConformanceStop::At(step),
             refusal: Box::new(refusal),
@@ -1637,7 +1648,9 @@ const fn walk_limits() -> RiggingLimits {
 /// step could not be divided out of the datum gap at all, because the one-nanosecond floor bit; the
 /// budget one fires when it divided cleanly but the first-datum bound is so many gaps away that
 /// crossing it would take more updates than the walk will ever spend.
-fn refuse_undrivable_flow_bounds<Subject>(frame_step: Duration) -> Result<(), ConformanceRefusal>
+fn refuse_undrivable_flow_bounds<Subject>(
+    frame_step: Duration,
+) -> Result<(), ConformanceRefusalError>
 where
     Subject: ConformanceSubject,
 {
@@ -1646,19 +1659,21 @@ where
     };
     let maximum_datum_gap = expectation.maximum_datum_gap().duration();
     if frame_step.saturating_mul(FRAME_STEPS_PER_FLOW_BOUND) > maximum_datum_gap {
-        return Err(ConformanceRefusal::FramePacingCrossesTheFlowBound {
+        return Err(ConformanceRefusalError::FramePacingCrossesTheFlowBound {
             frame_step,
             maximum_datum_gap,
         });
     }
     let frames_required = flow_frames::<Subject>();
     if frames_required > FLOW_FRAME_CEILING {
-        return Err(ConformanceRefusal::FlowBoundsExceedTheWalksFrameBudget {
-            first_datum_timeout: expectation.first_datum_timeout().duration(),
-            maximum_datum_gap,
-            frames_required,
-            frames_available: FLOW_FRAME_CEILING,
-        });
+        return Err(
+            ConformanceRefusalError::FlowBoundsExceedTheWalksFrameBudget {
+                first_datum_timeout: expectation.first_datum_timeout().duration(),
+                maximum_datum_gap,
+                frames_required,
+                frames_available: FLOW_FRAME_CEILING,
+            },
+        );
     }
     Ok(())
 }
@@ -1750,17 +1765,17 @@ fn declared(
 }
 
 /// The keyed, present device one completed scan names first.
-fn presented_device(scan: &ScriptedScan) -> Result<DeviceKey, ConformanceRefusal> {
+fn presented_device(scan: &ScriptedScan) -> Result<DeviceKey, ConformanceRefusalError> {
     let devices = match scan {
         ScriptedScan::Complete(devices) | ScriptedScan::CompleteWithProjection(devices) => devices,
         ScriptedScan::Deferred(_) | ScriptedScan::Failed(_) | ScriptedScan::Unsupported { .. } => {
-            return Err(ConformanceRefusal::ScanIsNotACompletedSet);
+            return Err(ConformanceRefusalError::ScanIsNotACompletedSet);
         },
     };
     devices
         .iter()
         .find_map(bindable_key)
-        .ok_or(ConformanceRefusal::ScanNamesNoPresentedDevice)
+        .ok_or(ConformanceRefusalError::ScanNamesNoPresentedDevice)
 }
 
 /// The durable key one scripted device can be bound to, if it names one and is there.

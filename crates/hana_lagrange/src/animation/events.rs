@@ -19,6 +19,7 @@ use hana_kana::SequenceStageId;
 use hana_kana::SequenceTime;
 use serde::Serialize;
 use serde::ser::SerializeStruct;
+use thiserror::Error;
 
 use super::lifecycle::AnimationConflictPolicy;
 use super::queue::CameraMove;
@@ -256,21 +257,28 @@ pub enum AnimationRejectionReason {
 
 /// Why a fit or look request could not assemble the camera and target data its
 /// solve reads.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Reflect)]
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq, Reflect)]
 pub enum CameraRequestPreparationError {
     /// The requested camera entity no longer has a `Camera` component.
+    #[error("the requested camera is missing")]
     MissingCamera,
     /// The requested camera has no projection component.
+    #[error("the requested camera has no projection")]
     MissingProjection,
     /// The requested target no longer has usable geometry.
+    #[error("the requested target has no usable geometry")]
     MissingTargetGeometry,
     /// The requested target no longer has a transform.
+    #[error("the requested target has no transform")]
     MissingTargetTransform,
     /// The fit solver could not determine an active viewport.
+    #[error("camera viewport size is unavailable")]
     ViewportUnavailable,
     /// The fit solver found every target point behind the camera.
+    #[error("all target points are behind the camera")]
     PointsBehindCamera,
     /// The requested camera projection cannot solve this fit operation.
+    #[error("the requested camera projection cannot fit the target")]
     UnsupportedProjection,
 }
 

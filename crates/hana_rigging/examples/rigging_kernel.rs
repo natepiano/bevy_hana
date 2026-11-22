@@ -44,7 +44,7 @@ use hana_rigging::prelude::BindingAuthoring;
 use hana_rigging::prelude::BindingPolicy;
 use hana_rigging::prelude::Bindings;
 use hana_rigging::prelude::Capabilities;
-use hana_rigging::prelude::CapabilityProjectionFailure;
+use hana_rigging::prelude::CapabilityProjectionError;
 use hana_rigging::prelude::CapabilityProjectionStatus;
 use hana_rigging::prelude::Claim;
 use hana_rigging::prelude::ConfiguredDevice;
@@ -1148,14 +1148,14 @@ fn print_reporter_diagnostics(world: &World, reporters: &[NamedReporter]) {
         };
         for failure in failures.entries() {
             match failure {
-                CapabilityProjectionFailure::ReflectComponentNotRegistered { type_path } => {
+                CapabilityProjectionError::ReflectComponentNotRegistered { type_path } => {
                     println!(
                         "reporter {} accepted its complete set but dropped capability \
                          {type_path}; repair: register this type in your app",
                         named_reporter.name
                     );
                 },
-                CapabilityProjectionFailure::ApplicationTypeRegistryUnavailable {
+                CapabilityProjectionError::ApplicationTypeRegistryUnavailable {
                     affected_type_path,
                 } => {
                     println!(

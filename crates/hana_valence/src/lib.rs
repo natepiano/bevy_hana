@@ -252,7 +252,7 @@ pub use relation::AnchoredHere;
 pub use relation::AnchoredTo;
 pub use relation::ResolvedAnchorOffset;
 pub use resolve::AnchorResolveDiagnostics;
-pub use resolve::AnchorResolveSkip;
+pub use resolve::AnchorResolveError;
 pub use resolve::AnchorResolverScratch;
 pub use resolve::local_transform_for_parent;
 pub use resolve::resolve_anchors;

@@ -26,7 +26,7 @@ use bevy::time::Time;
 use crate::AttachmentPath;
 use crate::BatchRef;
 use crate::Bindings;
-use crate::CapabilityProjectionFailure;
+use crate::CapabilityProjectionError;
 use crate::Claim;
 use crate::ConfiguredDeviceConnection;
 use crate::ConfiguredDeviceMode;
@@ -80,7 +80,7 @@ use crate::capabilities;
 use crate::capabilities::CapabilityDeclaration;
 use crate::capabilities::CapabilityProjectionDeclaration;
 use crate::capabilities::CapabilitySourceState;
-use crate::capabilities::ReporterCapabilityProjectionFailure;
+use crate::capabilities::ReporterCapabilityProjectionError;
 use crate::capabilities::reflect_component_for;
 use crate::devices;
 use crate::devices::ConfiguredDeviceConnectionChange;
@@ -1947,13 +1947,13 @@ fn collect_mirrored_devices(devices: &Devices) -> Vec<MirroredDevice> {
 fn publish_capability_projection_failures(
     world: &mut World,
     reporters: &mut Reporters,
-    failures: Vec<ReporterCapabilityProjectionFailure>,
+    failures: Vec<ReporterCapabilityProjectionError>,
 ) {
     reporters.record_capability_projection_failures(
         world,
         failures
             .into_iter()
-            .map(ReporterCapabilityProjectionFailure::into_parts),
+            .map(ReporterCapabilityProjectionError::into_parts),
     );
 }
 
@@ -1963,16 +1963,16 @@ fn attach_device_capabilities(
     agreed: Vec<CapabilityProjectionDeclaration<'_>>,
     disputed: Vec<CapabilityProjectionDeclaration<'_>>,
     key: &DeviceKey,
-) -> Vec<ReporterCapabilityProjectionFailure> {
+) -> Vec<ReporterCapabilityProjectionError> {
     match capabilities::project_declarations(device_entity, type_registry, &agreed, &disputed) {
         Ok(()) => Vec::new(),
         Err(failures) => {
             for failure in &failures {
                 let type_path = match failure.failure() {
-                    CapabilityProjectionFailure::ApplicationTypeRegistryUnavailable {
+                    CapabilityProjectionError::ApplicationTypeRegistryUnavailable {
                         affected_type_path,
                     } => affected_type_path,
-                    CapabilityProjectionFailure::ReflectComponentNotRegistered { type_path } => {
+                    CapabilityProjectionError::ReflectComponentNotRegistered { type_path } => {
                         type_path
                     },
                 };

@@ -100,7 +100,7 @@ use hana_rigging::prelude::TargetResolutionContext;
 use hana_rigging::prelude::TargetWait;
 use hana_rigging::prelude::TransportObservation;
 use hana_rigging_scripted::CapabilityDeclaration;
-use hana_rigging_scripted::ConformanceRefusal;
+use hana_rigging_scripted::ConformanceRefusalError;
 use hana_rigging_scripted::ConformanceStep;
 use hana_rigging_scripted::ConformanceStop;
 use hana_rigging_scripted::ConformanceSubject;
@@ -826,7 +826,7 @@ fn a_driver_that_never_files_its_lease_fails_the_walk() -> Result<(), Box<dyn Er
     assert!(
         matches!(
             failure.refusal(),
-            ConformanceRefusal::SubjectRecordContradictsTheKernel { .. }
+            ConformanceRefusalError::SubjectRecordContradictsTheKernel { .. }
         ),
         "the lease-less driver was failed by a kernel reading rather than by its own record: \
          {failure:?}"
@@ -868,7 +868,7 @@ fn a_driver_that_ignores_a_cancelled_attempt_fails_the_walk() -> Result<(), Box<
     assert!(
         matches!(
             failure.refusal(),
-            ConformanceRefusal::CleanupNeverReachedTheSubject { .. }
+            ConformanceRefusalError::CleanupNeverReachedTheSubject { .. }
         ),
         "the ignoring driver was failed by a kernel reading rather than by the cleanup verb never \
          reaching it: {failure:?}"
@@ -924,7 +924,7 @@ fn a_streaming_driver_that_delivers_no_datum_fails_the_flow_step() -> Result<(),
     assert!(
         matches!(
             failure.refusal(),
-            ConformanceRefusal::FlowStalledBeforeItPresented { .. }
+            ConformanceRefusalError::FlowStalledBeforeItPresented { .. }
         ),
         "the silent streamer was failed by an exhausted frame budget rather than by the kernel's \
          own stall judgement: {failure:?}"

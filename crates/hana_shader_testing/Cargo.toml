@@ -10,5 +10,6 @@ version.workspace = true
 workspace = true
 
 [dependencies]
-bevy.workspace = true
-naga.workspace = true
+bevy.workspace      = true
+naga.workspace      = true
+thiserror.workspace = true

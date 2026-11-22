@@ -15,7 +15,7 @@ use thiserror::Error;
 pub enum CameraEvaluationError {
     /// The selected external curve cannot ease its scope.
     #[error("the external camera easing curve was rejected: {0}")]
-    ExternalCurveRejected(SequenceEasingError),
+    ExternalCurveRejected(#[source] SequenceEasingError),
     /// An easing path produced a NaN or infinite output.
     #[error("the camera easing curve produced a non-finite output")]
     NonFiniteEasing,
@@ -41,15 +41,14 @@ impl From<SequenceOwner> for CameraEvaluationSource {
 }
 
 /// Every semantic reason a retained evaluation holds its last controller pose.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(super) enum CameraEvaluationDiagnosticError {
+    #[error("the camera sequence driver has no evaluation")]
     MissingDriverEvaluation,
-    UnresolvedDriverScope(SequenceScopeError),
-    Evaluation(CameraEvaluationError),
-}
-
-impl From<CameraEvaluationError> for CameraEvaluationDiagnosticError {
-    fn from(error: CameraEvaluationError) -> Self { Self::Evaluation(error) }
+    #[error("the camera sequence driver scope is unresolved: {0}")]
+    UnresolvedDriverScope(#[source] SequenceScopeError),
+    #[error("the camera pose evaluation failed: {0}")]
+    Evaluation(#[from] CameraEvaluationError),
 }
 
 /// Bounded reporting state for one exact evaluator source and failure.

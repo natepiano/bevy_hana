@@ -190,14 +190,14 @@ struct UnrebasedWire {
 /// Rejected `captured_scale` from a persisted `Unrebased` entry.
 #[derive(Debug, Error)]
 #[error("persisted captured_scale {0} is not a finite number greater than zero")]
-pub(crate) struct InvalidCapturedScale(f64);
+pub(crate) struct CapturedScaleError(f64);
 
 impl TryFrom<UnrebasedWire> for UnrebasedDesktopPosition {
-    type Error = InvalidCapturedScale;
+    type Error = CapturedScaleError;
 
     fn try_from(wire: UnrebasedWire) -> Result<Self, Self::Error> {
         Self::from_legacy(wire.logical, wire.captured_scale)
-            .ok_or(InvalidCapturedScale(wire.captured_scale))
+            .ok_or(CapturedScaleError(wire.captured_scale))
     }
 }
 

@@ -12,10 +12,11 @@ use bevy::prelude::Reflect;
 use bevy::prelude::Resource;
 use bevy::reflect::ReflectSerialize;
 use serde::Serialize;
+use thiserror::Error;
 
 use crate::AuthoritativeReporterCoverage;
 use crate::Bindings;
-use crate::CapabilityProjectionFailure;
+use crate::CapabilityProjectionError;
 use crate::CoveredDeviceIdentitySpace;
 use crate::DeviceAccessError;
 use crate::DeviceKind;
@@ -161,7 +162,7 @@ enum OneShotLogState {
     Emitted,
 }
 
-/// Error text and elapsed milestone retained across one uninterrupted failure run.
+/// The last logged error and milestone in an uninterrupted failure run.
 #[derive(Debug, PartialEq, Eq)]
 struct FailureLogState {
     last_logged_error:     LoggedFailureError,
@@ -183,15 +184,14 @@ impl FailureLogState {
         error: &DeviceAccessErrorView,
         failure_elapsed: Duration,
     ) -> FailureLogDecisions {
-        let error_text = format!("{error:?}");
-        let error = match &self.last_logged_error {
+        let error_decision = match &self.last_logged_error {
             LoggedFailureError::NoFailure => ReporterLogDecision::FirstFailure,
-            LoggedFailureError::Text(previous) if previous != &error_text => {
+            LoggedFailureError::Emitted(previous) if previous != error => {
                 ReporterLogDecision::ChangedError
             },
-            LoggedFailureError::Text(_) => ReporterLogDecision::NoLog,
+            LoggedFailureError::Emitted(_) => ReporterLogDecision::NoLog,
         };
-        self.last_logged_error = LoggedFailureError::Text(error_text);
+        self.last_logged_error = LoggedFailureError::Emitted(error.clone());
 
         let reached = FailureLogMilestoneIndex::reached_at(failure_elapsed);
         let milestone = if reached == FailureLogMilestoneIndex::BeforeFirst
@@ -203,7 +203,10 @@ impl FailureLogState {
             ReporterLogDecision::FailureMilestone(reached)
         };
 
-        FailureLogDecisions { error, milestone }
+        FailureLogDecisions {
+            error: error_decision,
+            milestone,
+        }
     }
 }
 
@@ -326,13 +329,15 @@ impl ReporterFailureRun {
     }
 }
 
-/// Error text most recently emitted for the current failure run.
-#[derive(Debug, PartialEq, Eq)]
+/// The error that the reporter last logged in the current failure run.
+#[derive(Debug, Eq, Error, PartialEq)]
 enum LoggedFailureError {
-    /// No failure in the current run has been emitted.
+    /// The reporter has yet to log an error in the current run.
+    #[error("the reporter has no logged error")]
     NoFailure,
-    /// This exact structured error text was emitted.
-    Text(String),
+    /// The reporter logged this error.
+    #[error("{0}")]
+    Emitted(DeviceAccessErrorView),
 }
 
 /// Whether the reporter registry has accepted a successful set and what its count was.
@@ -922,13 +927,13 @@ pub enum ReporterResume {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Reflect)]
 #[reflect(Serialize)]
 pub struct CapabilityProjectionFailures {
-    entries: Vec<CapabilityProjectionFailure>,
+    entries: Vec<CapabilityProjectionError>,
 }
 
 impl CapabilityProjectionFailures {
     fn new(
-        first: CapabilityProjectionFailure,
-        remaining: impl IntoIterator<Item = CapabilityProjectionFailure>,
+        first: CapabilityProjectionError,
+        remaining: impl IntoIterator<Item = CapabilityProjectionError>,
     ) -> Self {
         let mut entries = vec![first];
         entries.extend(remaining);
@@ -937,7 +942,7 @@ impl CapabilityProjectionFailures {
 
     /// Borrow the failures in ascending reflected type-path order.
     #[must_use]
-    pub fn entries(&self) -> &[CapabilityProjectionFailure] { &self.entries }
+    pub fn entries(&self) -> &[CapabilityProjectionError] { &self.entries }
 }
 
 /// Whether every capability in an accepted complete set reached reflected component projection.
@@ -951,10 +956,10 @@ pub enum CapabilityProjectionStatus {
 }
 
 impl CapabilityProjectionStatus {
-    pub(crate) fn from_failures(mut failures: Vec<CapabilityProjectionFailure>) -> Self {
+    pub(crate) fn from_failures(mut failures: Vec<CapabilityProjectionError>) -> Self {
         failures.sort_by(|left, right| {
-            capability_projection_failure_type_path(left)
-                .cmp(capability_projection_failure_type_path(right))
+            capability_projection_error_type_path(left)
+                .cmp(capability_projection_error_type_path(right))
         });
         failures.dedup();
 
@@ -965,7 +970,7 @@ impl CapabilityProjectionStatus {
         Self::Failed(CapabilityProjectionFailures::new(first, failures))
     }
 
-    fn extend_failures(&mut self, failures: impl IntoIterator<Item = CapabilityProjectionFailure>) {
+    fn extend_failures(&mut self, failures: impl IntoIterator<Item = CapabilityProjectionError>) {
         let mut combined = match self {
             Self::AllProjected => Vec::new(),
             Self::Failed(failures) => failures.entries.clone(),
@@ -975,12 +980,12 @@ impl CapabilityProjectionStatus {
     }
 }
 
-fn capability_projection_failure_type_path(failure: &CapabilityProjectionFailure) -> &str {
-    match failure {
-        CapabilityProjectionFailure::ApplicationTypeRegistryUnavailable { affected_type_path } => {
+fn capability_projection_error_type_path(error: &CapabilityProjectionError) -> &str {
+    match error {
+        CapabilityProjectionError::ApplicationTypeRegistryUnavailable { affected_type_path } => {
             affected_type_path
         },
-        CapabilityProjectionFailure::ReflectComponentNotRegistered { type_path } => type_path,
+        CapabilityProjectionError::ReflectComponentNotRegistered { type_path } => type_path,
     }
 }
 
@@ -1209,7 +1214,7 @@ impl ReporterHealth {
 
     pub(crate) fn record_capability_projection_failures(
         &mut self,
-        failures: impl IntoIterator<Item = CapabilityProjectionFailure>,
+        failures: impl IntoIterator<Item = CapabilityProjectionError>,
     ) {
         if let ReporterOutcomeHealth::Succeeded {
             capability_projection,

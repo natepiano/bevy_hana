@@ -9,6 +9,7 @@ use bevy::prelude::Component;
 use bevy::prelude::Reflect;
 use bevy::reflect::ReflectSerialize;
 use serde::Serialize;
+use thiserror::Error;
 
 use crate::AttemptInvalidation;
 use crate::AttemptRef;
@@ -151,7 +152,7 @@ pub enum WaitingStatusView {
     /// Application code must register the reflected capability component.
     ApplicationCapabilityRegistrationRequired {
         /// Capability type whose projection cannot proceed.
-        failure: CapabilityProjectionFailure,
+        failure: CapabilityProjectionError,
         /// Retained timing for this wait.
         timing:  WaitTiming,
     },
@@ -635,16 +636,18 @@ pub enum DeviceRevisionGateView {
     Retained(DeviceRevisionView),
 }
 
-/// Capability projection failure visible to reporter and role diagnostics.
-#[derive(Clone, Debug, PartialEq, Eq, Reflect, Serialize)]
+/// Capability projection error visible to reporter and role diagnostics.
+#[derive(Clone, Debug, Eq, Error, PartialEq, Reflect, Serialize)]
 #[reflect(Serialize)]
-pub enum CapabilityProjectionFailure {
+pub enum CapabilityProjectionError {
     /// The world has no application type registry resource.
+    #[error("the application type registry is unavailable for {affected_type_path}")]
     ApplicationTypeRegistryUnavailable {
         /// Reflected type path of a capability affected by the missing registry.
         affected_type_path: String,
     },
     /// The application type registry has no `ReflectComponent` entry for this type.
+    #[error("{type_path} has no ReflectComponent registration")]
     ReflectComponentNotRegistered {
         /// Reflected type path of the component that could not be projected.
         type_path: String,

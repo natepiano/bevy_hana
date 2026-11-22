@@ -242,7 +242,7 @@ impl ArrangementProvider for Provider {
                 plan.with_fold_groups(Selection, groups)?
                     .with_capability(Selection, clearance)
             },
-            Layout::ProviderError => Err(ArrangementError::provider(ProviderFailure)),
+            Layout::ProviderError => Err(ArrangementError::provider(ProviderError)),
             Layout::ForeignFoldGroupMember => {
                 let root_entity = members.entity(&0)?;
 
@@ -323,7 +323,7 @@ struct UnprovidedCapability;
 
 #[derive(Debug, thiserror::Error)]
 #[error("provider intentionally failed")]
-struct ProviderFailure;
+struct ProviderError;
 
 #[derive(Component, Default, FromTemplate)]
 struct SceneMarker;
@@ -2277,10 +2277,10 @@ fn every_built_in_reports_an_unrepresentable_endpoint() {
     );
 }
 
-/// Failure a downstream recipe defines for itself.
+/// An error from the downstream recipe.
 #[derive(Debug, thiserror::Error)]
 #[error("downstream recipe refused to fold")]
-struct DownstreamFailure;
+struct DownstreamError;
 
 /// How one downstream recipe misbehaves, one per assignment-coverage error.
 #[derive(Clone, Copy)]
@@ -2298,7 +2298,7 @@ enum DownstreamBehavior {
 struct DownstreamRecipe(DownstreamBehavior);
 
 impl FoldRecipe for DownstreamRecipe {
-    type Error = DownstreamFailure;
+    type Error = DownstreamError;
     type RequiredCapability = NoCapability;
 
     fn fold_assignments(
@@ -2308,7 +2308,7 @@ impl FoldRecipe for DownstreamRecipe {
         _: &Self::RequiredCapability,
     ) -> Result<Vec<FoldAssignment>, Self::Error> {
         if matches!(self.0, DownstreamBehavior::Fail) {
-            return Err(DownstreamFailure);
+            return Err(DownstreamError);
         }
         let mut assignments = groups
             .iter()

@@ -36,8 +36,8 @@ use bevy::prelude::World;
 use bevy::tasks::IoTaskPool;
 use bevy::tasks::TaskPoolBuilder;
 pub use conformance::CapabilityDeclaration;
-pub use conformance::ConformanceFailure;
-pub use conformance::ConformanceRefusal;
+pub use conformance::ConformanceError;
+pub use conformance::ConformanceRefusalError;
 pub use conformance::ConformanceReport;
 pub use conformance::ConformanceStep;
 pub use conformance::ConformanceStop;
@@ -61,6 +61,7 @@ use hana_rigging::DeviceRecord;
 use hana_rigging::DeviceReporter;
 use hana_rigging::DeviceScan;
 use hana_rigging::DiscoveryControl;
+use hana_rigging::DiscoveryControlError;
 use hana_rigging::DiscoveryJob;
 use hana_rigging::DiscoveryProgress;
 use hana_rigging::DiscoveryWork;
@@ -137,10 +138,15 @@ pub enum ScriptedKeyError {
 pub enum ScriptedAdvanceError {
     /// The kernel refused the discovery request, usually because the reporter is not registered.
     #[error("the kernel refused a discovery request for the scripted reporter: {0}")]
-    RequestRefused(String),
-    /// The reporter has no retained status, so its completion count cannot be watched.
-    #[error("the scripted reporter has no retained discovery status: {0}")]
-    NoStatus(String),
+    RequestRefused(#[source] DiscoveryControlError),
+    /// The reporter has no retained status.
+    #[error(
+        "the scripted reporter has no retained discovery status: reporter has no health component"
+    )]
+    NoStatus {
+        /// The reporter with no health component.
+        reporter: ReporterId,
+    },
 }
 
 /// Failure selecting an authority retained by a [`ScriptedDriver`].
@@ -818,7 +824,7 @@ pub fn advance_reporter(app: &mut App, reporter: ReporterId) -> Result<(), Scrip
     app.world_mut()
         .resource_mut::<DiscoveryControl>()
         .request(reporter)
-        .map_err(|error| ScriptedAdvanceError::RequestRefused(error.to_string()))?;
+        .map_err(ScriptedAdvanceError::RequestRefused)?;
 
     while completed_batches(app, reporter)? <= completed_before {
         await_running_discovery_job(app, reporter);
@@ -851,7 +857,7 @@ pub fn advance_until_running(
     app.world_mut()
         .resource_mut::<DiscoveryControl>()
         .request(reporter)
-        .map_err(|error| ScriptedAdvanceError::RequestRefused(error.to_string()))?;
+        .map_err(ScriptedAdvanceError::RequestRefused)?;
 
     while !is_running(app, reporter)? {
         app.update();
@@ -904,9 +910,7 @@ fn reporter_health(
         .iter_entities()
         .filter_map(|entity| entity.get::<ReporterHealth>())
         .find(|health| health.belongs_to(reporter))
-        .ok_or_else(|| {
-            ScriptedAdvanceError::NoStatus(String::from("reporter has no health component"))
-        })
+        .ok_or(ScriptedAdvanceError::NoStatus { reporter })
 }
 
 /// Build a [`ScriptedScan::Complete`] from a list of scripted devices.

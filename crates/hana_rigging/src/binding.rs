@@ -59,7 +59,7 @@ use crate::AttemptEnding;
 use crate::AttemptEndingView;
 use crate::AttemptInvalidation;
 use crate::AttemptRef;
-use crate::CapabilityProjectionFailure;
+use crate::CapabilityProjectionError;
 use crate::ClaimHolder;
 use crate::ClaimHolderView;
 use crate::DeviceAccessError;
@@ -1167,7 +1167,7 @@ pub(crate) enum WaitingCondition {
         error: DriverContractFailureReport,
     },
     ApplicationCapabilityRegistrationRequired {
-        failure: CapabilityProjectionFailure,
+        failure: CapabilityProjectionError,
     },
     ApplicationReporterRegistrationRequired {
         key: DeviceKey,

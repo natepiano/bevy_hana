@@ -4,39 +4,43 @@
 //! Types:
 //! - [`BindingsError`] — the public error enum surfaced by each camera's binding validation path.
 
-use std::error::Error;
-use std::fmt;
-use std::fmt::Display;
-use std::fmt::Formatter;
+use thiserror::Error;
 
 /// Structured binding validation error.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum BindingsError {
     /// A binding entry did not provide source metadata.
+    #[error("binding source metadata is missing")]
     MissingSources,
     /// A held action has motion without engagement.
+    #[error("{action} is a held binding but has no engagement binding")]
     HeldMotionMissingEngagement {
         /// Semantic action name.
         action: &'static str,
     },
     /// An impulse action was configured with held engagement.
+    #[error("{action} is an impulse binding and cannot have an engagement action")]
     ImpulseEngagement {
         /// Semantic action name.
         action: &'static str,
     },
     /// Held motion and engagement metadata did not match.
+    #[error("{action} motion and engagement bindings do not share source metadata")]
     HeldSourceMismatch {
         /// Semantic action name.
         action: &'static str,
     },
     /// A held binding requires and blocks the same gate input.
+    #[error("{action} requires and blocks the same gate input")]
     ContradictoryGate {
         /// Semantic action name.
         action: &'static str,
     },
     /// A scale modifier or input gain value was invalid.
+    #[error("binding scale modifier or input gain value is invalid")]
     InvalidScale,
     /// A dead-zone modifier used unsupported thresholds.
+    #[error("binding dead-zone thresholds are invalid")]
     InvalidDeadZone,
 }
 
@@ -53,43 +57,3 @@ impl BindingsError {
         }
     }
 }
-
-impl Display for BindingsError {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingSources => formatter.write_str("binding source metadata is missing"),
-            Self::HeldMotionMissingEngagement { action } => {
-                write!(
-                    formatter,
-                    "{action} is a held binding but has no engagement binding"
-                )
-            },
-            Self::ImpulseEngagement { action } => {
-                write!(
-                    formatter,
-                    "{action} is an impulse binding and cannot have an engagement action"
-                )
-            },
-            Self::HeldSourceMismatch { action } => {
-                write!(
-                    formatter,
-                    "{action} motion and engagement bindings do not share source metadata"
-                )
-            },
-            Self::ContradictoryGate { action } => {
-                write!(
-                    formatter,
-                    "{action} requires and blocks the same gate input"
-                )
-            },
-            Self::InvalidScale => {
-                formatter.write_str("binding scale modifier or input gain value is invalid")
-            },
-            Self::InvalidDeadZone => {
-                formatter.write_str("binding dead-zone thresholds are invalid")
-            },
-        }
-    }
-}
-
-impl Error for BindingsError {}

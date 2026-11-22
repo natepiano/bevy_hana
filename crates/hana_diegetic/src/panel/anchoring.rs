@@ -12,6 +12,7 @@
 //! coordinate-space positioners. World sources may target world panels or
 //! reified widgets in the same coordinate space.
 
+use bevy::ecs::query::QueryEntityError;
 use bevy::prelude::Camera;
 use bevy::prelude::Changed;
 use bevy::prelude::ChildOf;
@@ -285,6 +286,7 @@ fn apply_panel_attachment_operation(
 ) {
     let source = operation.source();
     let result = validate_panel_endpoint(source, &panels, PanelEndpointRole::Source)
+        .map_err(PanelAttachmentError::from)
         .and_then(|()| {
             operation.target().map_or(Ok(()), |target| {
                 validate_attachment_target(target, &panels, &widget_indices, &widgets)
@@ -295,12 +297,12 @@ fn apply_panel_attachment_operation(
                 authored_attachments
                     .get(source.entity)
                     .map(|_| ())
-                    .map_err(|_| "source panel has no live attachment")
+                    .map_err(PanelAttachmentError::NoSourceAttachment)
             },
             PanelAttachmentOperation::Attach { .. } => Ok(()),
         });
     if let Err(reason) = result {
-        warn_rejected_attachment(operation, reason);
+        warn_rejected_attachment(operation, &reason);
         return;
     }
 
@@ -339,34 +341,61 @@ fn validate_panel_endpoint(
     endpoint: PanelEndpoint,
     panels: &Query<&DiegeticPanel>,
     role: PanelEndpointRole,
-) -> Result<(), &'static str> {
-    let panel = panels.get(endpoint.entity).map_err(|_| role.missing())?;
+) -> Result<(), PanelEndpointError> {
+    let panel = panels
+        .get(endpoint.entity)
+        .map_err(|source| PanelEndpointError::Missing { role, source })?;
     if PanelSpace::from(panel.coordinate_space()) != endpoint.space {
-        return Err(role.space_changed());
+        return Err(PanelEndpointError::SpaceChanged(role));
     }
     Ok(())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum PanelEndpointRole {
     Source,
     Target,
 }
 
 impl PanelEndpointRole {
-    const fn missing(self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
-            Self::Source => "source panel is missing",
-            Self::Target => "target panel is missing",
+            Self::Source => "source",
+            Self::Target => "target",
         }
     }
+}
 
-    const fn space_changed(self) -> &'static str {
-        match self {
-            Self::Source => "source panel coordinate space changed",
-            Self::Target => "target panel coordinate space changed",
-        }
-    }
+#[derive(Debug, thiserror::Error)]
+enum PanelEndpointError {
+    #[error("{} panel is missing", .role.label())]
+    Missing {
+        role:   PanelEndpointRole,
+        #[source]
+        source: QueryEntityError,
+    },
+    #[error("{} panel coordinate space changed", .0.label())]
+    SpaceChanged(PanelEndpointRole),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum PanelAttachmentError {
+    #[error("{0}")]
+    Endpoint(#[from] PanelEndpointError),
+    #[error("source panel has no live attachment")]
+    NoSourceAttachment(#[source] QueryEntityError),
+    #[error("target widget is missing")]
+    MissingWidget(#[source] QueryEntityError),
+    #[error("target widget owner changed")]
+    WidgetOwnerChanged,
+    #[error("target widget owner panel is missing")]
+    MissingWidgetOwner(#[source] QueryEntityError),
+    #[error("target widget coordinate space changed")]
+    WidgetSpaceChanged,
+    #[error("target widget owner index is missing")]
+    MissingWidgetIndex(#[source] QueryEntityError),
+    #[error("target widget is no longer indexed by its owner panel")]
+    WidgetNotIndexed,
 }
 
 fn validate_attachment_target(
@@ -374,10 +403,11 @@ fn validate_attachment_target(
     panels: &Query<&DiegeticPanel>,
     widget_indices: &Query<&PanelWidgetIndex, With<DiegeticPanel>>,
     widgets: &Query<(&PanelWidget, &WidgetOf)>,
-) -> Result<(), &'static str> {
+) -> Result<(), PanelAttachmentError> {
     match target {
         PanelAttachmentTarget::Panel(panel) => {
             validate_panel_endpoint(panel, panels, PanelEndpointRole::Target)
+                .map_err(PanelAttachmentError::from)
         },
         PanelAttachmentTarget::Widget {
             entity,
@@ -386,21 +416,21 @@ fn validate_attachment_target(
         } => {
             let (widget, widget_of) = widgets
                 .get(entity)
-                .map_err(|_| "target widget is missing")?;
+                .map_err(PanelAttachmentError::MissingWidget)?;
             if widget_of.panel() != owner {
-                return Err("target widget owner changed");
+                return Err(PanelAttachmentError::WidgetOwnerChanged);
             }
             let owner = panels
                 .get(owner)
-                .map_err(|_| "target widget owner panel is missing")?;
+                .map_err(PanelAttachmentError::MissingWidgetOwner)?;
             if PanelSpace::from(owner.coordinate_space()) != space {
-                return Err("target widget coordinate space changed");
+                return Err(PanelAttachmentError::WidgetSpaceChanged);
             }
             let index = widget_indices
                 .get(widget_of.panel())
-                .map_err(|_| "target widget owner index is missing")?;
+                .map_err(PanelAttachmentError::MissingWidgetIndex)?;
             if !index.maps_to(widget.id(), entity) {
-                return Err("target widget is no longer indexed by its owner panel");
+                return Err(PanelAttachmentError::WidgetNotIndexed);
             }
             Ok(())
         },
@@ -421,7 +451,7 @@ fn set_screen_widget_relation(
     }
 }
 
-fn warn_rejected_attachment(operation: PanelAttachmentOperation, reason: &str) {
+fn warn_rejected_attachment(operation: PanelAttachmentOperation, reason: &PanelAttachmentError) {
     let source = operation.source().entity;
     if let Some(target) = operation.target() {
         warn!(
@@ -1038,7 +1068,7 @@ mod tests {
     use bevy::transform::TransformPlugin;
     use hana_valence::AnchorPose;
     use hana_valence::AnchorResolveDiagnostics;
-    use hana_valence::AnchorResolveSkip;
+    use hana_valence::AnchorResolveError;
     use hana_valence::AnchorSystems;
     use hana_valence::AnchoredHere;
     use hana_valence::AnchoredTo as ValenceAnchoredTo;
@@ -2074,7 +2104,7 @@ mod tests {
             .filter(|entry| {
                 entry.source == source
                     && entry.target == target
-                    && entry.reason == AnchorResolveSkip::MissingTargetGeometry
+                    && entry.reason == AnchorResolveError::MissingTargetGeometry
             })
             .collect::<Vec<_>>();
         assert_eq!(entries.len(), 1);

@@ -339,7 +339,7 @@ fn diegetic_app() -> Result<App, String> {
     for _ in 0..4 {
         app.update();
     }
-    hana_shader_testing::wait_for_shaders(&mut app)?;
+    hana_shader_testing::wait_for_shaders(&mut app).map_err(|error| error.to_string())?;
     Ok(app)
 }
 

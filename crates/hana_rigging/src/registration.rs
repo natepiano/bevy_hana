@@ -19,7 +19,7 @@ use bevy::time::Real;
 use bevy::time::Time;
 
 use crate::BatchRef;
-use crate::CapabilityProjectionFailure;
+use crate::CapabilityProjectionError;
 use crate::CapabilityProjectionStatus;
 use crate::DeviceAccessErrorView;
 use crate::DeviceReporter;
@@ -551,9 +551,9 @@ impl Reporters {
     pub(crate) fn record_capability_projection_failures(
         &mut self,
         world: &mut World,
-        failures: impl IntoIterator<Item = (ReporterId, CapabilityProjectionFailure)>,
+        failures: impl IntoIterator<Item = (ReporterId, CapabilityProjectionError)>,
     ) {
-        let mut failures_by_reporter: HashMap<ReporterId, Vec<CapabilityProjectionFailure>> =
+        let mut failures_by_reporter: HashMap<ReporterId, Vec<CapabilityProjectionError>> =
             HashMap::new();
         for (reporter, failure) in failures {
             failures_by_reporter

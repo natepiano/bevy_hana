@@ -14,6 +14,7 @@ use bevy::prelude::With;
 use bevy::prelude::Without;
 use hana_kana::SequenceCommands;
 use hana_kana::SequenceOwner;
+use thiserror::Error;
 
 use super::CameraSequence;
 use super::playback::CameraPose;
@@ -101,9 +102,11 @@ impl CameraControllerInstallation {
 }
 
 /// Why an available controller cannot yet name its installation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(super) enum CameraControllerInstallationError {
+    #[error("the camera controller is unavailable")]
     ControllerUnavailable,
+    #[error("the camera controller has no installation identity yet")]
     IdentityPending,
 }
 

@@ -376,7 +376,8 @@ impl FoldCommands<'_, '_> {
 }
 
 /// The authored ledger produced boundary positions local playback rejected.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
+#[error(transparent)]
 struct FoldPlaybackError(SequencePlaybackError);
 
 /// How the external curve of a selected producer meets authored stage easing

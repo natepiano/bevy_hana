@@ -55,8 +55,11 @@ pub struct EstablishedWindowPlacement {
 
 /// A window placement was requested for a device that is not a display.
 #[derive(Debug, thiserror::Error)]
-#[error("window placement requires a monitor, received {0:?}")]
-pub struct InvalidWindowDisplay(DeviceKind);
+pub enum WindowDisplayError {
+    /// The device is not a monitor.
+    #[error("window placement requires a monitor, received {0:?}")]
+    NonDisplay(DeviceKind),
+}
 
 /// Placement authored before a window has supplied driver readback.
 #[derive(Clone, Debug, PartialEq, Eq, Reflect)]
@@ -136,10 +139,10 @@ impl RequestedWindowPlacement {
     ///
     /// # Errors
     ///
-    /// Returns [`InvalidWindowDisplay`] for a non-display device key.
-    pub fn fullscreen_for_display(device: &DeviceKey) -> Result<Self, InvalidWindowDisplay> {
+    /// Returns [`WindowDisplayError`] for a non-display device key.
+    pub fn fullscreen_for_display(device: &DeviceKey) -> Result<Self, WindowDisplayError> {
         if device.kind != DeviceKind::Display {
-            return Err(InvalidWindowDisplay(device.kind));
+            return Err(WindowDisplayError::NonDisplay(device.kind));
         }
         let resolution = Window::default().resolution;
         Ok(Self {

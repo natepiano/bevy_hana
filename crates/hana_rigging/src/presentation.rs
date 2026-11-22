@@ -306,7 +306,7 @@ mod tests {
     use crate::AttemptRef;
     use crate::AuthoredId;
     use crate::BatchRef;
-    use crate::CapabilityProjectionFailure;
+    use crate::CapabilityProjectionError;
     use crate::ClaimHolderView;
     use crate::ContinuousFlowExpectation;
     use crate::ContinuousFlowExpiryCause;
@@ -606,7 +606,7 @@ mod tests {
                 timing: sample_timing(),
             },
             WaitingStatusView::ApplicationCapabilityRegistrationRequired {
-                failure: CapabilityProjectionFailure::ReflectComponentNotRegistered {
+                failure: CapabilityProjectionError::ReflectComponentNotRegistered {
                     type_path: "truth_table::Capability".to_owned(),
                 },
                 timing:  sample_timing(),

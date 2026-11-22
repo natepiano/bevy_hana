@@ -16,7 +16,7 @@ use bevy::transform::TransformSystems;
 use hana_valence::AnchorFrame;
 use hana_valence::AnchorPose;
 use hana_valence::AnchorResolveDiagnostics;
-use hana_valence::AnchorResolveSkip;
+use hana_valence::AnchorResolveError;
 use hana_valence::AnchorSite;
 use hana_valence::AnchoredTo;
 use hana_valence::Displacement;
@@ -179,7 +179,7 @@ fn assert_unsupported_parent(app: &App, parent: Entity, target: Entity, source: 
             .current()
             .any(|entry| entry.source == source
                 && entry.target == target
-                && entry.reason == AnchorResolveSkip::UnsupportedParentTransform),
+                && entry.reason == AnchorResolveError::UnsupportedParentTransform),
         "a local pose requiring shear must skip"
     );
     assert_eq!(
@@ -246,7 +246,7 @@ fn degenerate_parent_still_skips() {
                 .current()
                 .any(|entry| entry.source == source
                     && entry.target == target
-                    && entry.reason == AnchorResolveSkip::UnsupportedParentTransform)
+                    && entry.reason == AnchorResolveError::UnsupportedParentTransform)
         );
     }
 }
