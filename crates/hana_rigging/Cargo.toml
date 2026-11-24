@@ -24,7 +24,7 @@ serde.workspace     = true
 thiserror.workspace = true
 
 [dev-dependencies]
-bevy                            = { workspace = true, features = ["bevy_world_serialization"] }
+bevy                            = { workspace = true }
 fairy_dust.workspace            = true
 hana_diegetic.workspace         = true
 hana_lagrange.workspace         = true

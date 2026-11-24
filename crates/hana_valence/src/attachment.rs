@@ -484,13 +484,6 @@ impl<R: Send + Sync + 'static> AttachmentResolveDiagnostics<R> {
             if let Some(entry) = self.entries.iter_mut().find(matches) {
                 *entry = *active;
             }
-            tracing::warn!(target: "hana_valence::diagnostics",
-                source = ?source,
-                target = ?target,
-                reason = ?reason,
-                count = active.count,
-                "attachment skip repeated"
-            );
             return;
         }
 
@@ -614,12 +607,10 @@ mod tests {
 
     impl<S: Subscriber> Layer<S> for SkipTransitionLog {
         fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
-            if event.metadata().target() == "hana_valence::attachment" {
-                self.0
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(*event.metadata().level());
-            }
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(*event.metadata().level());
         }
     }
 

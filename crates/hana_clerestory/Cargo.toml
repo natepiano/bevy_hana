@@ -43,7 +43,7 @@ thiserror         = { workspace = true }
 tracing           = { workspace = true, optional = true }
 
 [dev-dependencies]
-bevy                  = { workspace = true, features = ["bevy_pbr", "bevy_ui", "default_font"] }
+bevy                  = { workspace = true }
 bevy_remote           = { workspace = true }
 hana_clerestory       = { path = ".", features = ["test"] }
 hana_rigging_scripted = { workspace = true }

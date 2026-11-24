@@ -49,7 +49,7 @@ thiserror = { workspace = true }
 ttf-parser = { workspace = true }
 
 [dev-dependencies]
-bevy                          = { workspace = true, features = ["default_font", "tonemapping_luts"] }
+bevy                          = { workspace = true }
 bevy_brp_extras               = { workspace = true }
 blake3                        = { workspace = true }
 clay-layout                   = { workspace = true }

@@ -32,7 +32,7 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-bevy          = { workspace = true, features = ["3d"] }
+bevy          = { workspace = true }
 bevy_tween    = { workspace = true }
 fairy_dust    = { workspace = true }
 hana_diegetic = { workspace = true }

@@ -64,6 +64,7 @@ use super::AncestorVisibility;
 use super::BatchRenderLayers;
 use super::CommandIndex;
 use super::Dirty;
+use super::PanelGeometryBuild;
 use super::VisualShadow;
 use super::batch_store;
 use super::batch_store::Batch;
@@ -635,6 +636,7 @@ impl Plugin for ImageBatchPlugin {
                 route_image_batch_records
                     .run_if(image_batch_route_inputs_changed)
                     .after(precompose::cleanup_retired_precompose_images)
+                    .after(PanelGeometryBuild)
                     .before(TransformSystems::Propagate)
                     .before(BatchResourcesReady),
             )

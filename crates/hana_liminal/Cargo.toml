@@ -48,21 +48,12 @@ serde_json.workspace          = true
 # it puts `AudioPlugin` into `DefaultPlugins` for every test binary. Audio
 # startup opens ALSA -> PipeWire -> D-Bus and asks the realtime portal for
 # priority with no timeout, which strands headless test processes forever.
-bevy = { workspace = true, features = [
-  "2d",
-  "3d",
-  "bevy_animation",
-  "bevy_anti_alias",
-  "bevy_gltf",
-  "bevy_post_process",
-  "scene",
-  "ui",
-] }
+bevy            = { workspace = true }
 bevy_brp_extras = { workspace = true }
-fairy_dust = { workspace = true }
+fairy_dust      = { workspace = true }
 hana_clerestory = { workspace = true }
-hana_diegetic = { workspace = true }
-hana_lagrange = { workspace = true, features = ["fit_overlay"] }
+hana_diegetic   = { workspace = true }
+hana_lagrange   = { workspace = true, features = ["fit_overlay"] }
 
 [[example]]
 name = "simple"

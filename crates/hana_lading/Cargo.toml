@@ -22,13 +22,8 @@ bevy_ecs   = { workspace = true }
 tracing    = { workspace = true }
 
 [dev-dependencies]
-bevy = { workspace = true, features = [
-  "bevy_asset",
-  "bevy_image",
-  "bevy_state",
-  "png",
-] }
-fairy_dust.workspace = true
+bevy                    = { workspace = true }
+fairy_dust.workspace    = true
 hana_diegetic.workspace = true
 hana_lagrange.workspace = true
 

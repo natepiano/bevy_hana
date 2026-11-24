@@ -43,7 +43,7 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-bevy            = { workspace = true, features = ["3d"] }
+bevy            = { workspace = true }
 bevy_brp_extras = { workspace = true }
 fairy_dust      = { workspace = true }
 float-cmp       = { workspace = true }
